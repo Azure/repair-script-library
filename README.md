@@ -1,5 +1,10 @@
+# Repair Script Library
 
-# Contributing
+The Repair Script Library organizes and archives known Windows and Linux repair scripts to automate frequent fix scenarios.
+Each repair script has a unique-id mapped on [map.json](https://github.com/Azure/repair-script-library/blob/master/map.json)
+
+
+## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
 Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us

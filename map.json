@@ -1,0 +1,10 @@
+[
+	{
+		"id" : "win-test",
+		"path" : "src/windows/win-test.ps1"
+	},
+	{
+		"id" : "linux-test",
+		"path" : "src/linux/linux-test.sh"
+	}
+]
