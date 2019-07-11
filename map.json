@@ -1,10 +1,18 @@
 [
 	{
-		"id" : "win-test",
-		"path" : "src/windows/win-test.ps1"
+		"id" : "win-hello-world",
+		"path" : "src/windows/win-hello-world.ps1"
 	},
 	{
-		"id" : "linux-test",
-		"path" : "src/linux/linux-test.sh"
+		"id" : "linux-hello-world",
+		"path" : "src/linux/linux-hello-world.sh"
+	},
+	{
+		"id" : "win-error-test",
+		"path" : "src/windows/win-error-test.ps1"
+	},
+	{
+		"id" : "linux-error-test",
+		"path" : "src/linux/linux-error-test.sh"
 	}
 ]
