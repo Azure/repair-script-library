@@ -14,5 +14,9 @@
 	{
 		"id" : "linux-error-test",
 		"path" : "src/linux/linux-error-test.sh"
+	},
+	{
+		"id" : "win-system-corruption",
+		"path" : "src/windows/win-system-corruption.ps1"
 	}
 ]
