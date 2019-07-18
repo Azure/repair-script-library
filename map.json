@@ -1,22 +1,27 @@
 [
 	{
 		"id" : "win-hello-world",
-		"path" : "src/windows/win-hello-world.ps1"
+		"path" : "src/windows/win-hello-world.ps1",
+		"description" : "Hello world test script"
 	},
 	{
 		"id" : "linux-hello-world",
-		"path" : "src/linux/linux-hello-world.sh"
+		"path" : "src/linux/linux-hello-world.sh",
+		"description" : "Hello world test script"
 	},
 	{
 		"id" : "win-error-test",
-		"path" : "src/windows/win-error-test.ps1"
+		"path" : "src/windows/win-error-test.ps1",
+		"description" : "Error test script"
 	},
 	{
 		"id" : "linux-error-test",
-		"path" : "src/linux/linux-error-test.sh"
+		"path" : "src/linux/linux-error-test.sh",
+		"description" : "Error test script"
 	},
 	{
 		"id" : "win-system-corruption",
-		"path" : "src/windows/win-system-corruption.ps1"
+		"path" : "src/windows/win-system-corruption.ps1",
+		"description" : "Runs chkdsk to fix file system corruption"
 	}
 ]

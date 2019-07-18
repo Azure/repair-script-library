@@ -2,6 +2,7 @@
 
 $partitionlist = Get-Disk-Partitions
 Write-Output $partitionlist
+
 forEach ( $partition in $partitionlist )
 {
     $driveLetter = ($partition.DriveLetter + ":")
