@@ -20,8 +20,13 @@
 		"description" : "Error test script"
 	},
 	{
-		"id" : "win-system-corruption",
-		"path" : "src/windows/win-system-corruption.ps1",
+		"id" : "win-chkdsk-fs-corruption",
+		"path" : "src/windows/win-chkdsk-fs-corruption.ps1",
 		"description" : "Runs chkdsk to fix file system corruption"
+	},
+	{
+		"id" : "win-sfc-sf-corruption",
+		"path" : "src/windows/win-sfc-sf-corruption.ps1",
+		"description" : "Runs sfc to fix system file corruption"
 	}
 ]
