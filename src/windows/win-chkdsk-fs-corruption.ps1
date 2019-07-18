@@ -17,5 +17,3 @@ forEach ( $partition in $partitionlist )
         Write-Output '02 - ' + $driveLetter + ' dirty bit not set  -> skipping chkdsk'
     }
 }
-
-return 0

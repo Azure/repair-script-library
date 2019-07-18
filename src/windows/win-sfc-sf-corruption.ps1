@@ -93,5 +93,3 @@ forEach ( $partitionGroup in $partitionlist | group DiskNumber )
         
     }      
 }
-
-return 0
