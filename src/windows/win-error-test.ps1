@@ -1,3 +1,4 @@
-echo "start script"
+. .\src\windows\common\helpers\Logger.ps1
+Log-Debug "start script"
 ExpectedError
-echo "end script"
+Log-Debug "end script"
