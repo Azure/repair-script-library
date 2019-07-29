@@ -1,3 +1,5 @@
-echo "start script"
+. ./src/linux/common/setup/init.sh
+Log-Debug "start script"
 ExpectedError
-echo "end script"
+Log-Debug "end script"
+exit $STATUS_SUCCESS

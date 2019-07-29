@@ -1,4 +1,5 @@
-. .\src\windows\common\helpers\Logger.ps1
+. .\src\windows\common\setup\init.ps1
 Log-Debug "start script"
 ExpectedError
 Log-Debug "end script"
+return $STATUS_SUCCESS
