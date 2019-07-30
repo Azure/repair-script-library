@@ -9,7 +9,7 @@ function Get-Disk-Partitions()
 		select disk $diskID
 		online disk noerr
 "@
-		$command | diskpart
+		$command | diskpart | out-null
 
 		$partitionlist += Get-Partition -DiskNumber $diskID
 	}

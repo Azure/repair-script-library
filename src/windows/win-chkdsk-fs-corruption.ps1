@@ -1,7 +1,7 @@
-. .\src\windows\common\helpers\Get-Disk-Partition.ps1
+. .\src\windows\common\setup\init.ps1
+. .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
 $partitionlist = Get-Disk-Partitions
-Write-Output $partitionlist
 
 forEach ( $partition in $partitionlist )
 {
@@ -9,11 +9,13 @@ forEach ( $partition in $partitionlist )
     $dirtyFlag = fsutil dirty query $driveLetter
     If ($dirtyFlag -notmatch "NOT Dirty")
     {
-        Write-Output '02 - ' + $driveLetter + ' dirty bit set  -> running chkdsk'
+        Log-Info "02 - $driveLetter dirty bit set  -> running chkdsk"
         chkdsk $driveLetter /f
     }
     else
     {
-        Write-Output '02 - ' + $driveLetter + ' dirty bit not set  -> skipping chkdsk'
+        Log-Info "02 - $driveLetter dirty bit not set  -> skipping chkdsk"
     }
 }
+
+return $STATUS_SUCCESS

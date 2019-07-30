@@ -1,10 +1,11 @@
-. .\src\windows\common\helpers\Get-Disk-Partition.ps1
+. .\src\windows\common\setup\init.ps1
+. .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
 $partitionlist = Get-Disk-Partitions
-Write-Output $partitionlist
+Log-Info $partitionlist
 $partitionGroup = $partitionlist | group DiskNumber 
 
-Write-Output '#03 - enumerate partitions to reconfigure boot cfg'
+Log-Info '#03 - enumerate partitions to reconfigure boot cfg'
 forEach ( $partitionGroup in $partitionlist | group DiskNumber )
 {
     #reset paths for each part group (disk)
@@ -53,17 +54,17 @@ forEach ( $partitionGroup in $partitionlist | group DiskNumber )
         #revert pending actions to let sfc succeed in most cases
         dism.exe /image:$osDrive /cleanup-image /revertpendingactions
 
-        Write-Output '#04 - runing SFC.exe' $osDrive\windows
+        Log-Info "#04 - runing SFC.exe $osDrive\windows"
         sfc /scannow /offbootdir=$osDrive /offwindir=$osDrive\windows
 
-        Write-Output '#05 - runing dism to restore health on ' $osDrive 
+        Log-Info "#05 - runing dism to restore health on $osDrive" 
         Dism /Image:$osDrive /Cleanup-Image /RestoreHealth /Source:c:\windows\winsxs
         
-        Write-Output '#06 - enumvering corrupt system files in ' $osDrive\windows\system32\
+        Log-Info "#06 - enumvering corrupt system files in $osDrive\windows\system32\"
         get-childitem -Path $osDrive\windows\system32\* -include *.dll,*.exe `
             | %{$_.VersionInfo | ? FileVersion -eq $null | select FileName, ProductVersion, FileVersion }  
 
-        Write-Output '#07 - setting bcd recovery and default id for ' $bcdPath
+        Log-Info "#07 - setting bcd recovery and default id for $bcdPath"
         $bcdout = bcdedit /store $bcdPath /enum bootmgr /v
         $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
         $defaultId = '{'+$defaultLine.ToString().Split('{}')[1] + '}'
@@ -86,10 +87,12 @@ forEach ( $partitionGroup in $partitionlist | group DiskNumber )
         $RegBackup = Get-ChildItem  $osDrive\windows\system32\config\Regback\system
         If($RegBackup.Length -ne 0)
 		{
-            Write-Output '#06 - restoring registry on ' $osDrive 
+            Log-Info "#06 - restoring registry on $osDrive" 
 			move $osDrive\windows\system32\config\system $osDrive\windows\system32\config\system_org -Force
 	                copy $osDrive\windows\system32\config\Regback\system $osDrive\windows\system32\config\system -Force
 		}
         
     }      
 }
+
+return $STATUS_SUCCESS
