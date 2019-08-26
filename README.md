@@ -5,7 +5,7 @@ Each repair script has a unique-id mapped on [map.json](https://github.com/Azure
 
 # Run Scripts on Azure VM via Azure CLI
 
-1. Open Cloud Shell (Or [install Azure CLI manually](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli?view=azure-cli-latest))
+1. Open [Azure Cloud Shell](https://docs.microsoft.com/en-us/azure/cloud-shell/overview) (Or [install Azure CLI manually](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli?view=azure-cli-latest))
 
 [![](https://shell.azure.com/images/launchcloudshell.png "Launch Azure Cloud Shell")](https://shell.azure.com)
 
@@ -46,7 +46,9 @@ az vm repair <command> -h
 
 # Contributing
 
-**Adding new scripts**:<br>https://github.com/Azure/azure-cli/blob/dev/doc/onboarding_guide.md
+**Adding new scripts**: https://github.com/Azure/repair-script-library/blob/master/doc/adding_new_scripts.md
+
+**Contact**: caiddev@microsoft.com
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
 Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
