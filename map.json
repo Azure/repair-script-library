@@ -28,5 +28,10 @@
 		"id" : "win-sfc-sf-corruption",
 		"path" : "src/windows/win-sfc-sf-corruption.ps1",
 		"description" : "Runs sfc to fix system file corruption"
+	},
+	{
+		"id" : "win-bcd-ignoreAllFailure",
+		"path" : "src/windows/win-ignoreAllFailures.ps1",
+		"description" : "Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs."
 	}
 ]
