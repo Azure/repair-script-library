@@ -62,5 +62,5 @@ forEach ( $partitionGroup in $partitionlist | group DiskNumber )
     }
 }
 
-Log-Info "Unable to find the BCD Path"
+Log-Error "Unable to find the BCD Path"
 return $STATUS_ERROR
