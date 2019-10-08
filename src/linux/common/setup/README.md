@@ -1,4 +1,4 @@
 # Linux Setup Scripts
 
-- init.ps : Script that runs before all Linux repair scripts.
-- finalize.ps : Script that runs after all Linux repair Scripts. 
+- init.sh : Script that runs before all Linux repair scripts.
+- finalize.sh : Script that runs after all Linux repair scripts. 
