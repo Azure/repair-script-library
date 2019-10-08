@@ -1,7 +1,7 @@
 # Repair Script Library
 
 The Repair Script Library organizes and archives known Windows and Linux repair scripts to automate frequent fix scenarios.
-Each repair script has a unique-id mapped on [map.json](https://github.com/Azure/repair-script-library/blob/master/map.json)
+Each repair script has a unique ID mapped on [map.json](https://github.com/Azure/repair-script-library/blob/master/map.json)
 
 # Run Scripts on Azure VM via Azure CLI
 
@@ -14,7 +14,7 @@ Each repair script has a unique-id mapped on [map.json](https://github.com/Azure
 az vm extension add -n vm-repair
 ```
 
-3. Run a script using its unique-id mapped on [map.json](https://github.com/Azure/repair-script-library/blob/master/map.json)
+3. Run a script using its unique ID mapped on [map.json](https://github.com/Azure/repair-script-library/blob/master/map.json)
 ```
 az vm repair run -g MyResourceGroup -n MyVM --run-id win-hello-world --verbose
 ```
