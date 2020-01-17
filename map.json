@@ -33,5 +33,10 @@
 		"id" : "win-bcdedit-ignoreAllFailure",
 		"path" : "src/windows/win-ignoreAllFailures.ps1",
 		"description" : "Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs."
+	},
+	{
+		"id" : "linux-recover-fstab",
+		"path" : "src/linux/recover-fstab.sh",
+		"description" : "linux-recover-fstab does fix a non-boot scenario where a malformed /etc/fstab does not allow the OS to boot correct"
 	}
 ]
