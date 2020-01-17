@@ -35,8 +35,8 @@
 		"description" : "Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs."
 	},
 	{
-		"id" : "linux-recover-fstab",
-		"path" : "src/linux/recover-fstab.sh",
-		"description" : "linux-recover-fstab does fix a non-boot scenario where a malformed /etc/fstab does not allow the OS to boot correct"
+		"id" : "linux-recover",
+		"path" : "src/linux/recover.sh",
+		"description" : "linux-recover allows to recover a failed VM. Three scenarios are possible: fstab, initrd and kernel. NOTE: use option --run-on-repair"
 	}
 ]
