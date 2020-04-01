@@ -34,6 +34,7 @@ whatFs() {
 fsck_partition() {
 	# $1 holds the type of the filesystem we need to check
 	# $2 holds the partiton info
+	Log-Info "File system check start"
 	if [[ "$1" == "xfs" ]]; then
 		xfs_repair -n "$2" > /dev/null 2>&1 
 	elif [[ "$1" == "fat16" ]]; then
@@ -44,18 +45,19 @@ fsck_partition() {
 
 	if [[ "$?" == 4 ]]; then
 		# error 4 is returned by fsck.ext4 only
-		echo  "${root_rescue} is not able to be automatically recovered. Aborting ALAR"
+		Log-Info  "${root_rescue} is not able to be automatically recovered. Aborting ALAR"
 		exit 1
 	fi
 
 	if [[ "${isXFS}" == "true" && "$?" == 1 ]]; then
 		# xfs_repair -n returns 1 if the fs is corrupted. 
 		# Also fsck may raise this error but we ignore it as even a normal recover is raising it. FALSE-NEGATIVE
-		echo "A general error occured while trying to recover the device ${root_rescue}. Aborting ALAR"
+		Log-Info "A general error occured while trying to recover the device ${root_rescue}. Aborting ALAR"
 		exit 1
 	fi
 
-	echo "The error state/number is: $?" 
+	Log-Info "The error state/number is: $?" 
+	Log-Info "File system check finished"
 }
 
 verifyRedHat() {
@@ -212,11 +214,11 @@ fi
 
 # Recent Ubuntu?
 if [[ "${#a_part_info[@]}" -eq 3 ]]; then
-	echo "This could be a recent Ubuntu 16.x or 18.x image"
+	Log-Info "This could be a recent Ubuntu 16.x or 18.x image"
 
 	# Check whether we have a Freebsd image. They have three partitions as well but we do not support this OS
 	if [[ "${a_part_info[@]}" =~ "freebsd" ]]; then
-		echo "Freebsd is not a supported OS. ALAR tool is stopped"
+		Log-Error "Freebsd is not a supported OS. ALAR tool is stopped"
 		osNotSupported="true"
 	else
 		boot_part_number=$(for i in "${a_part_info[@]}"; do grep boot <<<"$i"; done | cut -d':' -f1)
@@ -238,7 +240,7 @@ fi
 
 #Suse 12 or 15?
 if [[ "${#a_part_info[@]}" -eq 4 ]]; then
-	echo "This could be a SUSE 12 or 15 image"
+	Log-Info "This could be a SUSE 12 or 15 image"
 	# Get boot partition
 	boot_part_number=$(for i in "${a_part_info[@]}"; do grep lxboot <<<"$i"; done | cut -d':' -f1)
 	efi_part_number=$(for i in "${a_part_info[@]}"; do grep UEFI <<<"$i"; done | cut -d':' -f1)
@@ -258,7 +260,7 @@ fi
 
 # No standard image
 if [[ "${#a_part_info[@]}" -gt 4 ]]; then
-	echo "Unrecognized Linux distribution. ALAR tool is stopped"
+	Log-Error "Unrecognized Linux distribution. ALAR tool is stopped"
 	osNotSupported="true"
 fi
 
