@@ -24,26 +24,7 @@ export actions="fstab initrd kernel" # These are the basic actions at the moment
 
 # Functions START
 # Define some helper functions
-
-Log-Output() {
-    echo "[Output $(date "+%m/%d/%Y %T")]$1"
-}
-
-Log-Info() {
-    echo "[Info $(date "+%m/%d/%Y %T")]$1"
-}
-
-Log-Warning() {
-    echo "[Warning $(date "+%m/%d/%Y %T")]$1"
-}
-
-Log-Error() {
-    echo "[Error $(date "+%m/%d/%Y %T")]$1"
-}
-
-Log-Debug() {
-    echo "[Debug $(date "+%m/%d/%Y %T")]$1"
-}
+. ./src/linux/common/setup/init.sh
 
 recover_action() {
     cd "${tmp_dir}"
