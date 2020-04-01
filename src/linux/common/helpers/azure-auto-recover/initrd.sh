@@ -25,7 +25,6 @@ recover_redhat() {
     if [[ "$isRedHat6" == "true" ]]; then
         # verify the grub.conf and correct it if needed
         cd "$tmp_dir"
-        wget -q --no-cache https://raw.githubusercontent.com/malachma/azure-support-scripts/master/grub.awk
         awk -f grub.awk /boot/grub/grub.conf
         # rebuild the initrd
         dracut -f /boot/initramfs-"${kernel_version}".img "$kernel_version"
