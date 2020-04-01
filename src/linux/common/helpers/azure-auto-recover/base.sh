@@ -30,9 +30,6 @@ recover_action() {
     cd "${tmp_dir}"
     local recover_action=$1
 
-    # simple retry logic with a loop
-    wget -q --no-cache "https://raw.githubusercontent.com/malachma/azure-auto-recover/master/${recover_action}.sh"
-
     if [[ -f "${tmp_dir}/${recover_action}.sh" ]]; then
         Log-Info "Starting recover action:  ${recover_action}"
         chmod 700 "${tmp_dir}/${recover_action}.sh"
@@ -52,6 +49,10 @@ isInAction() {
     return "$?"
 }
 
+copyRecoverScriptsToTemp() {
+        cp ./src/linux/common/helpers/azure-auto-recovery/* ${tmp_dir}
+}
+
 # Funtions END
 
 #
@@ -60,6 +61,7 @@ isInAction() {
 
 # Create tmp dir in order to store our files we download
 tmp_dir="$(mktemp -d)"
+copyRecoverScriptsToTemp
 cd "${tmp_dir}"
 
 # Filename for the distro verification
