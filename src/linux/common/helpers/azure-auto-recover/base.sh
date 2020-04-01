@@ -29,6 +29,7 @@ export actions="fstab initrd kernel" # These are the basic actions at the moment
 recover_action() {
     cd "${tmp_dir}"
     local recover_action=$1
+    pwd
 
     if [[ -f "${tmp_dir}/${recover_action}.sh" ]]; then
         Log-Info "Starting recover action:  ${recover_action}"
@@ -50,7 +51,7 @@ isInAction() {
 }
 
 copyRecoverScriptsToTemp() {
-        cp ./src/linux/common/helpers/azure-auto-recovery/* ${tmp_dir}
+        cp ./src/linux/common/helpers/azure-auto-recover/* ${tmp_dir}
 }
 
 # Funtions END
@@ -69,16 +70,6 @@ distro_test="distro-test.sh"
 
 # Global redirection for ERR to STD
 exec 2>&1
-
-# simple retry logic with a loop
-while true; do
-    wget -q --no-cache https://raw.githubusercontent.com/malachma/azure-auto-recover/master/"${distro_test}"
-    if [[ $? -eq 0 ]]; then
-        Log-Info "File ${distro_test} fetched"
-        break # the file got fetched, otherwise we try this again
-    fi
-    sleep 1
-done
 
 #
 # What OS we need to recover?
