@@ -76,7 +76,7 @@ exec 2>&1
 #
 if [[ -f "$tmp_dir/alar-fki/${distro_test}" ]]; then
     chmod 700 "${tmp_dir}/alar-fki/${distro_test}"
-    . ${distro_test} # invoke the distro test
+    . "${tmp_dir}/alar-fki/${distro_test}" # invoke the distro test
 
     # Do we have identifed a supported distro?
     if [[ ${osNotSupported} == "true" ]]; then
