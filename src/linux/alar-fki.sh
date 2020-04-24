@@ -7,7 +7,7 @@ chmod 700 ./src/linux/common/helpers/alar/base.sh
 error=$?
 Log-Output "Recovery script finished"
 
-if [[ ${error} -eq=11 ]]; then
+if [[ ${error} -eq 11 ]]; then
 # exit code 11 from base.sh points out to a severe issue
     exit $STATUS_ERROR
 else
