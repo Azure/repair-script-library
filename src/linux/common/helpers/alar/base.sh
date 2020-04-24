@@ -24,12 +24,12 @@ export actions="fstab initrd kernel" # These are the basic actions at the moment
 
 # Functions START
 # Define some helper functions
+
 . ./src/linux/common/setup/init.sh
 
 recover_action() {
     cd "${tmp_dir}"
     local recover_action=$1
-    pwd
 
     if [[ -f "${tmp_dir}/${recover_action}.sh" ]]; then
         Log-Info "Starting recover action:  ${recover_action}"
@@ -51,7 +51,7 @@ isInAction() {
 }
 
 copyRecoverScriptsToTemp() {
-        cp ./src/linux/common/helpers/azure-auto-recover/* ${tmp_dir}
+        cp ./src/linux/common/helpers/alar/* ${tmp_dir}
 }
 
 # Funtions END
