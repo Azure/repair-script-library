@@ -31,10 +31,10 @@ recover_action() {
     cd "${tmp_dir}"
     local recover_action=$1
 
-    if [[ -f "${tmp_dir}/${recover_action}.sh" ]]; then
+    if [[ -f "${tmp_dir}/alar-fki/${recover_action}.sh" ]]; then
         Log-Info "Starting recover action:  ${recover_action}"
-        chmod 700 "${tmp_dir}/${recover_action}.sh"
-        chroot /mnt/rescue-root "${tmp_dir}/${recover_action}.sh"
+        chmod 700 "${tmp_dir}/ialar-fki/${recover_action}.sh"
+        chroot /mnt/rescue-root "${tmp_dir}/alar-fki/${recover_action}.sh"
         Log-Info "Recover action:  ${recover_action} finished"
     else
         Log-Error "File ${recover_action}.sh does not exist. Exiting ALAR"
@@ -74,8 +74,8 @@ exec 2>&1
 #
 # What OS we need to recover?
 #
-if [[ -f "$tmp_dir/${distro_test}" ]]; then
-    chmod 700 "${tmp_dir}/${distro_test}"
+if [[ -f "$tmp_dir/alar-fki/${distro_test}" ]]; then
+    chmod 700 "${tmp_dir}/alar-fki/${distro_test}"
     . ${distro_test} # invoke the distro test
 
     # Do we have identifed a supported distro?
