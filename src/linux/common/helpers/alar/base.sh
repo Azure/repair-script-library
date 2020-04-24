@@ -51,7 +51,7 @@ isInAction() {
 }
 
 copyRecoverScriptsToTemp() {
-        cp ./src/linux/common/helpers/alar/* ${tmp_dir}
+        cp -r ./src/linux/common/helpers/alar/* ${tmp_dir}
 }
 
 # Funtions END
