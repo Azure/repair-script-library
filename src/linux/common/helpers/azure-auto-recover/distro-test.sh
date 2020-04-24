@@ -174,7 +174,7 @@ done
 
 # Old Ubuntu?
 if [[ "${#a_part_info[@]}" -eq 1 ]]; then
-	echo "This could be an old Ubuntu image"
+	Log-Info "This could be an old Ubuntu image"
 	root_part_number=$(for i in "${a_part_info[@]}"; do grep boot <<<"$i"; done | cut -d':' -f1)
 	root_part_fs=$(for i in "${a_part_info[@]}"; do grep boot <<<"$i"; done | cut -d':' -f3)
 
@@ -184,7 +184,7 @@ fi
 
 # RedHat 6.x or 7.x?
 if [[ "${#a_part_info[@]}" -eq 2 ]]; then
-	echo "This could be a RedHat/Centos 6/7 image"
+	Log-Info "This could be a RedHat/Centos 6/7 image"
 	boot_part_number=$(for i in "${a_part_info[@]}"; do grep boot <<<"$i"; done | cut -d':' -f1)
 	boot_part_fs=$(for i in "${a_part_info[@]}"; do grep boot <<<"$i"; done | cut -d':' -f3)
 	root_part_number=$(for i in "${a_part_info[@]}"; do grep -v boot <<<"$i"; done | cut -d':' -f1)
