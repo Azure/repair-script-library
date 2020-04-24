@@ -11,6 +11,6 @@ awk '/rootvg-tmplv/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/rootvg-usrlv/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/rootvg-varlv/ {print}' /etc/fstab.copy >>/etc/fstab
 cat /etc/fstab
-echo "Renaming original file /etc/fstab to /etc/fstab.copy"
-echo "Creating new /etc/fstab file with only /boot and / partitions."
-echo "This ensures we have a bootable system"
+Log-Info "Renaming original file /etc/fstab to /etc/fstab.copy"
+Log-Info "Creating new /etc/fstab file with only /boot and / partitions."
+Log-Info  "This ensures we have a bootable system"
