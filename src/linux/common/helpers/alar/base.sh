@@ -33,7 +33,7 @@ recover_action() {
 
     if [[ -f "${tmp_dir}/alar-fki/${recover_action}.sh" ]]; then
         Log-Info "Starting recover action:  ${recover_action}"
-        chmod 700 "${tmp_dir}/ialar-fki/${recover_action}.sh"
+        chmod 700 "${tmp_dir}/alar-fki/${recover_action}.sh"
         chroot /mnt/rescue-root "${tmp_dir}/alar-fki/${recover_action}.sh"
         Log-Info "Recover action:  ${recover_action} finished"
     else
