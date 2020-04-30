@@ -1,4 +1,5 @@
 #!/bin/bash
+cd ${tmp_dir}
 . ./src/linux/common/setup/init.sh
 mv -f /etc/fstab{,.copy}
 awk '/[[:space:]]+\/[[:space:]]+/ {print}' /etc/fstab.copy >>/etc/fstab
