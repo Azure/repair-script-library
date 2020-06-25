@@ -35,7 +35,7 @@
 		"description" : "Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs."
 	},
 	{
-		"id" : "alar-fki",
+		"id" : "linux-alar-fki",
 		"path" : "src/linux/alar-fki.sh",
 		"description" : "alar-fki allows to recover a failed VM. Three recover scenarios are possible: fstab, initrd and kernel. NOTE: use option --run-on-repair"
 	}
