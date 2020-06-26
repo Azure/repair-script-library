@@ -33,11 +33,11 @@ The script-id for the automated recovery is: _linux-recover_
 
 #### Example ####
 
-az vm repair create -g centos7 -n cent7 --repair-username rescue --repair-password 'password!234’ 
+az vm repair create --verbose -g centos7 -n cent7 --repair-username rescue --repair-password 'password!234’ 
 
-az vm repair run -g centos7 -n cent7 --run-id linux-recover --parameters initrd --run-on-repair
+az vm repair run --verbose -g centos7 -n cent7 --run-id linux-recover --parameters initrd --run-on-repair
 
-az vm repair restore -g centos7 -n cent7
+az vm repair restore --verbose -g centos7 -n cent7
 
 You can pass over either a single recover-operation or multiple operations, i.e., fstab; ‘fstab,initrd’ 
 Separate the recover operation with a comma in this case – no spaces allowed!
