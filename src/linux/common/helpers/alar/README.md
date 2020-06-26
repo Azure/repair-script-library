@@ -29,7 +29,7 @@ So it either fixes the grub.cfg file and/or creates a new initrd image
 
 ### How can I recover my failed VM?
 To use the ALAR scripts with the help of the vm repair extension you have to utilize the command ‘run’ and its option ‘--run-id’
-The script-id for the automated recovery is: _linux-recover_
+The script-id for the automated recovery is: linux-alar-fki
 
 #### Example ####
 
