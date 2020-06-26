@@ -35,7 +35,7 @@ The script-id for the automated recovery is: _linux-recover_
 
 az vm repair create --verbose -g centos7 -n cent7 --repair-username rescue --repair-password 'password!234’ 
 
-az vm repair run --verbose -g centos7 -n cent7 --run-id linux-recover --parameters initrd --run-on-repair
+az vm repair run --verbose -g centos7 -n cent7 --run-id linux-alar-fki --parameters initrd --run-on-repair
 
 az vm repair restore --verbose -g centos7 -n cent7
 
