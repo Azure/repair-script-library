@@ -18,8 +18,6 @@ export efi_part=""
 export osNotSupported="true" # set to true by default, gets changed to false if this is the case
 export tmp_dir=""
 export global_error="false"
-STATUS_SUCCESS=0
-STATUS_ERROR=1
 export actions="fstab initrd kernel" # These are the basic actions at the moment
 
 # Functions START
