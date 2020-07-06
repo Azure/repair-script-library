@@ -6,7 +6,7 @@
 
 recover_suse() {
     kernel_type=$(uname -r | grep -q default && echo "kernel-default" || echo "kernel-azure")
-    kernel_version=$(zypper se -is ${kernel} | grep ${kernel} | awk '{print $7;exit}')
+    kernel_version=$(zypper se -is ${kernel_type} | grep ${kernel_type} | awk '{print $7;exit}')
     kernel_version=$(sed -e "s/kernel-//" <<< $(rpm -q kernel --last  | head -n 1 | cut -f1 -d' '))
     mkinitrd /boot/initrd-"${kernel_version}" "$kernel_version"
     grub2-mkconfig -o /boot/grub2/grub.cfg
