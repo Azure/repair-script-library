@@ -45,4 +45,5 @@ Separate the recover operation with a comma in this case – no spaces allowed!
 ### Limitation
 * encrypted images are not supported
 * Classic VMs are not supported
+* EFI based images are not supported yet. It is work in progress
 
