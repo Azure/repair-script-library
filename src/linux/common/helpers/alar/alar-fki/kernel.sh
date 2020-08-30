@@ -24,7 +24,7 @@ if [[ $isRedHat == "true" ]]; then
                 # Fix for a bug in RedHat 8.1/8.2
                 # This needs to be fixed as soon as the bug with grub2-mkconfig is solved too
                 # grub2-mkconfig must not be executed because of this bug
-                $(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) && $(sed -i 's/set default="0"/set default="${saved_entry}"/' grub.cfg)
+                $(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) && $(sed -i 's/set default="0"/set default="${saved_entry}"/' /boot/grub2/grub.cfg)
         fi
 fi
 
