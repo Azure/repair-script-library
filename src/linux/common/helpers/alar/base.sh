@@ -6,6 +6,7 @@ export isRedHat="false"
 export isRedHat6="false"
 export isSuse="false"
 export isUbuntu="false"
+export isUbuntuEFI="false"
 export tmp_dir=""
 export recover_action=""
 export boot_part=""
@@ -19,6 +20,7 @@ export osNotSupported="true" # set to true by default, gets changed to false if 
 export tmp_dir=""
 export global_error="false"
 export actions="fstab initrd kernel" # These are the basic actions at the moment
+export root_part_fs # set in distro-test
 
 # Functions START
 # Define some helper functions
@@ -42,6 +44,7 @@ recover_action() {
     [[ ${global_error} == "true" ]] && return 11
 }
 
+
 isInAction() {
     #be quiet, just let us know this action exists
     grep -q "$1" <<<"$actions"
@@ -49,8 +52,8 @@ isInAction() {
 }
 
 copyRecoverScriptsToTemp() {
-        cp -r ./src/linux/common/helpers/alar/* ${tmp_dir} 
-        cp -r ./src/linux/common/* ${tmp_dir}
+        cp -Lr ./src/linux/common/helpers/alar/* ${tmp_dir} 
+        cp -Lr ./src/linux/common/* ${tmp_dir}
         mkdir -p ${tmp_dir}/src/linux/common
         ln -s ${tmp_dir}/helpers ${tmp_dir}/src/linux/common/helpers
         ln -s ${tmp_dir}/setup ${tmp_dir}/src/linux/common/setup
@@ -90,12 +93,14 @@ else
     exit 1
 fi
 
-#Mount the root part
-#====================
+# Prepare and mount the partitions. Take into account what distro we have to deal with
+# At first we have to mount the root partion of the VM we need to recover
+
 if [[ ! -d /mnt/rescue-root ]]; then
     mkdir /mnt/rescue-root
 fi
 
+# At the moment we handle only LVM on RedHat/CentOS
 if [[ ${isLVM} == "true" ]]; then
     pvscan
     vgscan
@@ -106,15 +111,16 @@ if [[ ${isLVM} == "true" ]]; then
     usrlv=$(lvscan | grep usrlv | awk '{print $2}' | tr -d "'")
     varlv=$(lvscan | grep varlv | awk '{print $2}' | tr -d "'")
 
-    # ext4 i used together with LVM, so no further handling is required
+    # The mount tool is automatically able to handle other fs-types 
     mount ${rootlv} /mnt/rescue-root
-    mount ${tmplv} /mnt/rescue-root/tmp
-    mount ${optlv} /mnt/rescue-root/opt
+    #mount ${tmplv} /mnt/rescue-root/tmp
+    #mount ${optlv} /mnt/rescue-root/opt
     mount ${usrlv} /mnt/rescue-root/usr
     mount ${varlv} /mnt/rescue-root/var
-
+# No LVM, thus do the normal mount steps
 elif [[ "${isRedHat}" == "true" || "${isSuse}" == "true" ]]; then
     # noouid is valid for XFS only
+    # The extra step is only performed to be sure we have no overlaps with any UUID on an XFS FS
     if [[ "${isExt4}" == "true" ]]; then
         mount -n "${rescue_root}" /mnt/rescue-root
     elif [[ "${isXFS}" == "true" ]]; then
@@ -122,38 +128,30 @@ elif [[ "${isRedHat}" == "true" || "${isSuse}" == "true" ]]; then
     fi
 fi
 
+
 if [[ "$isUbuntu" == "true" ]]; then
     mount -n "$rescue_root" /mnt/rescue-root
 fi
 
 #Mount the boot part
 #===================
-if [[ ! -d /mnt/rescue-root/boot ]]; then
-    mkdir /mnt/rescue-root/boot
-fi
 
-if [[ ${isLVM} == "true" ]]; then
-    boot_part_number=$(for i in "${a_part_info[@]}"; do grep boot <<<"$i"; done | cut -d':' -f1)
-    boot_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${boot_part_number}")
-    mount ${boot_part} /mnt/rescue-root/boot
-else
-    if [[ "$isRedHat" == "true" || "$isSuse" == "true" ]]; then
-        # noouid is valid for XFS only
-        if [[ "${isExt4}" == "true" || "${isExt3}" == "true" ]]; then
-            mount "${boot_part}" /mnt/rescue-root/boot
-        elif [[ "${isXFS}" == "true" ]]; then
-            mount -o nouuid "${boot_part}" /mnt/rescue-root/boot
-        fi
+# Ubuntu does not have an extra boot partition
+if [[ "$isRedHat" == "true" || "$isSuse" == "true" ]]; then
+    # noouid is valid for XFS only
+    if [[ "${isExt4}" == "true" || "${isExt3}" == "true" ]]; then
+        mount "${boot_part}" /mnt/rescue-root/boot
+    elif [[ "${isXFS}" == "true" ]]; then
+        mount -o nouuid "${boot_part}" /mnt/rescue-root/boot
     fi
 fi
 
-# Mount the EFI part if Suse
-if [[ "${isSuse}" == "true" ]]; then
-    if [[ ! -d /mnt/rescue-root/boot/efi ]]; then
-        mkdir /mnt/rescue-root/boot/efi
-    fi
+# EFI partitions are only able to be mounted after we have mounted the boot partition
+if [[ -n "$efi_part" ]]; then 
     mount "${efi_part}" /mnt/rescue-root/boot/efi
 fi
+
+
 
 #Mount the support filesystems
 #==============================
@@ -205,23 +203,22 @@ for i in dev/pts proc tmp sys dev; do umount /mnt/rescue-root/"$i"; done
 if [[ "$isUbuntu" == "true" || "$isSuse" == "true" ]]; then
     #is this really needed for Suse?
     umount /mnt/rescue-root/run
-    if [[ -d /mnt/rescue-root/boot/efi ]]; then
-        umount /mnt/rescue-root/boot/efi
-    fi
 fi
 
 if [[ "${isLVM}" == "true" ]]; then
-    umount /mnt/rescue-root/tmp
-    umount /mnt/rescue-root/opt
+   # umount /mnt/rescue-root/tmp
+   # umount /mnt/rescue-root/opt
     umount /mnt/rescue-root/usr
     umount /mnt/rescue-root/var
 fi
 
-[[ $(mountpoint -q /mnt/rescue_root/boot) -eq 0 ]] && umount /mnt/rescue-root/boot && rm -d /mnt/rescue-root/boot
+if [[ -n "$efi_part" ]]; then 
+    umount "${efi_part}" 
+fi
 
-
+umount /mnt/rescue-root/boot
 umount /mnt/rescue-root
-rm -fr /mnt/rescue-root
+rmdir /mnt/rescue-root
 rm -fr "${tmp_dir}"
 
 if [[ "${recover_status}" == "11" ]]; then

@@ -31,9 +31,15 @@ recover_redhat() {
         # rebuild the initrd
         dracut -f /boot/initramfs-"${kernel_version}".img "$kernel_version"
     else
-        depmod ${kernel_version}
-        mkinitrd --force /boot/initramfs-"${kernel_version}".img "$kernel_version"
-        grub2-mkconfig -o /boot/grub2/grub.cfg
+        if [[ $(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) -eq 0  ]]; then
+            for installed_kernel in $(rpm -qa kernel); do
+                     kernel-install add $(sed 's/kernel-//' <<< $installed_kernel) /lib/modules/$(sed 's/kernel-//' <<< $installed_kernel)/vmlinuz
+            done
+        else
+            depmod ${kernel_version}
+            mkinitrd --force /boot/initramfs-"${kernel_version}".img "$kernel_version"
+            grub2-mkconfig -o /boot/grub2/grub.cfg
+        fi
     fi
 
 }
