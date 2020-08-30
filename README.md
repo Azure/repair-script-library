@@ -11,7 +11,7 @@ Each repair script has a unique ID mapped on [map.json](https://github.com/Azure
 
 2. Install the vm-repair extension
 ```
-az vm extension add -n vm-repair
+az extension add -n vm-repair
 ```
 
 3. Run a script using its unique ID mapped on [map.json](https://github.com/Azure/repair-script-library/blob/master/map.json)
