@@ -21,6 +21,7 @@ export tmp_dir=""
 export global_error="false"
 export actions="fstab initrd kernel" # These are the basic actions at the moment
 export root_part_fs # set in distro-test
+export LVM_SUPPRESS_FD_WARNINGS=1 
 
 # Functions START
 # Define some helper functions
