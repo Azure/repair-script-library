@@ -35,6 +35,7 @@ EOF
                 grub2-mkconfig -o /boot/grub2/grub.cfg
                 patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
                 fi
+        fi
 fi
 
 if [[ $isUbuntu == "true" ]]; then
