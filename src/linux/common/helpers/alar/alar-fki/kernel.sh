@@ -22,10 +22,19 @@ if [[ $isRedHat == "true" ]]; then
                 grubby --set-default=1 # This is the previous kernel
                 
                 # Fix for a bug in RedHat 8.1/8.2
+                # https://bugzilla.redhat.com/show_bug.cgi?id=1850193
                 # This needs to be fixed as soon as the bug with grub2-mkconfig is solved too
-                # grub2-mkconfig must not be executed because of this bug
-                $(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) && $(sed -i 's/set default="0"/set default="${saved_entry}"/' /boot/grub2/grub.cfg)
-        fi
+                if [[ ($(grep -qe 'ID="rhel"' /etc/os-release) -eq 0) && ($(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) -eq 0) ]]; then 
+                yum install -y patch
+cat > /boot/grub2/grub-cfg.patch <<EOF
+11,12c
+if [ -f (hd0,gpt15)/efi/redhat/grubenv ]; then
+load_env -f (hd0,gpt15)/efi/redhat/grubenv
+.
+EOF
+                grub2-mkconfig -o /boot/grub2/grub.cfg
+                patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
+                fi
 fi
 
 if [[ $isUbuntu == "true" ]]; then
