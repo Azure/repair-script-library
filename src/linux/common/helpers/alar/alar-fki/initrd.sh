@@ -33,7 +33,7 @@ recover_redhat() {
     else
         if [[ $(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) -eq 0  ]]; then
             for installed_kernel in $(rpm -qa kernel); do
-                     kernel-install add $(sed 's/kernel-//' <<< $installed_kernel) /lib/modules/$(sed 's/kernel-//' <<< $installed_kernel)/vmlinuz
+                     kernel-install -v add $(sed 's/kernel-//' <<< $installed_kernel) /boot/vmlinuz-$(sed 's/kernel-//' <<< $installed_kernel)
             done
         else
             depmod ${kernel_version}
