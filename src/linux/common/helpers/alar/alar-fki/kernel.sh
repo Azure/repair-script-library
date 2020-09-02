@@ -25,7 +25,10 @@ if [[ $isRedHat == "true" ]]; then
                 # https://bugzilla.redhat.com/show_bug.cgi?id=1850193
                 # This needs to be fixed as soon as the bug with grub2-mkconfig is solved too
                 if [[ ($(grep -qe 'ID="rhel"' /etc/os-release) -eq 0) && ($(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) -eq 0) ]]; then 
-                yum install -y patch
+                        if [[ -d /sys/firmware/efi ]]; then 
+                                grub2-mkconfig -o /boot/efi/EFI/redhat/grub.cfg
+                        else
+                        yum install -y patch
 cat > /boot/grub2/grub-cfg.patch <<EOF
 11,12c
 if [ -f (hd0,gpt15)/efi/redhat/grubenv ]; then
@@ -34,6 +37,7 @@ load_env -f (hd0,gpt15)/efi/redhat/grubenv
 EOF
                 grub2-mkconfig -o /boot/grub2/grub.cfg
                 patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
+                       fi
                 fi
         fi
 fi
