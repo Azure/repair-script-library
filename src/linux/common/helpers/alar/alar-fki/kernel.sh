@@ -38,6 +38,8 @@ load_env -f (hd0,gpt15)/efi/redhat/grubenv
 EOF
                 grub2-mkconfig -o /boot/grub2/grub.cfg
                 patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
+
+                # These lines are required as we have the ld.so.cache not build correct
                 chmod +x /etc/rc.d/rc.local
                 echo ldconfig >> /etc/rc.local
                        fi
