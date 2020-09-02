@@ -39,7 +39,7 @@ EOF
                 grub2-mkconfig -o /boot/grub2/grub.cfg
                 patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
                 chmod +x /etc/rc.d/rc.local
-                echo ldconfig /etc/rc.local
+                echo ldconfig >> /etc/rc.local
                        fi
                 fi
         fi
