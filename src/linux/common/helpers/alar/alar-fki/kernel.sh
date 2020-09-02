@@ -17,6 +17,7 @@ set_grub_default() {
 if [[ $isRedHat == "true" ]]; then
         if [[ $isRedHat6 == "true" ]]; then
                 grubby --set-default=1 # This is the previous kernel
+                ldconfig
         else
                 set_grub_default
                 grubby --set-default=1 # This is the previous kernel
@@ -37,6 +38,7 @@ load_env -f (hd0,gpt15)/efi/redhat/grubenv
 EOF
                 grub2-mkconfig -o /boot/grub2/grub.cfg
                 patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
+                ldconfig
                        fi
                 fi
         fi
