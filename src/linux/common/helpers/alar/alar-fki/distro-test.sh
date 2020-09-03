@@ -141,11 +141,11 @@ verifyUbuntu() {
 			umount /tmp/assert
 			rm -fr /tmp/assert
 			verifyRedHat
-			break
+		else
+			isUbuntu="false"
+			osNotSupported="true"
+			whatFs ${root_part_fs}
 		fi
-		isUbuntu="false"
-		osNotSupported="true"
-		whatFs ${root_part_fs}
 	fi
 	# clean up
 	umount /tmp/assert
