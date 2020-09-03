@@ -135,6 +135,14 @@ verifyUbuntu() {
 			;;
 		esac
 	else
+		# We need this part as in rare occasions CentOS may come with one partition as well
+		if [[ -e /tmp/assert/etc/redhat-release ]]; then 
+			# clean up
+			umount /tmp/assert
+			rm -fr /tmp/assert
+			verifyRedHat
+			break
+		fi
 		isUbuntu="false"
 		osNotSupported="true"
 		whatFs ${root_part_fs}
@@ -233,7 +241,7 @@ getPartitionFilesystemDetail(){
 
 # Old Ubuntu?
 if [[ "${#a_part_info[@]}" -eq 1 ]]; then
-	Log-Info "This could be an old Ubuntu image"
+	Log-Info "This could be an old Ubuntu image or even an CentOS with one partition only"
 
 	for k in ${!a_part_info[@]}; do 
 		grep -q boot <<< ${a_part_info[$k]} && root_part_number=$(getPartitionNumberDetail $k) && root_part_fs=$(getPartitionFilesystemDetail $k); 
