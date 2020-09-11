@@ -133,6 +133,11 @@ verifyUbuntu() {
 			osNotSupported="false"
 			whatFs ${root_part_fs}
 			;;
+		*Debian*)
+            isUbuntu="true"
+            osNotSupported="false"
+            whatFs ${root_part_fs}
+            ;;
 		esac
 	else
 		# We need this part as in rare occasions CentOS may come with one partition as well
