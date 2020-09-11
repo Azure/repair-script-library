@@ -1,5 +1,5 @@
 #!/bin/bash
-
+. ./src/linux/common/setup/init.sh
 #
 # recover logic for handling and initrd or kernel problem
 #
