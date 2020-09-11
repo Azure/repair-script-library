@@ -2,6 +2,10 @@
 cd ${tmp_dir}
 . ./src/linux/common/setup/init.sh
 mv -f /etc/fstab{,.copy}
+
+# For Debian we need to instal gawk first. It comes only with mawk
+apt install -y gawk
+
 awk '/[[:space:]]+\/[[:space:]]+/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/[[:space:]]+\/boot[[:space:]]+/ {print}' /etc/fstab.copy >>/etc/fstab
 # For Suse
