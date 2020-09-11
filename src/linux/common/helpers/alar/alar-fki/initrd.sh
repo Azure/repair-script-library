@@ -15,12 +15,12 @@ recover_suse() {
 
 recover_ubuntu() {
     if [[ ! -e /var/log/dpkg.log ]]; then
-        Log-Error "dpkg.log does not exist. This is a vanilla system with no previous kernel version installed. Nothing to do."
-        Log-Error "If you are sure there exists more than one kernel please do a manual recover "
-        return
+    # if this file is empty we have to assume that we have a vanilla system. Only one kernel available
+        kernel_version=$(ls /boot/vmlinuz-*)
+        kernel_version=${kernel_version#/boot/vmlinuz-}
+    else
+        kernel_version=$( zgrep linux-image /var/log/dpkg.log* | grep installed  | cut -d' ' -f5 | cut -d':' -f1 | sed -e 's/linux-image-//' | grep ^[1-9] | sort -V | tail -n 1)
     fi
-
-    kernel_version=$( zgrep linux-image /var/log/dpkg.log* | grep installed  | cut -d' ' -f5 | cut -d':' -f1 | sed -e 's/linux-image-//' | grep ^[1-9] | sort -V | tail -n 1)
     # This is needed on Debian only
     if [[ -e /boot/initrd.img-${kernel_version} ]]; then
             rm /boot/initrd.img-${kernel_version}
