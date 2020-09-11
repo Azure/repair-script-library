@@ -14,6 +14,10 @@ recover_suse() {
 
 recover_ubuntu() {
     kernel_version=$( zgrep linux-image /var/log/dpkg.log* | grep installed  | cut -d' ' -f5 | cut -d':' -f1 | sed -e 's/linux-image-//' | grep ^[1-9] | sort -V | tail -n 1)
+    # This is needed on Debian only
+    if [[ -e /boot/initrd.img-${kernel_version} ]]; then
+            rm /boot/initrd.img-${kernel_version}
+    fi
     update-initramfs -k "$kernel_version" -c
     update-grub
 
