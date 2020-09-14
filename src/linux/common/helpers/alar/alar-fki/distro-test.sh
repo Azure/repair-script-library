@@ -314,11 +314,13 @@ if [[ "${#a_part_info[@]}" -eq 4 ]]; then
 		# Not a RedHat 6.x system
 		isRedHat6="false"
 		if [[ ${isLVM} == "true" ]]; then
+			Log-Info "OS with LVM setup"
 			boot_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${boot_part_number}")
 			fsck_partition "${boot_part_fs}" "${boot_part}"
 			efi_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${efi_part_number}")
 			fsck_partition "${efi_part_fs}" "${efi_part}"
 		else
+			Log-Info "OS with no LVM setup"
 			efi_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${efi_part_number}")
 			fsck_partition "${efi_part_fs}" "${efi_part}"
 			# we can use hardcoded values 
