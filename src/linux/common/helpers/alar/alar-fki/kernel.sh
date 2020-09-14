@@ -60,6 +60,9 @@ grub2-mkconfig -o /boot/grub2/grub.cfg
                         fi
                 fi
         fi
+
+        # enable sysreq
+        echo "kernel.sysrq = 1" >> /etc/sysctl.conf
 fi
 
 if [[ $isUbuntu == "true" ]]; then
