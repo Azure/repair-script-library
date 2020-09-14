@@ -181,45 +181,6 @@ verifySuse() {
 	umount /tmp/assert
 	rm -fr /tmp/assert
 }
-# Logic
-# -----
-
-# Get partition info/details
-
-# parted -m /dev/sda print  | grep -E '^ ?[0-9]{1,2} *' | cut -d ':' -f1,5,6,7
-# 14:::bios_grub;
-# 15:fat16:EFI System Partition:boot, esp;
-# 1:xfs::;
-# 2:::lvm;
-# NAME="CentOS Linux"
-# VERSION="8 (Core)"
-
-# parted -m /dev/sda print  | grep -E '^ ?[0-9]{1,2} *' | cut -d ':' -f1,5,6,7
-# 14:::bios_grub;
-# 15:fat16:EFI System Partition:boot;
-# 1:ext4::;
-# 2:::lvm;
-# [root@alar-cent1 ~]# cat /etc/os-release
-# NAME="CentOS Linux"
-# VERSION="7 (Core)"
-
-# parted -m /dev/sda print  | grep -E '^ ?[0-9]{1,2} *' | cut -d ':' -f1,5,6,7
-# 1:fat16:EFI System Partition:boot;
-# 2:xfs::;
-# 3:::bios_grub;
-# 4:::lvm;
-# [root@alar1 ~]# cat /etc/os-release
-# NAME="Red Hat Enterprise Linux Server"
-# VERSION="7.8 (Maipo)"
-
-# parted -m /dev/sda print  | grep -E '^ ?[0-9]{1,2} *' | cut -d ':' -f1,5,6,7
-# 14:::bios_grub;
-# 15:fat16:EFI System Partition:boot, esp;
-# 1:xfs::;
-# 2:::lvm;
-# [root@alar2 ~]# cat /etc/os-release
-# NAME="Red Hat Enterprise Linux"
-# VERSION="8.2 (Ootpa)"
  
 OLDIFS=$IFS  
 IFS=; # overwriting IFS to use the semicolon as a line seperator
@@ -347,14 +308,25 @@ if [[ "${#a_part_info[@]}" -eq 4 ]]; then
 			grep -v EFI <<< ${a_part_info[$k]} | grep -v lvm | grep -v bios &&  boot_part_number=$(getPartitionNumberDetail $k) && boot_part_fs=$(getPartitionFilesystemDetail $k); 
 			grep -q lvm <<< ${a_part_info[$k]} &&  lvm_part_number=$(getPartitionNumberDetail $k); 
 		done
-		# Those images are LVM based	
-		isLVM="true"
+
+		# Further tests need to be performed as we can not be sure that OS does come with LVM
+		[[ -z ${lvm_part_number} ]] && isLVM="false" || isLVM="true"
 		# Not a RedHat 6.x system
 		isRedHat6="false"
-		boot_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${boot_part_number}")
-		fsck_partition "${boot_part_fs}" "${boot_part}"
-		efi_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${efi_part_number}")
-		fsck_partition "${efi_part_fs}" "${efi_part}"
+		if [[ ${isLVM} == "true" ]]; then
+			boot_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${boot_part_number}")
+			fsck_partition "${boot_part_fs}" "${boot_part}"
+			efi_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${efi_part_number}")
+			fsck_partition "${efi_part_fs}" "${efi_part}"
+		else
+			efi_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part"${efi_part_number}")
+			fsck_partition "${efi_part_fs}" "${efi_part}"
+			# we can use hardcoded values 
+			boot_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part1)
+			fsck_partition "xfs" "${boot_part}"
+			root_rescue=$(readlink -f /dev/disk/azure/scsi1/lun0-part2)
+			root_part_fs="xfs"
+		fi
 		verifyRedHat 
 	fi
 
