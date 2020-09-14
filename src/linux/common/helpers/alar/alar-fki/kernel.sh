@@ -37,7 +37,6 @@ if [[ $isRedHat == "true" ]]; then
                                 grub2-mkconfig -o /boot/efi/EFI/redhat/grub.cfg
                         else
 
-                                yum install -y patch
 cat > /boot/grub2/grub-cfg.patch <<EOF
 11,12c
 if [ -f (hd0,gpt15)/efi/redhat/grubenv ]; then
@@ -49,6 +48,7 @@ grub2-mkconfig -o /boot/grub2/grub.cfg
                                 # Need to handle the condition where grubenv is a softlink
                                 # This needs to be fixed if the new grub2 for redhat is available -->  https://bugzilla.redhat.com/show_bug.cgi?id=1850193
                                 if [[ -L /boot/grub2/grubenv ]]; then
+                                        yum install -y patch
                                         patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
                                 fi
 
