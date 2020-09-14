@@ -43,15 +43,15 @@ cat > /boot/grub2/grub-cfg.patch <<EOF
 if [ -f (hd0,gpt15)/efi/redhat/grubenv ]; then
 load_env -f (hd0,gpt15)/efi/redhat/grubenv
 .
-EOF                             
-                                grub2-mkconfig -o /boot/grub2/grub.cfg
+EOF
+grub2-mkconfig -o /boot/grub2/grub.cfg
 
                                 # Need to handle the condition where grubenv is a softlink
                                 # This needs to be fixed if the new grub2 for redhat is available -->  https://bugzilla.redhat.com/show_bug.cgi?id=1850193
                                 if [[ -L /boot/grub2/grubenv ]]; then
                                         patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
                                 fi
-                                
+
                                 # These lines are required as we have the ld.so.cache not build correct
                                 # Otherwise this can lead in no functional network afterwards
                                 # TODO find a better solution
