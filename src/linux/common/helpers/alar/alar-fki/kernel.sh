@@ -58,6 +58,8 @@ grub2-mkconfig -o /boot/grub2/grub.cfg
                                 mv /sbin/dhclient /sbin/dhclient.org
 cat > /sbin/dhclient <<EOF
 #!/bin/bash
+# This script got created by linux-alar-fki
+# in order to fix an ld.so.cache issue that does the dhclient not to work properly
 ldconfig
 /sbin/dhclient.org
 EOF
