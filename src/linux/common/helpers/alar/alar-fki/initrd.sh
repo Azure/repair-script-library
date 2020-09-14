@@ -42,7 +42,7 @@ recover_redhat() {
         # rebuild the initrd
         dracut -f /boot/initramfs-"${kernel_version}".img "$kernel_version"
     else
-        if [[ $(grep -qe 'VERSION_ID=\"8.\?[1-2]\?\"' /etc/os-release) -eq 0 ]]; then
+        if [[ $(grep -qe 'VERSION_ID=\"8.\?[0-2]\?\"' /etc/os-release) -eq 0 ]]; then
             for installed_kernel in $(rpm -qa kernel); do
                      kernel-install add $(sed 's/kernel-//' <<< $installed_kernel) /boot/vmlinuz-$(sed 's/kernel-//' <<< $installed_kernel)
             done
