@@ -326,7 +326,7 @@ if [[ "${#a_part_info[@]}" -eq 4 ]]; then
 			# we can use hardcoded values 
 			boot_part=$(readlink -f /dev/disk/azure/scsi1/lun0-part1)
 			fsck_partition "xfs" "${boot_part}"
-			root_rescue=$(readlink -f /dev/disk/azure/scsi1/lun0-part2)
+			rescue_root=$(readlink -f /dev/disk/azure/scsi1/lun0-part2)
 			root_part_fs="xfs"
 		fi
 		verifyRedHat 
