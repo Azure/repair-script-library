@@ -86,7 +86,13 @@ if [[ -f "$tmp_dir/alar-fki/${distro_test}" ]]; then
 
     # Do we have identifed a supported distro?
     if [[ ${osNotSupported} == "true" ]]; then
-        Log-Error "OS is not supported. ALAR will stop!"
+        Log-Error " Your OS can not be determined. The OS distros supported are"
+        Log-Error " CentOS/Redhat 6.8 - 8.2"
+        Log-Error " Ubuntu 16.4 LTS and Ubuntu 18.4 LTS"
+        Log-Error " Suse 12 and 15"
+        Log-Error " Debain 9 and 10"
+        Log-Error " ALAR will stop!"
+        Log-Error " If your OS is in the above list please report this issue at https://github.com/azure/repair-script-library/issues"
         exit 1
     fi
 else
