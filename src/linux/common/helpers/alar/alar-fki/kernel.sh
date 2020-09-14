@@ -25,7 +25,7 @@ if [[ $isRedHat == "true" ]]; then
                 # Fix for a bug in RedHat 8.1/8.2
                 # https://bugzilla.redhat.com/show_bug.cgi?id=1850193
                 # This needs to be fixed as soon as the bug with grub2-mkconfig is solved too
-                if [[ ($(grep -qe 'ID="rhel"' /etc/os-release) -eq 0) && ($(grep -qe 'VERSION_ID="8.[1-2]"' /etc/os-release) -eq 0) ]]; then 
+                if [[ ($(grep -qe 'ID="rhel"' /etc/os-release) -eq 0) && ($(grep -qe 'VERSION_ID=\"8.\?[1-2]\?\"' /etc/os-release) -eq 0) ]]; then 
                         if [[ -d /sys/firmware/efi ]]; then 
                                 grub2-mkconfig -o /boot/efi/EFI/redhat/grub.cfg
                         else
