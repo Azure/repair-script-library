@@ -22,27 +22,42 @@ if [[ $isRedHat == "true" ]]; then
                 set_grub_default
                 grubby --set-default=1 # This is the previous kernel
                 
+                # Exception for RedHat 8.0 i.e sku RedHat:RHEL-HA:8.0:8.0.2020021914
+                # here we don't have to run the patch operation
+                if [[ $(grep -qe 'VERSION_ID="8\.0"' /etc/os-release) -eq 0 ]]; then
+                        grub2-mkconfig -o /boot/grub2/grub.cfg
+                fi
+
                 # Fix for a bug in RedHat 8.1/8.2
                 # https://bugzilla.redhat.com/show_bug.cgi?id=1850193
                 # This needs to be fixed as soon as the bug with grub2-mkconfig is solved too
                 if [[ ($(grep -qe 'ID="rhel"' /etc/os-release) -eq 0) && ($(grep -qe 'VERSION_ID=\"8.\?[1-2]\?\"' /etc/os-release) -eq 0) ]]; then 
+                        # no bug with UEFI
                         if [[ -d /sys/firmware/efi ]]; then 
                                 grub2-mkconfig -o /boot/efi/EFI/redhat/grub.cfg
                         else
-                        yum install -y patch
+
+                                yum install -y patch
 cat > /boot/grub2/grub-cfg.patch <<EOF
 11,12c
 if [ -f (hd0,gpt15)/efi/redhat/grubenv ]; then
 load_env -f (hd0,gpt15)/efi/redhat/grubenv
 .
-EOF
-                grub2-mkconfig -o /boot/grub2/grub.cfg
-                patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
+EOF                             
+                                grub2-mkconfig -o /boot/grub2/grub.cfg
 
-                # These lines are required as we have the ld.so.cache not build correct
-                chmod +x /etc/rc.d/rc.local
-                echo ldconfig >> /etc/rc.local
-                       fi
+                                # Need to handle the condition where grubenv is a softlink
+                                # This needs to be fixed if the new grub2 for redhat is available -->  https://bugzilla.redhat.com/show_bug.cgi?id=1850193
+                                if [[ -L /boot/grub2/grubenv ]]; then
+                                        patch /boot/grub2/grub.cfg /boot/grub2/grub-cfg.patch
+                                fi
+                                
+                                # These lines are required as we have the ld.so.cache not build correct
+                                # Otherwise this can lead in no functional network afterwards
+                                # TODO find a better solution
+                                chmod +x /etc/rc.d/rc.local
+                                echo ldconfig >> /etc/rc.local
+                        fi
                 fi
         fi
 fi
