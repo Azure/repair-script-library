@@ -54,9 +54,14 @@ grub2-mkconfig -o /boot/grub2/grub.cfg
 
                                 # These lines are required as we have the ld.so.cache not build correct
                                 # Otherwise this can lead in no functional network afterwards
-                                # TODO find a better solution
-                                chmod +x /etc/rc.d/rc.local
-                                echo ldconfig >> /etc/rc.local
+                                # TODO find a better solution and the root cause for it
+                                mv /sbin/dhclient /sbin/dhclient.org
+cat > /sbin/dhclient <<EOF
+#!/bin/bash
+ldconfig
+/sbin/dhclient.org
+EOF
+chmod 755 /sbin/dhclient
                         fi
                 fi
         fi
