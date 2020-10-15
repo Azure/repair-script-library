@@ -38,5 +38,10 @@
 		"id" : "linux-alar-fki",
 		"path" : "src/linux/linux-alar-fki.sh",
 		"description" : "alar-fki allows to recover a failed VM. Three recover scenarios are possible: fstab, initrd and kernel. NOTE: use option --run-on-repair. Se the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar/README.md"
+	},
+	{
+		"id" : "enable-nested",
+		"path" : "src/windows/enable-nestedhyperv.ps1",
+		"description" : "enable nested hyperv script"
 	}
 ]
