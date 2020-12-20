@@ -1,6 +1,8 @@
 #!/bin/bash
-#cd ${tmp_dir}
-#. ./src/linux/common/setup/init.sh
+
+# This change into /tmp is necessary
+cd /tmp
+. ./src/linux/common/setup/init.sh
 mv -f /etc/fstab{,.copy}
 
 # For Debian we need to instal gawk first. It comes only with mawk
