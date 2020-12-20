@@ -1,10 +1,16 @@
-use crate::constants;
+use crate::{ade::is_ade_enabled, constants};
 use crate::distro;
 use crate::distro::DistroKind;
 use crate::helper;
 use crate::mount;
+use crate::cli;
+use crate::standalone;
+
 use cmd_lib::{run_cmd, run_fun};
-use std::{fs, io};
+use fs_extra::dir;
+use fs_extra::file;
+use std::{env, fs, io, process};
+use std::os::unix::fs::symlink as softlink;
 
 pub(crate) fn ubuntu_mount(distro: &distro::Distro) {
     // We have to verify also whether we have old Ubuntus/Debian with one partition only
@@ -192,7 +198,7 @@ fn rm_support_filesystems() -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn distro_mount(distro: &distro::Distro) {
+pub(crate) fn distro_mount(distro: &distro::Distro, is_standalone: bool) {
     match distro.kind {
         DistroKind::Debian | DistroKind::Ubuntu => ubuntu_mount(&distro),
         DistroKind::Suse => suse_mount(&distro),
@@ -200,6 +206,9 @@ pub(crate) fn distro_mount(distro: &distro::Distro) {
         DistroKind::RedHatCentOS6 => redhat6_mount(&distro),
         DistroKind::Undefined => {} // Nothing to do here we have covered this condition already
     }
+    // Also copy the recovery scripts to /tmp in order to make them available for the chroot 
+    // operation we do later
+    copy_actions_totmp(distro, is_standalone);
 }
 
 pub(crate) fn distro_umount(distro: &distro::Distro) {
@@ -210,4 +219,61 @@ pub(crate) fn distro_umount(distro: &distro::Distro) {
         DistroKind::RedHatCentOS6 => redhat6_umount(&distro),
         DistroKind::Undefined => {} // Nothing to do here we have covered this condition already
     }
+}
+
+fn copy_actions_totmp(distro: &distro::Distro, is_standalone: bool) {
+    // We need to copy the action scripts to /tmp
+    // This is the only directory we change with chroot
+    
+    if !is_standalone {
+    let mut options = dir::CopyOptions::new(); //Initialize default values for CopyOptions
+    options.skip_exist = true;
+
+    /*
+    match dir::copy("src/action_implementation", "/tmp", &options) {
+        Ok(_) => {},
+        Err(e) => {
+            println!("Copy operation for action_implementation directory failed. ALAR needs to stop: {}", e); 
+            distro_umount(distro);
+            process::exit(1);
+            }
+    }
+   */
+
+    match env::current_dir() {
+          Ok(cd) => println!("The current dir is : {}", cd.display() ),
+          Err(e) => println!("Error : {}", e),
+      }
+
+    match dir::copy("../../../../../src/", "/tmp", &options) {
+        Ok(_) => {},
+        Err(e) => {
+            println!("Copy operation for action_implementation directory failed. ALAR needs to stop: {}", e); 
+            distro_umount(distro);
+            process::exit(1);
+            }
+    }
+
+    if let Err(err) = fs::remove_file(constants::ACTION_IMPL_DIR) {
+        println!("File can not be removed : '{}'", err );
+        distro_umount(distro);
+        process::exit(1);
+    }
+    // Create a softlink in orders to ease the directory access.
+    match softlink("/tmp/src/linux/common/helpers/alar2/src/action_implementation", constants::ACTION_IMPL_DIR) {
+        Ok(_) => {},
+        Err(e) => {
+                println!("Softlink can not be created. ALAR needs to stop!: {}",e);
+                distro_umount(distro);
+                process::exit(1);
+        }
+    }
+} else {
+    if let Err(e) = standalone::download_action_scripts() {
+        panic!("action scripts are not able to be copied or downloadable : '{}'", e); 
+    }
+}
+    
+
+    
 }

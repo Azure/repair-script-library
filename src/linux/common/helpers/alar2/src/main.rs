@@ -1,11 +1,13 @@
 mod action;
 mod ade;
+mod cli;
 mod constants;
 mod distro;
 mod helper;
 mod mount;
 mod prepare_action;
 mod redhat;
+mod standalone;
 mod suse;
 mod ubuntu;
 
@@ -19,12 +21,16 @@ use std::{
 };
 
 fn main() {
+    // First verify we have the right amount of information to operate
+    let cli_info = cli::cli();
+
     // At first we need to verify the distro we have to work with
     // the Distro struct does contain then all of the required information
     let distro = distro::Distro::new();
     println!("{:?}", distro);
 
     // Do we have a valid distro or not?
+
     if distro.kind == distro::DistroKind::Undefined {
         helper::log_error("Unrecognized Linux distribution. ALAR tool is stopped\n
                  Your OS can not be determined. The OS distros supported are:\n
@@ -48,46 +54,28 @@ fn main() {
     }
 
     // Mount the right dirs depending on the distro determined
-    prepare_action::distro_mount(&distro);
+    prepare_action::distro_mount(&distro, cli_info.standalone);
 
     // Verify we have an implementation available for the action to be executed
-    let dir = "/tmp/action_implementation";
-    let action_name = "fstab";
+    // TODO
+    // Write loop for the actions passed over
 
-    match action::is_action_available(dir, action_name) {
-        // Do the action
-        Ok(_) => action::run_repair_script2( action_name),
-        Err(e) => helper::log_error(format!("Action '{}' is not available", action_name).as_str()),
+    for action_name in cli_info.actions.split(",") {
+        match action::is_action_available(action_name) {
+            // Do the action
+            Ok(_) => action::run_repair_script2(&distro, action_name),
+            Err(e) => {
+                helper::log_error(format!("Action '{}' is not available", action_name).as_str())
+            }
+        }
     }
 
     // Umount everything again
 
-      match env::current_dir() {
-          Ok(cd) => println!("The current dir is : {}", cd.display() ),
-          Err(e) => println!("Error : {}", e),
-      }
+    match env::current_dir() {
+        Ok(cd) => println!("The current dir is : {}", cd.display()),
+        Err(e) => println!("Error : {}", e),
+    }
 
     prepare_action::distro_umount(&distro);
-
-    // This is a test for doing a chroot
-    /*
-    unsafe {
-        //let mount_dir: *const libc::c_char = b"/my_root\0".as_ptr() as *const libc::c_char;
-        let mount_dir: *const libc::c_char = b"/mnt/rescue-root\0".as_ptr() as *const libc::c_char;
-        let code =libc::chroot(mount_dir);
-        println!("Return value is: {}", code);
-
-        //path=Path::new(r#"/grub2"#);
-        let path = Path::new(r#"/boot"#);
-
-        if let Ok(v) = env::set_current_dir(&path) {
-            println!("Set path was: {:?}", v);
-        }
-
-      let path = env::current_dir();
-        println!("The current directory is {}", path.unwrap().display());
-    }
-    */
 }
-
-// Start of the function definition

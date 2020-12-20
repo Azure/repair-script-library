@@ -14,3 +14,4 @@ pub(crate) const REDHAT_RELEASE: &str = "/tmp/assert/etc/redhat-release";
 pub(crate) const OS_RELEASE: &str = r#"/tmp/assert/etc/os-release"#;
 pub(crate) const PARTITION_TMP: &str = r#"/tmp/partition_file.tmp"#;
 pub(crate) const OSENCRYPT_PATH: &str = r#"/dev/mapper/osencrypt"#;
+pub(crate) const ACTION_IMPL_DIR: &str = r#"/tmp/action_implementation"#;
