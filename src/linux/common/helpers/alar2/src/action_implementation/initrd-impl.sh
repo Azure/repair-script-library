@@ -1,7 +1,4 @@
 #!/bin/bash
-cd ${tmp_dir}
-. ./src/linux/common/setup/init.sh
-#
 # recover logic for handling and initrd or kernel problem
 #
 
