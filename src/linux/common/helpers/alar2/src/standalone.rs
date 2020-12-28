@@ -3,7 +3,7 @@ use crate::helper;
 use crate::cli;
 use crate::constants;
 use std::{io,process,fs};
-use copy_dir;
+use fs_extra;
 
 pub(crate) fn download_action_scripts(cli_info: &cli::CliInfo) -> io::Result<()> {
     if cli_info.action_directory.len() == 0 {
@@ -27,16 +27,19 @@ pub(crate) fn download_action_scripts(cli_info: &cli::CliInfo) -> io::Result<()>
     // In case we have a local directory for our action scripts we need to copy the actions to
     // tmp/action_implementation
    if let Err(e) = load_local_action(cli_info.action_directory.as_str()) {
-       return Err(e);
+       return Err(io::Error::new(io::ErrorKind::Other, format!("Load local action failed : '{}'",e)));
    }
    Ok(())
 }
 }
 
-fn load_local_action(directory_source: &str) -> io::Result<()> {
+fn load_local_action(directory_source: &str) -> fs_extra::error::Result<u64> {
         let _ = fs::remove_dir_all(constants::ACTION_IMPL_DIR);
-        match copy_dir::copy_dir(directory_source, constants::ACTION_IMPL_DIR) {
-        Ok(_) => Ok(()),
+        let mut options = fs_extra::dir::CopyOptions::new();
+        options.skip_exist = true;
+        options.copy_inside = true;
+        match fs_extra::dir::copy(directory_source, constants::ACTION_IMPL_DIR, &options) {
+        Ok(v) => Ok(v),
         Err(e) => Err(e),
         }
 }
