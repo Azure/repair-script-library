@@ -251,9 +251,9 @@ fn do_redhat_lvm(partition_info: &Vec<String>, mut distro: &mut distro::Distro) 
 
 // verify_redhat_nolvm does set the DistroKind to either RedHatCentOS or RedHatCentOS6
 // if the verification is succesful
-pub(crate) fn verify_redhat_nolvm(mut distro: &mut distro::Distro) {
+pub(crate) fn verify_redhat_nolvm(distro: &mut distro::Distro) {
     if let Err(e) = mount::mkdir_assert() {
-        panic!("Creating assert directory is not possible. ALAR is not able to proceed further");
+        panic!("Creating assert directory is not possible : {}. ALAR is not able to proceed further",e);
     }
 
     mount::mount_path_assert(distro.rescue_root.root_part_path.as_str());
@@ -266,7 +266,7 @@ pub(crate) fn verify_redhat_nolvm(mut distro: &mut distro::Distro) {
     }
 }
 
-pub(crate) fn verify_redhat_lvm(mut distro: &mut distro::Distro) {
+pub(crate) fn verify_redhat_lvm(distro: &mut distro::Distro) {
     mount::mount_path_assert(distro.lvm_details.lvm_root_part.as_str());
 
     set_redhat_kind(distro);
@@ -311,7 +311,7 @@ pub(crate) fn lvm_path_helper(lvname: &str) -> String {
     lvpath
 }
 
-fn lvm_get_filesystem(lvpath: &str) -> String {
+fn _lvm_get_filesystem(lvpath: &str) -> String {
     let mut filesystem = "".to_string();
     match run_fun!(parted -m $lvpath print | grep -E "^ ?[0-9]{1,2} *") {
         Ok(value) => {

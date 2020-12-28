@@ -1,4 +1,4 @@
-use crate::{distro::{self, Distro}, helper};
+use crate::helper;
 use crate::constants;
 use std::{fs, io, process};
 //use cmd_lib::{run_cmd, run_fun};

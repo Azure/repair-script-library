@@ -7,7 +7,7 @@ use cmd_lib::{run_cmd, run_fun};
 pub(crate)  fn verify_ubuntu(mut distro: &mut distro::Distro) {
 
     if let Err(e) = mount::mkdir_assert() {
-        panic!("Creating assert directory is not possible. ALAR is not able to proceed further");
+        panic!("Creating assert directory is not possible: {} ALAR is not able to proceed further", e);
     }
 
     mount::mount_path_assert(distro.rescue_root.root_part_path.as_str());

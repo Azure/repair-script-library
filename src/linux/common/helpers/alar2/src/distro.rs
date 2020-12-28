@@ -173,10 +173,10 @@ fn get_partitions(partitions: &mut Vec<String>) {
 fn do_old_ubuntu_or_centos(partition_info: &Vec<String>, mut distro: &mut Distro) {
     helper::log_info("This could be an old Ubuntu image or even an CentOS with one partition only");
 
-    // At first e have to determine whether this is a Ubuntu distro
+    // At first we have to determine whether this is a Ubuntu distro
     // or whether it is a single partiton CentOs distro
     if let Err(e) = mount::mkdir_assert() {
-        panic!("Creating assert directory is not possible. ALAR is not able to proceed further");
+        panic!("Creating assert directory is not possible : '{}'. ALAR is not able to proceed further",e);
     }
 
     distro.rescue_root.root_part_fs = helper::get_partition_filesystem_detail(&partition_info[0]);
@@ -222,24 +222,24 @@ fn do_recent_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
 }
 
 // if we have 4 partition detected
-fn do_suse_or_lvm_or_ubuntu(partition_info: &Vec<String>, mut distro: &mut Distro) {
+fn do_suse_or_lvm_or_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
     // This function is also called if we have an recent Ubuntu distro with ADE enabled
     // With ADE a 4th partition got added to hold the boot-part-details plus luks
 
     // Define an enum which is used to decide which further part has to be executed
 
-    enum logic {
+    enum Logic {
         RedHat,
         Suse,
         Ubuntu,
     }
-    let mut which_logic = logic::RedHat; // Default value is Redhat
+    let mut which_logic = Logic::RedHat; // Default value is Redhat
 
     // Not sure whether this is a RedHat or CENTOS with LVM or it is a Suse 12/15 instead
     // Need to make a simple test
     for partition in partition_info.iter() {
         if partition.contains("lxboot") {
-            which_logic = logic::Suse;
+            which_logic = Logic::Suse;
         }
     }
 
@@ -253,14 +253,14 @@ fn do_suse_or_lvm_or_ubuntu(partition_info: &Vec<String>, mut distro: &mut Distr
             process::exit(1);
         }
         if pretty_name.contains("Ubuntu") {
-            which_logic = logic::Ubuntu;
+            which_logic = Logic::Ubuntu;
         }
     }
 
     match which_logic {
-        logic::RedHat => redhat::do_redhat_lvm_or(partition_info, distro),
-        logic::Suse => suse::do_suse(partition_info, distro),
-        logic::Ubuntu => ade::do_ubuntu_ade(partition_info, distro),
+        Logic::RedHat => redhat::do_redhat_lvm_or(partition_info, distro),
+        Logic::Suse => suse::do_suse(partition_info, distro),
+        Logic::Ubuntu => ade::do_ubuntu_ade(partition_info, distro),
     }
 }
 

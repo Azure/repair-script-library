@@ -1,6 +1,5 @@
 pub(crate) const RESCUE_DISK: &str = r#"/dev/disk/azure/scsi1/lun0"#;
 pub(crate) const RESCUE_ROOT: &str = r#"/mnt/rescue-root/"#;
-pub(crate) const RESCUE_ROOT_CSTRING: &str =  r#"/mnt/rescue-root\0"#;
 pub(crate) const RESCUE_ROOT_RUN: &str = r#"/mnt/rescue-root/run"#;
 pub(crate) const RESCUE_ROOT_BOOT: &str = r#"/mnt/rescue-root/boot"#;
 pub(crate) const RESCUE_ROOT_BOOT_EFI: &str = r#"/mnt/rescue-root/boot/efi"#;
@@ -9,7 +8,6 @@ pub(crate) const RESCUE_ROOT_VAR: &str = r#"/mnt/rescue-root/var"#;
 pub(crate) const SUPPORT_FILESYSTEMS: &str = r#"dev proc sys tmp dev/pts"#;
 pub(crate) const LUN_PART_PATH: &str = r#"/dev/disk/azure/scsi1/lun0-part"#;
 pub(crate) const ASSERT_PATH: &str = r#"/tmp/assert"#;
-pub(crate) const ASSERT_PATH_USR: &str = r#"/tmp/assert/usr"#;
 pub(crate) const REDHAT_RELEASE: &str = "/tmp/assert/etc/redhat-release";
 pub(crate) const OS_RELEASE: &str = r#"/tmp/assert/etc/os-release"#;
 pub(crate) const PARTITION_TMP: &str = r#"/tmp/partition_file.tmp"#;

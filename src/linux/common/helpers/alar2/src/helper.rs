@@ -1,14 +1,10 @@
-use std::process::Stdio;
 use crate::constants;
-use crate::mount;
 use crate::distro::{Distro, EfiPartT, EfiPartition};
+use crate::mount;
 use chrono::prelude::Utc;
-use cmd_lib::{run_cmd, run_fun};
-use std::{
-    fs, io,
-    io::{Error, Result},
-    process, result,
-};
+use std::process::Stdio;
+use std::{fs, process};
+use cmd_lib::run_fun;
 
 pub fn log_info(msg: &str) {
     println!("[Info {}] {}", Utc::now(), msg);
@@ -83,13 +79,12 @@ pub(crate) fn get_ade_mounpoint(source: &str) -> String {
     if let Ok(path) = cmd_lib::run_fun!(cat /proc/mounts | grep $source | cut -dr#" "# -f2) {
         mountpoint = path;
     }
-    log_info(format!("ADE mountpoint is: {}", &mountpoint).as_str() );
+    log_info(format!("ADE mountpoint is: {}", &mountpoint).as_str());
     mountpoint
 }
 
 pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
-
-    // Need to handel the condition if no filesystem is available 
+    // Need to handel the condition if no filesystem is available
     // This can happen if we have a LVM partition
     if partition_filesystem.len() == 0 {
         return;
@@ -100,9 +95,9 @@ pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
 
     match partition_filesystem {
         "xfs" => {
-            log_info(format!("fsck for XFS on {}", partition_path).as_str() );
+            log_info(format!("fsck for XFS on {}", partition_path).as_str());
             if let Err(e) = mount::mkdir_assert() {
-               panic!("Creating assert directory is not possible. ALAR is not able to proceed further");
+                panic!("Creating assert directory is not possible : '{}'. ALAR is not able to proceed further",e);
             }
 
             // In case the filesystem has valuable metadata changes in a log which needs to
@@ -153,7 +148,6 @@ pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
             log_error("Aborting ALAR");
             process::exit(1);
         }
-        
         // xfs_repair -n returns 1 if the fs is corrupted.
         // Also fsck may raise this error but we ignore it as even a normal recover is raising it. FALSE-NEGATIVE
         Some(_code @ 1) if partition_filesystem == "xfs" => {
@@ -161,13 +155,14 @@ pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
             log_error("Aborting ALAR");
             process::exit(1);
         }
-        
         None => {
-            panic!("fsck operation terminated by signal error. ALAR is not able to proceed further!");
+            panic!(
+                "fsck operation terminated by signal error. ALAR is not able to proceed further!"
+            );
         }
 
         // Any other error stat is not of interest for us
-        _ => {  }
+        _ => {}
     }
 
     log_info("File system check finished");

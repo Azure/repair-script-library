@@ -1,4 +1,4 @@
-use crate::{ade::is_ade_enabled, constants};
+use crate::constants;
 use crate::distro;
 use crate::distro::DistroKind;
 use crate::helper;
@@ -6,9 +6,7 @@ use crate::mount;
 use crate::cli;
 use crate::standalone;
 
-use cmd_lib::{run_cmd, run_fun};
 use fs_extra::dir;
-use fs_extra::file;
 use std::{env, fs, io, process};
 use std::os::unix::fs::symlink as softlink;
 
@@ -54,24 +52,15 @@ pub(crate) fn ubuntu_umount(distro: &distro::Distro) {
 }
 
 pub(crate) fn suse_mount(distro: &distro::Distro) {
-    //mount::bind_mount("/run", constants::RESCUE_ROOT_RUN);
     redhat_mount(distro); // We can use the same functionality
 }
 
 pub(crate) fn suse_umount(distro: &distro::Distro) {
-    //mount::umount(constants::RESCUE_ROOT_RUN);
     redhat_umount(distro); // we can use the same functionality
 }
 
 pub(crate) fn redhat_mount(distro: &distro::Distro) {
     if distro.is_lvm == true {
-        // REMOVE THIS NOT NEEDED AS WE HAVE DONE THIS ALREADY !!!!!!!!!!!!!!!!!!!!!
-        // At first we need to prepare the LVM setup
-        //match run_cmd!(pvscan; vgscan; lvscan;) {
-        //    Ok(_) => {},
-        //    Err(error) => panic!("There is a problem to setup LVM correct. {}", error),
-        //}
-
         let mut mount_option: Option<&str>;
         mount::mount_root_on_rescue_root(distro.lvm_details.lvm_root_part.as_str(), None);
         mount::mount_usr_on_rescue_root_usr(distro.lvm_details.lvm_usr_part.as_str());
@@ -191,14 +180,8 @@ fn mkdir_support_filesystems() -> io::Result<()> {
     Ok(())
 }
 
-fn rm_support_filesystems() -> io::Result<()> {
-    for fs in constants::SUPPORT_FILESYSTEMS.to_string().split(" ") {
-        mount::rmdir(format!("{}{}", constants::RESCUE_ROOT, fs).as_str())?;
-    }
-    Ok(())
-}
 
-pub(crate) fn distro_mount(distro: &distro::Distro, is_standalone: bool) {
+pub(crate) fn distro_mount(distro: &distro::Distro, cli_info: &cli::CliInfo) {
     match distro.kind {
         DistroKind::Debian | DistroKind::Ubuntu => ubuntu_mount(&distro),
         DistroKind::Suse => suse_mount(&distro),
@@ -208,7 +191,7 @@ pub(crate) fn distro_mount(distro: &distro::Distro, is_standalone: bool) {
     }
     // Also copy the recovery scripts to /tmp in order to make them available for the chroot 
     // operation we do later
-    copy_actions_totmp(distro, is_standalone);
+    copy_actions_totmp(distro, cli_info);
 }
 
 pub(crate) fn distro_umount(distro: &distro::Distro) {
@@ -221,24 +204,13 @@ pub(crate) fn distro_umount(distro: &distro::Distro) {
     }
 }
 
-fn copy_actions_totmp(distro: &distro::Distro, is_standalone: bool) {
+fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
     // We need to copy the action scripts to /tmp
     // This is the only directory we change with chroot
     
-    if !is_standalone {
+    if !cli_info.standalone {
     let mut options = dir::CopyOptions::new(); //Initialize default values for CopyOptions
     options.skip_exist = true;
-
-    /*
-    match dir::copy("src/action_implementation", "/tmp", &options) {
-        Ok(_) => {},
-        Err(e) => {
-            println!("Copy operation for action_implementation directory failed. ALAR needs to stop: {}", e); 
-            distro_umount(distro);
-            process::exit(1);
-            }
-    }
-   */
 
     match env::current_dir() {
           Ok(cd) => println!("The current dir is : {}", cd.display() ),
@@ -269,11 +241,10 @@ fn copy_actions_totmp(distro: &distro::Distro, is_standalone: bool) {
         }
     }
 } else {
-    if let Err(e) = standalone::download_action_scripts() {
+    if let Err(e) = standalone::download_action_scripts(cli_info) {
+        distro_umount(distro);
         panic!("action scripts are not able to be copied or downloadable : '{}'", e); 
     }
 }
-    
-
     
 }

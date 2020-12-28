@@ -3,9 +3,7 @@ use crate::distro;
 use crate::helper;
 use crate::mount;
 use crate::redhat;
-use crate::suse;
 use crate::ubuntu;
-use cmd_lib::{run_cmd, run_fun};
 
 /*
 

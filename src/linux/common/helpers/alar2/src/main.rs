@@ -11,12 +11,8 @@ mod standalone;
 mod suse;
 mod ubuntu;
 
-use cmd_lib::{run_cmd, run_fun};
-use distro::DistroKind;
 use std::{
-    env, fs,
-    io::{self, Error},
-    path::Path,
+    env, 
     process,
 };
 
@@ -53,20 +49,23 @@ fn main() {
         ),
     }
 
-    // Mount the right dirs depending on the distro determined
-    prepare_action::distro_mount(&distro, cli_info.standalone);
+    // Step 2 of prepare and mount. Mount the right dirs depending on the distro determined
+    prepare_action::distro_mount(&distro, &cli_info);
 
     // Verify we have an implementation available for the action to be executed
-    // TODO
-    // Write loop for the actions passed over
-
+    // Define a variable for the error condition that may happen
+    let mut is_action_error = false;
     for action_name in cli_info.actions.split(",") {
         match action::is_action_available(action_name) {
             // Do the action
-            Ok(_) => action::run_repair_script2(&distro, action_name),
-            Err(e) => {
-                helper::log_error(format!("Action '{}' is not available", action_name).as_str())
+            Ok( _is @ true) => {
+                match action::run_repair_script(&distro, action_name) {
+                    Ok(_) => is_action_error = false,
+                    Err(e) => {helper::log_error(format!("Action {} raised an error: '{}'", &action_name, e).as_str()); is_action_error=true;}
+                }
             }
+            Ok( _is @ false) => {helper::log_error(format!("Action '{}' is not available", action_name).as_str()); is_action_error=true; }
+            Err(e) => { helper::log_error(format!("There was an error raised while verifying the action: '{}'", e).as_str()); is_action_error=true; }
         }
     }
 
@@ -78,4 +77,11 @@ fn main() {
     }
 
     prepare_action::distro_umount(&distro);
+
+    // Inform the calling process about the success
+    if is_action_error {
+        process::exit(1);
+    } else {
+        process::exit(0);
+    }
 }
