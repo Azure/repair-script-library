@@ -1,7 +1,6 @@
 use crate::helper;
 use crate::constants;
 use std::{fs, io, process};
-//use cmd_lib::{run_cmd, run_fun};
 use sys_mount;
 
 pub(crate)  fn mkdir_assert()  -> Result<(), io::Error>{
