@@ -36,7 +36,7 @@ pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> i
     }
     // Execute the action script
     let output = cmd_lib::run_fun!(chroot "/mnt/rescue-root" /tmp/action_implementation/${action_name}-impl.sh)?;
-    helper::log_output(output.as_str());
+    helper::log_debug(output.as_str());
 
     helper::log_info("----- Action stopped -----");
 
@@ -52,6 +52,5 @@ pub(crate) fn is_action_available(action_name: &str) -> io::Result<bool> {
             actions.push(entry.path().file_name().unwrap().to_str().unwrap().to_string());
         }
     }
-    println!("{:?}",actions);
     Ok(actions.contains( &format!("{}-impl.sh",action_name) ))
 }
