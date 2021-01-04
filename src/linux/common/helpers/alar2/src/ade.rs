@@ -73,7 +73,8 @@ pub(crate) fn is_ade_enabled() -> bool {
     cmd_lib::run_cmd!(lsblk | grep -q osencrypt).is_ok()
 }
 
-pub(crate) fn do_ubuntu_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+//pub(crate) fn do_ubuntu_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+pub(crate) fn do_ubuntu_ade(partition_info: &[String], mut distro: &mut distro::Distro) {
     helper::log_info("This is a recent Ubuntu 16.x/18.x with ADE enabled");
 
     // Only get the EFI partition
@@ -111,7 +112,8 @@ pub(crate) fn do_ubuntu_ade(partition_info: &Vec<String>, mut distro: &mut distr
     ubuntu::verify_ubuntu(distro);
 }
 
-pub(crate) fn do_redhat_nolvm_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+//pub(crate) fn do_redhat_nolvm_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+pub(crate) fn do_redhat_nolvm_ade(partition_info: &[String], mut distro: &mut distro::Distro) {
     // Unfortunately we need to work with hardcoded values as there exist no label information
     distro.boot_part.boot_part_fs = "xfs".to_string();
     distro.boot_part.boot_part_number = 1;
@@ -147,7 +149,8 @@ pub(crate) fn do_redhat_nolvm_ade(partition_info: &Vec<String>, mut distro: &mut
     redhat::verify_redhat_nolvm(distro);
 }
 
-pub(crate) fn do_redhat6_or_7_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+//pub(crate) fn do_redhat6_or_7_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+pub(crate) fn do_redhat6_or_7_ade(mut distro: &mut distro::Distro) {
 // Unfortunately we need to work with hardcoded values as there exist no label information
     distro.boot_part.boot_part_fs = "xfs".to_string();
     distro.boot_part.boot_part_number = 1;
@@ -174,7 +177,7 @@ pub(crate) fn do_redhat6_or_7_ade(partition_info: &Vec<String>, mut distro: &mut
     redhat::verify_redhat_nolvm(distro);
 }
 
-pub(crate) fn do_redhat_lvm_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+pub(crate) fn do_redhat_lvm_ade(partition_info: &[String], mut distro: &mut distro::Distro) {
     /*
      Unfortunately we need to work with hardcoded values as there exist no label information
 

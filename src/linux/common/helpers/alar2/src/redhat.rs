@@ -8,7 +8,7 @@ use crate::mount;
 
 use cmd_lib::{run_cmd, run_fun};
 
-pub(crate) fn do_redhat_lvm_or(partition_info: &Vec<String>, distro: &mut distro::Distro) {
+pub(crate) fn do_redhat_lvm_or(partition_info: &[String], distro: &mut distro::Distro) {
     let mut contains_lvm_partition: bool = false;
 
     for partition in partition_info.iter() {
@@ -17,18 +17,16 @@ pub(crate) fn do_redhat_lvm_or(partition_info: &Vec<String>, distro: &mut distro
         }
     }
 
-    if contains_lvm_partition == true {
+    if contains_lvm_partition {
         do_redhat_lvm(partition_info, distro);
+    } else if partition_info.len() == 1 {
+        do_centos_single_partition(distro);
     } else {
-        if partition_info.len() == 1 {
-            do_centos_single_partition(distro);
-        } else {
-            do_redhat_nolvm(partition_info, distro);
-        }
+        do_redhat_nolvm(partition_info, distro);
     }
 }
 
-pub(crate) fn do_redhat6_or_7(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+pub(crate) fn do_redhat6_or_7(partition_info: &[String], mut distro: &mut distro::Distro) {
     if !distro.is_ade {
         for partition in partition_info {
             if helper::get_partition_number_detail(partition) == 1 {
@@ -74,11 +72,11 @@ pub(crate) fn do_redhat6_or_7(partition_info: &Vec<String>, mut distro: &mut dis
         verify_redhat_nolvm(distro);
     } else {
         // ADE part
-        ade::do_redhat6_or_7_ade(partition_info, distro);
+        ade::do_redhat6_or_7_ade( distro);
     }
 }
 
-fn do_redhat_nolvm(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+fn do_redhat_nolvm(partition_info: &[String], mut distro: &mut distro::Distro) {
     if !distro.is_ade {
         // 4 partitions with no LVM we find on an 'CentOS Linux release 7.7.1908' for instance
         /*
@@ -159,7 +157,7 @@ fn do_redhat_nolvm(partition_info: &Vec<String>, mut distro: &mut distro::Distro
     }
 }
 
-fn do_redhat_lvm(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+fn do_redhat_lvm(partition_info: &[String], mut distro: &mut distro::Distro) {
     helper::log_info("This is a recent RedHat or CentOS image with 4 partitions and LVM signature");
     distro.is_lvm = true;
 
@@ -253,7 +251,10 @@ fn do_redhat_lvm(partition_info: &Vec<String>, mut distro: &mut distro::Distro) 
 // if the verification is succesful
 pub(crate) fn verify_redhat_nolvm(distro: &mut distro::Distro) {
     if let Err(e) = mount::mkdir_assert() {
-        panic!("Creating assert directory is not possible : {}. ALAR is not able to proceed further",e);
+        panic!(
+            "Creating assert directory is not possible : {}. ALAR is not able to proceed further",
+            e
+        );
     }
 
     mount::mount_path_assert(distro.rescue_root.root_part_path.as_str());
@@ -261,7 +262,7 @@ pub(crate) fn verify_redhat_nolvm(distro: &mut distro::Distro) {
     set_redhat_kind(distro);
 
     mount::umount(constants::ASSERT_PATH);
-    if let Err(_) = mount::rmdir(constants::ASSERT_PATH) {
+    if mount::rmdir(constants::ASSERT_PATH).is_err() {
         helper::log_info("ASSERT_PATH can not be removed. This is a minor issue. ALAR is able to continue further");
     }
 }
@@ -276,7 +277,7 @@ pub(crate) fn verify_redhat_lvm(distro: &mut distro::Distro) {
 
 fn set_redhat_kind(mut distro: &mut distro::Distro) {
     let mut pretty_name = helper::get_pretty_name(constants::OS_RELEASE);
-    if pretty_name.len() == 0 {
+    if pretty_name.is_empty() {
         // if len is 0 then it points to a RedHat or CentOS 6 distro
         // let us read the correct file instead
         match fs::read_to_string(constants::REDHAT_RELEASE) {
@@ -287,39 +288,31 @@ fn set_redhat_kind(mut distro: &mut distro::Distro) {
             }
         }
         if pretty_name.contains("CentOS") || pretty_name.contains("Red Hat") {
-            helper::log_info(format!("Pretty Name is : {}", &pretty_name).as_str() );
+            helper::log_info(format!("Pretty Name is : {}", &pretty_name).as_str());
             distro.kind = distro::DistroKind::RedHatCentOS6;
         }
-    } else {
-        if pretty_name.contains("CentOS") || pretty_name.contains("Red Hat") {
-            helper::log_info(format!("Pretty Name is : {}", &pretty_name).as_str() );
-            distro.kind = distro::DistroKind::RedHatCentOS;
-        }
+    } else if pretty_name.contains("CentOS") || pretty_name.contains("Red Hat") {
+        helper::log_info(format!("Pretty Name is : {}", &pretty_name).as_str());
+        distro.kind = distro::DistroKind::RedHatCentOS;
     }
 }
 
 pub(crate) fn lvm_path_helper(lvname: &str) -> String {
     let mut lvpath: String = "".to_string();
-    match run_fun!(lvscan | grep $lvname) {
-        Ok(value) => {
-            if let Some(path) = value.split("'").nth(1) {
-                lvpath = path.to_string();
-            }
+    if let Ok(value) = run_fun!(lvscan | grep $lvname) {
+        if let Some(path) = value.split('\'').nth(1) {
+            lvpath = path.to_string();
         }
-        Err(_) => {}
     }
     lvpath
 }
 
 fn _lvm_get_filesystem(lvpath: &str) -> String {
     let mut filesystem = "".to_string();
-    match run_fun!(parted -m $lvpath print | grep -E "^ ?[0-9]{1,2} *") {
-        Ok(value) => {
-            if let Some(path) = value.split(":").nth(4) {
+    if let Ok(value) = run_fun!(parted -m $lvpath print | grep -E "^ ?[0-9]{1,2} *") {
+            if let Some(path) = value.split(':').nth(4) {
                 filesystem = path.to_string();
             }
-        }
-        Err(_) => {}
     }
     filesystem
 }

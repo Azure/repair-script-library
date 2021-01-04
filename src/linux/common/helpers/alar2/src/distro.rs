@@ -170,7 +170,8 @@ fn get_partitions(partitions: &mut Vec<String>) {
 }
 
 // If there is only one partition detected
-fn do_old_ubuntu_or_centos(partition_info: &Vec<String>, mut distro: &mut Distro) {
+//fn do_old_ubuntu_or_centos(partition_info: &Vec<String>, mut distro: &mut Distro) {
+fn do_old_ubuntu_or_centos(partition_info: &[String], mut distro: &mut Distro) {
     helper::log_info("This could be an old Ubuntu image or even an CentOS with one partition only");
 
     // At first we have to determine whether this is a Ubuntu distro
@@ -209,20 +210,22 @@ fn do_old_ubuntu_or_centos(partition_info: &Vec<String>, mut distro: &mut Distro
 }
 
 // if we have two partition detected
-fn do_red_hat(partition_info: &Vec<String>, distro: &mut Distro) {
+//fn do_red_hat(partition_info: &Vec<String>, distro: &mut Distro) {
+fn do_red_hat(partition_info: &[String], distro: &mut Distro) {
     helper::log_info("This could be a RedHat/Centos 6/7 image");
     redhat::do_redhat6_or_7(partition_info, distro);
 }
 
 // if we have 3 partition detected
-fn do_recent_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
+//fn do_recent_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
+fn do_recent_ubuntu(partition_info: &[String], distro: &mut Distro) {
     // In case of a disk with ADE
     helper::log_info("This could be a recent Ubuntu 16.x or 18.x image");
     ubuntu::do_ubuntu(partition_info, distro);
 }
 
 // if we have 4 partition detected
-fn do_suse_or_lvm_or_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
+fn do_suse_or_lvm_or_ubuntu(partition_info: &[String], distro: &mut Distro) {
     // This function is also called if we have an recent Ubuntu distro with ADE enabled
     // With ADE a 4th partition got added to hold the boot-part-details plus luks
 
@@ -248,7 +251,7 @@ fn do_suse_or_lvm_or_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
     // Since with ADE on Ubuntu we got a 4th partition added
     if distro.is_ade {
         let pretty_name = helper::get_pretty_name("/investigateroot/etc/os-release"); // This path must exists, otherwise it can not be determined
-        if pretty_name.len() == 0 {
+        if pretty_name.is_empty() {
             helper::log_error("'/investigationrooot' needs to be mounted first. Please do this first. ALAR does stop");
             process::exit(1);
         }
@@ -264,7 +267,8 @@ fn do_suse_or_lvm_or_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
     }
 }
 
-fn dispatch(partition_info: &Vec<String>, mut distro: &mut Distro) {
+//fn dispatch(partition_info: &Vec<String>, mut distro: &mut Distro) {
+fn dispatch(partition_info: &[String], mut distro: &mut Distro) {
     // Test for an ADE repair environment
     distro.is_ade = ade::is_ade_enabled();
     helper::log_info(format!("Ade is enabled : {}", distro.is_ade).as_str());

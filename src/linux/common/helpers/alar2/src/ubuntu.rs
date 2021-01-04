@@ -14,7 +14,7 @@ pub(crate)  fn verify_ubuntu(mut distro: &mut distro::Distro) {
     let pretty_name = helper::get_pretty_name(constants::OS_RELEASE);
     mount::umount(constants::ASSERT_PATH);
 
-    if let Err(_) = mount::rmdir(constants::ASSERT_PATH) {
+    if mount::rmdir(constants::ASSERT_PATH).is_err() {
         helper::log_info("ASSERT_PATH can not be removed. This is a minor issue. ALAR is able to continue further");
     }
 
@@ -28,7 +28,7 @@ pub(crate)  fn verify_ubuntu(mut distro: &mut distro::Distro) {
     }
 }
 
-pub(crate) fn do_ubuntu(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+pub(crate) fn do_ubuntu(partition_info: &[String], mut distro: &mut distro::Distro) {
     for partition in partition_info {
         // TMP is required for the macro run_fun! or run_cmd!
         let _TMP = constants::PARTITION_TMP;

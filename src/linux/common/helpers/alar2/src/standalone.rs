@@ -6,7 +6,7 @@ use std::{io,process,fs};
 use fs_extra;
 
 pub(crate) fn download_action_scripts(cli_info: &cli::CliInfo) -> io::Result<()> {
-    if cli_info.action_directory.len() == 0 {
+    if cli_info.action_directory.is_empty() {
     // First download the git archive
     // Process::Command used in order to ensure we finish the download process
     if let Ok(mut child) = process::Command::new("curl").args(&["-o","/tmp/alar2.tar.gz","-L","https://api.github.com/repos/Azure/repair-script-library/tarball/alar2-test"]).spawn() {

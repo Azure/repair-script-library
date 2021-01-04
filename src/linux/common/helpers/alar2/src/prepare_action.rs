@@ -60,7 +60,7 @@ pub(crate) fn suse_umount(distro: &distro::Distro) {
 }
 
 pub(crate) fn redhat_mount(distro: &distro::Distro) {
-    if distro.is_lvm == true {
+    if distro.is_lvm  {
         let mut mount_option: Option<&str>;
         mount::mount_root_on_rescue_root(distro.lvm_details.lvm_root_part.as_str(), None);
         mount::mount_usr_on_rescue_root_usr(distro.lvm_details.lvm_usr_part.as_str());
@@ -134,7 +134,7 @@ pub(crate) fn redhat6_umount(distro: &distro::Distro) {
 }
 
 pub(crate) fn redhat_umount(distro: &distro::Distro) {
-    if distro.is_lvm == true {
+    if distro.is_lvm  {
         umount_support_filesystem();
         mount::umount(constants::RESCUE_ROOT_BOOT_EFI);
         mount::umount(constants::RESCUE_ROOT_BOOT);
@@ -159,7 +159,7 @@ fn mount_support_filesystem() {
             e
         ),
     }
-    for fs in constants::SUPPORT_FILESYSTEMS.to_string().split(" ") {
+    for fs in constants::SUPPORT_FILESYSTEMS.to_string().split(' ') {
         println!("Mount supportfs : {}", fs);
         mount::bind_mount(
             format!("/{}/", fs).as_str(),
@@ -168,13 +168,13 @@ fn mount_support_filesystem() {
     }
 }
 fn umount_support_filesystem() {
-    for fs in constants::SUPPORT_FILESYSTEMS.to_string().rsplit(" ") {
+    for fs in constants::SUPPORT_FILESYSTEMS.to_string().rsplit(' ') {
         mount::umount(format!("{}{}", constants::RESCUE_ROOT, fs).as_str());
     }
 }
 
 fn mkdir_support_filesystems() -> io::Result<()> {
-    for fs in constants::SUPPORT_FILESYSTEMS.to_string().split(" ") {
+    for fs in constants::SUPPORT_FILESYSTEMS.to_string().split(' ') {
         fs::create_dir_all(format!("{}{}", constants::RESCUE_ROOT, fs))?;
     }
     Ok(())
@@ -240,11 +240,9 @@ fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
                 process::exit(1);
         }
     }
-} else {
-    if let Err(e) = standalone::download_action_scripts(cli_info) {
+} else if let Err(e) = standalone::download_action_scripts(cli_info) {
         distro_umount(distro);
         panic!("action scripts are not able to be copied or downloadable : '{}'", e); 
-    }
 }
     
 }

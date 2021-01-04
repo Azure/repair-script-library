@@ -55,7 +55,7 @@ fn main() {
     // Verify we have an implementation available for the action to be executed
     // Define a variable for the error condition that may happen
     let mut is_action_error = false;
-    for action_name in cli_info.actions.split(",") {
+    for action_name in cli_info.actions.split(',') {
         match action::is_action_available(action_name) {
             // Do the action
             Ok( _is @ true) => {

@@ -86,7 +86,7 @@ pub(crate) fn get_ade_mounpoint(source: &str) -> String {
 pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
     // Need to handel the condition if no filesystem is available
     // This can happen if we have a LVM partition
-    if partition_filesystem.len() == 0 {
+    if partition_filesystem.is_empty()  {
         return;
     }
 

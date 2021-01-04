@@ -67,10 +67,9 @@ the administrator to further recover the VM after it is up, running and accessib
     // this is true for directory as well if flag standalone is present 
     cli_info.actions = matches.value_of("ACTION").unwrap().to_string();
     cli_info.standalone = matches.is_present("standalone"); 
-    if cli_info.standalone {
-        if matches.is_present("directory") {
+    if cli_info.standalone && matches.is_present("directory") {
             cli_info.action_directory = matches.value_of("directory").unwrap().to_string();
         }
-    }
+    
     cli_info
 }

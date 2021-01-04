@@ -2,7 +2,7 @@ use crate::constants;
 use crate::distro;
 use crate::helper;
 
-pub(crate) fn do_suse(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
+pub(crate) fn do_suse(partition_info: &[String], mut distro: &mut distro::Distro) {
     if !distro.is_ade {
         distro.kind = distro::DistroKind::Suse;
 
