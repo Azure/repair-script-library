@@ -23,7 +23,7 @@ fn main() {
     // At first we need to verify the distro we have to work with
     // the Distro struct does contain then all of the required information
     let distro = distro::Distro::new();
-    println!("{:?}", distro);
+    eprintln!("{:?}", distro);
 
     // Do we have a valid distro or not?
 
@@ -71,10 +71,6 @@ fn main() {
 
     // Umount everything again
 
-    match env::current_dir() {
-        Ok(cd) => println!("The current dir is : {}", cd.display()),
-        Err(e) => println!("Error : {}", e),
-    }
 
     prepare_action::distro_umount(&distro);
 
