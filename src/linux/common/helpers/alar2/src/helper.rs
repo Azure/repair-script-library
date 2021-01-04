@@ -22,7 +22,7 @@ pub fn log_error(msg: &str) {
 }
 
 pub fn log_debug(msg: &str) {
-    println!("[Debug {}] {}", Utc::now(), msg);
+    eprintln!("[Debug {}] {}", Utc::now(), msg);
 }
 
 pub fn read_link(path: &str) -> String {
