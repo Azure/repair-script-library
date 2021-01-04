@@ -3,5 +3,6 @@
 
 Log-Output "Starting the recovery"
 cd ./src/linux/common/helpers/alar2
+chmod 700 ./bin/alar2
 ./bin/alar2 $1
 Log-Output "Recovery script finished"
