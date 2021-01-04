@@ -35,7 +35,8 @@ pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> i
         DistroKind::Undefined => {} // Nothing to do
     }
     // Execute the action script
-    cmd_lib::run_fun!(chroot "/mnt/rescue-root" /tmp/action_implementation/${action_name}-impl.sh)?;
+    let output = cmd_lib::run_fun!(chroot "/mnt/rescue-root" /tmp/action_implementation/${action_name}-impl.sh)?;
+    helper::log_output(output.as_str());
 
     helper::log_info("----- Action stopped -----");
 
