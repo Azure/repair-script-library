@@ -160,7 +160,6 @@ fn mount_support_filesystem() {
         ),
     }
     for fs in constants::SUPPORT_FILESYSTEMS.to_string().split(' ') {
-        println!("Mount supportfs : {}", fs);
         mount::bind_mount(
             format!("/{}/", fs).as_str(),
             format!("{}{}", constants::RESCUE_ROOT, fs).as_str(),
@@ -227,7 +226,7 @@ fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
     }
 
     if let Err(err) = fs::remove_dir_all(constants::ACTION_IMPL_DIR) {
-        println!("File can not be removed : '{}'", err );
+        println!("Directory can not be removed : '{}'", err );
         distro_umount(distro);
         process::exit(1);
     }
