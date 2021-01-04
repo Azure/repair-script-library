@@ -86,3 +86,4 @@ fi
 
 # For reference --> https://www.linuxsecrets.com/2815-grub2-submenu-change-boot-order
 
+exit 0
