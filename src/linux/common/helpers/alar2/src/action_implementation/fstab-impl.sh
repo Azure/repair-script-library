@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# This change into /tmp is necessary
-cd /tmp
-. ./src/linux/common/setup/init.sh
 mv -f /etc/fstab{,.copy}
 
 # For Debian we need to instal gawk first. It comes only with mawk
@@ -21,6 +18,5 @@ awk '/rootvg-tmplv/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/rootvg-usrlv/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/rootvg-varlv/ {print}' /etc/fstab.copy >>/etc/fstab
 cat /etc/fstab
-Log-Info "Renaming original file /etc/fstab to /etc/fstab.copy"
-Log-Info "Creating new /etc/fstab file with only /boot and / partitions."
-Log-Info  "This ensures we have a bootable system"
+
+exit 0
