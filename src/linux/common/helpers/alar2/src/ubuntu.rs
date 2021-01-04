@@ -15,7 +15,7 @@ pub(crate)  fn verify_ubuntu(mut distro: &mut distro::Distro) {
     mount::umount(constants::ASSERT_PATH);
 
     if mount::rmdir(constants::ASSERT_PATH).is_err() {
-        helper::log_info("ASSERT_PATH can not be removed. This is a minor issue. ALAR is able to continue further");
+        helper::log_debug("ASSERT_PATH can not be removed. This is a minor issue. ALAR is able to continue further");
     }
 
     println!("pretty : {}", &pretty_name);
