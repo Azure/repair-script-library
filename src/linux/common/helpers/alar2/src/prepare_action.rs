@@ -226,7 +226,7 @@ fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
             }
     }
 
-    if let Err(err) = fs::remove_file(constants::ACTION_IMPL_DIR) {
+    if let Err(err) = fs::remove_dir_all(constants::ACTION_IMPL_DIR) {
         println!("File can not be removed : '{}'", err );
         distro_umount(distro);
         process::exit(1);
