@@ -39,7 +39,7 @@ fn mount( source: &str, destination: &str, option: Option<&str>) {
 
     match sys_mount::Mount::new(source, destination, &supported, sys_mount::MountFlags::empty(), option) {
         Ok(_) => {
-            helper::log_info(format!("mounted {} to {}", source, &destination).as_str() );
+            helper::log_debug(format!("mounted {} to {}", source, &destination).as_str() );
         }
         Err(why) => {
             helper::log_error(format!("failed to mount {} to {}: {}", source, destination, why).as_str());
