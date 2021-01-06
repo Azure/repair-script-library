@@ -21,16 +21,28 @@ pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> i
     match distro.kind {
         DistroKind::Debian | DistroKind::Ubuntu => {
             env::set_var("isUbuntu", "true");
+            env::remove_var("isSuse");
+            env::remove_var("isRedHat");
+            env::remove_var("isRedHat6");
+
         }
         DistroKind::Suse => {
             env::set_var("isSuse", "true");
+            env::remove_var("isUbuntu");
+            env::remove_var("isRedHat");
+            env::remove_var("isRedHat6");
         }
         DistroKind::RedHatCentOS => {
             env::set_var("isRedHat", "true");
+            env::remove_var("isUbuntu");
+            env::remove_var("isSuse");
+            env::remove_var("isRedHat6");
         }
         DistroKind::RedHatCentOS6 => {
             env::set_var("isRedHat", "true");
             env::set_var("isRedHat6", "true");
+            env::remove_var("isUbuntu");
+            env::remove_var("isSuse");
         }
         DistroKind::Undefined => {} // Nothing to do
     }
