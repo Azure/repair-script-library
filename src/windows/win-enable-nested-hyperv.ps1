@@ -34,7 +34,7 @@ if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Install
 
         # Configure NAT so nested guest has external network connectivity
         # See also https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/user-guide/nested-virtualization#networking-options
-        $switch = get-vmswitch -Name Internal -SwitchType Internal -ErrorAction SilentlyContinue | select -first 1
+        $switch = Get-VMSwitch -Name Internal -SwitchType Internal -ErrorAction SilentlyContinue | select -first 1
         if (!$switch)
         {
             $switch = New-VMSwitch -Name Internal -SwitchType Internal -ErrorAction Stop
