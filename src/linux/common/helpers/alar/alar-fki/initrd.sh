@@ -13,7 +13,7 @@ recover_suse() {
     grub2-mkconfig -o /boot/grub2/grub.cfg
     
     # Added for Suse 15
-    zypper --non-interactive install shim-*
+    zypper install -y shim
     /usr/sbin/shim-install --config-file=/boot/grub2/grub.cfg
 }
 
