@@ -6,13 +6,17 @@ use std::process::Stdio;
 use std::{fs, process};
 use cmd_lib::run_fun;
 
+
 pub fn log_info(msg: &str) {
     println!("[Info {}] {}", Utc::now(), msg);
 }
 
+#[allow(dead_code)] 
 pub fn log_output(msg: &str) {
     println!("[Output {}] {}", Utc::now(), msg);
 }
+
+#[allow(dead_code)] 
 pub fn log_warning(msg: &str) {
     println!("[Warning {}] {}", Utc::now(), msg);
 }

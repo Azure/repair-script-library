@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use std::{fs, process};
 
 use crate::ade;
@@ -7,6 +8,7 @@ use crate::helper;
 use crate::mount;
 
 use cmd_lib::{run_cmd, run_fun};
+
 
 pub(crate) fn do_redhat_lvm_or(partition_info: &[String], distro: &mut distro::Distro) {
     let mut contains_lvm_partition: bool = false;

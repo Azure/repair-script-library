@@ -12,7 +12,6 @@ mod suse;
 mod ubuntu;
 
 use std::{
-    env, 
     process,
 };
 

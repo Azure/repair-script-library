@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 use crate::constants;
 use crate::distro;
 use crate::helper;
