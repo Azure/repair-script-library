@@ -17,6 +17,8 @@ awk '/rootvg-optlv/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/rootvg-tmplv/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/rootvg-usrlv/ {print}' /etc/fstab.copy >>/etc/fstab
 awk '/rootvg-varlv/ {print}' /etc/fstab.copy >>/etc/fstab
+
+echo "Content of fstab after running the script -->"
 cat /etc/fstab
 
 exit 0
