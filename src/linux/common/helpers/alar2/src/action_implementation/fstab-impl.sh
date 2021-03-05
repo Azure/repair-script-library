@@ -4,7 +4,7 @@ mv -f /etc/fstab{,.copy}
 
 # For Debian we need to instal gawk first. It comes only with mawk
 if [[ -f /usr/bin/apt ]]; then
-    apt install -qq -y gawk
+    apt-get install -qq -y gawk
 fi
 
 awk '/[[:space:]]+\/[[:space:]]+/ {print}' /etc/fstab.copy >>/etc/fstab
