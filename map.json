@@ -35,8 +35,19 @@
 		"description" : "Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs."
 	},
 	{
+<<<<<<< HEAD
 		"id" : "linux-alar2",
 		"path" : "src/linux/linux-alar2.sh",
 		"description" : "alar2 allows to recover a failed VM. Various ations are available like: fstab, initrd and kernel. NOTE: use option --run-on-repair. See the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar2/README.md"
+=======
+		"id" : "linux-alar-fki",
+		"path" : "src/linux/linux-alar-fki.sh",
+		"description" : "alar-fki allows to recover a failed VM. Three recover scenarios are possible: fstab, initrd and kernel. NOTE: use option --run-on-repair. Se the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar/README.md"
+	},
+	{
+		"id" : "win-enable-nested-hyperv",
+		"path" : "src/windows/win-enable-nested-hyperv.ps1",
+		"description" : "Enables nested hyperV using attached data disk as OS disk."
+>>>>>>> master
 	}
 ]

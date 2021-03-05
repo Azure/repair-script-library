@@ -11,6 +11,10 @@ recover_suse() {
     kernel_version=$(sed -e "s/kernel-//" <<< $(rpm -q kernel --last  | head -n 1 | cut -f1 -d' '))
     mkinitrd /boot/initrd-"${kernel_version}" "$kernel_version"
     grub2-mkconfig -o /boot/grub2/grub.cfg
+    
+    # Added for Suse 15
+    zypper install -y shim
+    /usr/sbin/shim-install --config-file=/boot/grub2/grub.cfg
 }
 
 recover_ubuntu() {
