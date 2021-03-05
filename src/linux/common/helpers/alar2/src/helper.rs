@@ -26,7 +26,7 @@ pub fn log_error(msg: &str) {
 }
 
 pub fn log_debug(msg: &str) {
-    eprintln!("[Debug {}] {}", Utc::now(), msg);
+    println!("[Debug {}] {}", Utc::now(), msg);
 }
 
 pub fn read_link(path: &str) -> String {
