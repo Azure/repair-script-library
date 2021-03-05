@@ -226,9 +226,9 @@ fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
     }
 
     if let Err(err) = fs::remove_dir_all(constants::ACTION_IMPL_DIR) {
-        println!("Directory can not be removed : '{}'", err );
+        println!("Directory {} can not be removed : '{}'", constants::ACTION_IMPL_DIR, err );
         distro_umount(distro);
-        process::exit(1);
+        //process::exit(1);
     }
     // Create a softlink in orders to ease the directory access.
     match softlink("/tmp/src/linux/common/helpers/alar2/src/action_implementation", constants::ACTION_IMPL_DIR) {
