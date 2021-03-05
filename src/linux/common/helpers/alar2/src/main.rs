@@ -22,7 +22,7 @@ fn main() {
     // At first we need to verify the distro we have to work with
     // the Distro struct does contain then all of the required information
     let distro = distro::Distro::new();
-    eprintln!("{:?}", distro);
+    //eprintln!("{:?}", distro);
 
     // Do we have a valid distro or not?
 
