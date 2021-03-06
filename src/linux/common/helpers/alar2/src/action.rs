@@ -52,10 +52,10 @@ pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> i
     //helper::log_debug(output.as_str());
 
     let output = process::Command::new("chroot")
-        .arg("/mnt/rescue-root")
+        .arg(constants::RESCUE_ROOT)
         .arg("/bin/bash")
         .arg("-c")
-        .arg(format!("/tmp/action_implementation/{}-impl.sh",action_name))
+        .arg(format!("{}/{}-impl.sh",constants::ACTION_IMPL_DIR, action_name))
         .output()?;
 
     io::stdout().write_all(&output.stdout).unwrap();
