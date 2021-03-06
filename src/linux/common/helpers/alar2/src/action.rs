@@ -1,7 +1,8 @@
 
 use crate::{constants, distro, helper};
 use distro::DistroKind;
-use std::{env, fs, io};
+use std::{env, fs, io, process};
+use std::io::Write;
 
 pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> io::Result<()> {
     helper::log_info("----- Start action -----");
@@ -47,9 +48,17 @@ pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> i
         DistroKind::Undefined => {} // Nothing to do
     }
     // Execute the action script
-    let output = cmd_lib::run_fun!(chroot "/mnt/rescue-root" /tmp/action_implementation/${action_name}-impl.sh)?;
-    helper::log_debug(output.as_str());
+    //let output = cmd_lib::run_fun!(chroot "/mnt/rescue-root" /tmp/action_implementation/${action_name}-impl.sh)?;
+    //helper::log_debug(output.as_str());
 
+    let output = process::Command::new("chroot")
+        .arg("/mnt/rescue-root")
+        .arg("/bin/bash")
+        .arg("-c")
+        .arg(format!("/tmp/action_implementation/{}-impl.sh",action_name))
+        .output()?;
+
+    io::stdout().write_all(&output.stdout).unwrap();
     helper::log_info("----- Action stopped -----");
 
     Ok(())
