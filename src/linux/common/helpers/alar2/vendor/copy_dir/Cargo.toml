@@ -1,0 +1,20 @@
+[package]
+name = "copy_dir"
+version = "0.1.2"
+description = "Copy directories recursively in a straightforward and predictable way."
+license = "MIT"
+authors = ["Michael Dunsmuir <mjdunsmuir@gmail.com>"]
+homepage = "https://github.com/mdunsmuir/copy_dir"
+include = [
+    "**/*.rs",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+]
+
+[dependencies]
+walkdir = "0.1"
+
+[dev-dependencies]
+tempdir = "0.3"
