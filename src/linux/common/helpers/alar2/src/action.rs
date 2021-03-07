@@ -3,14 +3,17 @@ use crate::{constants, distro, helper};
 use distro::DistroKind;
 use std::{env, fs, io, process};
 use std::io::Write;
+use uapi;
 
 pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> io::Result<()> {
     helper::log_info("----- Start action -----");
 
     // At first make the script executable
-    if let Err(e) = cmd_lib::run_fun!(chmod 700 /tmp/action_implementation/${action_name}-impl.sh) {
-        helper::log_error(format!("Setting the execute permission bit failed! {}",e).as_str());
-    }
+    uapi::chmod(format!("{}/{}-impl.sh", constants::ACTION_IMPL_DIR, action_name), uapi::c::S_IXUSR)?;
+    
+    //if let Err(e) = cmd_lib::run_fun!(chmod 700 /tmp/action_implementation/${action_name}-impl.sh) {
+    //    helper::log_error(format!("Setting the execute permission bit failed! {}",e).as_str());
+    //}
 
     match env::set_current_dir(constants::RESCUE_ROOT) {
         Ok(_) => {}
@@ -48,8 +51,6 @@ pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> i
         DistroKind::Undefined => {} // Nothing to do
     }
     // Execute the action script
-    //let output = cmd_lib::run_fun!(chroot "/mnt/rescue-root" /tmp/action_implementation/${action_name}-impl.sh)?;
-    //helper::log_debug(output.as_str());
 
     let output = process::Command::new("chroot")
         .arg(constants::RESCUE_ROOT)
