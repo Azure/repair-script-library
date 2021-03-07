@@ -8,11 +8,11 @@ use crate::standalone;
 
 use fs_extra::dir;
 use std::{env, fs, io, process};
-use std::os::unix::fs::symlink as softlink;
+// use std::os::unix::fs::symlink as softlink;
 
 pub(crate) fn ubuntu_mount(distro: &distro::Distro) {
     // We have to verify also whether we have old Ubuntus/Debian with one partition only
-    // Or whehter we have also an EFI partition available
+    // Or whether we have also an EFI partition available
 
     mount::mount_root_on_rescue_root(distro.rescue_root.root_part_path.as_str(), None);
 
@@ -205,8 +205,13 @@ pub(crate) fn distro_umount(distro: &distro::Distro) {
 
 fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
     // We need to copy the action scripts to /tmp
-    // This is the only directory we change with chroot
-    
+    // This is the directory chroot can access
+
+    if let Err(err) = fs::remove_dir_all(constants::ACTION_IMPL_DIR) {
+        println!("Directory {} can not be removed : '{}'", constants::ACTION_IMPL_DIR, err );
+        //distro_umount(distro);
+        //process::exit(1);
+    }
     if !cli_info.standalone {
     let mut options = dir::CopyOptions::new(); //Initialize default values for CopyOptions
     options.skip_exist = true;
@@ -216,7 +221,8 @@ fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
           Err(e) => println!("Error : {}", e),
       }
 
-    match dir::copy("../../../../../src/", "/tmp", &options) {
+    // base directory already set correct by linux-alar2.sh
+    match dir::copy("src/action_implementation", "/tmp", &options) {
         Ok(_) => {},
         Err(e) => {
             println!("Copy operation for action_implementation directory failed. ALAR needs to stop: {}", e); 
@@ -225,20 +231,7 @@ fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
             }
     }
 
-    if let Err(err) = fs::remove_dir_all(constants::ACTION_IMPL_DIR) {
-        println!("Directory {} can not be removed : '{}'", constants::ACTION_IMPL_DIR, err );
-        distro_umount(distro);
-        //process::exit(1);
-    }
-    // Create a softlink in orders to ease the directory access.
-    match softlink("/tmp/src/linux/common/helpers/alar2/src/action_implementation", constants::ACTION_IMPL_DIR) {
-        Ok(_) => {},
-        Err(e) => {
-                println!("Softlink can not be created. ALAR needs to stop!: {}",e);
-                distro_umount(distro);
-                process::exit(1);
-        }
-    }
+    
 } else if let Err(e) = standalone::download_action_scripts(cli_info) {
         distro_umount(distro);
         panic!("action scripts are not able to be copied or downloadable : '{}'", e); 
