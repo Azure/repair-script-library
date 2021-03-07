@@ -14,10 +14,10 @@ cmd_lib = "0.8.5"
 fs_extra = "1.2.0"
 clap = "2.33.3"
 copy_dir = "0.1.2"
+uapi = "0.2.1"
 
-[source]
-[source.crates-io]
-replace-with = "vendored-sources"
+#[source.crates-io]
+#replace-with = "vendored-sources"
 
-[source.vendored-sources]
-directory = "vendor"
+#[source.vendored-sources]
+#directory = "vendor"
