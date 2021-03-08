@@ -9,7 +9,7 @@ pub(crate) fn run_repair_script(distro: &distro::Distro, action_name: &str) -> i
     helper::log_info("----- Start action -----");
 
     // At first make the script executable
-    uapi::chmod(format!("{}/{}-impl.sh", constants::ACTION_IMPL_DIR, action_name), uapi::c::S_IXUSR)?;
+    uapi::chmod(format!("{}/{}-impl.sh", constants::ACTION_IMPL_DIR, action_name), uapi::c::S_IXUSR | uapi::c::S_IRUSR)?;
     
     //if let Err(e) = cmd_lib::run_fun!(chmod 700 /tmp/action_implementation/${action_name}-impl.sh) {
     //    helper::log_error(format!("Setting the execute permission bit failed! {}",e).as_str());
