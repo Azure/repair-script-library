@@ -15,9 +15,3 @@ fs_extra = "1.2.0"
 clap = "2.33.3"
 copy_dir = "0.1.2"
 uapi = "0.2.1"
-
-#[source.crates-io]
-#replace-with = "vendored-sources"
-
-#[source.vendored-sources]
-#directory = "vendor"
