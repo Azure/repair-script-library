@@ -77,8 +77,10 @@ try {
                 }
             }
         }
+
         # If both was found grab bcd store
         if ( $isBcdPath -and $isOsPath ) {
+            
             # Get Safe Mode state
             Log-Info "#04 - Checking safeboot flag for $bcdPath" | out-file -FilePath $logFile -Append
             $bcdout = bcdedit /store $bcdPath /enum
@@ -97,6 +99,7 @@ try {
                 Log-Info "#05 - Configuring safeboot flag for $bcdPath" | out-file -FilePath $logFile -Append
                 bcdedit /store $bcdPath /set $defaultId safeboot network
             }
+
             # Bring disk offline 
             Log-Info "#06 - Bringing disk offline" | out-file -FilePath $logFile -Append
             $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
@@ -105,6 +108,7 @@ try {
             Log-Info "END: Starting VM, please verify Safe Mode w/ Networking using MSCONFIG.exe" | out-file -FilePath $logFile -Append
             $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
+            # Log finish time
             $scriptEndTime = get-date -f yyyyMMddHHmmss
             $scriptEndTime | out-file -FilePath $logFile -Append
 
@@ -125,6 +129,7 @@ catch {
     Log-Info "END: could not start Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
     $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
+    # Log finish time
     $scriptEndTime = get-date -f yyyyMMddHHmmss
     $scriptEndTime | out-file -FilePath $logFile -Append   
 
