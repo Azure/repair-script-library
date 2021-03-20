@@ -1,7 +1,18 @@
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
+#########################################################################################################
+# Azure VMs do not natively support Safe Mode because RDP access is disabled in Safe Mode. Some users
+# need to boot their VM in Safe Mode for specific reasons (e.g. uninstalling certain software). Other
+# users may find their VM booting into Safe Mode inadvertantly due to user error or misconfiguration,
+# which will disable RDP access until corrected. This script utilizes the az vm repair extension to 
+# clone the VM into a Hyper-V environment using Nested Virtualization and toggle Safe Boot. The user
+# may then access their VM in Safe Mode via the Rescue VM or revert Safe Mode on their Azure VM. They may
+# then swap the disk using the `az vm repair restore` functionality.
+#
+# https://docs.microsoft.com/en-us/cli/azure/ext/vm-repair/vm/repair?view=azure-cli-latest
 # https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/troubleshoot-rdp-safe-mode
+#########################################################################################################
 
 # Initialize script log variables
 $scriptStartTime = get-date -f yyyyMMddHHmmss
