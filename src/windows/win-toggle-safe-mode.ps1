@@ -31,12 +31,12 @@ try {
     # Make sure guest VM is shut down
     $guestHyperVVirtualMachine = Get-VM
     Log-Info "#01 - Stopping nested guest VM $guestHyperVVirtualMachine.VMName" | out-file -FilePath $logFile -Append
-    $return = Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
+    Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
 
     # Make sure the disk is online
     Log-Info "#02 - Bringing disk online" | out-file -FilePath $logFile -Append
     $disk = get-disk -ErrorAction Stop | where { $_.FriendlyName -eq 'Msft Virtual Disk' }
-    $return = $disk | set-disk -IsOffline $false -ErrorAction Stop
+    $disk | set-disk -IsOffline $false -ErrorAction Stop
  
     # Handle disk partitions
     $partitionlist = Get-Disk-Partitions
@@ -104,11 +104,11 @@ try {
 
             # Bring disk offline 
             Log-Info "#06 - Bringing disk offline" | out-file -FilePath $logFile -Append
-            $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
+            $disk | set-disk -IsOffline $true -ErrorAction Stop
 
             # Start Hyper-V VM
             Log-Output "END: Starting VM, please verify status of Safe Mode using MSCONFIG.exe" | out-file -FilePath $logFile -Append
-            $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
+            start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
             # Log finish time
             $scriptEndTime = get-date -f yyyyMMddHHmmss
@@ -125,11 +125,11 @@ catch {
 
     # Bring disk offline again
     Log-Info "#05 - Bringing disk offline" | out-file -FilePath $logFile -Append
-    $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
+    $disk | set-disk -IsOffline $true -ErrorAction Stop
 
     # Start Hyper-V VM again
     Log-Output "END: could not start Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
-    $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
+    start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
     # Log finish time
     $scriptEndTime = get-date -f yyyyMMddHHmmss
