@@ -43,5 +43,10 @@
 		"id" : "win-enable-nested-hyperv",
 		"path" : "src/windows/win-enable-nested-hyperv.ps1",
 		"description" : "Enables nested hyperV using attached data disk as OS disk."
+	},
+	{
+		"id" : "win-toggle-safe-mode",
+		"path" : "src/windows/win-toggle-safe-mode.ps1",
+		"description" : "Disable Safe Mode if your VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
 	}
 ]
