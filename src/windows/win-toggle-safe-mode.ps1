@@ -120,7 +120,7 @@ try {
 }
 catch {
     
-    # Log failure to run successfully
+    # Log failure
     Log-Error "ERROR: Unable to find the BCD Path" | out-file -FilePath $logFile -Append
 
     # Bring disk offline again
