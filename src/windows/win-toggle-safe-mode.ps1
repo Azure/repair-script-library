@@ -10,6 +10,8 @@
 # may then access their VM in Safe Mode via the Rescue VM or revert Safe Mode on their Azure VM. They 
 # may then swap the disk using the `az vm repair restore` functionality.
 #
+# Tested on Windows Server 2019 Datacenter (Gen 1)
+#
 # https://docs.microsoft.com/en-us/cli/azure/ext/vm-repair/vm/repair?view=azure-cli-latest
 # https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/troubleshoot-rdp-safe-mode
 #########################################################################################################
@@ -21,7 +23,7 @@ $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0
 
 # Initialize script log
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
-Log-Info 'START: Running Script win-toggle-safe-mode' | out-file -FilePath $logFile -Append
+Log-Output 'START: Running Script win-toggle-safe-mode' | out-file -FilePath $logFile -Append
 $scriptStartTime | out-file -FilePath $logFile -Append
 
 try {
@@ -80,7 +82,7 @@ try {
 
         # If both was found grab bcd store
         if ( $isBcdPath -and $isOsPath ) {
-            
+
             # Get Safe Mode state
             Log-Info "#04 - Checking safeboot flag for $bcdPath" | out-file -FilePath $logFile -Append
             $bcdout = bcdedit /store $bcdPath /enum
@@ -105,7 +107,7 @@ try {
             $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
 
             # Start Hyper-V VM
-            Log-Info "END: Starting VM, please verify Safe Mode w/ Networking using MSCONFIG.exe" | out-file -FilePath $logFile -Append
+            Log-Output "END: Starting VM, please verify Safe Mode w/ Networking using MSCONFIG.exe" | out-file -FilePath $logFile -Append
             $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
             # Log finish time
@@ -126,7 +128,7 @@ catch {
     $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
 
     # Start Hyper-V VM again
-    Log-Info "END: could not start Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
+    Log-Output "END: could not start Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
     $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
     # Log finish time
