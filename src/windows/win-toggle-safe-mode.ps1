@@ -28,7 +28,7 @@ $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0
 
 # Initialize script log
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
-Log-Output 'START: Running Script win-toggle-safe-mode' | out-file -FilePath $logFile -Append
+Log-Output 'START: Running script win-toggle-safe-mode' | out-file -FilePath $logFile -Append
 $scriptStartTime | out-file -FilePath $logFile -Append
 
 try {
@@ -36,10 +36,15 @@ try {
     # Make sure guest VM is shut down
     $guestHyperVVirtualMachine = Get-VM
     $guestHyperVVirtualMachineName = $guestHyperVVirtualMachine.VMName
-    if ($guestHyperVVirtualMachine.State -eq 'Running') {
-        Log-Info "#01 - Stopping nested guest VM $guestHyperVVirtualMachineName" | out-file -FilePath $logFile -Append
-        Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force   
-    }    
+    if ($guestHyperVVirtualMachine) {
+        if ($guestHyperVVirtualMachine.State -eq 'Running') {
+            Log-Info "#01 - Stopping nested guest VM $guestHyperVVirtualMachineName" | out-file -FilePath $logFile -Append
+            Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force   
+        }         
+    }
+    else {
+        Log-Info "#01 - No nested guest VM, flipping safeboot switch anyways" | out-file -FilePath $logFile -Append
+    }  
 
     # Make sure the disk is online
     Log-Info "#02 - Bringing disk online" | out-file -FilePath $logFile -Append
@@ -102,13 +107,17 @@ try {
                 bcdedit /store $bcdPath /set $defaultId safeboot network
             }
 
-            # Bring disk offline 
-            Log-Info "#06 - Bringing disk offline" | out-file -FilePath $logFile -Append
-            $disk | set-disk -IsOffline $true -ErrorAction Stop
+            if ($guestHyperVVirtualMachine) {
+                # Bring disk offline 
+                Log-Info "#06 - Bringing disk offline" | out-file -FilePath $logFile -Append
+                $disk | set-disk -IsOffline $true -ErrorAction Stop
 
-            # Start Hyper-V VM
-            Log-Output "END: Starting VM, please verify status of Safe Mode using MSCONFIG.exe" | out-file -FilePath $logFile -Append
-            start-vm $guestHyperVVirtualMachine -ErrorAction Stop
+                # Start Hyper-V VM            
+                Log-Output "#07 - Starting VM" | out-file -FilePath $logFile -Append
+                start-vm $guestHyperVVirtualMachine -ErrorAction Stop
+            }
+
+            Log-Output "END: Please verify status of Safe Mode using MSCONFIG.exe" | out-file -FilePath $logFile -Append
 
             # Log finish time
             $scriptEndTime = get-date -f yyyyMMddHHmmss
@@ -123,13 +132,17 @@ catch {
     # Log failure
     Log-Error "ERROR: Unable to find the BCD Path" | out-file -FilePath $logFile -Append
 
-    # Bring disk offline again
-    Log-Info "#05 - Bringing disk offline to restart Hyper-V VM" | out-file -FilePath $logFile -Append
-    $disk | set-disk -IsOffline $true -ErrorAction Stop
+    if ($guestHyperVVirtualMachine) {
+        # Bring disk offline again
+        Log-Info "#05 - Bringing disk offline to restart Hyper-V VM" | out-file -FilePath $logFile -Append
+        $disk | set-disk -IsOffline $true -ErrorAction Stop
 
-    # Start Hyper-V VM again
+        # Start Hyper-V VM again
+        Log-Output "#06 - Starting VM" | out-file -FilePath $logFile -Append
+        start-vm $guestHyperVVirtualMachine -ErrorAction Stop
+    }
+
     Log-Output "END: could not start/stop Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
-    start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
     # Log finish time
     $scriptEndTime = get-date -f yyyyMMddHHmmss
