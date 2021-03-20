@@ -105,6 +105,9 @@ try {
             Log-Info "END: Starting VM, please verify Safe Mode w/ Networking using MSCONFIG.exe" | out-file -FilePath $logFile -Append
             $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
+            $scriptEndTime = get-date -f yyyyMMddHHmmss
+            $scriptEndTime | out-file -FilePath $logFile -Append
+
             return $STATUS_SUCCESS
         }
     }
@@ -121,6 +124,9 @@ catch {
     # Start Hyper-V VM again
     Log-Info "END: could not start Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
     $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
+
+    $scriptEndTime = get-date -f yyyyMMddHHmmss
+    $scriptEndTime | out-file -FilePath $logFile -Append   
 
     throw $_
     return $STATUS_ERROR
