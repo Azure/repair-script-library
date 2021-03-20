@@ -107,7 +107,7 @@ try {
             $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
 
             # Start Hyper-V VM
-            Log-Output "END: Starting VM, please verify Safe Mode w/ Networking using MSCONFIG.exe" | out-file -FilePath $logFile -Append
+            Log-Output "END: Starting VM, please verify status of Safe Mode using MSCONFIG.exe" | out-file -FilePath $logFile -Append
             $return = start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
             # Log finish time
