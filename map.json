@@ -51,6 +51,6 @@
 	},
 	{	"id" : "win-toggle-safe-mode",
 		"path" : "src/windows/win-toggle-safe-mode.ps1",
-		"description" : "Disable Safe Mode if your VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
+		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
 	}
 ]
