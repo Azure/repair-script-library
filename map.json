@@ -48,5 +48,9 @@
 		"id" : "win-dumpconfigurator",
 		"path" : "src/windows/win-dumpconfigurator.ps1",
 		"description" : "Changes the dump configuration of a VM while its running without the need to reboot it. Which is to say, you can change the dump configuration from Kernel to Full without a reboot."
+	},
+	{	"id" : "win-toggle-safe-mode",
+		"path" : "src/windows/win-toggle-safe-mode.ps1",
+		"description" : "Disable Safe Mode if your VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
 	}
 ]
