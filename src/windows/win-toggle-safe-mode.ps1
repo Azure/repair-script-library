@@ -135,6 +135,6 @@ catch {
     $scriptEndTime = get-date -f yyyyMMddHHmmss
     $scriptEndTime | out-file -FilePath $logFile -Append   
 
-    throw $_
+    throw $_ | out-file -FilePath $logFile -Append
     return $STATUS_ERROR
 }
