@@ -124,11 +124,11 @@ catch {
     Log-Error "ERROR: Unable to find the BCD Path" | out-file -FilePath $logFile -Append
 
     # Bring disk offline again
-    Log-Info "#05 - Bringing disk offline" | out-file -FilePath $logFile -Append
+    Log-Info "#05 - Bringing disk offline to restart Hyper-V VM" | out-file -FilePath $logFile -Append
     $disk | set-disk -IsOffline $true -ErrorAction Stop
 
     # Start Hyper-V VM again
-    Log-Output "END: could not start Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
+    Log-Output "END: could not start/stop Safe Mode, BCD store may need to be repaired" | out-file -FilePath $logFile -Append
     start-vm $guestHyperVVirtualMachine -ErrorAction Stop
 
     # Log finish time
