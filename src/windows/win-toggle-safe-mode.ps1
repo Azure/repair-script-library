@@ -10,7 +10,13 @@
 # may then access their VM in Safe Mode via the Rescue VM or revert Safe Mode on their Azure VM. They 
 # may then swap the disk using the `az vm repair restore` functionality.
 #
-# Tested on Windows Server 2019 Datacenter (Gen 1)
+# Testing:
+# 1. Copied scripts to newly created Windows Server 2019 Datacenter (Gen 1)
+# 2. Ran win-enable-nested-hyperv once to install Hyper-V, restarted, and ran again to create new nested VM
+# 3. Ran win-toggle-safe-mode.ps1, worked successfully in toggling Safe Mode
+# 4. Set up new VM and ran the following from my local machine, worked successfully (~69 seconds): 
+#    az vm repair run -g sourcevm_group -n sourcevm --custom-script-file .\win-toggle-safe-mode.ps1 --verbose --run-on-repair
+# 5. Tried on a WS 2016 Gen 2 Azure VM, but was unsuccessful, not compatible with Gen 2 right now
 #
 # https://docs.microsoft.com/en-us/cli/azure/ext/vm-repair/vm/repair?view=azure-cli-latest
 # https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/troubleshoot-rdp-safe-mode
@@ -18,7 +24,6 @@
 
 # Initialize script log variables
 $scriptStartTime = get-date -f yyyyMMddHHmmss
-$scriptPath = split-path -path $MyInvocation.MyCommand.Path -parent
 $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0]
 
 # Initialize script log
@@ -30,8 +35,11 @@ try {
 
     # Make sure guest VM is shut down
     $guestHyperVVirtualMachine = Get-VM
-    Log-Info "#01 - Stopping nested guest VM $guestHyperVVirtualMachine.VMName" | out-file -FilePath $logFile -Append
-    Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
+    $guestHyperVVirtualMachineName = $guestHyperVVirtualMachine.VMName
+    if ($guestHyperVVirtualMachine.State -eq 'Running') {
+        Log-Info "#01 - Stopping nested guest VM $guestHyperVVirtualMachineName" | out-file -FilePath $logFile -Append
+        Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force   
+    }    
 
     # Make sure the disk is online
     Log-Info "#02 - Bringing disk online" | out-file -FilePath $logFile -Append
@@ -40,8 +48,7 @@ try {
  
     # Handle disk partitions
     $partitionlist = Get-Disk-Partitions
-    Log-Info $partitionlist | out-file -FilePath $logFile -Append
-    $partitionGroup = $partitionlist | group DiskNumber | out-file -FilePath $logFile -Append
+    $partitionGroup = $partitionlist | group DiskNumber
 
     Log-Info '#03 - enumerate partitions for boot config' | out-file -FilePath $logFile -Append
 
@@ -49,23 +56,19 @@ try {
         # Reset paths for each part group (disk)
         $isBcdPath = $false
         $bcdPath = ''
-        $bcdDrive = ''
         $isOsPath = $false
         $osPath = ''
-        $osDrive = ''
 
         # Scan all partitions of a disk for bcd store and os file location 
         ForEach ($drive in $partitionGroup.Group | select -ExpandProperty DriveLetter ) {      
             # Check if no bcd store was found on the previous partition already
             if ( -not $isBcdPath ) {
                 $bcdPath = $drive + ':\boot\bcd'
-                $bcdDrive = $drive + ':'
                 $isBcdPath = Test-Path $bcdPath
 
                 # If no bcd was found yet at the default location look for the uefi location too
                 if ( -not $isBcdPath ) {
                     $bcdPath = $drive + ':\efi\microsoft\boot\bcd'
-                    $bcdDrive = $drive + ':'
                     $isBcdPath = Test-Path $bcdPath
                 } 
             }        
@@ -74,9 +77,6 @@ try {
             if (-not $isOsPath) {
                 $osPath = $drive + ':\windows\system32\winload.exe'
                 $isOsPath = Test-Path $osPath
-                if ($isOsPath) {
-                    $osDrive = $drive + ':'
-                }
             }
         }
 
