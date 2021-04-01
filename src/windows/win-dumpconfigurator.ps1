@@ -29,9 +29,6 @@ Param(
 [parameter()] [string]$VMName,
 [parameter()] [string]$ResourceGroup)
 
-#For testing purposes
-#$DumpType = 'full'
-#$DedicatedDumpFile="C:\DedicatedDumpFile.sys"
 
 if (!$DumpType) 
 {
@@ -43,7 +40,15 @@ if (!$DumpType)
 ## Add any registry prereqs to the script
 ## For example, if you want to use a DedicatedDumpFile, you'll need to make sure the key exists.
 $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
-$CrashDumpEnabledValue = (Get-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled).CrashDumpEnabled
+$CrashDumpEnabledValue = "CrashDumpEnabled"
+$CrashDumpEnabledData = (Get-ItemProperty -Path $CrashCtrlPath).$CrashDumpEnabledValue
+
+if (!$CrashDumpEnabledData) 
+{
+    Log-Output "Getting the value of $CrashDumpEnabledValue failed. Verify the key is present and contains a value. The default value should be 7."
+    Log-Output "Unable to continue, exiting..."
+    exit 
+}
 
 if ($DumpFile)
 {
