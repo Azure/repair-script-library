@@ -24,9 +24,7 @@ Param(
 [parameter()] [switch]$OneDump,
 [parameter()] [ValidateSet("active", "automatic", "full", "kernel", "mini" )] [string]$DumpType,
 [parameter()] [string]$DumpFile,
-[parameter()] [string]$DedicatedDumpFile,
-[parameter()] [string]$VMName,
-[parameter()] [string]$ResourceGroup)
+[parameter()] [string]$DedicatedDumpFile)
 
 # Initialize script
 . .\src\windows\common\setup\init.ps1
