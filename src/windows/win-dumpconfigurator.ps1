@@ -1,4 +1,3 @@
- . .\src\windows\common\setup\init.ps1
 <#
 .SYNOPSIS
     This script will change the dump configuration without requiring a reboot.
@@ -25,10 +24,10 @@ Param(
 [parameter()] [switch]$OneDump,
 [parameter()] [ValidateSet("active", "automatic", "full", "kernel", "mini" )] [string]$DumpType,
 [parameter()] [string]$DumpFile,
-[parameter()] [string]$DedicatedDumpFile="C:\DedicatedDumpFile.sys",
-[parameter()] [string]$VMName,
-[parameter()] [string]$ResourceGroup)
+[parameter()] [string]$DedicatedDumpFile)
 
+# Initialize script
+. .\src\windows\common\setup\init.ps1
 
 if (!$DumpType) 
 {
@@ -63,8 +62,8 @@ Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value C:\Dedicate
 # This is to clear the CrashDumpEnabled Key before kdbgctrl.exe sets it. This is helpful in scenarios where you want to 
 # use a DedicatedDump File but you do not wish to change the dump type.
 Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
-$kdbgctrl_return =   .\src\windows\common\tools\kdbgctrl.exe -sd full
-if ($OneDump)
+$kdbgctrl_return =   .\src\windows\common\tools\kdbgctrl.exe -sd $DumpType
+if ($OneDump -eq "True")
 {
  # Restore orignal CrashDumpEnabled value. This is helpful when you might not want to leave a system configured for a 
  # complete dump because of the downtime involved in writing out the dump. Which is to say, change the dump configuration
