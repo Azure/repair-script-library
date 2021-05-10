@@ -42,6 +42,9 @@ $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
 $CrashDumpEnabledValue = "CrashDumpEnabled"
 $CrashDumpEnabledData = (Get-ItemProperty -Path $CrashCtrlPath).$CrashDumpEnabledValue
 
+$DDFileLength = $DedicatedDumpFile.Length
+$DumpFileLenth = $DumpFile.Length
+
 if (!$CrashDumpEnabledData) 
 {
     Log-Output "Getting the value of $CrashDumpEnabledValue failed. Verify the key is present and contains a value. The default value should be 7."
@@ -49,16 +52,27 @@ if (!$CrashDumpEnabledData)
     exit 
 }
 
-if ($DumpFile)
-{
+if ($DumpFileLenth -gt 0) 
+{    
     Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
 }
 
-if ($DedicatedDumpFile)
+if ($DDFileLength -gt 0) 
 {
-    Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile
+    if ($DedicatedDumpFile -eq "delete") 
+    {
+        if ([bool]((Get-itemproperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl").DedicatedDumpFile)) 
+        {
+            Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFiled
+        }
+
+    }else
+    {
+        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile
+    }
+
 }
-Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value C:\DedicatedDumpFile.sys
+
 # This is to clear the CrashDumpEnabled Key before kdbgctrl.exe sets it. This is helpful in scenarios where you want to 
 # use a DedicatedDump File but you do not wish to change the dump type.
 Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
