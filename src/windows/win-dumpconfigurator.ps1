@@ -63,7 +63,7 @@ if ($DDFileLength -gt 0)
     {
         if ([bool]((Get-itemproperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl").DedicatedDumpFile)) 
         {
-            Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFiled
+            Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile
         }
 
     }else
