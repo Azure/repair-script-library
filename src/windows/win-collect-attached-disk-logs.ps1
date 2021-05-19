@@ -69,7 +69,7 @@ try {
 	# Clean up array for parsing
 	$removeDuplicates = $githubContent | Select-Object -uniq
 	$removeKeywords = $removeDuplicates | ForEach-Object { $_ -replace "copy,", "" } | ForEach-Object { $_ -replace "diskinfo,", "" } | ForEach-Object { $_ -replace ",noscan", "" } | ForEach-Object { $_ -replace "ll,", "" }
-	$logArray = $removeKeywords | Where-Object { $_ -notmatch "/Boot/BCD" } | Where-Object { $_ -notmatch "echo," }  | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object { $_.length }
+	$logArray = $removeKeywords | Where-Object { $_ -notmatch "/Boot/BCD" } | Where-Object { $_ -notmatch "echo," }  | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object
 
 	# Make sure the disk is online
 	Log-Output "#01 - Bringing disk online"
@@ -124,8 +124,9 @@ try {
 		$subFolder = New-Item -Path $folder.ToString() -Name "$($scriptStartTimeUTC)_UTC" -ItemType "directory"
 
 		# Create log files indicating files successfully and unsuccessfully grabbed by script
-		$logFile = "$subfolder\collectedLogFiles.log"
-		$failedLogFile = "$subfolder\failedLogFiles.log"
+		$logFile = "$subFolder\collectedLogFiles.log"
+		$failedLogFile = "$subFolder\failedLogFiles.log"
+		$treeFile = "$subFolder\collectedLogFilesTree.log"
 
 		# If Boot partition found grab bcd store
 		if ( $isBcdPath ) {
@@ -192,6 +193,9 @@ try {
 			return $STATUS_ERROR
 		}
 	}
+
+	# Include tree of subdirectory
+	tree $subFolder /f /a | out-file -FilePath $treeFile -Append
 
 	# Zip files
 	Log-Output "#06 - Creating zipped archive $($subFolder.Name).zip"
