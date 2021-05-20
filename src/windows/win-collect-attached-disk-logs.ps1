@@ -17,6 +17,7 @@
 #	VM. These logs are saved as an archive on the desktop and can then be grabbed from the Rescue VM for analysis.
 #
 #   https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/agent-windows#windows-guest-agent-automatic-logs-collection
+#	https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/iaas-logs
 #   https://docs.microsoft.com/en-us/cli/azure/vm/repair?view=azure-cli-latest
 #
 # .EXAMPLE
