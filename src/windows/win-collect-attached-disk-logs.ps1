@@ -20,10 +20,39 @@
 #	https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/iaas-logs
 #   https://docs.microsoft.com/en-us/cli/azure/vm/repair?view=azure-cli-latest
 #
+# 	Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives 
+#	to the target VM. However, there are a few caveats:
+#		- Does not return the Registry hives because the mapped VMs are still operational. 
+#		- If logs are being written to while the script is running and copying them over to the Rescue VM,
+			the copied log file may be corrupted. You can try re-running the script or copying the corrupted log
+			file manually. 
+		- Skips copy of logs if the resulting log has a name too long for Windows to handle.
+#
+# .PARAMETER fileShareLetter
+#   If using a mapped drive, select an available letter for your mapped drive.
+# .PARAMETER fileSharePath 
+#   If using a mapped drive, enter the private IP address and drive name in UNC format.
+# .PARAMETER username
+#   If using a mapped drive, enter the username of an account with credentials to access the remote computer.
+# .PARAMETER password
+#   If using a mapped drive, enter the matching password of an account with credentials to access the remote computer.
+#
 # .EXAMPLE
+#	Copy logs from OS disk attached to Rescue VM as a data disk
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-collect-attached-disk-logs --verbose --run-on-repair
+#
+#	Copy logs from a drive mapped to the Rescue VM as a network drive using the Private IP
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-collect-attached-disk-logs --parameters fileShareLetter=Z fileSharePath="\\10.0.0.5\c$" username=azureadmin password=pa$$w0rd!1
 #>
 #########################################################################################################
+
+# Set the Parameters for the script
+Param(
+	[Parameter(Mandatory = $false)][string]$fileShareLetter,
+	[Parameter(Mandatory = $false)][string]$fileSharePath,
+	[Parameter(Mandatory = $false)][string]$username,
+	[Parameter(Mandatory = $false)][SecureString]$password
+)
 
 # Initialize script
 . .\src\windows\common\setup\init.ps1
@@ -37,6 +66,7 @@ try {
 	$scriptStartTime = get-date
 	$scriptStartTimeUTC = ($scriptStartTime).ToUniversalTime() | ForEach-Object { $_ -replace ":", "." } | ForEach-Object { $_ -replace "/", "-" } | ForEach-Object { $_ -replace " ", "_" }
 	$collectedLogArray = @()
+	$githubContent = @()
 	
 	#Download GitHub files from https://github.com/Azure/azure-diskinspect-service/tree/master/pyServer/manifests/windows
 	$urls = @(
@@ -54,8 +84,7 @@ try {
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/site-recovery"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/sql-iaas"    
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/workloadbackup"
-	)
-	$githubContent = @()
+	)	
 
 	ForEach ( $url in $urls) {
 		try {
@@ -73,65 +102,93 @@ try {
 	$logArray = $removeKeywords | Where-Object { $_ -notmatch "/Boot/BCD" } | Where-Object { $_ -notmatch "echo," }  | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object
 
 	# Make sure the disk is online
-	Log-Output "#01 - Bringing disk online"
+	Log-Output "#01 - Bringing partition(s) online if present"
 	$disk = get-disk -ErrorAction Stop | Where-Object { $_.FriendlyName -eq 'Msft Virtual Disk' }
-	$disk | set-disk -IsOffline $false -ErrorAction Stop
-
+	$disk | set-disk -IsOffline $false -ErrorAction SilentlyContinue
+	
 	# Handle disk partitions
 	$partitionlist = Get-Disk-Partitions
 	$partitionGroup = $partitionlist | Group-Object DiskNumber
+	$driveLetters = @()
+	$fixedDrives = $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter
+	# $mappedDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot -ne $null } | Select-Object -ExpandProperty Name
+	# $mappedDrives = Get-SmbMapping | Select-Object -ExpandProperty "LocalPath" | ForEach-Object { $_ -replace ":", "" }
+	# $mappedDrives = Get-CimInstance -Class Win32_NetworkConnection | Select-Object -ExpandProperty "LocalName" | ForEach-Object { $_ -replace ":", "" }
 
-	Log-Output "#02 - Enumerate partitions for boot config"
+	if ($fileShareLetter -and $fileSharePath -and $username -and $password) {
+		# Configure TLS 1.2 security protocol key
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-	forEach ( $partitionGroup in $partitionlist | Group-Object DiskNumber ) {
-		# Reset paths for each part group (disk)
-		$isBcdPath = $false
-		$bcdPath = ''
-		$isOsPath = $false
-		$osPath = ''
+		# Install package and module necessary to work with az vm script
+		# More info: https://docs.microsoft.com/en-us/azure/virtual-machines/windows/run-command#restrictions
+		# https://github.com/mkellerman/Invoke-CommandAs
+		Install-PackageProvider -name NuGet -MinimumVersion 2.8.5.201 -Force
+		Install-Module -Name Invoke-CommandAs -Force
 
-		# Scan all partitions of a disk for bcd store and os file location 
-		ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter ) {      
-			# Check if no bcd store was found on the previous partition already
-			if ( -not $isBcdPath ) {
-				$bcdPath = $drive + ':\boot\bcd'
-				$isBcdPath = Test-Path $bcdPath
+		# Map network drive as SYSTEM	
+		$ScriptBlock = [scriptblock]::Create("net use $($fileShareLetter): $($fileSharePath) /persistent:no /user:$($username) $($password)")
+		Invoke-CommandAs -ScriptBlock $ScriptBlock -AsSystem
+	}
 
-				# If no bcd was found yet at the default location look for the uefi location too
-				if ( -not $isBcdPath ) {
-					$bcdPath = $drive + ':\efi\microsoft\boot\bcd'
-					$isBcdPath = Test-Path $bcdPath
-				} 
-			}        
+	# Grab fileshares if mounted as System
+	$mappedDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot -ne $null } | Select-Object -ExpandProperty Name
 
-			# Check if os loader was found on the previous partition already
-			if (-not $isOsPath) {
-				$osPath = $drive + ':\windows\system32\winload.exe'
-				$isOsPath = Test-Path $osPath
-			}
-		}
+	# Log drive letters
+	if ($fixedDrives) {
+		Log-Output "Attached volumes: $($fixedDrives -join ", ")"
+	}
 	
-		# Create or get CaseLogs folder on desktop
-		if (Test-Path "$($desktopFolderPath)$($logFolderName)") {
-			$folder = Get-Item -Path "$($desktopFolderPath)$($logFolderName)"
-			Log-Output "#03 - Grabbing folder $($folder)"
-		}
-		else {
-			$folder = New-Item -Path $desktopFolderPath -Name $logFolderName -ItemType "directory"
-			Log-Output "#03 - Creating folder $($folder)"
-		}
+	if ($mappedDrives) {
+		Log-Output "Mapped drives: $($mappedDrives -join ", ")"
+	}
 
-		# Create subfolder named after the current time in UTC
-		$subFolder = New-Item -Path $folder.ToString() -Name "$($scriptStartTimeUTC)_UTC" -ItemType "directory"
+	# Collect drive letters except for root drive of Rescue VM
+	$driveLetters += $fixedDrives
+	# Collect drive letters of mapped network drives
+	$driveLetters += $mappedDrives
+	
+	# Create or get CaseLogs folder on desktop
+	if (Test-Path "$($desktopFolderPath)$($logFolderName)") {
+		$folder = Get-Item -Path "$($desktopFolderPath)$($logFolderName)"
+		Log-Output "#02 - Grabbing folder $($folder) to store logs"
+	}
+	else {
+		$folder = New-Item -Path $desktopFolderPath -Name $logFolderName -ItemType "directory"
+		Log-Output "#02 - Creating folder $($folder) to store logs"
+	}
+
+	# Create subfolder named after the current time in UTC
+	$timeFolder = New-Item -Path $folder.ToString() -Name "$($scriptStartTimeUTC)_UTC" -ItemType "directory"	
+	
+	Log-Output "#03 - Copy log files to $($timeFolder.ToString())"
+
+	# Scan all collected partitions to determine if BCD or OS partition
+	ForEach ($drive in $driveLetters ) {
+		# Check if BCD store - Gen1
+		$bcdPath = $drive + ':\boot\bcd'
+		$isBcdPath = Test-Path $bcdPath
+		
+		# Not found? Check if BCD store - Gen2
+		if ( -not $isBcdPath ) {
+			$bcdPath = $drive + ':\efi\microsoft\boot\bcd'
+			$isBcdPath = Test-Path $bcdPath
+		}        
+		
+		# Check if partition is OS loader					
+		$osPath = $drive + ':\windows\system32\winload.exe'
+		$isOsPath = Test-Path $osPath
+	
+		# Create new subfolder with the current drive name
+		$subFolder = New-Item -Path $timeFolder.ToString() -Name $drive -ItemType "directory"
 
 		# Create log files indicating files successfully and unsuccessfully grabbed by script
-		$logFile = "$subFolder\collectedLogFiles.log"
-		$failedLogFile = "$subFolder\failedLogFiles.log"
-		$treeFile = "$subFolder\collectedLogFilesTree.log"
+		$logFile = "$timeFolder\collectedLogFiles.log"
+		$failedLogFile = "$timeFolder\failedLogFiles.log"
+		$treeFile = "$timeFolder\collectedLogFilesTree.log"
 
-		# If Boot partition found grab bcd store
+		# If Boot partition found grab BCD store
 		if ( $isBcdPath ) {
-			$bcdParentFolderName = $bcdPath.Split("\")[-2]
+			$bcdParentFolderName = "bcd" 
 			$bcdFileName = $bcdPath.Split("\")[-1]
 
 			if (Test-Path "$($subFolder.ToString())\$($bcdParentFolderName)") {
@@ -141,19 +198,18 @@ try {
 				$folder = New-Item -Path $subFolder -Name $bcdParentFolderName -ItemType "directory"
 			}
 
-			Log-Output "#04 - Copy $($bcdFileName) to $($subFolder.ToString())"
+			Log-Output "Copy $($bcdPath) to $($subFolder.ToString())"
 			Copy-Item -Path $bcdPath -Destination "$($folder)\$($bcdFileName)" -Recurse
 			$bcdPath | out-file -FilePath $logFile -Append
 		}
 		else {
-			Log-Warning "#04 - Cannot grab $($bcdFileName), make sure disk is attached and partition is online"
-			"NOT FOUND: $($bcdFileName)" | out-file -FilePath $failedLogFile -Append
+			Log-Warning "No BCD store on ($drive)"
 		}
 	
 		# If Windows partition found grab log files
 		if ( $isOsPath ) {
 			foreach ($logName in $logArray) {
-				$logLocation = "$($drive):$($logName)"; 
+				$logLocation = "$($drive):$($logName)" 
 
 				# Confirm file exists
 				if (Test-Path $logLocation) {                    
@@ -167,52 +223,54 @@ try {
 				}
 			}
 
-			Log-Output "#05 - Copy Windows OS logs to $($subFolder.ToString())"
+			Log-Output "Copy Windows OS logs to $($subFolder.ToString())"
 			# Copy verified logs to subfolder on Rescue VM desktop
 			$collectedLogArray | ForEach-Object {				
-				# Retain directory structure while replacing partition letter
-				$split = $_ -split '\\'
-				$DestFile = $split[1..($split.Length - 1)] -join '\' 
-				$DestFile = "$subFolder\$DestFile"
-					
-				# Confirm if current log is a file or folder prior to copying       
-				if (Test-Path -Path $_ -PathType Leaf) {
-					$logType = "File";
-					$temp = New-Item -Path $DestFile -Type $logType -Force
-					Copy-Item -Path $_ -Destination $DestFile
+				# Retain directory structure while replacing partition letter					
+				try {
+					$split = $_ -split '\\'
+					$DestFile = $split[1..($split.Length - 1)] -join '\' 
+					$DestFile = "$subFolder\$DestFile"
+					# Confirm if current log is a file or folder prior to copying       
+					if (Test-Path -Path $_ -PathType Leaf) {
+						$logType = "File"
+						$temp = New-Item -Path $DestFile -Type $logType -Force
+						Copy-Item -Path $_ -Destination $DestFile -erroraction SilentlyContinue
+					}
+					elseif (Test-Path -Path $_ -PathType Container) {
+						$logType = "Directory"
+						Copy-Item -Path $_ -Destination $DestFile -Recurse -erroraction SilentlyContinue
+					}           
+					$_ | out-file -FilePath $logFile -Append
 				}
-				elseif (Test-Path -Path $_ -PathType Container) {
-					$logType = "Directory";
-					Copy-Item -Path $_ -Destination $DestFile -Recurse
-				}           
-				$_ | out-file -FilePath $logFile -Append
+				catch {
+					$_.Exception | out-file -FilePath $failedLogFile -Append
+				}
 			}
 		}   
 		else {
-			Log-Error "END: Can't grab Windows OS logs, make sure disk is attached and partition is online"
-			$logArray | ForEach-Object { "NOT FOUND: $($_)" } | out-file -FilePath $failedLogFile -Append
-			return $STATUS_ERROR
+			Log-Warning "No OS logs on ($drive)"
 		}
 	}
 
 	# Include tree of subdirectory
-	tree $subFolder /f /a | out-file -FilePath $treeFile -Append
+	tree $timeFolder /f /a | out-file -FilePath $treeFile -Append
 
 	# Zip files
-	Log-Output "#06 - Creating zipped archive $($subFolder.Name).zip"
+	Log-Output "#04 - Creating zipped archive $($timeFolder.Name).zip"
 	$compress = @{
-		Path             = $subFolder
+		Path             = $timeFolder
 		CompressionLevel = "Fastest"
-		DestinationPath  = "$($desktopFolderPath)\$($subFolder.Name).zip"
+		DestinationPath  = "$($desktopFolderPath)\$($timeFolder.Name).zip"
 	}
 	Compress-Archive @compress
-	Log-Output "END: Please collect zipped log file $($desktopFolderPath)\$($subFolder.Name).zip from Rescue VM desktop"
+	Log-Output "END: Please collect zipped log file $($desktopFolderPath)\$($timeFolder.Name).zip from Rescue VM desktop"
 	return $STATUS_SUCCESS
 }
 
 # Log failure scenario
 catch {
-	Log-Error "END: Script failed on $($logLocation)"   
+	Log-Error "END: Script failed $(if ($logLocation) { "at $($logLocation)" } )"   
 	throw $_ 
 	return $STATUS_ERROR
 }
