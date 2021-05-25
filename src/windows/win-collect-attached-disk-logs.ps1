@@ -28,38 +28,20 @@
 			file manually. 
 		- Skips copy of logs if the resulting log has a name too long for Windows to handle.
 #
-# .PARAMETER fileShareLetter
-#   If using a mapped drive, select an available letter for your mapped drive.
-# .PARAMETER fileSharePath 
-#   If using a mapped drive, enter the private IP address and drive name in UNC format.
-# .PARAMETER username
-#   If using a mapped drive, enter the username of an account with credentials to access the remote computer.
-# .PARAMETER password
-#   If using a mapped drive, enter the matching password of an account with credentials to access the remote computer.
-#
 # .EXAMPLE
 #	Copy logs from OS disk attached to Rescue VM as a data disk
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-collect-attached-disk-logs --verbose --run-on-repair
 #
-#	Copy logs from a drive mapped to the Rescue VM as a network drive using the Private IP (note: must enter all parameters)
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-collect-attached-disk-logs --parameters fileShareLetter=Z fileSharePath="\\10.0.0.5\c$" username=azureadmin password=pa$$w0rd!1
+#	Want to copy logs from a VM in the same subnet? Map a Windows OS drive to the Rescue VM as a network drive using the Private IP via "az vm run-command"
+#	az vm run-command invoke --command-id RunPowerShellScript --name vm --resource-group rg --scripts "net use T: \\10.0.0.5\c$ /persistent:no /user:azureadmin MyPa$$w0rd!" --debug
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-collect-attached-disk-logs
 #
 #>
 #########################################################################################################
 
-# Set the Parameters for the script
-# Param(
-# 	[Parameter(Mandatory = $false)][string]$fileShareLetter,
-# 	[Parameter(Mandatory = $false)][string]$fileSharePath,
-# 	[Parameter(Mandatory = $false)][string]$username,
-# 	[Parameter(Mandatory = $false)][SecureString]$password,
-# )
-
-
 # Initialize script
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
-Log-Output "$fileSharePath"
 Log-Output "START: Running script win-collect-attached-disk-logs"
 
 try {
@@ -76,9 +58,6 @@ try {
 	$logArray = @()
 	$driveLetters = @()
 	
-	# Configure TLS 1.2 security protocol key
-	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
 	# Download Windows manifest files from Github 
 	# https://github.com/Azure/azure-diskinspect-service/tree/master/pyServer/manifests/windows
 	$urls = @(
@@ -122,19 +101,6 @@ try {
 	$partitionGroup = $partitionlist | Group-Object DiskNumber	
 	$fixedDrives = $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter
 
-	if ($fileShareLetter -and $fileSharePath -and $username -and $password) {
-		# Install package and module necessary to Map network drive as SYSTEM with az vm repair
-		# More info: https://docs.microsoft.com/en-us/azure/virtual-machines/windows/run-command#restrictions
-		# https://github.com/mkellerman/Invoke-CommandAs
-		# Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
-		# Install-Module -Name Invoke-CommandAs -Force
-
-		# Map network drive as SYSTEM	
-		# $ScriptBlock = [scriptblock]::Create("net use $($fileShareLetter): $($fileSharePath) /persistent:no /user:$($username) $($password)")
-		# Invoke-CommandAs -ScriptBlock $ScriptBlock -AsSystem
-		# Log-Output "$(net use)"
-	}
-
 	# Grab fileshares if mounted as System
 	$mappedDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot -ne $null } | Select-Object -ExpandProperty Name
 
@@ -167,7 +133,7 @@ try {
 
 	# Scan all collected partitions to determine if BCD or OS partition
 	ForEach ($drive in $driveLetters ) {
-		if (![String]::IsNullOrWhiteSpace($drive)) {		
+		if ($drive.ToString() -ne "") {		
 			# Check if BCD store - Gen1
 			$bcdPath = $drive + ':\boot\bcd'
 			$isBcdPath = Test-Path $bcdPath
@@ -260,10 +226,10 @@ try {
 	$compress = @{
 		Path             = $timeFolder
 		CompressionLevel = "Fastest"
-		DestinationPath  = "$($desktopFolderPath)\$($timeFolder.Name).zip"
+		DestinationPath  = "$($desktopFolderPath)$($timeFolder.Name).zip"
 	}
 	Compress-Archive @compress
-	Log-Output "END: Please collect zipped log file $($desktopFolderPath)\$($timeFolder.Name).zip from Rescue VM desktop"
+	Log-Output "END: Please collect zipped log file $($desktopFolderPath)$($timeFolder.Name).zip from Rescue VM desktop"
 	return $STATUS_SUCCESS
 }
 
