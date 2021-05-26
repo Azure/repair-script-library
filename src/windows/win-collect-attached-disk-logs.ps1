@@ -58,6 +58,8 @@ try {
 	$logArray = @()
 	$driveLetters = @()
 	
+	Log-Output "#01 - Collect log manifest files"
+
 	# Download Windows manifest files from Github 
 	# https://github.com/Azure/azure-diskinspect-service/tree/master/pyServer/manifests/windows
 	$urls = @(
@@ -92,7 +94,7 @@ try {
 	$logArray = $removeKeywords | Where-Object { $_ -notmatch "/Boot/BCD" } | Where-Object { $_ -notmatch "echo," } | Where-Object { ![String]::IsNullOrWhiteSpace($_) } | Sort-Object
 
 	# Make sure the disk is online
-	Log-Output "#01 - Bringing partition(s) online if present"
+	Log-Output "#02 - Bringing partition(s) online if present"
 	$disk = Get-Disk -ErrorAction Stop | Where-Object { $_.FriendlyName -eq 'Msft Virtual Disk' }
 	$disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
 	
@@ -120,10 +122,8 @@ try {
 	# Create or get CaseLogs folder on desktop
 	if (Test-Path "$($desktopFolderPath)$($logFolderName)") {
 		$folder = Get-Item -Path "$($desktopFolderPath)$($logFolderName)"
-		Log-Output "#02 - Grabbing folder $($folder) to store logs"
 	} else {
 		$folder = New-Item -Path $desktopFolderPath -Name $logFolderName -ItemType "directory"
-		Log-Output "#02 - Creating folder $($folder) to store logs"
 	}
 
 	# Create subfolder named after the current time in UTC
@@ -223,7 +223,6 @@ try {
 	# Check if Health Signals log exists
 	$TransparentInstallerLog = "$($subFolder)\WindowsAzure\Logs\TransparentInstaller.log"
 	if (Test-Path $TransparentInstallerLog) {
-	
 		# If so, search log for latest Health Report
 		$search = Select-String -Path $TransparentInstallerLog -Pattern "(?<= Microsoft Azure VM Health Report )(.*)"
 		$start = $search[-2].Line
