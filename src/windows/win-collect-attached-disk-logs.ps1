@@ -1,7 +1,7 @@
 #########################################################################################################
 <#
 # .SYNOPSIS
-#   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk.
+#   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk. v0.2.0
 #
 # .DESCRIPTION
 #   Azure support can normally collect relevant OS logs from an Azure VM by running one of the following:
@@ -155,6 +155,7 @@ try {
 			$logFile = "$timeFolder\collectedLogFiles.log"
 			$failedLogFile = "$timeFolder\failedLogFiles.log"
 			$treeFile = "$timeFolder\collectedLogFilesTree.log"
+			$healthSignalsFile = "$timeFolder\healthSignals_latest.json"
 
 			# If Boot partition found grab BCD store
 			if ( $isBcdPath ) {
@@ -190,7 +191,7 @@ try {
 					}
 				}
 
-				Log-Output "Copy Windows OS logs to $($subFolder.ToString())"
+				Log-Output "Copy Windows OS logs from $($drive) to $($subFolder.ToString())"
 				# Copy verified logs to subfolder on Rescue VM desktop
 				$collectedLogArray | ForEach-Object {				
 					# Retain directory structure while replacing partition letter					
@@ -198,6 +199,7 @@ try {
 						$split = $_ -split '\\'
 						$DestFile = $split[1..($split.Length - 1)] -join '\' 
 						$DestFile = "$subFolder\$DestFile"
+						
 						# Confirm if current log is a file or folder prior to copying       
 						if (Test-Path -Path $_ -PathType Leaf) {
 							$logType = "File"
@@ -218,6 +220,27 @@ try {
 		}
 	}
 
+	# Check if Health Signals log exists
+	$TransparentInstallerLog = "$($subFolder)\WindowsAzure\Logs\TransparentInstaller.log"
+	if (Test-Path $TransparentInstallerLog) {
+	
+		# If so, search log for latest Health Report
+		$search = Select-String -Path $TransparentInstallerLog -Pattern "(?<= Microsoft Azure VM Health Report )(.*)"
+		$start = $search[-2].Line
+		$end = $search[-1].Line
+
+		# Collect log contents
+		$logString = Get-Content $TransparentInstallerLog -Raw
+
+		# Grab the Health Report if present and print to JSON file
+		$matchResult = $logString -match "(?s)$start(?<content>.*)$end"
+		if ($matchResult) {
+			$jsonResult = $matches['content']
+			$jsonConversion = ConvertFrom-Json $jsonResult 
+			$jsonConversion | ConvertTo-Json | Out-File -FilePath $healthSignalsFile -Append
+		}
+	}
+
 	# Include tree of subdirectory
 	tree $timeFolder /f /a | Out-File -FilePath $treeFile -Append
 
@@ -229,7 +252,7 @@ try {
 		DestinationPath  = "$($desktopFolderPath)$($timeFolder.Name).zip"
 	}
 	Compress-Archive @compress
-	Log-Output "END: Please collect zipped log file $($desktopFolderPath)$($timeFolder.Name).zip from Rescue VM desktop"
+	Log-Output "END: Please collect zipped log file $($desktopFolderPath)$($timeFolder.Name).zip from desktop"
 	return $STATUS_SUCCESS
 }
 
