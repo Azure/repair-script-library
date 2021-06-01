@@ -8,7 +8,7 @@
 #       - C:\WindowsAzure\GuestAgent_2.7.41491.<VERSION>\CollectGuestLogs.exe
 #       - C:\WindowsAzure\Packages\CollectGuestLogs.exe
 #       - invoke-expression (get-childitem -Path c:\windowsazure -Filter CollectGuestLogs.exe -Recurse 
-			| sort LastAccessTime -desc | select -first 1).FullName       
+#		| sort LastAccessTime -desc | select -first 1).FullName       
 #   This will generate a zipped archive of the relevant guest logs. However, this cannot be used if the
 #   guest OS is inaccessible (e.g. refusing to boot) or the package is missing. The alternative way to 
 #   grab the logs in this situation is to clone the OS disk of the problem VM and attach the clone to a
@@ -17,16 +17,16 @@
 #	VM. These logs are saved as an archive on the desktop and can then be grabbed from the Rescue VM for analysis.
 #
 #   https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/agent-windows#windows-guest-agent-automatic-logs-collection
-#	https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/iaas-logs
+#   https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/iaas-logs
 #   https://docs.microsoft.com/en-us/cli/azure/vm/repair?view=azure-cli-latest
 #
-# 	Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives 
-#	to the target VM. However, there are a few caveats:
-#		- Does not return the Registry hives because the mapped VMs are still operational. 
-#		- If logs are being written to while the script is running and copying them over to the Rescue VM,
-			the copied log file may be corrupted. You can try re-running the script or copying the corrupted log
-			file manually. 
-		- Skips copy of logs if the resulting log has a name too long for Windows to handle.
+#   Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives 
+#   to the target VM. However, there are a few caveats:
+#	- Does not return the Registry hives because the mapped VMs are still operational. 
+#	- If logs are being written to while the script is running and copying them over to the Rescue VM,
+#		the copied log file may be corrupted. You can try re-running the script or copying the corrupted log
+#		file manually. 
+#	- Skips copy of logs if the resulting log has a name too long for Windows to handle.
 #
 # .EXAMPLE
 #	Copy logs from OS disk attached to Rescue VM as a data disk
