@@ -22,7 +22,7 @@
 #
 #   Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives 
 #   to the target VM. However, there are a few caveats:
-#	- Does not return the Registry hives because the mapped VMs are still operational. 
+#	- Does not return the Registry hives because the mapped VMs' hives are still operational. 
 #	- If logs are being written to while the script is running and copying them over to the Rescue VM,
 #		the copied log file may be corrupted. You can try re-running the script or copying the corrupted log
 #		file manually. 
