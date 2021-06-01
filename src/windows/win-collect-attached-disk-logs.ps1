@@ -257,7 +257,11 @@ try {
 
 # Log failure scenario
 catch {
-	Log-Error "END: Script failed $(if ($logLocation) { "at $($logLocation)" } )"   
+	Log-Error "END: Script failed $(if ($logLocation) { "at $($logLocation)" } )    
+	Please confirm a Windows OS disk is attached as a data disk 
+	You can also map a network drive with: 
+	az vm run-command invoke --command-id RunPowerShellScript --name vm --resource-group rg --scripts 'net use <DRIVE 
+	LETTER>: \\<PRIVATE_IP_OF_VM_ON_VNET>\c$ /persistent:no /user:<USERNAME> <PASSWORD>'"
 	throw $_ 
 	return $STATUS_ERROR
 }
