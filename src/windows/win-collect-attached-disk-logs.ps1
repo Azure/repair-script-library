@@ -18,6 +18,7 @@
 #
 #   https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/agent-windows#windows-guest-agent-automatic-logs-collection
 #   https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/iaas-logs
+#   https://docs.microsoft.com/en-us/archive/blogs/kwill/windows-azure-paas-compute-diagnostics-data
 #   https://docs.microsoft.com/en-us/cli/azure/vm/repair?view=azure-cli-latest
 #
 #   Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives 
