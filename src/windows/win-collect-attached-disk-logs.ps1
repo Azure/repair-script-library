@@ -30,13 +30,16 @@
 #	- Skips copy of logs if the resulting log has a name too long for Windows to handle.
 #
 # .EXAMPLE
-#	Copy logs from OS disk attached to Rescue VM as a data disk
+#	<# Copy logs from OS disk attached to Rescue VM as a data disk #>
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-collect-attached-disk-logs --verbose --run-on-repair
 #
-#	Want to copy logs from a VM in the same subnet? Map a Windows OS drive to the Rescue VM as a network drive using the Private IP via "az vm run-command"
+# .EXAMPLE
+#	<# Want to copy logs from a VM in the same subnet? Map a Windows OS drive to the Rescue VM as a network drive using the Private IP via "az vm run-command" #>
 #	az vm run-command invoke --command-id RunPowerShellScript --name vm --resource-group rg --scripts "net use T: \\10.0.0.5\c$ /persistent:no /user:azureadmin MyPa$$w0rd!" --debug
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-collect-attached-disk-logs
 #
+# .NOTES
+#   Author: Ryan McCallum
 #>
 #########################################################################################################
 
@@ -125,7 +128,7 @@ try {
 	if (Test-Path "$($desktopFolderPath)$($logFolderName)") {
 		$folder = Get-Item -Path "$($desktopFolderPath)$($logFolderName)"
 	}
- else {
+	else {
 		$folder = New-Item -Path $desktopFolderPath -Name $logFolderName -ItemType "directory"
 	}
 
@@ -155,10 +158,11 @@ try {
 			$subFolder = New-Item -Path $timeFolder.ToString() -Name $drive -ItemType "directory"
 
 			# Create log files indicating files successfully and unsuccessfully grabbed by script
-			$logFile = "$timeFolder\collectedLogFiles.log"
+			$logFile = "$timeFolder\collectedLogFiles.csv"
+			"sep=," | Out-File -FilePath $logFile -Force
+			'"Source Log File","Type","Destination Log File","Number of Destination Files","Size of Destination Files"' | Out-File -FilePath $logFile -Append
 			$failedLogFile = "$timeFolder\failedLogFiles.log"
-			$treeFile = "$timeFolder\collectedLogFilesTree.log"
-			$healthSignalsFile = "$timeFolder\healthSignals_latest.json"
+			$treeFile = "$timeFolder\collectedLogFilesTree.log"			
 
 			# If Boot partition found grab BCD store
 			if ( $isBcdPath ) {
@@ -174,10 +178,10 @@ try {
 
 				Log-Output "Copy $($bcdPath) to $($subFolder.ToString())"
 				Copy-Item -Path $bcdPath -Destination "$($folder)\$($bcdFileName)" -Recurse
-				$bcdPath | Out-File -FilePath $logFile -Append
+				"$($bcdPath)" | Out-File -FilePath $logFile -Append
 			}
 			else {
-				Log-Warning "No BCD store on ($drive)"
+				Log-Warning "No BCD store on $($drive)"
 			}
 	
 			# If Windows partition found grab log files
@@ -204,22 +208,31 @@ try {
 					try {
 						$split = $_ -split '\\'
 						$DestFile = $split[1..($split.Length - 1)] -join '\' 
-						$DestFile = "$subFolder\$DestFile"
+						$DestFile = "$($subFolder)\$($DestFile)"
 						
 						# Confirm if current log is a file or folder prior to copying       
 						if (Test-Path -Path $_ -PathType Leaf) {
 							$logType = "File"
 							New-Item -Path $DestFile -Type $logType -Force | Out-Null
-							Copy-Item -Path $_ -Destination $DestFile -ErrorAction SilentlyContinue
+							$copiedItem = Copy-Item -Path $_ -Destination $DestFile -PassThru -Force
 						}
 						elseif (Test-Path -Path $_ -PathType Container) {
 							$logType = "Directory"
-							Copy-Item -Path $_ -Destination $DestFile -Recurse -ErrorAction SilentlyContinue
-						}           
-						$_ | Out-File -FilePath $logFile -Append
+							$copiedItem = Copy-Item -Path $_ -Destination $DestFile -Recurse -PassThru -Force
+						}
+						$destNumLogFiles = "$(($copiedItem | Measure-Object -Property length).Count)"				
+						$destSizeLogFiles = "$(($copiedItem | Get-ChildItem | Measure-Object -Sum Length | Select-Object Sum).sum)"
+
+						# Print relevant information to log file
+						if (Test-Path $DestFile) {
+							"`"{0}`",`"{1}`",`"{2}`",`"{3}`",`"{4}`"" -f $_, $logType, $DestFile, $destNumLogFiles, $destSizeLogFiles | Out-File -FilePath $logFile -Append						
+						} else {
+							throw "FAILED $($_)" | Out-File -FilePath $failedLogFile -Append
+						}
+						
 					}
 					catch {
-						$_.Exception | Out-File -FilePath $failedLogFile -Append
+						"FAILED $($split -join '\'): $($_.Exception)" | Out-File -FilePath $failedLogFile -Append
 					}
 				}
 			}
@@ -227,25 +240,26 @@ try {
 				Log-Warning "No OS logs on ($drive)"
 			}
 		}
-	}
 
-	# Check if Health Signals log exists
-	$TransparentInstallerLog = "$($subFolder)\WindowsAzure\Logs\TransparentInstaller.log"
-	if (Test-Path $TransparentInstallerLog) {
-		# If so, search log for latest Health Report
-		$search = Select-String -Path $TransparentInstallerLog -Pattern "(?<= Microsoft Azure VM Health Report )(.*)"
-		$start = $search[-2].Line
-		$end = $search[-1].Line
+		# Check if Health Signals log exists
+		$TransparentInstallerLog = "$($subFolder)\WindowsAzure\Logs\TransparentInstaller.log"
+		if (Test-Path $TransparentInstallerLog) {
+			# If so, search log for latest Health Report
+			$search = Select-String -Path $TransparentInstallerLog -Pattern "(?<= Microsoft Azure VM Health Report )(.*)"
+			$start = $search[-2].Line
+			$end = $search[-1].Line
 
-		# Collect log contents
-		$logString = Get-Content $TransparentInstallerLog -Raw
+			# Collect log contents
+			$logString = Get-Content $TransparentInstallerLog -Raw
 
-		# Grab the Health Report if present and print to JSON file
-		$matchResult = $logString -match "(?s)$start(?<content>.*)$end"
-		if ($matchResult) {
-			$jsonResult = $matches['content']
-			$jsonConversion = ConvertFrom-Json $jsonResult 
-			$jsonConversion | ConvertTo-Json | Out-File -FilePath $healthSignalsFile -Append
+			# Grab the Health Report if present and print to JSON file
+			$matchResult = $logString -match "(?s)$start(?<content>.*)$end"
+			if ($matchResult) {
+				$healthSignalsFile = "$($subFolder.ToString())\healthSignals_latest.json"
+				$jsonResult = $matches['content']
+				$jsonConversion = ConvertFrom-Json $jsonResult 
+				$jsonConversion | ConvertTo-Json | Out-File -FilePath $healthSignalsFile -Append
+			}
 		}
 	}
 
