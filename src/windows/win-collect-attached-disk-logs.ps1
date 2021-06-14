@@ -40,6 +40,7 @@
 #
 # .NOTES
 #   Author: Ryan McCallum
+# 	Testing: Brought script to PowerShell ISE locally, converted all "Log-" strings to "Write-", imported Get-Disk-Partitions.ps1 in same file and commented out lines initializing init.ps1 and Get-Disk-Partitions.ps1
 #>
 #########################################################################################################
 
@@ -160,7 +161,7 @@ try {
 			# Create log files indicating files successfully and unsuccessfully grabbed by script
 			$logFile = "$timeFolder\collectedLogFiles.csv"
 			"sep=," | Out-File -FilePath $logFile -Force
-			'"Source Log File","Type","Destination Log File","Number of Destination Files","Size of Destination Files"' | Out-File -FilePath $logFile -Append
+			'"Source Log File","Type","Destination Log File","Number of Destination Files","Size of Destination File(s) [Bytes]"' | Out-File -FilePath $logFile -Append
 			$failedLogFile = "$timeFolder\failedLogFiles.log"
 			$treeFile = "$timeFolder\collectedLogFilesTree.log"			
 
@@ -191,7 +192,7 @@ try {
 
 					# Confirm file exists
 					if (Test-Path $logLocation) {                    
-						$itemToCopy = Get-ChildItem $logLocation -Force                    
+						$itemToCopy = Get-ChildItem -Recurse $logLocation -Force                    
 						foreach ($collectedLog in $itemToCopy) {
 							$collectedLogArray += $collectedLog.FullName
 						}
@@ -201,8 +202,7 @@ try {
 					}
 				}
 
-				Log-Output "Copy Windows OS logs from $($drive) to $($subFolder.ToString())"
-				# Copy verified logs to subfolder on Rescue VM desktop
+				Log-Output "Copy Windows OS logs from $($drive) to $($subFolder.ToString())"				
 				$collectedLogArray | ForEach-Object {				
 					# Retain directory structure while replacing partition letter					
 					try {
@@ -213,68 +213,108 @@ try {
 						# Confirm if current log is a file or folder prior to copying       
 						if (Test-Path -Path $_ -PathType Leaf) {
 							$logType = "File"
-							New-Item -Path $DestFile -Type $logType -Force | Out-Null
-							$copiedItem = Copy-Item -Path $_ -Destination $DestFile -PassThru -Force
+							New-Item -Path $DestFile -Type $logType -Force -ErrorAction SilentlyContinue -ErrorVariable newItemErrors -WarningAction SilentlyContinue -WarningVariable newItemWarnings | Out-Null
+							$copiedItem = Copy-Item -Path $_ -Destination $DestFile -PassThru -Force -ErrorAction SilentlyContinue -ErrorVariable copyErrors -WarningAction SilentlyContinue -WarningVariable copyWarnings
 						}
 						elseif (Test-Path -Path $_ -PathType Container) {
 							$logType = "Directory"
-							$copiedItem = Copy-Item -Path $_ -Destination $DestFile -Recurse -PassThru -Force
+							$copiedItem = Copy-Item -Path $_ -Destination $DestFile -Recurse -PassThru -Force -ErrorAction SilentlyContinue -ErrorVariable copyErrors -WarningAction SilentlyContinue -WarningVariable copyWarnings
 						}
-						$destNumLogFiles = "$(($copiedItem | Measure-Object -Property length).Count)"				
-						$destSizeLogFiles = "$(($copiedItem | Get-ChildItem | Measure-Object -Sum Length | Select-Object Sum).sum)"
 
-						# Print relevant information to log file
+						$destNumLogFiles = "$(($copiedItem | Measure-Object -Property length).Count)"
+						$destSizeLogFiles = "$(($copiedItem | Get-ChildItem -Recurse -ErrorAction SilentlyContinue -ErrorVariable getChildItemErrors -WarningAction SilentlyContinue -WarningVariable getChildItemWarnings | Measure-Object -Sum Length | Select-Object Sum).sum)"
+						
+						# Log any errors
+						foreach ($getChildItemWarning in $getChildItemWarnings) {
+							"WARNING (thrown during Get-ChildItem operation): $($getChildItemWarning)" | Out-File -FilePath $failedLogFile -Append
+						}
+						foreach ($getChildItemError in $getChildItemErrors) {
+							"EXCEPTION (thrown during Get-ChildItem operation): $($getChildItemError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
+						}
+						foreach ($newItemError in $newItemErrors) {
+							"EXCEPTION (thrown during New-Item operation): $($newItemError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
+						}
+						foreach ($newItemWarning in $newItemWarnings) {
+							"WARNING (thrown during New-Item operation): $($newItemWarning)" | Out-File -FilePath $failedLogFile -Append
+						}						
+						foreach ($copyError in $copyErrors) {
+							"EXCEPTION (thrown during Copy operation): $($copyError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
+						}
+						foreach ($copyWarning in $copyWarnings) {
+							"WARNING (thrown during Copy operation): $($copyWarning)" | Out-File -FilePath $failedLogFile -Append
+						}
+						# Print relevant information to log file						
 						if (Test-Path $DestFile) {
 							"`"{0}`",`"{1}`",`"{2}`",`"{3}`",`"{4}`"" -f $_, $logType, $DestFile, $destNumLogFiles, $destSizeLogFiles | Out-File -FilePath $logFile -Append						
-						} else {
-							throw "FAILED $($_)" | Out-File -FilePath $failedLogFile -Append
-						}
-						
+						}						
 					}
 					catch {
-						"FAILED $($split -join '\'): $($_.Exception)" | Out-File -FilePath $failedLogFile -Append
+						"FAILED $($split -join '\'): $($_.Exception.Message)" | Out-File -FilePath $failedLogFile -Append						
 					}
 				}
+
+				# Check if Health Signals log exists
+				try {
+					$TransparentInstallerLog = "$($subFolder)\WindowsAzure\Logs\TransparentInstaller.log"
+					if (Test-Path $TransparentInstallerLog) {
+						# If so, search log for latest Health Report
+						$search = Select-String -Path $TransparentInstallerLog -Pattern "(?<= Microsoft Azure VM Health Report )(.*)"
+						$start = $search[-2].Line
+						$end = $search[-1].Line
+
+						# Collect log contents
+						$logString = Get-Content $TransparentInstallerLog -Raw
+
+						# Grab the Health Report if present and print to JSON file
+						$matchResult = $logString -match "(?s)$start(?<content>.*)$end"
+						if ($matchResult) {
+							$healthSignalsFile = "$($subFolder.ToString())\healthSignals_latest.json"
+							$jsonResult = $matches['content']
+							$jsonConversion = ConvertFrom-Json $jsonResult 
+							$jsonConversion | ConvertTo-Json | Out-File -FilePath $healthSignalsFile -Append
+						}
+						else {
+							Log-Warning "Could not generate Health Signals log, confirm $($subFolder)\WindowsAzure\Logs\TransparentInstaller.log has Health Signals logged"
+						}
+					}
+					else {
+						Log-Warning "Could not generate Health Signals log, confirm $($subFolder)\WindowsAzure\Logs\TransparentInstaller.log exists"
+					}		
+				}
+				catch {
+					Log-Warning "Could not generate Health Signals log, confirm $($subFolder)\WindowsAzure\Logs\TransparentInstaller.log exists"
+				}
+
+
 			}
 			else {
-				Log-Warning "No OS logs on ($drive)"
-			}
-		}
-
-		# Check if Health Signals log exists
-		$TransparentInstallerLog = "$($subFolder)\WindowsAzure\Logs\TransparentInstaller.log"
-		if (Test-Path $TransparentInstallerLog) {
-			# If so, search log for latest Health Report
-			$search = Select-String -Path $TransparentInstallerLog -Pattern "(?<= Microsoft Azure VM Health Report )(.*)"
-			$start = $search[-2].Line
-			$end = $search[-1].Line
-
-			# Collect log contents
-			$logString = Get-Content $TransparentInstallerLog -Raw
-
-			# Grab the Health Report if present and print to JSON file
-			$matchResult = $logString -match "(?s)$start(?<content>.*)$end"
-			if ($matchResult) {
-				$healthSignalsFile = "$($subFolder.ToString())\healthSignals_latest.json"
-				$jsonResult = $matches['content']
-				$jsonConversion = ConvertFrom-Json $jsonResult 
-				$jsonConversion | ConvertTo-Json | Out-File -FilePath $healthSignalsFile -Append
+				Log-Warning "No OS logs on $($drive)"
 			}
 		}
 	}
 
 	# Include tree of subdirectory
-	tree $timeFolder /f /a | Out-File -FilePath $treeFile -Append
+	try {
+		tree $timeFolder /f /a | Out-File -FilePath $treeFile -Append
+	}
+ catch {
+		Log-Warning "Could not generate tree file"
+	}
 
 	# Zip files
-	Log-Output "#04 - Creating zipped archive $($timeFolder.Name).zip"
-	$compress = @{
-		Path             = $timeFolder
-		CompressionLevel = "Fastest"
-		DestinationPath  = "$($desktopFolderPath)$($timeFolder.Name).zip"
+	try {
+		Log-Output "#04 - Creating zipped archive $($timeFolder.Name).zip"
+		$compress = @{
+			Path             = $timeFolder
+			CompressionLevel = "Fastest"
+			DestinationPath  = "$($desktopFolderPath)$($timeFolder.Name).zip"
+		}
+		Compress-Archive @compress
+		Log-Output "END: Please collect zipped log file $($desktopFolderPath)$($timeFolder.Name).zip from desktop"
 	}
-	Compress-Archive @compress
-	Log-Output "END: Please collect zipped log file $($desktopFolderPath)$($timeFolder.Name).zip from desktop"
+ catch {
+		Log-Warning "Could not generate ZIP file, collect logs from CaseFiles folder on desktop instead"
+	}	
 	return $STATUS_SUCCESS
 }
 
