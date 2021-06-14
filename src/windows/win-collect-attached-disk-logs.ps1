@@ -192,7 +192,7 @@ try {
 
 					# Confirm file exists
 					if (Test-Path $logLocation) {                    
-						$itemToCopy = Get-ChildItem -Recurse $logLocation -Force                    
+						$itemToCopy = Get-ChildItem -Recurse $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings                   
 						foreach ($collectedLog in $itemToCopy) {
 							$collectedLogArray += $collectedLog.FullName
 						}
@@ -225,23 +225,29 @@ try {
 						$destSizeLogFiles = "$(($copiedItem | Get-ChildItem -Recurse -ErrorAction SilentlyContinue -ErrorVariable getChildItemErrors -WarningAction SilentlyContinue -WarningVariable getChildItemWarnings | Measure-Object -Sum Length | Select-Object Sum).sum)"
 						
 						# Log any errors
+						foreach ($getLogItemWarning in $getLogItemWarnings) {
+							"WARNING (thrown during log collection operation): $($getLogItemWarning)" | Out-File -FilePath $failedLogFile -Append
+						}
+						foreach ($getLogItemError in $getLogItemErrors) {
+							"EXCEPTION (thrown during log collection operation): $($getLogItemError)" | Out-File -FilePath $failedLogFile -Append
+						}
 						foreach ($getChildItemWarning in $getChildItemWarnings) {
-							"WARNING (thrown during Get-ChildItem operation): $($getChildItemWarning)" | Out-File -FilePath $failedLogFile -Append
+							"WARNING (thrown during measure operation): $($getChildItemWarning)" | Out-File -FilePath $failedLogFile -Append
 						}
 						foreach ($getChildItemError in $getChildItemErrors) {
-							"EXCEPTION (thrown during Get-ChildItem operation): $($getChildItemError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
+							"EXCEPTION (thrown during measure operation): $($getChildItemError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
 						}
 						foreach ($newItemError in $newItemErrors) {
-							"EXCEPTION (thrown during New-Item operation): $($newItemError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
+							"EXCEPTION (thrown during New-Item operation at destination): $($newItemError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
 						}
 						foreach ($newItemWarning in $newItemWarnings) {
-							"WARNING (thrown during New-Item operation): $($newItemWarning)" | Out-File -FilePath $failedLogFile -Append
+							"WARNING (thrown during New-Item operation at destination): $($newItemWarning)" | Out-File -FilePath $failedLogFile -Append
 						}						
 						foreach ($copyError in $copyErrors) {
-							"EXCEPTION (thrown during Copy operation): $($copyError.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
+							"EXCEPTION (thrown during Copy operation to destination): $($copyError.Exception.Message)$(if($getLogItemError -eq "Container cannot be copied onto existing leaf item.") {" - " + $copyError})" | Out-File -FilePath $failedLogFile -Append
 						}
 						foreach ($copyWarning in $copyWarnings) {
-							"WARNING (thrown during Copy operation): $($copyWarning)" | Out-File -FilePath $failedLogFile -Append
+							"WARNING (thrown during Copy operation to destination): $($copyWarning)" | Out-File -FilePath $failedLogFile -Append
 						}
 						# Print relevant information to log file						
 						if (Test-Path $DestFile) {
