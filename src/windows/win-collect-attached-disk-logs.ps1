@@ -1,4 +1,4 @@
-#########################################################################################################
+﻿#########################################################################################################
 <#
 # .SYNOPSIS
 #   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk. v0.3.0
@@ -7,13 +7,13 @@
 #   Azure support can normally collect relevant OS logs from an Azure VM by running one of the following:
 #       - C:\WindowsAzure\GuestAgent_2.7.41491.<VERSION>\CollectGuestLogs.exe
 #       - C:\WindowsAzure\Packages\CollectGuestLogs.exe
-#       - invoke-expression (get-childitem -Path c:\windowsazure -Filter CollectGuestLogs.exe -Recurse 
-#		| sort LastAccessTime -desc | select -first 1).FullName       
+#       - invoke-expression (get-childitem -Path c:\windowsazure -Filter CollectGuestLogs.exe -Recurse
+#		| sort LastAccessTime -desc | select -first 1).FullName
 #   This will generate a zipped archive of the relevant guest logs. However, this cannot be used if the
-#   guest OS is inaccessible (e.g. refusing to boot) or the package is missing. The alternative way to 
+#   guest OS is inaccessible (e.g. refusing to boot) or the package is missing. The alternative way to
 #   grab the logs in this situation is to clone the OS disk of the problem VM and attach the clone to a
-#   Rescue VM, where we can manually grab the relevant logs. This script helps this process by using 
-#   PowerShell to automate the log collection process from an OS disk attached as a data disk to a Rescue 
+#   Rescue VM, where we can manually grab the relevant logs. This script helps this process by using
+#   PowerShell to automate the log collection process from an OS disk attached as a data disk to a Rescue
 #	VM. These logs are saved as an archive on the desktop and can then be grabbed from the Rescue VM for analysis.
 #
 #   https://docs.microsoft.com/en-us/azure/virtual-machines/extensions/agent-windows#windows-guest-agent-automatic-logs-collection
@@ -21,12 +21,12 @@
 #   https://docs.microsoft.com/en-us/archive/blogs/kwill/windows-azure-paas-compute-diagnostics-data
 #   https://docs.microsoft.com/en-us/cli/azure/vm/repair?view=azure-cli-latest
 #
-#   Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives 
+#   Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives
 #   to the target VM. However, there are a few caveats:
-#	- Does not return the Registry hives because the mapped VMs' hives are still operational. 
+#	- Does not return the Registry hives because the mapped VMs' hives are still operational.
 #	- If logs are being written to while the script is running and copying them over to the Rescue VM,
 #		the copied log file may be corrupted. You can try re-running the script or copying the corrupted log
-#		file manually. 
+#		file manually.
 #	- Skips copy of logs if the resulting log has a name too long for Windows to handle.
 #
 # .EXAMPLE
@@ -40,7 +40,7 @@
 #
 # .NOTES
 #   Author: Ryan McCallum
-# 	Testing: Brought script to PowerShell ISE locally, converted all "Log-" strings to "Write-", imported Get-Disk-Partitions.ps1 in same file and commented out lines initializing init.ps1 and Get-Disk-Partitions.ps1
+# 	Testing: Brought script to PowerShell ISE locally, converted all "Log-" strings to "Write-", imported Get-Disk-Partitions.ps1 in same file and commented out lines initializing init.ps1 and Get-Disk-Partitions.ps1. Also ran Invoke-ScriptAnalyzer -Path .\win-collect-attached-disk-logs.ps1  to find recommended updates and Invoke-ScriptAnalyzer -Path .\win-collect-attached-disk-logs.ps1 -Fix to fix them. More info: https://docs.microsoft.com/en-us/powershell/module/psscriptanalyzer/invoke-scriptanalyzer?view=ps-modules
 #>
 #########################################################################################################
 
@@ -50,7 +50,7 @@
 Log-Output "START: Running script win-collect-attached-disk-logs"
 
 try {
-	# Declaring variables    
+	# Declaring variables
 	$desktopFolderPath = "$env:PUBLIC\Desktop\"
 	$logFolderName = "CaseLogs"
 	$scriptStartTime = Get-Date
@@ -62,17 +62,17 @@ try {
 	$removeKeywords = @()
 	$logArray = @()
 	$driveLetters = @()
-	
+
 	Log-Output "#01 - Collect log manifest files"
 
-	# Download Windows manifest files from Github 
+	# Download Windows manifest files from Github
 	# https://github.com/Azure/azure-diskinspect-service/tree/master/pyServer/manifests/windows
 	$urls = @(
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/windowsupdate"    
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/windowsupdate"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/diagnostic"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/agents"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/aks"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/asc-vmhealth"    
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/asc-vmhealth"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/eg"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/genspec"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/min-diagnostic"
@@ -80,18 +80,18 @@ try {
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/normal"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/servicefabric"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/site-recovery"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/sql-iaas"    
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/sql-iaas"
 		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/workloadbackup"
-	)	
+	)
 
 	ForEach ( $url in $urls) {
 		try {
 			$githubContent += (New-Object System.Net.WebClient).DownloadString($url).Split([Environment]::NewLine)
 			Log-Output "Grabbed $($url)"
 		}
-		catch {        
+		catch {
 			Log-Warning "Error for $($url)"
-		}    
+		}
 	}
 
 	# Clean up array for parsing
@@ -103,10 +103,10 @@ try {
 	Log-Output "#02 - Bringing partition(s) online if present"
 	$disk = Get-Disk -ErrorAction Stop | Where-Object { $_.FriendlyName -eq 'Msft Virtual Disk' }
 	$disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
-	
+
 	# Handle disk partitions
 	$partitionlist = Get-Disk-Partitions
-	$partitionGroup = $partitionlist | Group-Object DiskNumber	
+	$partitionGroup = $partitionlist | Group-Object DiskNumber
 	$fixedDrives = $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter
 
 	# Grab fileshares if mounted as System
@@ -115,7 +115,7 @@ try {
 	# Log drive letters
 	if ($fixedDrives) {
 		Log-Output "Attached volumes: $($fixedDrives -join ", ")"
-	}	
+	}
 	if ($mappedDrives) {
 		Log-Output "Mapped drives: $($mappedDrives -join ", ")"
 	}
@@ -124,7 +124,7 @@ try {
 	$driveLetters += $fixedDrives
 	# Collect drive letters of mapped network drives
 	$driveLetters += $mappedDrives
-	
+
 	# Create or get CaseLogs folder on desktop
 	if (Test-Path "$($desktopFolderPath)$($logFolderName)") {
 		$folder = Get-Item -Path "$($desktopFolderPath)$($logFolderName)"
@@ -134,27 +134,27 @@ try {
 	}
 
 	# Create subfolder named after the current time in UTC
-	$timeFolder = New-Item -Path $folder.ToString() -Name "$($scriptStartTimeUTC)_UTC" -ItemType "directory"	
-	
+	$timeFolder = New-Item -Path $folder.ToString() -Name "$($scriptStartTimeUTC)_UTC" -ItemType "directory"
+
 	Log-Output "#03 - Copy log files to $($timeFolder.ToString())"
 
 	# Scan all collected partitions to determine if BCD or OS partition
 	ForEach ($drive in $driveLetters ) {
-		if ($drive.ToString() -ne "") {		
+		if ($drive.ToString() -ne "") {
 			# Check if BCD store - Gen1
 			$bcdPath = $drive + ':\boot\bcd'
 			$isBcdPath = Test-Path $bcdPath
-		
+
 			# Not found? Check if BCD store - Gen2
 			if ( -not $isBcdPath ) {
 				$bcdPath = $drive + ':\efi\microsoft\boot\bcd'
 				$isBcdPath = Test-Path $bcdPath
-			}        
-		
-			# Check if partition is OS loader					
+			}
+
+			# Check if partition is OS loader
 			$osPath = $drive + ':\windows\system32\winload.exe'
 			$isOsPath = Test-Path $osPath
-	
+
 			# Create new subfolder with the current drive name
 			$subFolder = New-Item -Path $timeFolder.ToString() -Name $drive -ItemType "directory"
 
@@ -163,11 +163,11 @@ try {
 			"sep=," | Out-File -FilePath $logFile -Force
 			'"Source Log File","Type","Destination Log File","Number of Destination Files","Size of Destination File(s) [Bytes]"' | Out-File -FilePath $logFile -Append
 			$failedLogFile = "$timeFolder\failedLogFiles.log"
-			$treeFile = "$timeFolder\collectedLogFilesTree.log"			
+			$treeFile = "$timeFolder\collectedLogFilesTree.log"
 
 			# If Boot partition found grab BCD store
 			if ( $isBcdPath ) {
-				$bcdParentFolderName = "bcd" 
+				$bcdParentFolderName = "bcd"
 				$bcdFileName = $bcdPath.Split("\")[-1]
 
 				if (Test-Path "$($subFolder.ToString())\$($bcdParentFolderName)") {
@@ -184,15 +184,15 @@ try {
 			else {
 				Log-Warning "No BCD store on $($drive)"
 			}
-	
+
 			# If Windows partition found grab log files
 			if ( $isOsPath ) {
 				foreach ($logName in $logArray) {
-					$logLocation = "$($drive):$($logName)" 
+					$logLocation = "$($drive):$($logName)"
 
 					# Confirm file exists
-					if (Test-Path $logLocation) {                    
-						$itemToCopy = Get-ChildItem -Recurse $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings                   
+					if (Test-Path $logLocation) {
+						$itemToCopy = Get-ChildItem -Recurse $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings
 						foreach ($collectedLog in $itemToCopy) {
 							$collectedLogArray += $collectedLog.FullName
 						}
@@ -202,15 +202,15 @@ try {
 					}
 				}
 
-				Log-Output "Copy Windows OS logs from $($drive) to $($subFolder.ToString())"				
-				$collectedLogArray | ForEach-Object {				
-					# Retain directory structure while replacing partition letter					
+				Log-Output "Copy Windows OS logs from $($drive) to $($subFolder.ToString())"
+				$collectedLogArray | ForEach-Object {
+					# Retain directory structure while replacing partition letter
 					try {
 						$split = $_ -split '\\'
-						$DestFile = $split[1..($split.Length - 1)] -join '\' 
+						$DestFile = $split[1..($split.Length - 1)] -join '\'
 						$DestFile = "$($subFolder)\$($DestFile)"
-						
-						# Confirm if current log is a file or folder prior to copying       
+
+						# Confirm if current log is a file or folder prior to copying
 						if (Test-Path -Path $_ -PathType Leaf) {
 							$logType = "File"
 							New-Item -Path $DestFile -Type $logType -Force -ErrorAction SilentlyContinue -ErrorVariable newItemErrors -WarningAction SilentlyContinue -WarningVariable newItemWarnings | Out-Null
@@ -223,7 +223,7 @@ try {
 
 						$destNumLogFiles = "$(($copiedItem | Measure-Object -Property length).Count)"
 						$destSizeLogFiles = "$(($copiedItem | Get-ChildItem -Recurse -ErrorAction SilentlyContinue -ErrorVariable getChildItemErrors -WarningAction SilentlyContinue -WarningVariable getChildItemWarnings | Measure-Object -Sum Length | Select-Object Sum).sum)"
-						
+
 						# Log any errors
 						foreach ($getLogItemWarning in $getLogItemWarnings) {
 							"WARNING (thrown during log collection operation): $($getLogItemWarning)" | Out-File -FilePath $failedLogFile -Append
@@ -242,20 +242,20 @@ try {
 						}
 						foreach ($newItemWarning in $newItemWarnings) {
 							"WARNING (thrown during New-Item operation at destination): $($newItemWarning)" | Out-File -FilePath $failedLogFile -Append
-						}						
+						}
 						foreach ($copyError in $copyErrors) {
 							"EXCEPTION (thrown during Copy operation to destination): $($copyError.Exception.Message)$(if($getLogItemError -eq "Container cannot be copied onto existing leaf item.") {" - " + $copyError})" | Out-File -FilePath $failedLogFile -Append
 						}
 						foreach ($copyWarning in $copyWarnings) {
 							"WARNING (thrown during Copy operation to destination): $($copyWarning)" | Out-File -FilePath $failedLogFile -Append
 						}
-						# Print relevant information to log file						
+						# Print relevant information to log file
 						if (Test-Path $DestFile) {
-							"`"{0}`",`"{1}`",`"{2}`",`"{3}`",`"{4}`"" -f $_, $logType, $DestFile, $destNumLogFiles, $destSizeLogFiles | Out-File -FilePath $logFile -Append						
-						}						
+							"`"{0}`",`"{1}`",`"{2}`",`"{3}`",`"{4}`"" -f $_, $logType, $DestFile, $destNumLogFiles, $destSizeLogFiles | Out-File -FilePath $logFile -Append
+						}
 					}
 					catch {
-						"FAILED $($split -join '\'): $($_.Exception.Message)" | Out-File -FilePath $failedLogFile -Append						
+						"FAILED $($split -join '\'): $($_.Exception.Message)" | Out-File -FilePath $failedLogFile -Append
 					}
 				}
 
@@ -276,7 +276,7 @@ try {
 						if ($matchResult) {
 							$healthSignalsFile = "$($subFolder.ToString())\healthSignals_latest.json"
 							$jsonResult = $matches['content']
-							$jsonConversion = ConvertFrom-Json $jsonResult 
+							$jsonConversion = ConvertFrom-Json $jsonResult
 							$jsonConversion | ConvertTo-Json | Out-File -FilePath $healthSignalsFile -Append
 						}
 						else {
@@ -285,7 +285,7 @@ try {
 					}
 					else {
 						Log-Warning "Could not generate Health Signals log, confirm $($subFolder)\WindowsAzure\Logs\TransparentInstaller.log exists"
-					}		
+					}
 				}
 				catch {
 					Log-Warning "Could not generate Health Signals log, confirm $($subFolder)\WindowsAzure\Logs\TransparentInstaller.log exists"
@@ -320,17 +320,17 @@ try {
 	}
  catch {
 		Log-Warning "Could not generate ZIP file, collect logs from CaseFiles folder on desktop instead"
-	}	
+	}
 	return $STATUS_SUCCESS
 }
 
 # Log failure scenario
 catch {
-	Log-Error "END: Script failed $(if ($logLocation) { "at $($logLocation)" } )    
-	Please confirm a Windows OS disk is attached as a data disk 
-	You can also map a network drive with: 
-	az vm run-command invoke --command-id RunPowerShellScript --name vm --resource-group rg --scripts `"net use <DRIVE 
+	Log-Error "END: Script failed $(if ($logLocation) { "at $($logLocation)" } )
+	Please confirm a Windows OS disk is attached as a data disk
+	You can also map a network drive with:
+	az vm run-command invoke --command-id RunPowerShellScript --name vm --resource-group rg --scripts `"net use <DRIVE
 	LETTER>: \\<PRIVATE_IP_OF_VM_ON_VNET>\c$ /persistent:no /user:<USERNAME> <PASSWORD>`""
-	throw $_ 
+	throw $_
 	return $STATUS_ERROR
 }
