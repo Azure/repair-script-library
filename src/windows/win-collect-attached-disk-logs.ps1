@@ -192,7 +192,13 @@ try {
 
 					# Confirm file exists
 					if (Test-Path $logLocation) {
-						$itemToCopy = Get-ChildItem -Recurse $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings
+						if (Test-Path $logLocation -PathType Container) {
+							$itemToCopy = Get-ChildItem -Recurse $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings
+						}
+						elseif (Test-Path $logLocation -PathType Leaf) {
+							$itemToCopy = Get-ChildItem $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings
+						}
+
 						foreach ($collectedLog in $itemToCopy) {
 							$collectedLogArray += $collectedLog.FullName
 						}
