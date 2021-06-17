@@ -1,7 +1,7 @@
 ﻿#########################################################################################################
 <#
 # .SYNOPSIS
-#   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk. v0.3.0
+#   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk. v0.4.0
 #
 # .DESCRIPTION
 #   Azure support can normally collect relevant OS logs from an Azure VM by running one of the following:
@@ -192,7 +192,8 @@ try {
 
 					# Confirm file exists
 					if (Test-Path $logLocation) {
-						$itemToCopy = Get-ChildItem -Recurse $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings
+						$itemToCopy = Get-ChildItem $logLocation -Force -ErrorAction SilentlyContinue -ErrorVariable getLogItemErrors -WarningAction SilentlyContinue -WarningVariable getLogItemWarnings
+
 						foreach ($collectedLog in $itemToCopy) {
 							$collectedLogArray += $collectedLog.FullName
 						}
