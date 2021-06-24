@@ -5,7 +5,7 @@
 #
 # .NOTES
 #   Author: Ryan McCallum
-#   Sources: 
+#   Sources:
         https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty?view=powershell-7.1
 #
 # .PARAMETER rootKey
@@ -19,8 +19,8 @@
 #       via Get-ItemProperty -Path "HKLM:\brokenSYSTEM\Select" -Name Current.
 #
 # .PARAMETER relativePath
-#   Path to reg key after the hive and control set. Add backticks to escape spaces and surround the string in single quotes. 
-#   E.G. to target the following key on the Rescue VM: 
+#   Path to reg key after the hive and control set. Add backticks to escape spaces and surround the string in single quotes.
+#   E.G. to target the following key on the Rescue VM:
 #       HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\Terminal Server\WinStations\RDP-Tcp
 #   You will just need to enter the following for the relative path:
 #       'Control\Terminal` Server\WinStations\RDP-Tcp'
@@ -29,7 +29,7 @@
 #   Add the name of the property that we are adding or updating.
 #
 # .PARAMETER propertyType
-#   [Optional] Add the type of the property that we are adding or updating. Necessary if a new value, 
+#   [Optional] Add the type of the property that we are adding or updating. Necessary if a new value,
 #   not necessary if updating already existing value. Follows the naming convention of the following doc:
 #       https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty?view=powershell-7.1
 #
@@ -115,7 +115,7 @@ try {
                         $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
                     } else {
                         # If the path for the new key doesn't exist, create it as well
-                        $propertyType = "dword"                        
+                        $propertyType = "dword"
                         New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop | Out-Null
                     }
                 }
@@ -134,7 +134,7 @@ try {
         else {
             Log-Warning "Could not parse drive: $($drive)"
         }
-    }    
+    }
     Log-Output "END: Script Successful, modified key:"
     Log-Output $modifiedKey
     return $STATUS_SUCCESS
