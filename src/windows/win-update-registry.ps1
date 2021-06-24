@@ -1,7 +1,7 @@
-#########################################################################################################
+﻿#########################################################################################################
 <#
 # .SYNOPSIS
-#  Modify the registry on an OS disk attached to a Rescue VM.
+#  Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk. v0.2.0
 #
 # .NOTES
 #   Author: Ryan McCallum
@@ -13,6 +13,7 @@
 #
 # .PARAMETER hive
 #   [Optional] "System" to target System Registry (default), "Software" to target Software registry, etc.
+#       https://docs.microsoft.com/en-us/windows/win32/sysinfo/registry-hives
 #
 # .PARAMETER controlSet
 #   [Optional] Enter the controlSet manually. Optional as script will normally select the last active Control Set if using the System reg
@@ -37,20 +38,23 @@
 #   Add the value of the property/entry that we are adding or updating.
 #
 # .EXAMPLE
-#   az vm repair run -g sourceRG -n problemVM --run-id win-registry-update --run-on-repair --parameters rootKey=HKLM controlSet=1 hive=SYSTEM relativePath='Control\Terminal` Server' propertyName=fDenyTSConnections propertyValue=0 propertyType=dword
+#   <# This will run Set-ItemProperty -Path "HKLM:\brokenSystemF\ControlSet001\Control\Terminal Server" -name fDenyTSConnections -type DWORD -Value 0 #>
+#   <# Where brokenSystemF is the System hive from the attached OS disk's F: partition #>
+#   az vm repair run -g sourceRG -n problemVM --run-id win-update-registry --run-on-repair --parameters rootKey=HKLM hive=SYSTEM controlSet=1
+#     relativePath='Control\Terminal` Server' propertyName=fDenyTSConnections propertyValue=0 propertyType=dword
 #
 #>
 #########################################################################################################
 
 # Set the Parameters for the script
 Param(
-    [Parameter(Mandatory = $false)][string]$rootKey = 'HKLM',
-    [Parameter(Mandatory = $false)][string]$hive = 'SYSTEM',
+    [Parameter(Mandatory = $false)][ValidateSet("HKLM", "HKCC", "HKCR", "HKCU", "HKU")][string]$rootKey = "HKLM",
+    [Parameter(Mandatory = $false)][ValidateSet("SYSTEM", "SOFTWARE", "SAM", "SECURITY", "HARDWARE", "DEFAULT")][string]$hive = "System",
+    [Parameter(Mandatory = $false)][ValidateSet("String", "ExpandString", "Binary", "DWord", "MultiString", "Qword", "Unknown")][string]$propertyType = "",
     [Parameter(Mandatory = $false)][ValidateSet(1, 2)] [Int]$controlSet,
-    [Parameter(Mandatory = $true)][string]$relativePath = '',
-    [Parameter(Mandatory = $true)][string]$propertyName = '',
-    [Parameter(Mandatory = $false)][ValidateSet("String", "ExpandString", "Binary", "DWord", "MultiString", "Qword", "Unknown")][string]$propertyType = '',
-    [Parameter(Mandatory = $true)][string]$propertyValue = ''
+    [Parameter(Mandatory = $true)][string]$relativePath = "",
+    [Parameter(Mandatory = $true)][string]$propertyName = "",
+    [Parameter(Mandatory = $true)][string]$propertyValue = ""
 )
 
 # Initialize script
@@ -89,14 +93,14 @@ try {
                 Log-Output "Load requested Registry hive from $($drive)"
 
                 # Load hive into Rescue VM's registry from attached disk
-                $null = reg load "$($rootKey)\broken$($hive)$($drive)" "$($drive):\Windows\System32\config\$($hive)"
+                reg load "$($rootKey)\broken$($hive)$($drive)" "$($drive):\Windows\System32\config\$($hive)"
 
                 # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
                 if ($hive -eq "system") {
                     Log-Output "Using a System registry, getting specified Control Set"
                     $controlSetText = "ControlSet00"
                     if ($controlSet -eq "") {
-                        $controlSet = (Get-ItemProperty -Path "$($rootKey):\broken$($hive)\Select" -Name Current).Current
+                        $controlSet = (Get-ItemProperty -Path "$($rootKey):\broken$($hive)$($drive)\Select" -Name Current).Current
                     }
                     $controlSetText += $controlSet
                     $controlSetText += "\"
@@ -106,14 +110,15 @@ try {
                 }
 
                 # Modify the Registry
-                $propPath = "$($rootKey):\broken$($hive)\$($controlSetText)$($relativePath)"
+                $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
                 Log-Output "Modify Registry key $($propPath)"
 
                 # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
                 If ($propertyType -eq "") {
                     if (Test-Path $propPath) {
                         $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
-                    } else {
+                    }
+                    else {
                         # If the path for the new key doesn't exist, create it as well
                         $propertyType = "dword"
                         New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop | Out-Null
@@ -124,8 +129,9 @@ try {
                 $modifiedKey += Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
 
                 # Unload hive
-                Log-Output "Unload attached disk registry"
-                $null = reg unload "$($rootKey)\broken$($hive)"
+                Log-Output "Unload attached disk registry hive on $($drive)"
+                [gc]::Collect()
+                reg unload "$($rootKey)\broken$($hive)$($drive)"
             }
             else {
                 Log-Warning "No Registry found on $($drive)"
