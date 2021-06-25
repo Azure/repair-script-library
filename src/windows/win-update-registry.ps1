@@ -115,6 +115,16 @@ try {
 
                 # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
                 If ($propertyType -eq "") {
+                    $propertyType = "dword"
+                }
+
+                if (Test-Path $propPath) {
+                    $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
+                }
+                else {
+                    # If the path for the new key doesn't exist, create it as well
+                    New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop
+                }
                     if (Test-Path $propPath) {
                         $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
                     }
@@ -125,8 +135,9 @@ try {
                     }
                 }
 
-                $modifiedKey += "Drive $($drive)"
-                $modifiedKey += Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+                # Update the key
+                $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+                Log-Output $modifiedKey
 
                 # Unload hive
                 Log-Output "Unload attached disk registry hive on $($drive)"
