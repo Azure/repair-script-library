@@ -113,21 +113,22 @@ try {
                 $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
                 Log-Output "Modify Registry key $($propPath)"
 
-                # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord                
+                # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
                 If ($propertyType -eq "") {
                     $propertyType = "dword"
                 }
 
                 if (Test-Path $propPath) {
-                    $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)                        
+                    $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
                 }
                 else {
-                    # If the path for the new key doesn't exist, create it as well                        
+                    # If the path for the new key doesn't exist, create it as well
                     New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop
-                }                
+                }
 
-                $modifiedKey += "Drive $($drive)"
-                $modifiedKey += Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+                # Update the key
+                $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+                Log-Output $modifiedKey
 
                 # Unload hive
                 Log-Output "Unload attached disk registry hive on $($drive)"
@@ -143,8 +144,7 @@ try {
         }
     }
     # Log success scenario
-    Log-Output "END: Script successful, modified key(s):"
-    Log-Output $modifiedKey
+    Log-Output "END: Script successful"
     return $STATUS_SUCCESS
 }
 
