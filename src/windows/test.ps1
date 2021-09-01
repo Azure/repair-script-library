@@ -5,3 +5,4 @@ Param(
 )
 
 Write-Output 'Running Script Enable-NestedHyperV $Gen'
+return $STATUS_SUCCESS
