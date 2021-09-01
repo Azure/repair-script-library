@@ -1,3 +1,5 @@
+Param([Parameter(Mandatory=$false)][string]$gen)
+
 . .\src\windows\common\setup\init.ps1
 
 Log-Info 'Running Script Enable-NestedHyperV'
@@ -70,7 +72,13 @@ if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Install
         $return = Set-DhcpServerv4OptionValue -DnsServer 168.63.129.16 -Router 192.168.0.1 -ErrorAction Stop
 
         # Create the nested guest VM
-        $return = new-vm -name $nestedGuestVmName -MemoryStartupBytes 4GB -NoVHD -BootDevice IDE -Generation 1 -ErrorAction Stop
+        if(!$gen)
+        {
+            $return = new-vm -name $nestedGuestVmName -MemoryStartupBytes 4GB -NoVHD -BootDevice IDE -Generation 1 -ErrorAction Stop
+        }
+        else {
+            $return = new-vm -name $nestedGuestVmName -MemoryStartupBytes 4GB -NoVHD -BootDevice IDE -Generation $gen -ErrorAction Stop
+        }
         $return = set-vm -name $nestedGuestVmName -ProcessorCount 2 -CheckpointType Disabled -ErrorAction Stop
         $disk = get-disk -ErrorAction Stop | where {$_.FriendlyName -eq 'Msft Virtual Disk'}
         $return = $disk | set-disk -IsOffline $true -ErrorAction Stop

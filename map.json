@@ -63,5 +63,6 @@
 		"id" : "win-collect-attached-disk-logs",
 		"path" : "src/windows/win-collect-attached-disk-logs.ps1",
 		"description" : "Collect OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk."
+
 	}
 ]
