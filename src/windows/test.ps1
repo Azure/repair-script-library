@@ -1,10 +1,7 @@
-Param(
-    [Parameter(Mandatory=$true)]
-    [string]
-    $Gen
-)
+
+Param([Parameter(Mandatory=$false)][string]$gen='1')
 . .\src\windows\common\setup\init.ps1
 
-Write-Output 'Running Script Enable-NestedHyperV $Gen'
+Write-Output "Running Script Enable-NestedHyperV $gen"
 Log-Output '$Gen'
 return $STATUS_SUCCESS
