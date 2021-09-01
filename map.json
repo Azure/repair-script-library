@@ -43,5 +43,10 @@
 		"id" : "win-enable-nested-hyperv",
 		"path" : "src/windows/win-enable-nested-hyperv.ps1",
 		"description" : "Enables nested hyperV using attached data disk as OS disk."
+	},
+	{
+		"id" : "test",
+		"path" : "src/windows/test.ps1",
+		"description" : "Test script"
 	}
 ]
