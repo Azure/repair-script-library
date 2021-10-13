@@ -83,7 +83,6 @@ if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Install
         $return = set-vm -name $nestedGuestVmName -ProcessorCount 2 -CheckpointType Disabled -ErrorAction Stop
         $disk = get-disk -ErrorAction Stop | where {$_.FriendlyName -eq 'Msft Virtual Disk'}
         $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
-        $return = $disk | Add-VMHardDiskDrive -VMName $nestedGuestVmName -ErrorAction Stop
 
         if (!$gen) {
             Log-Info "Gen1: Adding hard drive to IDE controller" | Out-File -FilePath $logFile -Append
@@ -93,7 +92,7 @@ if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Install
             Log-Info "Gen$($gen): Adding hard drive to SCSI controller" | Out-File -FilePath $logFile -Append
             $return = $disk | Add-VMHardDiskDrive -VMName $nestedGuestVmName -ControllerType SCSI -ControllerNumber 0 -ErrorAction Stop
             Log-Info "Gen$($gen): Modifying firmware boot order (we do not need to network boot)" | Out-File -FilePath $logFile -Append
-            $return = Set-VMFirmware $nestedGuestVmName -FirstBootDevice ((Get-VMFirmware $nestedGuestVmName).BootOrder | Where-Object { $_.BootType -eq "File" })[0]
+            $return = Set-VMFirmware $nestedGuestVmName -FirstBootDevice ((Get-VMFirmware $nestedGuestVmName).BootOrder | Where-Object { $_.BootType -eq "Drive" })[0]
         }
 
         $return = $switch | Connect-VMNetworkAdapter -VMName $nestedGuestVmName -ErrorAction Stop
