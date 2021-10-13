@@ -9,7 +9,6 @@ $scriptPath = split-path -path $MyInvocation.MyCommand.Path -parent
 $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0]
 
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
-$scriptStartTime | Out-File -FilePath $logFile -Append
 $scriptStartTime | out-file -FilePath $logFile -Append
 
 $nestedGuestVmName = 'ProblemVM'
