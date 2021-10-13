@@ -10,6 +10,7 @@ $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0
 
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 $scriptStartTime | Out-File -FilePath $logFile -Append
+$scriptStartTime | out-file -FilePath $logFile -Append
 
 $nestedGuestVmName = 'ProblemVM'
 $batchFile = "$env:allusersprofile\Microsoft\Windows\Start Menu\Programs\StartUp\RunHyperVManagerAndVMConnect.cmd"
