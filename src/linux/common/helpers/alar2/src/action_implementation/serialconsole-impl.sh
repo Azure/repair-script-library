@@ -92,28 +92,33 @@ if [[ "$isSuse" == "true" ]]; then
 fi
 
 # UBUNTU PART
+# if #1
 if [[ "$isUbuntu" == "true" ]]; then
     grub_file="/etc/default/grub.d/50-cloudimg-settings.cfg"
     enable_sysreq
-
+    
+    # if #2
     if [[ -f $grub_file ]]; then
         sed -i 's/GRUB_TIMEOUT=.*/GRUB_TIMEOUT=10/' $grub_file
 	grep -Eq '^GRUB_CMDLINE_LINUX.*' $grub_file
 
+    # if #3
 	if [[ $? -eq 0  ]]; then
         	sed -i '/GRUB_CMDLINE_LINUX.*/s/"$//; s|GRUB_CMDLINE_LINUX.*|& console=tty1 console=ttyS0 earlyprintk=ttyS0"|' $grub_file
 	else
 		echo 'GRUB_CMDLINE_LINUX="console=tty1 console=ttyS0 earlyprintk=ttyS0"' >> $grub_file
-	fi
+	fi # close if#3
 
         # modify GRUB serial if required
         grep -q "GRUB_TERMINAL=serial" $grub_file
+        
+        # if#4
         if [[ $? -ne 0 ]]; then
             echo "GRUB_TERMINAL=serial" >>  $grub_file
         else
         # make a full replacement
             sed -i 's/GRUB_SERIAL_COMMAND.*/GRUB_SERIAL_COMMAND="serial --speed=9600 --unit=0 --word=8 --parity=no --stop=1"/' $grub_file
-        fi
+        fi # close if#4
     else
 
 # file does not exist
@@ -135,7 +140,7 @@ GRUB_RECORDFAIL_TIMEOUT=30
 # Wait briefly on grub prompt
 GRUB_TIMEOUT=10
 EOF
-    fi
+    fi # close if#2
     # update grub
     update-grub
-fi
+fi # close if#1
