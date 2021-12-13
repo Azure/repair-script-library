@@ -1,3 +1,5 @@
+Param([Parameter(Mandatory=$false)][string]$gen)
+
 . .\src\windows\common\setup\init.ps1
 
 Log-Info 'Running Script Enable-NestedHyperV'
@@ -70,11 +72,29 @@ if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Install
         $return = Set-DhcpServerv4OptionValue -DnsServer 168.63.129.16 -Router 192.168.0.1 -ErrorAction Stop
 
         # Create the nested guest VM
-        $return = new-vm -name $nestedGuestVmName -MemoryStartupBytes 4GB -NoVHD -BootDevice IDE -Generation 1 -ErrorAction Stop
+        if (!$gen) {
+            Log-Info 'Creating Gen1 VM with 4GB memory' | Out-File -FilePath $logFile -Append
+            $return = New-VM -Name $nestedGuestVmName -MemoryStartupBytes 4GB -NoVHD -BootDevice IDE -Generation 1 -ErrorAction Stop
+        }
+        else {
+            Log-Info "Creating Gen$($gen) VM with 4GB memory" | Out-File -FilePath $logFile -Append
+            $return = New-VM -Name $nestedGuestVmName -MemoryStartupBytes 4GB -NoVHD -Generation $gen -ErrorAction Stop
+        }
         $return = set-vm -name $nestedGuestVmName -ProcessorCount 2 -CheckpointType Disabled -ErrorAction Stop
         $disk = get-disk -ErrorAction Stop | where {$_.FriendlyName -eq 'Msft Virtual Disk'}
         $return = $disk | set-disk -IsOffline $true -ErrorAction Stop
-        $return = $disk | Add-VMHardDiskDrive -VMName $nestedGuestVmName -ErrorAction Stop
+
+        if (!$gen) {
+            Log-Info "Gen1: Adding hard drive to IDE controller" | Out-File -FilePath $logFile -Append
+            $return = $disk | Add-VMHardDiskDrive -VMName $nestedGuestVmName -ErrorAction Stop            
+        }
+        else {
+            Log-Info "Gen$($gen): Adding hard drive to SCSI controller" | Out-File -FilePath $logFile -Append
+            $return = $disk | Add-VMHardDiskDrive -VMName $nestedGuestVmName -ControllerType SCSI -ControllerNumber 0 -ErrorAction Stop
+            Log-Info "Gen$($gen): Modifying firmware boot order (we do not need to network boot)" | Out-File -FilePath $logFile -Append
+            $return = Set-VMFirmware $nestedGuestVmName -FirstBootDevice ((Get-VMFirmware $nestedGuestVmName).BootOrder | Where-Object { $_.BootType -eq "Drive" })[0]
+        }
+
         $return = $switch | Connect-VMNetworkAdapter -VMName $nestedGuestVmName -ErrorAction Stop
         $return = start-vm -Name $nestedGuestVmName -ErrorAction Stop
         $nestedGuestVmState = (get-vm -Name $nestedGuestVmName -ErrorAction Stop).State

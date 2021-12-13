@@ -25,7 +25,7 @@ if [[ $isRedHat == "true" ]]; then
                 if [[ $(grep -qe 'VERSION_ID=\"7.\?[1-9]\?\"' /etc/os-release) ]]; then
                         grub2-mkconfig -o /boot/grub2/grub.cfg
                 fi
-                
+
                 # Exception for RedHat 8.0 i.e sku RedHat:RHEL-HA:8.0:8.0.2020021914
                 # here we don't have to run the patch operation
                 if [[ $(grep -qe 'VERSION_ID="8\.0"' /etc/os-release) -eq 0 ]]; then
@@ -90,3 +90,4 @@ fi
 
 # For reference --> https://www.linuxsecrets.com/2815-grub2-submenu-change-boot-order
 
+exit 0
