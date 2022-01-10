@@ -1,6 +1,8 @@
 #!/bin/bash
 . ./src/linux/common/setup/init.sh
 
+# libclang needs to be installed as well, due to a new dependency
+apt-get install libclang-dev -y
 Log-Output "Starting the recovery"
 cd ./src/linux/common/helpers/alar2
 /root/.cargo/bin/cargo build -q --release 
