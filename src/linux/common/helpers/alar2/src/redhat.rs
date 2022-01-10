@@ -1,5 +1,4 @@
 #![allow(non_snake_case)]
-use std::{fs, process};
 
 use crate::ade;
 use crate::constants;
@@ -9,12 +8,11 @@ use crate::mount;
 
 use cmd_lib::{run_cmd, run_fun};
 
-
-pub(crate) fn do_redhat_lvm_or(partition_info: &[String], distro: &mut distro::Distro) {
+pub(crate) fn do_redhat_lvm_or(partition_info: Vec<String>, distro: &mut distro::Distro) {
     let mut contains_lvm_partition: bool = false;
 
     for partition in partition_info.iter() {
-        if partition.contains("lvm") {
+        if partition.contains("8E00") {
             contains_lvm_partition = true;
         }
     }
@@ -28,42 +26,38 @@ pub(crate) fn do_redhat_lvm_or(partition_info: &[String], distro: &mut distro::D
     }
 }
 
-pub(crate) fn do_redhat6_or_7(partition_info: &[String], mut distro: &mut distro::Distro) {
+pub(crate) fn do_redhat6_or_7(partition_info: Vec<String>, mut distro: &mut distro::Distro) {
+    // this function does handle the condition if only two partitions are available
     if !distro.is_ade {
-        for partition in partition_info {
-            if helper::get_partition_number_detail(partition) == 1 {
-                distro.boot_part.boot_part_number = 1;
-                distro.boot_part.boot_part_fs = helper::get_partition_filesystem_detail(partition);
-            }
-
-            if helper::get_partition_number_detail(partition) == 2 {
-                distro.rescue_root.root_part_number = 2;
-                distro.rescue_root.root_part_fs =
-                    helper::get_partition_filesystem_detail(partition);
-            }
+        if let Some(root_info) = partition_info.iter().find(|x| x.contains("GiB")) {
+            distro.rescue_root.root_part_fs = helper::get_partition_filesystem_detail(root_info);
+            distro.rescue_root.root_part_number = helper::get_partition_number_detail(root_info);
+            distro.rescue_root.root_part_path = format!(
+                "{}{}",
+                helper::read_link(constants::RESCUE_DISK),
+                distro.rescue_root.root_part_number
+            );
         }
 
-        distro.rescue_root.root_part_path = helper::read_link(
-            format!(
+        if let Some(boot_info) = partition_info.iter().find(|x| x.contains("MiB")) {
+            distro.boot_part.boot_part_fs = helper::get_partition_filesystem_detail(boot_info);
+            distro.boot_part.boot_part_number = helper::get_partition_number_detail(boot_info);
+            distro.boot_part.boot_part_path = format!(
                 "{}{}",
-                constants::LUN_PART_PATH,
-                distro.rescue_root.root_part_number
-            )
-            .as_str(),
+                helper::read_link(constants::RESCUE_DISK),
+                distro.boot_part.boot_part_number
+            );
+        }
+
+        distro.boot_part.boot_part_path = format!(
+            "{}{}",
+            helper::read_link(constants::RESCUE_DISK),
+            distro.boot_part.boot_part_number
         );
 
         helper::fsck_partition(
             distro.rescue_root.root_part_path.as_str(),
             distro.rescue_root.root_part_fs.as_str(),
-        );
-
-        distro.boot_part.boot_part_path = helper::read_link(
-            format!(
-                "{}{}",
-                constants::LUN_PART_PATH,
-                distro.boot_part.boot_part_number
-            )
-            .as_str(),
         );
 
         helper::fsck_partition(
@@ -74,11 +68,11 @@ pub(crate) fn do_redhat6_or_7(partition_info: &[String], mut distro: &mut distro
         verify_redhat_nolvm(distro);
     } else {
         // ADE part
-        ade::do_redhat6_or_7_ade( distro);
+        ade::do_redhat6_or_7_ade(partition_info, distro);
     }
 }
 
-fn do_redhat_nolvm(partition_info: &[String], mut distro: &mut distro::Distro) {
+fn do_redhat_nolvm(mut partition_info: Vec<String>, mut distro: &mut distro::Distro) {
     if !distro.is_ade {
         // 4 partitions with no LVM we find on an 'CentOS Linux release 7.7.1908' for instance
         /*
@@ -94,30 +88,39 @@ fn do_redhat_nolvm(partition_info: &[String], mut distro: &mut distro::Distro) {
         );
 
         distro.is_lvm = false;
-
-        // Unfortunately we need to work with hardcoded values as there exist no label information
-        distro.boot_part.boot_part_fs = "xfs".to_string();
-        distro.boot_part.boot_part_number = 1;
-
-        distro.rescue_root.root_part_fs = "xfs".to_string();
-        distro.rescue_root.root_part_number = 2;
-
-        //For EFI partition we use normal logic in order to setup the details correct
-        for partition in partition_info.iter() {
-            if partition.contains("EFI") {
-                helper::set_efi_part_number_and_fs(&mut distro, &partition);
-            }
+        if let Some(uefi) = partition_info.iter().by_ref().find(|x| x.contains("EF00")) {
+            helper::set_efi_part_number_and_fs(distro, uefi);
+            helper::set_efi_part_path(distro);
         }
 
-        // In the next steps we have to set the partition path correct and do a fsck on them
+        partition_info.retain(|x| !(x.contains("EF00") || x.contains("EF02")));
+        //remove the UEFI the bios_boot partition. We have two partitions left
 
-        distro.rescue_root.root_part_path = helper::read_link(
-            format!(
+        // We need to determine what part is the root and what part is the boot one.
+        if let Some(root_info) = partition_info.iter().find(|x| x.contains("GiB")) {
+            distro.rescue_root.root_part_fs = helper::get_partition_filesystem_detail(root_info);
+            distro.rescue_root.root_part_number = helper::get_partition_number_detail(root_info);
+            distro.rescue_root.root_part_path = format!(
                 "{}{}",
-                constants::LUN_PART_PATH,
+                helper::read_link(constants::RESCUE_DISK),
                 distro.rescue_root.root_part_number
-            )
-            .as_str(),
+            );
+        }
+
+        if let Some(boot_info) = partition_info.iter().find(|x| x.contains("MiB")) {
+            distro.boot_part.boot_part_fs = helper::get_partition_filesystem_detail(boot_info);
+            distro.boot_part.boot_part_number = helper::get_partition_number_detail(boot_info);
+            distro.boot_part.boot_part_path = format!(
+                "{}{}",
+                helper::read_link(constants::RESCUE_DISK),
+                distro.boot_part.boot_part_number
+            );
+        }
+
+        distro.boot_part.boot_part_path = format!(
+            "{}{}",
+            helper::read_link(constants::RESCUE_DISK),
+            distro.boot_part.boot_part_number
         );
 
         helper::fsck_partition(
@@ -125,27 +128,15 @@ fn do_redhat_nolvm(partition_info: &[String], mut distro: &mut distro::Distro) {
             distro.rescue_root.root_part_fs.as_str(),
         );
 
-        distro.boot_part.boot_part_path = helper::read_link(
-            format!(
-                "{}{}",
-                constants::LUN_PART_PATH,
-                distro.boot_part.boot_part_number
-            )
-            .as_str(),
-        );
-
         helper::fsck_partition(
             distro.boot_part.boot_part_path.as_str(),
             distro.boot_part.boot_part_fs.as_str(),
         );
 
-        helper::set_efi_part_path(&mut distro);
-
         helper::fsck_partition(
-            helper::get_efi_part_path(&distro).as_str(),
-            helper::get_efi_part_fs(&distro).as_str(),
+            helper::get_efi_part_path(distro).as_str(),
+            helper::get_efi_part_fs(distro).as_str(),
         );
-
         verify_redhat_nolvm(distro);
     } else {
         // This an ADE enabled OS
@@ -159,7 +150,7 @@ fn do_redhat_nolvm(partition_info: &[String], mut distro: &mut distro::Distro) {
     }
 }
 
-fn do_redhat_lvm(partition_info: &[String], mut distro: &mut distro::Distro) {
+fn do_redhat_lvm(mut partition_info: Vec<String>, mut distro: &mut distro::Distro) {
     helper::log_info("This is a recent RedHat or CentOS image with 4 partitions and LVM signature");
     distro.is_lvm = true;
 
@@ -170,40 +161,37 @@ fn do_redhat_lvm(partition_info: &[String], mut distro: &mut distro::Distro) {
     }
 
     if !distro.is_ade {
-        // TMP is required for the macro run_fun! or run_cmd!
-        let TMP = constants::PARTITION_TMP;
-
-        for partition in partition_info {
-            let _ = run_cmd!(echo $partition > $TMP);
-            if let Ok(name) = run_fun!(grep -s -v EFI $TMP | grep -v lvm | grep -v bios) {
-                helper::log_debug(&name);
-                distro.boot_part.boot_part_fs =
-                    helper::get_partition_filesystem_detail(&name.as_str());
-                distro.boot_part.boot_part_number =
-                    helper::get_partition_number_detail(&name.as_str());
-            }
-
-            if let Ok(name) = run_fun!(grep -s lvm $TMP) {
-                helper::log_debug(&name);
-                distro.rescue_root.root_part_fs =
-                    helper::get_partition_filesystem_detail(&name.as_str());
-                distro.rescue_root.root_part_number =
-                    helper::get_partition_number_detail(&name.as_str());
-            }
-
-            if partition.contains("EFI") {
-                helper::log_debug(format!("UEFI partition is '{}'", &partition).as_str());
-                helper::set_efi_part_number_and_fs(&mut distro, &partition);
-            }
+        if let Some(lvm_info) = partition_info.iter().find(|x| x.contains("8E00")) {
+            distro.rescue_root.root_part_fs = helper::get_partition_filesystem_detail(lvm_info);
+            distro.rescue_root.root_part_number = helper::get_partition_number_detail(lvm_info);
+            distro.rescue_root.root_part_path = format!(
+                "{}{}",
+                helper::read_link(constants::RESCUE_DISK),
+                distro.rescue_root.root_part_number
+            );
         }
 
-        distro.rescue_root.root_part_path = helper::read_link(
-            format!(
-                "{}{}",
-                constants::LUN_PART_PATH,
-                distro.rescue_root.root_part_number
-            )
-            .as_str(),
+        if let Some(uefi) = partition_info.iter().by_ref().find(|x| x.contains("EF00")) {
+            helper::set_efi_part_number_and_fs(distro, uefi);
+            helper::set_efi_part_path(distro);
+        }
+
+        partition_info
+            .retain(|x| !(x.contains("EF00") || x.contains("EF02") || x.contains("8E00")));
+        //remove the UEFI the bios_boot and the root partition to get the boot partition only
+
+        distro.boot_part.boot_part_fs = helper::get_partition_filesystem_detail(&partition_info[0]);
+        distro.boot_part.boot_part_number = helper::get_partition_number_detail(&partition_info[0]);
+        distro.boot_part.boot_part_path = format!(
+            "{}{}",
+            helper::read_link(constants::RESCUE_DISK),
+            distro.boot_part.boot_part_number
+        );
+
+        distro.boot_part.boot_part_path = format!(
+            "{}{}",
+            helper::read_link(constants::RESCUE_DISK),
+            distro.boot_part.boot_part_number
         );
 
         helper::fsck_partition(
@@ -211,25 +199,14 @@ fn do_redhat_lvm(partition_info: &[String], mut distro: &mut distro::Distro) {
             distro.rescue_root.root_part_fs.as_str(),
         );
 
-        distro.boot_part.boot_part_path = helper::read_link(
-            format!(
-                "{}{}",
-                constants::LUN_PART_PATH,
-                distro.boot_part.boot_part_number
-            )
-            .as_str(),
-        );
-
         helper::fsck_partition(
             distro.boot_part.boot_part_path.as_str(),
             distro.boot_part.boot_part_fs.as_str(),
         );
 
-        helper::set_efi_part_path(&mut distro);
-
         helper::fsck_partition(
-            helper::get_efi_part_path(&distro).as_str(),
-            helper::get_efi_part_fs(&distro).as_str(),
+            helper::get_efi_part_path(distro).as_str(),
+            helper::get_efi_part_fs(distro).as_str(),
         );
 
         // Set the path details for later usage
@@ -237,6 +214,7 @@ fn do_redhat_lvm(partition_info: &[String], mut distro: &mut distro::Distro) {
         distro.lvm_details.lvm_usr_part = lvm_path_helper("usrlv");
         distro.lvm_details.lvm_var_part = lvm_path_helper("varlv");
 
+        helper::log_info(&format!("LVM Details '{:?}'", &distro.lvm_details));
         verify_redhat_lvm(distro);
     } else {
         // Ade part
@@ -270,6 +248,12 @@ pub(crate) fn verify_redhat_nolvm(distro: &mut distro::Distro) {
 }
 
 pub(crate) fn verify_redhat_lvm(distro: &mut distro::Distro) {
+    if let Err(e) = mount::mkdir_assert() {
+        panic!(
+            "Creating assert directory is not possible : {}. ALAR is not able to proceed further",
+            e
+        );
+    }
     mount::mount_path_assert(distro.lvm_details.lvm_root_part.as_str());
 
     set_redhat_kind(distro);
@@ -278,22 +262,11 @@ pub(crate) fn verify_redhat_lvm(distro: &mut distro::Distro) {
 }
 
 fn set_redhat_kind(mut distro: &mut distro::Distro) {
-    let mut pretty_name = helper::get_pretty_name(constants::OS_RELEASE);
-    if pretty_name.is_empty() {
-        // if len is 0 then it points to a RedHat or CentOS 6 distro
-        // let us read the correct file instead
-        match fs::read_to_string(constants::REDHAT_RELEASE) {
-            Ok(value) => pretty_name = value,
-            Err(_) => {
-                helper::log_error( "It is not possible to determine the OS kind. ALAR is not able to proceed further");
-                process::exit(1);
-            }
-        }
-        if pretty_name.contains("CentOS") || pretty_name.contains("Red Hat") {
-            helper::log_info(format!("Pretty Name is : {}", &pretty_name).as_str());
-            distro.kind = distro::DistroKind::RedHatCentOS6;
-        }
-    } else if pretty_name.contains("CentOS") || pretty_name.contains("Red Hat") {
+    let pretty_name = helper::get_pretty_name(constants::OS_RELEASE);
+    if pretty_name.contains("6.") {
+        helper::log_info(format!("Pretty Name is : {}", &pretty_name).as_str());
+        distro.kind = distro::DistroKind::RedHatCentOS6;
+    } else {
         helper::log_info(format!("Pretty Name is : {}", &pretty_name).as_str());
         distro.kind = distro::DistroKind::RedHatCentOS;
     }
@@ -309,21 +282,10 @@ pub(crate) fn lvm_path_helper(lvname: &str) -> String {
     lvpath
 }
 
-fn _lvm_get_filesystem(lvpath: &str) -> String {
-    let mut filesystem = "".to_string();
-    if let Ok(value) = run_fun!(parted -m $lvpath print | grep -E "^ ?[0-9]{1,2} *") {
-            if let Some(path) = value.split(':').nth(4) {
-                filesystem = path.to_string();
-            }
-    }
-    filesystem
-}
-
 pub(crate) fn do_centos_single_partition(mut distro: &mut distro::Distro) {
     // It is safe to use hardcoded values
     distro.rescue_root.root_part_path =
-        helper::read_link(format!("{}{}", constants::LUN_PART_PATH, 1).as_str());
-
+        format!("{}{}", helper::read_link(constants::RESCUE_DISK), 1);
     helper::fsck_partition(
         distro.rescue_root.root_part_path.as_str(),
         distro.rescue_root.root_part_fs.as_str(),
