@@ -1,14 +1,13 @@
+use crate::cli;
 use crate::constants;
 use crate::distro;
 use crate::distro::DistroKind;
 use crate::helper;
 use crate::mount;
-use crate::cli;
 use crate::standalone;
 
 use fs_extra::dir;
 use std::{env, fs, io, process};
-// use std::os::unix::fs::symlink as softlink;
 
 pub(crate) fn ubuntu_mount(distro: &distro::Distro) {
     // We have to verify also whether we have old Ubuntus/Debian with one partition only
@@ -23,12 +22,12 @@ pub(crate) fn ubuntu_mount(distro: &distro::Distro) {
 
     let mount_option: Option<&str>;
     if distro.efi_part != distro::EfiPartT::NoEFI {
-        if helper::get_efi_part_fs(&distro) == "xfs" {
+        if helper::get_efi_part_fs(distro) == "xfs" {
             mount_option = Some("nouuid");
         } else {
             mount_option = None;
         }
-        mount::mount_efi_on_rescue_efi(helper::get_efi_part_path(&distro).as_str(), mount_option);
+        mount::mount_efi_on_rescue_efi(helper::get_efi_part_path(distro).as_str(), mount_option);
     }
 
     mount_support_filesystem();
@@ -60,7 +59,7 @@ pub(crate) fn suse_umount(distro: &distro::Distro) {
 }
 
 pub(crate) fn redhat_mount(distro: &distro::Distro) {
-    if distro.is_lvm  {
+    if distro.is_lvm {
         let mut mount_option: Option<&str>;
         mount::mount_root_on_rescue_root(distro.lvm_details.lvm_root_part.as_str(), None);
         mount::mount_usr_on_rescue_root_usr(distro.lvm_details.lvm_usr_part.as_str());
@@ -73,12 +72,12 @@ pub(crate) fn redhat_mount(distro: &distro::Distro) {
         }
         mount::mount_boot_on_rescue_boot(distro.boot_part.boot_part_path.as_str(), mount_option);
 
-        if helper::get_efi_part_fs(&distro) == "xfs" {
+        if helper::get_efi_part_fs(distro) == "xfs" {
             mount_option = Some("nouuid");
         } else {
             mount_option = None;
         }
-        mount::mount_efi_on_rescue_efi(helper::get_efi_part_path(&distro).as_str(), mount_option);
+        mount::mount_efi_on_rescue_efi(helper::get_efi_part_path(distro).as_str(), mount_option);
 
         mount_support_filesystem();
     } else {
@@ -98,16 +97,24 @@ pub(crate) fn redhat_mount(distro: &distro::Distro) {
             mount_option = None;
         }
 
-        mount::mount_boot_on_rescue_boot(distro.boot_part.boot_part_path.as_str(), mount_option);
+        // if no boot partition is available we skip this step
+        // this is required if we have the special condition that a RedHat RAW image does only have 3 partitons
+        // root, EF00 and EF02
+        if distro.boot_part.boot_part_number != 0 {
+            mount::mount_boot_on_rescue_boot(
+                distro.boot_part.boot_part_path.as_str(),
+                mount_option,
+            );
+        }
 
         if distro.efi_part != distro::EfiPartT::NoEFI {
-            if helper::get_efi_part_fs(&distro) == "xfs" {
+            if helper::get_efi_part_fs(distro) == "xfs" {
                 mount_option = Some("nouuid");
             } else {
                 mount_option = None;
             }
             mount::mount_efi_on_rescue_efi(
-                helper::get_efi_part_path(&distro).as_str(),
+                helper::get_efi_part_path(distro).as_str(),
                 mount_option,
             );
         }
@@ -134,7 +141,7 @@ pub(crate) fn redhat6_umount(distro: &distro::Distro) {
 }
 
 pub(crate) fn redhat_umount(distro: &distro::Distro) {
-    if distro.is_lvm  {
+    if distro.is_lvm {
         umount_support_filesystem();
         mount::umount(constants::RESCUE_ROOT_BOOT_EFI);
         mount::umount(constants::RESCUE_ROOT_BOOT);
@@ -146,7 +153,13 @@ pub(crate) fn redhat_umount(distro: &distro::Distro) {
         if distro.efi_part != distro::EfiPartT::NoEFI {
             mount::umount(constants::RESCUE_ROOT_BOOT_EFI);
         }
-        mount::umount(constants::RESCUE_ROOT_BOOT);
+
+        // if no boot partition is available we skip this step
+        // this is required if we have the special condition that a RedHat RAW image does only have 3 partitons
+        // root, EF00 and EF02
+        if distro.boot_part.boot_part_number != 0 {
+            mount::umount(constants::RESCUE_ROOT_BOOT);
+        }
         mount::umount(constants::RESCUE_ROOT);
     }
 }
@@ -179,26 +192,25 @@ fn mkdir_support_filesystems() -> io::Result<()> {
     Ok(())
 }
 
-
 pub(crate) fn distro_mount(distro: &distro::Distro, cli_info: &cli::CliInfo) {
     match distro.kind {
-        DistroKind::Debian | DistroKind::Ubuntu => ubuntu_mount(&distro),
-        DistroKind::Suse => suse_mount(&distro),
-        DistroKind::RedHatCentOS => redhat_mount(&distro),
-        DistroKind::RedHatCentOS6 => redhat6_mount(&distro),
+        DistroKind::Debian | DistroKind::Ubuntu => ubuntu_mount(distro),
+        DistroKind::Suse => suse_mount(distro),
+        DistroKind::RedHatCentOS => redhat_mount(distro),
+        DistroKind::RedHatCentOS6 => redhat6_mount(distro),
         DistroKind::Undefined => {} // Nothing to do here we have covered this condition already
     }
-    // Also copy the recovery scripts to /tmp in order to make them available for the chroot 
+    // Also copy the recovery scripts to /tmp in order to make them available for the chroot
     // operation we do later
     copy_actions_totmp(distro, cli_info);
 }
 
 pub(crate) fn distro_umount(distro: &distro::Distro) {
     match distro.kind {
-        DistroKind::Debian | DistroKind::Ubuntu => ubuntu_umount(&distro),
-        DistroKind::Suse => suse_umount(&distro),
-        DistroKind::RedHatCentOS => redhat_umount(&distro),
-        DistroKind::RedHatCentOS6 => redhat6_umount(&distro),
+        DistroKind::Debian | DistroKind::Ubuntu => ubuntu_umount(distro),
+        DistroKind::Suse => suse_umount(distro),
+        DistroKind::RedHatCentOS => redhat_umount(distro),
+        DistroKind::RedHatCentOS6 => redhat6_umount(distro),
         DistroKind::Undefined => {} // Nothing to do here we have covered this condition already
     }
 }
@@ -208,33 +220,35 @@ fn copy_actions_totmp(distro: &distro::Distro, cli_info: &cli::CliInfo) {
     // This is the directory chroot can access
 
     if let Err(err) = fs::remove_dir_all(constants::ACTION_IMPL_DIR) {
-        println!("Directory {} can not be removed : '{}'", constants::ACTION_IMPL_DIR, err );
-        //distro_umount(distro);
-        //process::exit(1);
+        println!(
+            "Directory {} can not be removed : '{}'",
+            constants::ACTION_IMPL_DIR,
+            err
+        );
     }
     if !cli_info.standalone {
-    let mut options = dir::CopyOptions::new(); //Initialize default values for CopyOptions
-    options.skip_exist = true;
+        let mut options = dir::CopyOptions::new(); //Initialize default values for CopyOptions
+        options.skip_exist = true;
 
-    match env::current_dir() {
-          Ok(cd) => println!("The current dir is : {}", cd.display() ),
-          Err(e) => println!("Error : {}", e),
-      }
+        match env::current_dir() {
+            Ok(cd) => println!("The current dir is : {}", cd.display()),
+            Err(e) => println!("Error : {}", e),
+        }
 
-    // base directory already set correct by linux-alar2.sh
-    match dir::copy("src/action_implementation", "/tmp", &options) {
-        Ok(_) => {},
-        Err(e) => {
-            println!("Copy operation for action_implementation directory failed. ALAR needs to stop: {}", e); 
-            distro_umount(distro);
-            process::exit(1);
+        // base directory already set correct by linux-alar2.sh
+        match dir::copy("src/action_implementation", "/tmp", &options) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Copy operation for action_implementation directory failed. ALAR needs to stop: {}", e);
+                distro_umount(distro);
+                process::exit(1);
             }
-    }
-
-    
-} else if let Err(e) = standalone::download_action_scripts(cli_info) {
+        }
+    } else if let Err(e) = standalone::download_action_scripts(cli_info) {
         distro_umount(distro);
-        panic!("action scripts are not able to be copied or downloadable : '{}'", e); 
-}
-    
+        panic!(
+            "action scripts are not able to be copied or downloadable : '{}'",
+            e
+        );
+    }
 }

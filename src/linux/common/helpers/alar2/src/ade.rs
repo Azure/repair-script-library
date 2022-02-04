@@ -73,35 +73,31 @@ pub(crate) fn is_ade_enabled() -> bool {
     cmd_lib::run_cmd!(lsblk | grep -q osencrypt).is_ok()
 }
 
-//pub(crate) fn do_ubuntu_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
-pub(crate) fn do_ubuntu_ade(partition_info: &[String], mut distro: &mut distro::Distro) {
+pub(crate) fn do_ubuntu_ade(mut partition_info: Vec<String>, mut distro: &mut distro::Distro) {
     helper::log_info("This is a recent Ubuntu 16.x/18.x with ADE enabled");
 
-    // Only get the EFI partition
-    // The root part we set manually later as we have a crypt filesystem on the usual root partition
-    for partition in partition_info {
-        if partition.contains("boot") {
-            helper::set_efi_part_number_and_fs(&mut distro, partition);
-        }
-    }
-    helper::set_efi_part_path(&mut distro);
+    // Get EFI partition
+    partition_info.retain(|x| x.contains("EF00")); //Get the UEFI partition
+    helper::set_efi_part_number_and_fs(distro, &partition_info[0]);
+    helper::set_efi_part_path(distro);
+    helper::fsck_partition(
+        helper::get_efi_part_path(distro).as_str(),
+        helper::get_efi_part_fs(distro).as_str(),
+    );
 
     // Set the root_part_path manually
     distro.rescue_root.root_part_path = constants::OSENCRYPT_PATH.to_string();
 
-    set_root_part_fs(&mut distro);
+    set_root_part_fs(distro);
 
     // Due to the changed partition layout on an ADE enabled OS we have to set the boot partiton details
     // We use hardcoded values in this case
     distro.boot_part.boot_part_fs = "ext2".to_string();
     distro.boot_part.boot_part_number = 2;
-    distro.boot_part.boot_part_path = helper::read_link(
-        format!(
-            "{}{}",
-            constants::LUN_PART_PATH,
-            distro.boot_part.boot_part_number
-        )
-        .as_str(),
+    distro.boot_part.boot_part_path = format!(
+        "{}{}",
+        helper::read_link(constants::RESCUE_DISK),
+        distro.boot_part.boot_part_number
     );
 
     // Due to the fact that we have already mounted filesystems for ADE on a repair-vm
@@ -112,13 +108,12 @@ pub(crate) fn do_ubuntu_ade(partition_info: &[String], mut distro: &mut distro::
     ubuntu::verify_ubuntu(distro);
 }
 
-//pub(crate) fn do_redhat_nolvm_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
-pub(crate) fn do_redhat_nolvm_ade(partition_info: &[String], mut distro: &mut distro::Distro) {
+pub(crate) fn do_redhat_nolvm_ade(partition_info: Vec<String>, mut distro: &mut distro::Distro) {
     // Unfortunately we need to work with hardcoded values as there exist no label information
     distro.boot_part.boot_part_fs = "xfs".to_string();
     distro.boot_part.boot_part_number = 1;
 
-    set_root_part_fs(&mut distro);
+    set_root_part_fs(distro);
     distro.rescue_root.root_part_number = 2;
 
     // Set the root_part_path manually for ADE
@@ -127,20 +122,17 @@ pub(crate) fn do_redhat_nolvm_ade(partition_info: &[String], mut distro: &mut di
     //For EFI partition we use normal logic in order to setup the details correct
     for partition in partition_info.iter() {
         if partition.contains("EFI") {
-            helper::set_efi_part_number_and_fs(&mut distro, &partition);
+            helper::set_efi_part_number_and_fs(distro, partition);
         }
     }
 
-    distro.boot_part.boot_part_path = helper::read_link(
-        format!(
-            "{}{}",
-            constants::LUN_PART_PATH,
-            distro.boot_part.boot_part_number
-        )
-        .as_str(),
+    distro.boot_part.boot_part_path = format!(
+        "{}{}",
+        helper::read_link(constants::RESCUE_DISK),
+        distro.boot_part.boot_part_number
     );
 
-    helper::set_efi_part_path(&mut distro);
+    helper::set_efi_part_path(distro);
 
     //Unmount the investigation path, otherwise the fsck isn't possible
     umount_investigations(distro);
@@ -149,26 +141,30 @@ pub(crate) fn do_redhat_nolvm_ade(partition_info: &[String], mut distro: &mut di
     redhat::verify_redhat_nolvm(distro);
 }
 
-//pub(crate) fn do_redhat6_or_7_ade(partition_info: &Vec<String>, mut distro: &mut distro::Distro) {
-pub(crate) fn do_redhat6_or_7_ade(mut distro: &mut distro::Distro) {
-// Unfortunately we need to work with hardcoded values as there exist no label information
-    distro.boot_part.boot_part_fs = "xfs".to_string();
-    distro.boot_part.boot_part_number = 1;
+pub(crate) fn do_redhat6_or_7_ade(partition_info: Vec<String>, mut distro: &mut distro::Distro) {
+    println!("6_7 info : {:?}", &partition_info);
+    if let Some(root_info) = partition_info.iter().find(|x| x.contains("GiB")) {
+        distro.rescue_root.root_part_number = helper::get_partition_number_detail(root_info);
+        distro.rescue_root.root_part_path = format!(
+            "{}{}",
+            helper::read_link(constants::RESCUE_DISK),
+            distro.rescue_root.root_part_number
+        );
+    }
 
-    set_root_part_fs(&mut distro);
-    distro.rescue_root.root_part_number = 2;
+    if let Some(boot_info) = partition_info.iter().find(|x| x.contains("MiB")) {
+        distro.boot_part.boot_part_fs = helper::get_partition_filesystem_detail(boot_info);
+        distro.boot_part.boot_part_number = helper::get_partition_number_detail(boot_info);
+        distro.boot_part.boot_part_path = format!(
+            "{}{}",
+            helper::read_link(constants::RESCUE_DISK),
+            distro.boot_part.boot_part_number
+        );
+    }
 
     // Set the root_part_path manually for ADE
     distro.rescue_root.root_part_path = constants::OSENCRYPT_PATH.to_string();
-
-    distro.boot_part.boot_part_path = helper::read_link(
-        format!(
-            "{}{}",
-            constants::LUN_PART_PATH,
-            distro.boot_part.boot_part_number
-        )
-        .as_str(),
-    );
+    set_root_part_fs(distro);
 
     //Unmount the investigation path, otherwise the fsck isn't possible
     umount_investigations(distro);
@@ -177,7 +173,7 @@ pub(crate) fn do_redhat6_or_7_ade(mut distro: &mut distro::Distro) {
     redhat::verify_redhat_nolvm(distro);
 }
 
-pub(crate) fn do_redhat_lvm_ade(partition_info: &[String], mut distro: &mut distro::Distro) {
+pub(crate) fn do_redhat_lvm_ade(mut partition_info: Vec<String>, mut distro: &mut distro::Distro) {
     /*
      Unfortunately we need to work with hardcoded values as there exist no label information
 
@@ -188,32 +184,31 @@ pub(crate) fn do_redhat_lvm_ade(partition_info: &[String], mut distro: &mut dist
     4      1052MB  68.7GB  67.7GB                                     lvm
     */
 
-    distro.boot_part.boot_part_fs = "xfs".to_string();
-    distro.boot_part.boot_part_number = 2;
+    // Get the right partitions
+    // Get the boot partition first
+    let mut partition_info_copy = partition_info.to_owned(); // we need a copy for later usage
+    partition_info.retain(|x| !(x.contains("EF00") || x.contains("EF02") || x.contains("8E00"))); //remove the UEFI, the bios_boot partition
 
-    set_root_part_fs(&mut distro);
+    distro.boot_part.boot_part_fs = helper::get_partition_filesystem_detail(&partition_info[0]);
+    distro.boot_part.boot_part_number = helper::get_partition_number_detail(&partition_info[0]);
+
+    set_root_part_fs(distro);
     distro.rescue_root.root_part_number = 4;
 
     // Set the root_part_path manually for ADE
     distro.rescue_root.root_part_path = constants::OSENCRYPT_PATH.to_string();
 
     //For EFI partition we use normal logic in order to setup the details correct
-    for partition in partition_info.iter() {
-        if partition.contains("EFI") {
-            helper::set_efi_part_number_and_fs(&mut distro, &partition);
-        }
-    }
+    partition_info_copy.retain(|x| x.contains("EF00")); //Get the UEFI partition only
+    helper::set_efi_part_number_and_fs(distro, &partition_info_copy[0]);
 
-    distro.boot_part.boot_part_path = helper::read_link(
-        format!(
-            "{}{}",
-            constants::LUN_PART_PATH,
-            distro.boot_part.boot_part_number
-        )
-        .as_str(),
+    distro.boot_part.boot_part_path = format!(
+        "{}{}",
+        helper::read_link(constants::RESCUE_DISK),
+        distro.boot_part.boot_part_number
     );
 
-    helper::set_efi_part_path(&mut distro);
+    helper::set_efi_part_path(distro);
 
     // LVM mounts need to be removed. We need to remount them later
     umount_investigations_lvm();
@@ -225,7 +220,6 @@ pub(crate) fn do_redhat_lvm_ade(partition_info: &[String], mut distro: &mut dist
     distro.lvm_details.lvm_root_part = redhat::lvm_path_helper("rootlv");
     distro.lvm_details.lvm_usr_part = redhat::lvm_path_helper("usrlv");
     distro.lvm_details.lvm_var_part = redhat::lvm_path_helper("varlv");
-
 
     redhat::verify_redhat_lvm(distro);
 }
@@ -242,24 +236,28 @@ fn fsck_partitions(distro: &distro::Distro) {
     );
 
     helper::fsck_partition(
-        helper::get_efi_part_path(&distro).as_str(),
-        helper::get_efi_part_fs(&distro).as_str(),
+        helper::get_efi_part_path(distro).as_str(),
+        helper::get_efi_part_fs(distro).as_str(),
     );
 }
 
 fn umount_investigations(distro: &distro::Distro) {
     // umount EFI
-    mount::umount(helper::get_ade_mounpoint(helper::get_efi_part_path(distro).as_str()).as_str());
-
+    if helper::has_efi_part(distro) {
+        mount::umount(
+            helper::get_ade_mounpoint(helper::get_efi_part_path(distro).as_str()).as_str(),
+        );
+    }
     // umount boot
     mount::umount(helper::get_ade_mounpoint(distro.boot_part.boot_part_path.as_str()).as_str());
 
     // umount osencrypt
     if !distro.is_lvm {
         //  If it is LVM we have already unmounted the '/investigationroot'
-        mount::umount(helper::get_ade_mounpoint(distro.rescue_root.root_part_path.as_str()).as_str());
-    } 
-    
+        mount::umount(
+            helper::get_ade_mounpoint(distro.rescue_root.root_part_path.as_str()).as_str(),
+        );
+    }
 }
 
 fn umount_investigations_lvm() {

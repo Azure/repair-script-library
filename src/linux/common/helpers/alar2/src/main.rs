@@ -11,9 +11,8 @@ mod standalone;
 mod suse;
 mod ubuntu;
 
-use std::{
-    process,
-};
+use std::process;
+
 
 fn main() {
     // First verify we have the right amount of information to operate
@@ -22,8 +21,10 @@ fn main() {
     // At first we need to verify the distro we have to work with
     // the Distro struct does contain then all of the required information
     let distro = distro::Distro::new();
-    //eprintln!("{:?}", distro);
+    eprintln!("{:?}", distro);
 
+    
+   
     // Do we have a valid distro or not?
 
     if distro.kind == distro::DistroKind::Undefined {
@@ -57,19 +58,33 @@ fn main() {
     for action_name in cli_info.actions.split(',') {
         match action::is_action_available(action_name) {
             // Do the action
-            Ok( _is @ true) => {
-                match action::run_repair_script(&distro, action_name) {
-                    Ok(_) => is_action_error = false,
-                    Err(e) => {helper::log_error(format!("Action {} raised an error: '{}'", &action_name, e).as_str()); is_action_error=true;}
+            Ok(_is @ true) => match action::run_repair_script(&distro, action_name) {
+                Ok(_) => is_action_error = false,
+                Err(e) => {
+                    helper::log_error(
+                        format!("Action {} raised an error: '{}'", &action_name, e).as_str(),
+                    );
+                    is_action_error = true;
                 }
+            },
+            Ok(_is @ false) => {
+                helper::log_error(format!("Action '{}' is not available", action_name).as_str());
+                is_action_error = true;
             }
-            Ok( _is @ false) => {helper::log_error(format!("Action '{}' is not available", action_name).as_str()); is_action_error=true; }
-            Err(e) => { helper::log_error(format!("There was an error raised while verifying the action: '{}'", e).as_str()); is_action_error=true; }
+            Err(e) => {
+                helper::log_error(
+                    format!(
+                        "There was an error raised while verifying the action: '{}'",
+                        e
+                    )
+                    .as_str(),
+                );
+                is_action_error = true;
+            }
         }
     }
 
     // Umount everything again
-
 
     prepare_action::distro_umount(&distro);
 

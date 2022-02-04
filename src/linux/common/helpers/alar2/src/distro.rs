@@ -6,7 +6,6 @@ use crate::mount;
 use crate::redhat;
 use crate::suse;
 use crate::ubuntu;
-use cmd_lib;
 use std::process;
 
 #[derive(Debug)]
@@ -132,63 +131,72 @@ impl Distro {
         let kind: DistroKind = Default::default();
         let lvm_details = LVMDetails::new();
         let mut distro: Distro = Distro {
-            boot_part: boot_part,
+            boot_part,
             rescue_root: root_part,
-            efi_part: efi_part,
+            efi_part,
             is_lvm: false,
             is_ade: false,
-            lvm_details: lvm_details,
-            kind: kind,
+            lvm_details,
+            kind,
         };
 
         // here we start the core logic in order to determine what distro and type we have to cope with
-        dispatch(&partitions, &mut distro);
+        dispatch(partitions, &mut distro);
 
         distro
     }
 }
 
 fn get_partitions(partitions: &mut Vec<String>) {
-    let link = read_link(constants::RESCUE_DISK);
-    let out = cmd_lib::run_fun!(parted -m ${link} print | grep -E "^ ?[0-9]{1,2} *");
+    // For testing ALAR we need a conditional compile
 
-    match out {
-        Ok(v) => {
-            for line in v.lines() {
-                partitions.push(line.to_string());
+        let link = read_link(constants::RESCUE_DISK);
+        let sedscript = r#"s|[ ]\+| |g;s|^[ \t]*||"#;
+        let out =
+            cmd_lib::run_fun!(sgdisk ${link} -p | grep -E "^ *[1,2,3,4,5,6]" | sed $sedscript);
+        // we are only interested in partitions which contain the numbers 1-6. Multiple whitespaces and trailing ones are removed
+
+        match out {
+            Ok(v) => {
+                for line in v.lines() {
+                    // Need to check if no garbage is in it
+                    if line.contains("GiB") || line.contains("MiB") {
+                        partitions.push(line.to_string());
+                    }
+                }
+                helper::log_info(
+                    format!(
+                        "We have the following partitions determined: {:?}",
+                        partitions
+                    )
+                    .as_str(),
+                );
             }
-            helper::log_info(
-                format!(
-                    "We have the following partitions determined: {:?}",
-                    partitions
-                )
-                .as_str(),
-            );
+            Err(e) => panic!("Error {:?}", e),
         }
-        Err(e) => panic!("Fehler {:?}", e),
-    }
+
+    
 }
 
 // If there is only one partition detected
-//fn do_old_ubuntu_or_centos(partition_info: &Vec<String>, mut distro: &mut Distro) {
-fn do_old_ubuntu_or_centos(partition_info: &[String], mut distro: &mut Distro) {
+fn do_old_ubuntu_or_centos(partition_info: Vec<String>, mut distro: &mut Distro) {
     helper::log_info("This could be an old Ubuntu image or even an CentOS with one partition only");
 
     // At first we have to determine whether this is a Ubuntu distro
     // or whether it is a single partiton CentOs distro
     if let Err(e) = mount::mkdir_assert() {
-        panic!("Creating assert directory is not possible : '{}'. ALAR is not able to proceed further",e);
+        panic!(
+            "Creating assert directory is not possible : '{}'. ALAR is not able to proceed further",
+            e
+        );
     }
 
     distro.rescue_root.root_part_fs = helper::get_partition_filesystem_detail(&partition_info[0]);
     distro.rescue_root.root_part_number = helper::get_partition_number_detail(&partition_info[0]);
-    distro.rescue_root.root_part_path = helper::read_link(
-        format!(
-            "{}{}",
-            constants::LUN_PART_PATH,
-            distro.rescue_root.root_part_number
-        )
-        .as_str(),
+    distro.rescue_root.root_part_path = format!(
+        "{}{}",
+        read_link(constants::RESCUE_DISK),
+        distro.rescue_root.root_part_number
     );
 
     helper::fsck_partition(
@@ -211,20 +219,27 @@ fn do_old_ubuntu_or_centos(partition_info: &[String], mut distro: &mut Distro) {
 
 // if we have two partition detected
 //fn do_red_hat(partition_info: &Vec<String>, distro: &mut Distro) {
-fn do_red_hat(partition_info: &[String], distro: &mut Distro) {
+fn do_red_hat(partition_info: Vec<String>, distro: &mut Distro) {
     helper::log_info("This could be a RedHat/Centos 6/7 image");
     redhat::do_redhat6_or_7(partition_info, distro);
 }
 
 // if we have 3 partition detected
-//fn do_recent_ubuntu(partition_info: &Vec<String>, distro: &mut Distro) {
-fn do_recent_ubuntu(partition_info: &[String], distro: &mut Distro) {
-    helper::log_info("This could be a recent Ubuntu 16.x or 18.x image");
+// Usuall this is a layout for Ubuntu. But recent RedHat RAW images do have this layout as well
+fn do_recent_ubuntu_or(partition_info: Vec<String>, distro: &mut Distro) {
+    helper::log_info(
+        "This could be a recent Ubuntu 16.x or 18.x image. Or a RedHat with RAW partitions",
+    );
+    // We call this function for both Ubuntu and RedHat the logic is the same to get partitions determined
     ubuntu::do_ubuntu(partition_info, distro);
+
+    // In the next step we figure out what it is
+    ubuntu::verify_ubuntu(distro);
+    redhat::verify_redhat_nolvm(distro);
 }
 
 // if we have 4 partition detected
-fn do_suse_or_lvm_or_ubuntu(partition_info: &[String], distro: &mut Distro) {
+fn do_suse_or_lvm_or_ubuntu(partition_info: Vec<String>, distro: &mut Distro) {
     // This function is also called if we have an recent Ubuntu distro with ADE enabled
     // With ADE a 4th partition got added to hold the boot-part-details plus luks
 
@@ -266,8 +281,7 @@ fn do_suse_or_lvm_or_ubuntu(partition_info: &[String], distro: &mut Distro) {
     }
 }
 
-//fn dispatch(partition_info: &Vec<String>, mut distro: &mut Distro) {
-fn dispatch(partition_info: &[String], mut distro: &mut Distro) {
+fn dispatch(partition_info: Vec<String>, mut distro: &mut Distro) {
     // Test for an ADE repair environment
     distro.is_ade = ade::is_ade_enabled();
     helper::log_info(format!("Ade is enabled : {}", distro.is_ade).as_str());
@@ -275,7 +289,7 @@ fn dispatch(partition_info: &[String], mut distro: &mut Distro) {
     match partition_info.len() {
         1 => do_old_ubuntu_or_centos(partition_info, distro),
         2 => do_red_hat(partition_info, distro),
-        3 => do_recent_ubuntu(partition_info, distro),
+        3 => do_recent_ubuntu_or(partition_info, distro),
         4 => do_suse_or_lvm_or_ubuntu(partition_info, distro),
         _ => {
             helper::log_error("Unrecognized Linux distribution. ALAR tool is stopped\n

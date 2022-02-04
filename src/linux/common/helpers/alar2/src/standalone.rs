@@ -1,9 +1,7 @@
-use cmd_lib;
 use crate::helper;
 use crate::cli;
 use crate::constants;
 use std::{io,process,fs};
-use fs_extra;
 
 pub(crate) fn download_action_scripts(cli_info: &cli::CliInfo) -> io::Result<()> {
     if cli_info.action_directory.is_empty() {
@@ -19,9 +17,6 @@ pub(crate) fn download_action_scripts(cli_info: &cli::CliInfo) -> io::Result<()>
     // Expand the action_implementation directory
     cmd_lib::run_cmd!(tar --wildcards --strip-component=7 -xzf /tmp/alar2.tar.gz -C /tmp  *src/linux/common/helpers/alar2/src/action_implementation)?;
 
-    // Get two further files
-    //cmd_lib::run_cmd!(tar --wildcards --strip-component=1 -xzf /tmp/alar2.tar.gz -C /tmp *src/linux/common/helpers/Logger.sh)?;
-    //cmd_lib::run_cmd!(tar --wildcards --strip-component=1 -xzf /tmp/alar2.tar.gz -C /tmp *src/linux/common/setup/init.sh)?;
     Ok(())
 } else {
     // In case we have a local directory for our action scripts we need to copy the actions to

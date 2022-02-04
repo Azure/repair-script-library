@@ -59,7 +59,7 @@ serial_fix_suse_redhat (){
         
 # file does not exist
 touch $grub_file
-cat $grub_file << EOF
+cat << EOF > $grub_file
 GRUB_TIMEOUT=30
 GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
 GRUB_DEFAULT=saved
