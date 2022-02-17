@@ -26,11 +26,9 @@ if [[ $isRedHat == "true" ]]; then
                 # set to previous kernel
                 sed -i -e 's/GRUB_DEFAULT=.*/GRUB_DEFAULT=1/' /etc/default/grub
 
-                if [[ -d /sys/firmware/efi ]]; then
-                        grub2-mkconfig -o /boot/efi/EFI/$(ls /boot/efi/EFI | grep -i -E "centos|redhat")/grub.cfg
-                else
-                        grub2-mkconfig -o /boot/grub2/grub.cfg
-                fi
+                # Generate both config files. 
+                rub2-mkconfig -o /boot/efi/EFI/$(ls /boot/efi/EFI | grep -i -E "centos|redhat")/grub.cfg
+                grub2-mkconfig -o /boot/grub2/grub.cfg
 
                 # enable sysreq
                 echo "kernel.sysrq = 1" >>/etc/sysctl.conf
