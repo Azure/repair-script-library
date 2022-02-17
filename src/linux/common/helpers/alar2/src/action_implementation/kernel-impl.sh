@@ -27,7 +27,7 @@ if [[ $isRedHat == "true" ]]; then
                 sed -i -e 's/GRUB_DEFAULT=.*/GRUB_DEFAULT=1/' /etc/default/grub
 
                 # Generate both config files. 
-                rub2-mkconfig -o /boot/efi/EFI/$(ls /boot/efi/EFI | grep -i -E "centos|redhat")/grub.cfg
+                grub2-mkconfig -o /boot/efi/EFI/$(ls /boot/efi/EFI | grep -i -E "centos|redhat")/grub.cfg
                 grub2-mkconfig -o /boot/grub2/grub.cfg
 
                 # enable sysreq
