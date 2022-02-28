@@ -234,8 +234,9 @@ fn do_recent_ubuntu_or(partition_info: Vec<String>, distro: &mut Distro) {
     ubuntu::do_ubuntu(partition_info, distro);
 
     // In the next step we figure out what it is
-    ubuntu::verify_ubuntu(distro);
+    // The order is important otherwise an incorrect distro gets reported
     redhat::verify_redhat_nolvm(distro);
+    ubuntu::verify_ubuntu(distro);
 }
 
 // if we have 4 partition detected
