@@ -25,9 +25,10 @@ recover_ubuntu() {
             rm /boot/initrd.img-${kernel_version}
     fi
     # Get sure that all required modles are loaded
-    for module in "hv_vmbus hv_netvsc hv_storvsc"; do
-        echo $module >> /etc/initramfs-tools/modules
-    done
+        echo "hv_vmbus" >> /etc/initramfs-tools/modules
+        echo "hv_storvsc" >> /etc/initramfs-tools/modules
+        echo "hv_netvsc" >> /etc/initramfs-tools/modules
+
     update-initramfs -k "$kernel_version" -c
     update-grub
 
