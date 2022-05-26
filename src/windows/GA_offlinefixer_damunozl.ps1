@@ -7,7 +7,6 @@ cmd /c color 0A
 $title="                                                                                  --== VMAgent Fixer by Daniel Muñoz L ==--"
 $host.UI.RawUI.WindowTitle = $Title
 # Welcome to the VMAgent fixer by Daniel Muñoz L!"
-# ***** THIS SCRIPT MUST RUN IN AN ELEVATED CMD WITH ADMIN CREDENTIALS *****"
 
 # Rescue OS variable
 $diska='c'
@@ -37,12 +36,10 @@ if (Test-Path -Path 'h:\Windows') {
 "Path doesn't exist."
 }}}}}}}
 
-
 # HIVE LOADER
 # A Backup of the BROKENSYSTEM was taken and left on $($diskb):\ as regbackupbeforeGAchanges just in case!
 reg load "HKLM\BROKENSYSTEM" "$($diskb):\Windows\System32\config\SYSTEM"
 reg export "HKLM\BROKENSYSTEM" "$($diskb):\regbackupbeforeGAchanges" /y
-
 
 # EXPORTING GOOD VMAGENT REGS FROM RESCUE VM
 reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WindowsAzureGuestAgent" "$($diskb):\WAGA.reg" /y
@@ -71,7 +68,6 @@ reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\RdAgent" "$($diskb)
 regedit /s "$($diskb):\WATS.reg"
 regedit /s "$($diskb):\WAGA.reg"
 regedit /s "$($diskb):\RdAgent.reg"
-
 
 # BACKUP TAKEN ON FOLDER $($diskb):\WindowsazurefaultyGAbackup"
 mkdir "$($diskb):\WindowsazurefaultyGAbackup"
