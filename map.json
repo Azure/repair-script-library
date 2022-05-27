@@ -1,5 +1,10 @@
 [
 	{
+		"id" : "win-GA-fix",
+		"path" : "src/windows/GA_offlinefixer_damunozl.ps1",
+		"description" : "Fixes integrity of files and registry from windows guest agent offline"
+	},
+	{
 		"id" : "win-hello-world",
 		"path" : "src/windows/win-hello-world.ps1",
 		"description" : "Hello world test script"
