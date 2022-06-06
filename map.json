@@ -3,6 +3,11 @@
 		"id" : "win-LKGC",
 		"path" : "src/windows/win-LKGC.ps1",
 		"description" : "Last Known Good Configuration enabler offline from rescue VM"
+  },
+  {
+    "id" : "win-GA-fix",
+		"path" : "src/windows/GA_offlinefixer_damunozl.ps1",
+		"description" : "Fixes integrity of files and registry from windows guest agent offline"
 	},
 	{
 		"id" : "win-hello-world",
