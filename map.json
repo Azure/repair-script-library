@@ -4,7 +4,6 @@
 		"path" : "src/windows/sac-enabler.ps1",
 		"description" : "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs"
 	},
-
 	{
 		"id" : "win-sacdump-on",
 		"path" : "src/windows/sac-os-dump-enabler.ps1",
