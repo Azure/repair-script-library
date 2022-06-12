@@ -24,8 +24,8 @@ if ($diskb -eq "000") {write-output "SCRIPT COULD NOT FIND A RESCUE OS DISK ATTA
 # OS VER PEEK
 reg.exe load "HKLM\BROKENSYSTEM" "$($diskb):\Windows\System32\config\software"
 Start-sleep 3
-(Get-ItemProperty -path 'registry::hklm\BROKENSYSTEM\microsoft\windows nt\currentversion').ProductName | %{ [int]$winosver=$_.Split(' ')[1]; } 2> $null
-(Get-ItemProperty -path 'registry::hklm\BROKENSYSTEM\microsoft\windows nt\currentversion').ProductName | %{ [int]$winosver=$_.Split(' ')[2]; } 2> $null
+(Get-ItemProperty -path 'registry::hklm\BROKENSYSTEM\microsoft\windows nt\currentversion').ProductName | %{ [int]$winosver=$_.Split(' ')[1]; }
+(Get-ItemProperty -path 'registry::hklm\BROKENSYSTEM\microsoft\windows nt\currentversion').ProductName | %{ [int]$winosver=$_.Split(' ')[2]; }
 reg.exe unload "HKLM\BROKENSYSTEM"
 Start-sleep 3
 
