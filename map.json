@@ -1,11 +1,22 @@
 [
 	{
+		"id" : "win-sac-on",
+		"path" : "src/windows/sac-enabler.ps1",
+		"description" : "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs"
+	},
+
+	{
+		"id" : "win-sacdump-on",
+		"path" : "src/windows/sac-os-dump-enabler.ps1",
+		"description" : "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs and enables os dump collector as well on main OS drive"
+	},
+	{
 		"id" : "win-LKGC",
 		"path" : "src/windows/win-LKGC.ps1",
 		"description" : "Last Known Good Configuration enabler offline from rescue VM"
-  },
-  {
-    "id" : "win-GA-fix",
+ 	},
+ 	{
+		"id" : "win-GA-fix",
 		"path" : "src/windows/GA_offlinefixer_damunozl.ps1",
 		"description" : "Fixes integrity of files and registry from windows guest agent offline"
 	},
