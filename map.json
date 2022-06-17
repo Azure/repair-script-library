@@ -4,6 +4,7 @@
 		"path" : "src/windows/win-dhcp-fix.ps1",
 		"description" : "DHCP Service fixer offline from rescue VM"
  	},
+	{
 		"id" : "win-sac-on",
 		"path" : "src/windows/sac-enabler.ps1",
 		"description" : "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs"
