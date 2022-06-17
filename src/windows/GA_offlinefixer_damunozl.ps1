@@ -1,40 +1,25 @@
-# Contact me Daniel Muñoz L : damunozl@microsoft.com if support is required.
-# Echo off null outputs
+# Welcome to the VM Azure Agent Offline fixer by Daniel Muñoz L!
+# Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
 out-null
-
-# Change color, title and welcome
 cmd /c color 0A
-$title="                                                                                  --== VMAgent Fixer by Daniel Muñoz L ==--"
-$host.UI.RawUI.WindowTitle = $Title
-# Welcome to the VMAgent fixer by Daniel Muñoz L!"
+$host.UI.RawUI.WindowTitle = "                                                                                  --== VMAgent Offline Fixer by Daniel Muñoz L ==--"
 
 # Rescue OS variable
 $diska='c'
 
 # FINDER FOR FAULTY OS DRIVE
-if (Test-Path -Path 'l:\Windows') {
-  $diskb='l'
-} else {
-if (Test-Path -Path 'i:\Windows') {
-  $diskb='i'
-} else {
-if (Test-Path -Path 'g:\Windows') {
-  $diskb='g'
-} else {
-if (Test-Path -Path 'j:\Windows') {
-  $diskb='j'
-} else {
-if (Test-Path -Path 'k:\Windows') {
-  $diskb='k'
-} else {
-if (Test-Path -Path 'f:\Windows') {
-  $diskb='f'
-} else {
-if (Test-Path -Path 'h:\Windows') {
-  $diskb='h'
-} else {	
-"Path doesn't exist."
-}}}}}}}
+$diskarray = "d","q","w","e","r","t","y","u","i","o","p","s","f","g","h","j","k","l","z","x","v","n","m"
+$diskb="000"
+foreach ($diskt in $diskarray)
+{
+   if (Test-Path -Path "$($diskt):\Windows")
+   {
+    $diskb=$diskt
+    } 
+}
+
+# IN CASE OF FINDER FAILURE
+if ($diskb -eq "000") {write-output "SCRIPT COULD NOT FIND A RESCUE OS DISK ATTACHED, EXITING";start-sleep 10;Exit}
 
 # HIVE LOADER
 # A Backup of the BROKENSYSTEM was taken and left on $($diskb):\ as regbackupbeforeGAchanges just in case!
@@ -43,7 +28,7 @@ reg export "HKLM\BROKENSYSTEM" "$($diskb):\regbackupbeforeGAchanges" /y
 
 # EXPORTING GOOD VMAGENT REGS FROM RESCUE VM
 reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WindowsAzureGuestAgent" "$($diskb):\WAGA.reg" /y
-# Telemetry service was merged into rdagent so an error might be displayed for wats
+# Telemetry service was merged into rdagent so you can expect an error from wats
 reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WindowsAzureTelemetryService" "$($diskb):\WATS.reg"  /y
 reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\RdAgent" "$($diskb):\RdAgent.reg" /y
 
@@ -54,7 +39,7 @@ reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\RdAgent" "$($diskb)
 (gc "$($diskb):\waga.reg") -replace 'notyet', 'localsystem' | Out-File "$($diskb):\waga.reg"
 
 # TELEMETRY MODIFICATIONS
-# Telemetry service was merged into rdagent so an error might be displayed for wats
+# Telemetry service was merged into rdagent so an error might be expected from wats key
 (gc "$($diskb):\wats.reg") -replace 'LocalSystem', 'notyet' | Out-File "$($diskb):\wats.reg"
 (gc "$($diskb):\wats.reg") -replace 'system', 'BROKENSYSTEM' | Out-File "$($diskb):\wats.reg"
 (gc "$($diskb):\wats.reg") -replace 'notyet', 'localsystem' | Out-File "$($diskb):\wats.reg"
@@ -85,3 +70,5 @@ del "$($diskb):\rdagent.reg" -force
 del "$($diskb):\waga.reg" -force
 del "$($diskb):\wats.reg" -force
 
+write-output "   --------------   SCRIPT FINISHED PROPERLY, BACKUP OF PREVIOUS GA IS IN ROOT AS WindowsazurefaultyGAbackup folder and registry backup as regbackupbeforeGAchanges   --------------   "
+start-sleep 10
