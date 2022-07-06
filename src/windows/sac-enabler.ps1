@@ -15,26 +15,31 @@ foreach ($diskt in $diskarray)
    if (Test-Path -Path "$($diskt):\Windows") {$diskb=$diskt} 
 }
 
-# ADDING BCD DRIVE
-$diskc="000"
-foreach ($diskt in $diskarray)
-{
-   if ((Test-Path -Path "$($diskt):\efi") -or (Test-Path -Path "$($diskt):\boot")){$diskc=$diskt} 
-}
+# DETECT IF GEN2
+$partboot='000'
+$diskd='000'
+get-disk > "$($diskb):\txtempvar"
+Select-String -Pattern "Msft Virtual Disk" -Path "$($diskb):\txtempvar" -list -SimpleMatch | select-object -First 1 | %{$diskboot=$_.Line.Split('')[0]}
 
-# ADDING BCD PATH
-$diskd="000"
-foreach ($diskt in $diskarray)
+get-partition -disknumber $diskboot > "$($diskb):\txtempvar"
+Select-String -Pattern "System" -Path "$($diskb):\txtempvar" -list -SimpleMatch | select-object -First 1 | %{$partboot=$_.Line.Split('')[0]}
+
+Get-Partition -DiskNumber $diskboot -PartitionNumber $partboot | Set-Partition -NewDriveLetter z
+
+	if ($partboot -ne '000') {write-output "VM is GEN2";$diskd="z:\efi\Microsoft\boot\bcd"}
+
+# DETECT IF GEN1
+if ($diskd -eq '000')
 {
-   if (Test-Path -Path "$($diskt):\efi") 
-      {write-output "VM is GEN2";$diskd="$($diskc):\efi\Microsoft\boot\bcd"}
-   elseif (Test-Path -Path "$($diskt):\boot")
-      {write-output "VM is GEN1";$diskd="$($diskc):\boot\bcd"}
+	foreach ($diskt in $diskarray)
+	{
+	   	if (Test-Path -Path "$($diskt):\boot")
+      	{write-output "VM is GEN1";$diskd="$($diskt):\boot\bcd"}
+	}
 }
 
 # IN CASE OF FINDER FAILURE WITH MITIGATION REASURE OS DISK IS MOUNTED AS DATA BEFORE CHECKING BOOTMGR
 if ($diskb -eq "000") {write-output "SCRIPT COULD NOT FIND A RESCUE OS DISK ATTACHED, EXITING";start-sleep 10;Exit}
-if ($diskc -eq "000") {write-output "SCRIPT COULD NOT FIND A BOOT FOLDER, EXITING";start-sleep 10;Exit}
 
 # SAC ENABLE
 bcdedit /store "$($diskd)" /set "{bootmgr}" displaybootmenu yes
@@ -43,6 +48,7 @@ bcdedit /store "$($diskd)" /set "{bootmgr}" bootems yes
 bcdedit /store "$($diskd)" /ems "{default}" ON
 bcdedit /store "$($diskd)" /emssettings EMSPORT:1 EMSBAUDRATE:115200
 
+Remove-Item -force "$($diskb):\txtempvar"
+
 write-output "          ---------------          SCRIPT FINISHED PROPERLY, CHANGES APPLIED          ---------------          "
 start-sleep 10
-
