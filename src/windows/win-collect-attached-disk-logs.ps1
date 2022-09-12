@@ -40,7 +40,7 @@
 #
 # .NOTES
 #   Author: Ryan McCallum
-# 	Testing: Brought script to PowerShell ISE locally. Ran [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::TLS12; in session. Converted all "Log-" strings to "Write-", imported Get-Disk-Partitions.ps1 in same file and commented out lines initializing init.ps1 and Get-Disk-Partitions.ps1. Also ran Invoke-ScriptAnalyzer -Path .\win-collect-attached-disk-logs.ps1  to find recommended updates and Invoke-ScriptAnalyzer -Path .\win-collect-attached-disk-logs.ps1 -Fix to fix them. More info: https://docs.microsoft.com/en-us/powershell/module/psscriptanalyzer/invoke-scriptanalyzer?view=ps-modules
+# 	Testing: Brought script to PowerShell ISE locally. Ran [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::TLS12; in session. Converted all "Log-" strings to "Write-", imported Get-Disk-Partitions.ps1 in same file and commented out lines initializing init.ps1 and Get-Disk-Partitions.ps1. Also ran custom-script version 'az vm repair run -g $rg -n $vmName   --run-on-repair --verbose --custom-script-file "C:\Users\rymccall\Github\repair-script-library\src\windows\win-collect-attached-disk-logs.ps1"'. Also ran Invoke-ScriptAnalyzer -Path .\win-collect-attached-disk-logs.ps1  to find recommended updates and Invoke-ScriptAnalyzer -Path .\win-collect-attached-disk-logs.ps1 -Fix to fix them. More info: https://docs.microsoft.com/en-us/powershell/module/psscriptanalyzer/invoke-scriptanalyzer?view=ps-modules
 #>
 #########################################################################################################
 
