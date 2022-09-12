@@ -99,7 +99,7 @@ pub(crate) fn umount(destination: &str) {
         Ok(()) => (),
         Err(why) => {
             helper::log_error(format!("Failed to unmount {}: {}", destination, why).as_str());
-            helper::log_error("This shouldn't cause a sever issue for ALAR.");
+            helper::log_error("This shouldn't cause a severe issue for ALAR.");
         }
     }
 }

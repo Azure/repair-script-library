@@ -54,13 +54,13 @@ forEach ( $partitionGroup in $partitionlist | group DiskNumber )
         #revert pending actions to let sfc succeed in most cases
         dism.exe /image:$osDrive /cleanup-image /revertpendingactions
 
-        Log-Info "#04 - runing SFC.exe $osDrive\windows"
+        Log-Info "#04 - running SFC.exe $osDrive\windows"
         sfc /scannow /offbootdir=$osDrive /offwindir=$osDrive\windows
 
-        Log-Info "#05 - runing dism to restore health on $osDrive" 
+        Log-Info "#05 - running dism to restore health on $osDrive" 
         Dism /Image:$osDrive /Cleanup-Image /RestoreHealth /Source:c:\windows\winsxs
         
-        Log-Info "#06 - enumvering corrupt system files in $osDrive\windows\system32\"
+        Log-Info "#06 - enumerating corrupt system files in $osDrive\windows\system32\"
         get-childitem -Path $osDrive\windows\system32\* -include *.dll,*.exe `
             | %{$_.VersionInfo | ? FileVersion -eq $null | select FileName, ProductVersion, FileVersion }  
 

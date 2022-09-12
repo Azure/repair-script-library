@@ -1,5 +1,30 @@
 [
 	{
+		"id" : "win-dhcp-fix",
+		"path" : "src/windows/win-dhcp-fix.ps1",
+		"description" : "DHCP Service fixer offline from rescue VM"
+ 	},
+	{
+		"id" : "win-sac-on",
+		"path" : "src/windows/sac-enabler.ps1",
+		"description" : "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs"
+	},
+	{
+		"id" : "win-sacdump-on",
+		"path" : "src/windows/sac-os-dump-enabler.ps1",
+		"description" : "Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs and enables os dump collector as well on main OS drive"
+	},
+	{
+		"id" : "win-LKGC",
+		"path" : "src/windows/win-LKGC.ps1",
+		"description" : "Last Known Good Configuration enabler offline from rescue VM"
+	},
+	{
+		"id" : "win-GA-fix",
+		"path" : "src/windows/GA_offlinefixer_damunozl.ps1",
+		"description" : "Fixes integrity of files and registry from windows guest agent offline"
+	},
+	{
 		"id" : "win-hello-world",
 		"path" : "src/windows/win-hello-world.ps1",
 		"description" : "Hello world test script"
@@ -39,11 +64,11 @@
 		"path" : "src/linux/linux-alar-fki.sh",
 		"description" : "alar-fki allows to recover a failed VM. Three recover scenarios are possible: fstab, initrd and kernel. NOTE: use option --run-on-repair. Se the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar/README.md"
 	},
-    {
-        "id" : "linux-alar2",
-        "path" : "src/linux/linux-alar2.sh",
-        "description" : "alar2 allows to recover a failed VM. Various ations are available like: fstab, initrd and kernel. NOTE: use option --run-on-repair. See the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar2/README.md. The script takes around 2min to run."
-    },
+    	{
+		"id" : "linux-alar2",
+		"path" : "src/linux/linux-alar2.sh",
+		"description" : "alar2 allows to recover a failed VM. Various ations are available like: fstab, initrd and kernel. NOTE: use option --run-on-repair. See the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar2/README.md. The script takes around 2min to run."
+    	},
 	{
 		"id" : "win-enable-nested-hyperv",
 		"path" : "src/windows/win-enable-nested-hyperv.ps1",
@@ -63,10 +88,5 @@
 		"id" : "win-collect-attached-disk-logs",
 		"path" : "src/windows/win-collect-attached-disk-logs.ps1",
 		"description" : "Collect OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk."
-	},
-	{
-		"id" : "win-update-registry",
-		"path" : "src/windows/win-update-registry.ps1",
-		"description" : "Modify the registry on an OS disk attached to a Rescue VM."
 	}
 ]

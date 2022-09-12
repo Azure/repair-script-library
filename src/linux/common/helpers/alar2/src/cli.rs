@@ -40,7 +40,7 @@ one or more different actions in order to get a VM in a running state that allow
 the administrator to further recover the VM after it is up, running and accessible again.
 ";
    let matches = App::new("Azure Linux Auto Recover")
-                          .version("0.9")
+                          .version("0.3.1")
                           .author("Marcus Lachmanez , malachma@microsoft.com")
                           .about(about)
                           .arg(Arg::with_name("standalone")

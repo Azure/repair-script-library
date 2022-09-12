@@ -2,21 +2,20 @@ use crate::constants;
 use crate::distro::{Distro, EfiPartT, EfiPartition};
 use crate::mount;
 use chrono::prelude::Utc;
+use cmd_lib::*;
 use std::process::Stdio;
 use std::{fs, process};
-use cmd_lib::run_fun;
-
 
 pub fn log_info(msg: &str) {
     println!("[Info {}] {}", Utc::now(), msg);
 }
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub fn log_output(msg: &str) {
     println!("[Output {}] {}", Utc::now(), msg);
 }
 
-#[allow(dead_code)] 
+#[allow(dead_code)]
 pub fn log_warning(msg: &str) {
     println!("[Warning {}] {}", Utc::now(), msg);
 }
@@ -29,27 +28,24 @@ pub fn log_debug(msg: &str) {
     println!("[Debug {}] {}", Utc::now(), msg);
 }
 
-pub fn read_link(path: &str) -> String {
-    let real_path: String;
-    match fs::metadata(&path) {
-        Ok(_) => {
-            real_path = fs::canonicalize(&path)
-                .unwrap_or_default()
-                .as_os_str()
-                .to_str()
-                .unwrap_or_default()
-                .to_string();
-            /* let os_option  = fs::canonicalize(&path).ok().unwrap_or_default().as_os_str().to_str();
-            if let Some(inner_real_path) = os_option { real_path = &inner_real_path.to_string(); }
-            */
-        }
-        Err(_) => {
-            let message = format!("{} {}", "Path not found", &path);
-            log_error(&message);
-            panic!("Panic in function read_link");
+pub(crate) fn read_link(path: &str) -> String {
+    match fs::canonicalize(&path) {
+        Ok(value) => return format!("{}", value.display()),
+        Err(e) => {
+            log_error(&e.to_string());
+            panic!("readlink did fail")
         }
     }
-    real_path
+}
+
+pub(crate) fn part_info_helper(sgdiskinfo: &str) -> String {
+    let part_number = cut(sgdiskinfo, " ", 0).trim_end().parse::<u8>().unwrap();
+    let path = format!("{}{}", read_link(constants::RESCUE_DISK), part_number);
+    let run_output = run_fun!(blkid -o export $path);
+    match run_output {
+        Ok(value) => value,
+        Err(_) => "ERROR".to_string(),
+    }
 }
 
 pub(crate) fn cut<'a>(source: &'a str, delimiter: &str, field: usize) -> &'a str {
@@ -62,35 +58,48 @@ pub(crate) fn cut<'a>(source: &'a str, delimiter: &str, field: usize) -> &'a str
     }
 }
 
-pub fn get_partition_number_detail(source: &str) -> u8 {
-    cut(source, ":", 0).parse::<u8>().unwrap()
+pub(crate) fn get_partition_number_detail(sgdiskinfo: &str) -> u8 {
+    cut(sgdiskinfo, " ", 0).parse::<u8>().unwrap()
 }
 
-pub fn get_partition_filesystem_detail(source: &str) -> String {
-    cut(source, ":", 4).to_string()
+pub(crate) fn get_partition_filesystem_detail(sgdiskinfo: &str) -> String {
+    let info = part_info_helper(sgdiskinfo);
+    let mut lines = vec![];
+    let mut fs_return = "".to_string();
+    for i in info.lines() {
+        lines.push(i);
+    }
+    lines.retain(|x| x.starts_with("TYPE="));
+    if let Some(fs) = lines[0].to_string().strip_prefix("TYPE=") {
+        fs_return = fs.to_string();
+    }
+    fs_return
 }
 
 pub(crate) fn get_pretty_name(path: &str) -> String {
     let mut pretty_name: String = "".to_string();
     if let Ok(name) = run_fun!(grep -s PRETTY_NAME $path) {
         pretty_name = cut(&name, "=", 1).to_string();
+    } else if let Ok(value) = fs::read_to_string(constants::REDHAT_RELEASE) {
+        pretty_name = value;
     }
+    log_info(format!("Pretty Name is : {}", &pretty_name).as_str());
     pretty_name
 }
 
 pub(crate) fn get_ade_mounpoint(source: &str) -> String {
     let mut mountpoint = "".to_string();
-    if let Ok(path) = cmd_lib::run_fun!(cat /proc/mounts | grep $source | cut -dr#" "# -f2) {
+    if let Ok(path) = cmd_lib::run_fun!(cat /proc/mounts | grep $source | cut -d" " -f2) {
         mountpoint = path;
     }
-    log_info(format!("ADE mountpoint is: {}", &mountpoint).as_str());
+    log_info(format!("unmounted: {}", &mountpoint).as_str());
     mountpoint
 }
 
 pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
     // Need to handel the condition if no filesystem is available
     // This can happen if we have a LVM partition
-    if partition_filesystem.is_empty()  {
+    if partition_filesystem.is_empty() {
         return;
     }
 
@@ -122,7 +131,7 @@ pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
         "fat16" => {
             log_info("fsck for fat16/vfat");
             if let Ok(stat) = process::Command::new("fsck.vfat")
-                .args(&["-p", &partition_path])
+                .args(&["-p", partition_path])
                 .status()
             {
                 exit_code = stat.code();
@@ -131,7 +140,7 @@ pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
         _ => {
             log_info(format!("fsck for {}", partition_filesystem).as_str());
             if let Ok(stat) = process::Command::new(format!("fsck.{}", partition_filesystem))
-                .args(&["-p", &partition_path])
+                .args(&["-p", partition_path])
                 .status()
             {
                 exit_code = stat.code();
@@ -165,7 +174,7 @@ pub(crate) fn fsck_partition(partition_path: &str, partition_filesystem: &str) {
             );
         }
 
-        // Any other error stat is not of interest for us
+        // Any other error state is not of interest for us
         _ => {}
     }
 
@@ -195,8 +204,7 @@ pub(crate) fn set_efi_part_path(distro: &mut Distro) {
         efi_part_path: ref mut ref_to_efi_part_path,
     }) = distro.efi_part
     {
-        *ref_to_efi_part_path =
-            read_link(format!("{}{}", constants::LUN_PART_PATH, part_number).as_str());
+        *ref_to_efi_part_path = format!("{}{}", read_link(constants::RESCUE_DISK), part_number);
     }
 }
 
@@ -211,6 +219,13 @@ pub(crate) fn get_efi_part_path(distro: &Distro) -> String {
         path = ref_to_efi_part_path.to_string();
     }
     path
+}
+
+pub(crate) fn has_efi_part(distro: &Distro) -> bool {
+    match distro.efi_part {
+        EfiPartT::NoEFI => false,
+        EfiPartT::EfiPart(_) => true,
+    }
 }
 
 pub(crate) fn get_efi_part_fs(distro: &Distro) -> String {
