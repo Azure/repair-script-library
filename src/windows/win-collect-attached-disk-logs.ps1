@@ -68,20 +68,15 @@ try {
 	# Download Windows manifest files from Github
 	# https://github.com/Azure/azure-diskinspect-service/tree/master/pyServer/manifests/windows
 	$urls = @(
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/windowsupdate"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/diagnostic"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/agents"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/aks"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/asc-vmhealth"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/eg"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/genspec"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/min-diagnostic"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/monitor-mgmt"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/normal"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/servicefabric"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/site-recovery"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/sql-iaas"
-		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/pyServer/manifests/windows/workloadbackup"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/windowsupdate"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/diagnostic"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/asc-vmhealth"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/eg"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/genspec"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/normal"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/site-recovery"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/sql-iaas"
+		"https://raw.githubusercontent.com/Azure/azure-diskinspect-service/master/manifests/windows/vmdiagnostic"
 	)
 
 	ForEach ( $url in $urls) {
