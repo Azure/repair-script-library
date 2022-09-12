@@ -162,6 +162,7 @@ try {
 
 			# If Boot partition found grab BCD store
 			if ( $isBcdPath ) {
+				Log-Output " BCD store on $($drive)"
 				$bcdParentFolderName = "bcd"
 				$bcdFileName = $bcdPath.Split("\")[-1]
 
@@ -175,6 +176,9 @@ try {
 				Log-Output "Copy $($bcdPath) to $($subFolder.ToString())"
 				Copy-Item -Path $bcdPath -Destination "$($folder)\$($bcdFileName)" -Recurse
 				"$($bcdPath)" | Out-File -FilePath $logFile -Append
+				Log-Output "Print $($bcdPath) to $($subFolder.ToString())"
+				bcdedit /store $bcdPath /enum /v > "$($folder)\$($bcdFileName).txt"
+				"$($bcdFileName).txt" | Out-File -FilePath $logFile -Append
 			}
 			else {
 				Log-Warning "No BCD store on $($drive)"
@@ -182,6 +186,7 @@ try {
 
 			# If Windows partition found grab log files
 			if ( $isOsPath ) {
+				Log-Output "OS logs on $($drive)"
 				foreach ($logName in $logArray) {
 					$logLocation = "$($drive):$($logName)"
 
