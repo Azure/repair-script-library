@@ -32,7 +32,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --verbose --run-on-repair
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=on --verbose --run-on-repair
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off --verbose --run-on-repair
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off DC --verbose --run-on-repair
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off DC=$true --verbose --run-on-repair
 #
 # .NOTES
 #   Author: Ryan McCallum
