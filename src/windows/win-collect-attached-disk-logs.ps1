@@ -159,6 +159,7 @@ try {
 			'"Source Log File","Type","Destination Log File","Number of Destination Files","Size of Destination File(s) [Bytes]"' | Out-File -FilePath $logFile -Append
 			$failedLogFile = "$timeFolder\failedLogFiles.log"
 			$treeFile = "$timeFolder\collectedLogFilesTree.log"
+			$partitionSizeFile = "$timeFolder\partitionSizeFile.log"
 
 			# If Boot partition found grab BCD store
 			if ( $isBcdPath ) {
@@ -306,6 +307,20 @@ try {
 	}
  catch {
 		Log-Warning "Could not generate tree file"
+	}
+
+	# Include size of partitions: https://devblogs.microsoft.com/scripting/inventory-drive-types-by-using-powershell/
+	try {
+		$hash = @{
+			2 = "Removable disk"
+			3 = "Fixed local disk"
+			4 = "Network disk"
+			5 = "Compact disk"
+		}
+		Get-CimInstance -Class CIM_LogicalDisk | Select-Object @{Name = "Size(GB)"; Expression = { $_.size / 1gb } }, @{Name = "Free Space(GB)"; Expression = { $_.freespace / 1gb } }, @{Name = "Free (%)"; Expression = { "{0,6:P0}" -f (($_.freespace / 1gb) / ($_.size / 1gb)) } }, DeviceID, @{Name = "DriveType (Type)"; Expression = { $hash.item([int]$_.DriveType) } } | Format-Table | Out-File -FilePath $partitionSizeFile -Append
+	}
+	catch {
+		Log-Warning "Could not collect partition sizes"
 	}
 
 	# Zip files
