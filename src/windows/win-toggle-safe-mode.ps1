@@ -116,11 +116,12 @@ try {
             $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
             $defaultId = '{' + $defaultLine.ToString().Split('{}')[1] + '}'
             $safeModeIndicator = $bcdout | Select-String 'safeboot' | select -First 1
+            $safeBootVersion = If ($DC) { "dsrepair" } Else { "network" }
 
             if ($safeModeSwitch -eq "on") {
                 # Setting flag so VM boots in Safe Mode
                 Log-Output "#05 - Configuring safeboot flag for $bcdPath"
-                bcdedit /store $bcdPath /set $defaultId safeboot network
+                bcdedit /store $bcdPath /set $defaultId safeboot $safeBootVersion
             }
             elseif ($safeModeSwitch -eq "off") {
                 # Removing flag so VM doesn't boot in Safe Mode
@@ -138,7 +139,7 @@ try {
                 else {
                     # Flag doesn't exist, adding so VM boots in Safe Mode
                     Log-Output "#05 - Configuring safeboot flag for $bcdPath"
-                    bcdedit /store $bcdPath /set $defaultId safeboot network
+                    bcdedit /store $bcdPath /set $defaultId safeboot $safeBootVersion
                 }
             }
 
