@@ -32,6 +32,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --verbose --run-on-repair
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=on --verbose --run-on-repair
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off --verbose --run-on-repair
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off DC --verbose --run-on-repair
 #
 # .NOTES
 #   Author: Ryan McCallum
@@ -51,7 +52,7 @@ Param(
 # Initialize script
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
-Log-Output 'START: Running script win-toggle-safe-mode'
+Log-Output "START: Running script win-toggle-safe-mode $(if ($DC) { 'on Domain Controller' })"
 
 try {
 
