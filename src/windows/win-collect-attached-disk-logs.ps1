@@ -1,7 +1,7 @@
 ﻿#########################################################################################################
 <#
 # .SYNOPSIS
-#   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk. v0.5.0
+#   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk. v0.6.0
 #
 # .DESCRIPTION
 #   Azure support can normally collect relevant OS logs from an Azure VM by running one of the following:
@@ -20,6 +20,8 @@
 #   https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/iaas-logs
 #   https://docs.microsoft.com/en-us/archive/blogs/kwill/windows-azure-paas-compute-diagnostics-data
 #   https://docs.microsoft.com/en-us/cli/azure/vm/repair?view=azure-cli-latest
+#
+#	Update (Feb 2023): Added partition sizes.
 #
 #   Update (May 2021): This script can now work with neighbor VMs on the same network by mapping their drives
 #   to the target VM. However, there are a few caveats:
@@ -303,6 +305,7 @@ try {
 
 	# Include tree of subdirectory
 	try {
+		Log-Output "Generating tree file"
 		tree $timeFolder /f /a | Out-File -FilePath $treeFile -Append
 	}
  catch {
@@ -311,13 +314,14 @@ try {
 
 	# Include size of partitions: https://devblogs.microsoft.com/scripting/inventory-drive-types-by-using-powershell/
 	try {
+		Log-Output "Collecting partition sizes"
 		$hash = @{
 			2 = "Removable disk"
 			3 = "Fixed local disk"
 			4 = "Network disk"
 			5 = "Compact disk"
 		}
-		Get-CimInstance -Class CIM_LogicalDisk | Select-Object @{Name = "Size(GB)"; Expression = { $_.size / 1gb } }, @{Name = "Free Space(GB)"; Expression = { $_.freespace / 1gb } }, @{Name = "Free (%)"; Expression = { "{0,6:P0}" -f (($_.freespace / 1gb) / ($_.size / 1gb)) } }, DeviceID, @{Name = "DriveType (Type)"; Expression = { $hash.item([int]$_.DriveType) } } | Format-Table | Out-File -FilePath $partitionSizeFile -Append
+		Get-CimInstance -Class CIM_LogicalDisk | Select-Object @{Name = "Size(GB)"; Expression = { ($_.size / 1gb).tostring("#.###") } }, @{Name = "Free Space(GB)"; Expression = { ($_.freespace / 1gb).tostring("#.###") } }, @{Name = "Free (%)"; Expression = { "{0,6:P0}" -f (($_.freespace / 1gb) / ($_.size / 1gb)) } }, DeviceID, @{Name = "DriveType (Type)"; Expression = { $hash.item([int]$_.DriveType) } } | Where-Object { ($_.DeviceID -split ":")[0] -in $driveLetters } | Format-Table | Out-File -FilePath $partitionSizeFile -Append
 	}
 	catch {
 		Log-Warning "Could not collect partition sizes"
