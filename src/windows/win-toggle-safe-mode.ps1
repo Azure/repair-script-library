@@ -52,7 +52,16 @@ Param(
 # Initialize script
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
-Log-Output "START: Running script win-toggle-safe-mode $(if ($DC) { 'on Domain Controller' })"
+
+# Declare variables
+$scriptStartTime = get-date -f yyyyMMddHHmmss
+$scriptPath = split-path -path $MyInvocation.MyCommand.Path -parent
+$scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0]
+
+$logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
+$scriptStartTime | Tee-Object -FilePath $logFile -Append
+
+Log-Output "START: Running script win-toggle-safe-mode $(if ($DC) { 'on Domain Controller' })" | Tee-Object -FilePath $logFile -Append
 
 try {
 
@@ -61,16 +70,16 @@ try {
     $guestHyperVVirtualMachineName = $guestHyperVVirtualMachine.VMName
     if ($guestHyperVVirtualMachine) {
         if ($guestHyperVVirtualMachine.State -eq 'Running') {
-            Log-Output "#01 - Stopping nested guest VM $guestHyperVVirtualMachineName"
+            Log-Output "#01 - Stopping nested guest VM $guestHyperVVirtualMachineName" | Tee-Object -FilePath $logFile -Append
             Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
         }
     }
     else {
-        Log-Output "#01 - No nested guest VM, flipping safeboot switch anyways"
+        Log-Output "#01 - No nested guest VM, flipping safeboot switch anyways" | Tee-Object -FilePath $logFile -Append
     }
 
     # Make sure the disk is online
-    Log-Output "#02 - Bringing disk online"
+    Log-Output "#02 - Bringing disk online" | Tee-Object -FilePath $logFile -Append
     $disk = get-disk -ErrorAction Stop | where { $_.FriendlyName -eq 'Msft Virtual Disk' }
     $disk | set-disk -IsOffline $false -ErrorAction Stop
 
@@ -78,7 +87,7 @@ try {
     $partitionlist = Get-Disk-Partitions
     $partitionGroup = $partitionlist | group DiskNumber
 
-    Log-Output '#03 - enumerate partitions for boot config'
+    Log-Output '#03 - enumerate partitions for boot config' | Tee-Object -FilePath $logFile -Append
 
     forEach ( $partitionGroup in $partitionlist | group DiskNumber ) {
         # Reset paths for each part group (disk)
@@ -112,7 +121,7 @@ try {
         if ( $isBcdPath -and $isOsPath ) {
 
             # Get Safe Mode state
-            Log-Output "#04 - Checking safeboot flag for $bcdPath"
+            Log-Output "#04 - Checking safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
             $bcdout = bcdedit /store $bcdPath /enum
             $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
             $defaultId = '{' + $defaultLine.ToString().Split('{}')[1] + '}'
@@ -121,12 +130,12 @@ try {
 
             if ($safeModeSwitch -eq "on") {
                 # Setting flag so VM boots in Safe Mode
-                Log-Output "#05 - Configuring safeboot flag for $bcdPath"
+                Log-Output "#05 - Configuring safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
                 bcdedit /store $bcdPath /set $defaultId safeboot $safeBootVersion
             }
             elseif ($safeModeSwitch -eq "off") {
                 # Removing flag so VM doesn't boot in Safe Mode
-                Log-Output "#05 - Removing safeboot flag for $bcdPath"
+                Log-Output "#05 - Removing safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
                 bcdedit /store $bcdPath /deletevalue $defaultId safeboot
             }
             else {
@@ -134,27 +143,27 @@ try {
                 # Toggle Mode, check if flag exists
                 if ($safeModeIndicator) {
                     # Flag exists, delete to take VM out of Safe Mode
-                    Log-Output "#05 - Removing safeboot flag for $bcdPath"
+                    Log-Output "#05 - Removing safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
                     bcdedit /store $bcdPath /deletevalue $defaultId safeboot
                 }
                 else {
                     # Flag doesn't exist, adding so VM boots in Safe Mode
-                    Log-Output "#05 - Configuring safeboot flag for $bcdPath"
+                    Log-Output "#05 - Configuring safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
                     bcdedit /store $bcdPath /set $defaultId safeboot $safeBootVersion
                 }
             }
 
             if ($guestHyperVVirtualMachine) {
                 # Bring disk offline
-                Log-Output "#06 - Bringing disk offline"
+                Log-Output "#06 - Bringing disk offline" | Tee-Object -FilePath $logFile -Append
                 $disk | set-disk -IsOffline $true -ErrorAction Stop
 
                 # Start Hyper-V VM
-                Log-Output "#07 - Starting VM"
+                Log-Output "#07 - Starting VM" | Tee-Object -FilePath $logFile -Append
                 start-vm $guestHyperVVirtualMachine -ErrorAction Stop
             }
 
-            Log-Output "END: Please verify status of Safe Mode using MSCONFIG.exe (GUI) or BCDEDIT /enum (shell)"
+            Log-Output "END: Please verify status of Safe Mode using MSCONFIG.exe (GUI) or BCDEDIT /enum (shell)" | Tee-Object -FilePath $logFile -Append
             return $STATUS_SUCCESS
         }
     }
@@ -163,16 +172,16 @@ catch {
 
     if ($guestHyperVVirtualMachine) {
         # Bring disk offline again
-        Log-Output "#05 - Bringing disk offline to restart Hyper-V VM"
+        Log-Output "#05 - Bringing disk offline to restart Hyper-V VM" | Tee-Object -FilePath $logFile -Append
         $disk | set-disk -IsOffline $true -ErrorAction Stop
 
         # Start Hyper-V VM again
-        Log-Output "#06 - Starting VM"
+        Log-Output "#06 - Starting VM" | Tee-Object -FilePath $logFile -Append
         start-vm $guestHyperVVirtualMachine -ErrorAction Stop
     }
 
     # Log failure scenario
-    Log-Error "END: could not start/stop Safe Mode, BCD store may need to be repaired"
+    Log-Error "END: could not start/stop Safe Mode, BCD store may need to be repaired" | Tee-Object -FilePath $logFile -Append
     throw $_
     return $STATUS_ERROR
 }
