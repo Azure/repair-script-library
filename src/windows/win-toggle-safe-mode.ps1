@@ -46,7 +46,7 @@
 
 # Set the Parameters for the script
 Param(
-    [Parameter(Mandatory = $false)][string]$safeModeSwitch = '',
+    [Parameter(Mandatory = $false)][ValidateSet("On", "Off", IgnoreCase = $true)][string]$safeModeSwitch = '',
     [Parameter(Mandatory = $false)][switch]$DC
 )
 
@@ -121,20 +121,26 @@ try {
         # If both was found grab bcd store
         if ( $isBcdPath -and $isOsPath ) {
 
+            # Get Safe Mode state
+            Log-Output "#04 - Checking safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
+            $bcdout = bcdedit /store $bcdPath /enum
+            $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
+            $defaultId = '{' + $defaultLine.ToString().Split('{}')[1] + '}'
+            $safeModeIndicator = $bcdout | Select-String 'safeboot' | select -First 1
+
             # Check if partition has Registry path
             $regPath = $drive + ':\Windows\System32\config\'
             $isRegPath = Test-Path $regPath
         
-            # If Registry path found, continue script
-            if ($isRegPath) {
+            # If Registry path found and we're enabling safe mode, check if DC
+            if ($isRegPath -and ($safeModeSwitch -ne "Off")) {
         
-                Log-Output "Load requested Registry hive from $($drive)"
+                Log-Output "Load requested Registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
         
                 # Load hive into Rescue VM's registry from attached disk
                 reg load "HKLM\BROKENSYSTEM" "$($drive):\Windows\System32\config\SYSTEM"
         
                 # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
-                Log-Output "SYSTEM: getting specified Control Set"
                 $controlSetText = "ControlSet00"
                 $controlSet = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
                 $controlSetText += $controlSet
@@ -146,8 +152,7 @@ try {
 
                     # If Domain Controller, set the DSRM switch
                     if ($isDC) {                    
-                        Log-Output "DSA Database file found in \$($controlSetText)\Services\NTDS\parameters, probably a Domain Controller"
-                        $safeModeSwitch = 'dsrepair'
+                        Log-Output "DSA Database file found in \$($controlSetText)\Services\NTDS\parameters, probably a Domain Controller" | Tee-Object -FilePath $logFile -Append
 
                         # Modify the Registry                
                         $propertyValue = 0
@@ -169,29 +174,23 @@ try {
         
                         # Update the SecurityLayer key
                         $previousValueOfKey = Get-ItemPropertyValue -Path $propPath -Name $propertyName
-                        Log-Output "Modifying Registry key $($propPath) -> $($propertyName) to be $($propertyValue) for login, please reset back to previous value $($previousValueOfKey) after mitigation applied"
+                        Log-Output "Modifying Registry key $($propPath) -> $($propertyName) to be $($propertyValue) for login, please reset back to previous value $($previousValueOfKey) after mitigation applied" | Tee-Object -FilePath $logFile -Append
                         $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
-                        Log-Output $modifiedKey
-                    } else {
-                        Log-Output "DSA Database file not found in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller"
+                    }
+                    else {
+                        Log-Output "DSA Database file not found in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller" | Tee-Object -FilePath $logFile -Append
                     }
                 }
                 catch {
-                    Log-Output "Error searching for DSA Database file in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller"
+                    Log-Output "Error searching for DSA Database file in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller" | Tee-Object -FilePath $logFile -Append
                 }
         
                 # Unload hive
-                Log-Output "Unload attached disk registry hive on $($drive)"
+                Log-Output "Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
                 [gc]::Collect()
                 reg unload "HKLM\BROKENSYSTEM"                
             }
-
-            # Get Safe Mode state
-            Log-Output "#04 - Checking safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
-            $bcdout = bcdedit /store $bcdPath /enum
-            $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
-            $defaultId = '{' + $defaultLine.ToString().Split('{}')[1] + '}'
-            $safeModeIndicator = $bcdout | Select-String 'safeboot' | select -First 1
+            
             $safeBootVersion = If ($DC -or $isDC) { "dsrepair" } Else { "network" }
 
             if ($safeModeSwitch -eq "on") {
@@ -205,7 +204,6 @@ try {
                 bcdedit /store $bcdPath /deletevalue $defaultId safeboot
             }
             else {
-
                 # Toggle Mode, check if flag exists
                 if ($safeModeIndicator) {
                     # Flag exists, delete to take VM out of Safe Mode
