@@ -38,6 +38,7 @@
 #   Author: Ryan McCallum
 #
 # .VERSION
+    v0.3: [July 2023] - Detect if a Domain Controller from the attached OS drive's imported registry
 #   v0.2: [Feb 2023] - run with the -DC switch to initiate DSRM (Directory Services Recovery Mode) for Domain Controllers
 #   v0.1: Initial commit
 #>
@@ -47,7 +48,7 @@
 Param(
     [Parameter(Mandatory = $false)][string]$safeModeSwitch = '',
     [Parameter(Mandatory = $false)][switch]$DC
-    )
+)
 
 # Initialize script
 . .\src\windows\common\setup\init.ps1
@@ -120,13 +121,78 @@ try {
         # If both was found grab bcd store
         if ( $isBcdPath -and $isOsPath ) {
 
+            # Check if partition has Registry path
+            $regPath = $drive + ':\Windows\System32\config\'
+            $isRegPath = Test-Path $regPath
+        
+            # If Registry path found, continue script
+            if ($isRegPath) {
+        
+                Log-Output "Load requested Registry hive from $($drive)"
+        
+                # Load hive into Rescue VM's registry from attached disk
+                reg load "HKLM\BROKENSYSTEM" "$($drive):\Windows\System32\config\SYSTEM"
+        
+                # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
+                Log-Output "SYSTEM: getting specified Control Set"
+                $controlSetText = "ControlSet00"
+                $controlSet = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select" -Name Current).Current
+                $controlSetText += $controlSet
+
+                # Check if Domain Controller
+                try {                
+                    $dsaDatabase = Get-ItemPropertyValue -Path "HKLM:\BROKENSYSTEM\$($controlSetText)\Services\NTDS\parameters" -Name "DSA Database file" -ErrorAction Stop
+                    $isDC = ![String]::IsNullOrWhiteSpace($dsaDatabase)
+
+                    # If Domain Controller, set the DSRM switch
+                    if ($isDC) {                    
+                        Log-Output "DSA Database file found in \$($controlSetText)\Services\NTDS\parameters, probably a Domain Controller"
+                        $safeModeSwitch = 'dsrepair'
+
+                        # Modify the Registry                
+                        $propertyValue = 0
+                        $propertyName = "SecurityLayer"
+                        $propPath = "HKLM:\BROKENSYSTEM\$($controlSetText)\Control\Terminal Server\WinStations\RDP-Tcp"                        
+        
+                        # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
+                        If ($propertyType -eq "") {
+                            $propertyType = "dword"
+                        }
+        
+                        if (Test-Path $propPath) {
+                            $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
+                        }
+                        else {
+                            # If the path for the new key doesn't exist, create it as well
+                            New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop
+                        }
+        
+                        # Update the SecurityLayer key
+                        $previousValueOfKey = Get-ItemPropertyValue -Path $propPath -Name $propertyName
+                        Log-Output "Modifying Registry key $($propPath) -> $($propertyName) to be $($propertyValue) for login, please reset back to previous value $($previousValueOfKey) after mitigation applied"
+                        $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+                        Log-Output $modifiedKey
+                    } else {
+                        Log-Output "DSA Database file not found in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller"
+                    }
+                }
+                catch {
+                    Log-Output "Error searching for DSA Database file in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller"
+                }
+        
+                # Unload hive
+                Log-Output "Unload attached disk registry hive on $($drive)"
+                [gc]::Collect()
+                reg unload "HKLM\BROKENSYSTEM"                
+            }
+
             # Get Safe Mode state
             Log-Output "#04 - Checking safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
             $bcdout = bcdedit /store $bcdPath /enum
             $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
             $defaultId = '{' + $defaultLine.ToString().Split('{}')[1] + '}'
             $safeModeIndicator = $bcdout | Select-String 'safeboot' | select -First 1
-            $safeBootVersion = If ($DC) { "dsrepair" } Else { "network" }
+            $safeBootVersion = If ($DC -or $isDC) { "dsrepair" } Else { "network" }
 
             if ($safeModeSwitch -eq "on") {
                 # Setting flag so VM boots in Safe Mode
