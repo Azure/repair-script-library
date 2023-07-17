@@ -58,7 +58,7 @@ Param(
 $scriptStartTime = get-date -f yyyyMMddHHmmss
 $scriptPath = split-path -path $MyInvocation.MyCommand.Path -parent
 $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0]
-
+$regLoaded = $false
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 $scriptStartTime | Tee-Object -FilePath $logFile -Append
 
@@ -133,12 +133,13 @@ try {
             $isRegPath = Test-Path $regPath
         
             # If Registry path found and we're enabling safe mode, check if DC
-            if ($isRegPath -and ($safeModeSwitch -ne "Off")) {
+            if ($isRegPath -and ($safeModeIndicator -eq $false)) {
         
                 Log-Output "Load requested Registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
         
                 # Load hive into Rescue VM's registry from attached disk
                 reg load "HKLM\BROKENSYSTEM" "$($drive):\Windows\System32\config\SYSTEM"
+                $regLoaded = $true
         
                 # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
                 $controlSetText = "ControlSet00"
@@ -153,29 +154,6 @@ try {
                     # If Domain Controller, set the DSRM switch
                     if ($isDC) {                    
                         Log-Output "DSA Database file found in \$($controlSetText)\Services\NTDS\parameters, probably a Domain Controller" | Tee-Object -FilePath $logFile -Append
-
-                        # Modify the Registry                
-                        $propertyValue = 0
-                        $propertyName = "SecurityLayer"
-                        $propPath = "HKLM:\BROKENSYSTEM\$($controlSetText)\Control\Terminal Server\WinStations\RDP-Tcp"                        
-        
-                        # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
-                        If ($propertyType -eq "") {
-                            $propertyType = "dword"
-                        }
-        
-                        if (Test-Path $propPath) {
-                            $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
-                        }
-                        else {
-                            # If the path for the new key doesn't exist, create it as well
-                            New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop
-                        }
-        
-                        # Update the SecurityLayer key
-                        $previousValueOfKey = Get-ItemPropertyValue -Path $propPath -Name $propertyName
-                        Log-Output "Modifying Registry key $($propPath) -> $($propertyName) to be $($propertyValue) for login, please reset back to previous value $($previousValueOfKey) after mitigation applied" | Tee-Object -FilePath $logFile -Append
-                        $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
                     }
                     else {
                         Log-Output "DSA Database file not found in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller" | Tee-Object -FilePath $logFile -Append
@@ -183,12 +161,7 @@ try {
                 }
                 catch {
                     Log-Output "Error searching for DSA Database file in \$($controlSetText)\Services\NTDS\parameters, probably not a Domain Controller" | Tee-Object -FilePath $logFile -Append
-                }
-        
-                # Unload hive
-                Log-Output "Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
-                [gc]::Collect()
-                reg unload "HKLM\BROKENSYSTEM"                
+                }               
             }
             
             $safeBootVersion = If ($DC -or $isDC) { "dsrepair" } Else { "network" }
@@ -209,12 +182,52 @@ try {
                     # Flag exists, delete to take VM out of Safe Mode
                     Log-Output "#05 - Removing safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
                     bcdedit /store $bcdPath /deletevalue $defaultId safeboot
+                    $safeModeSwitch = "off"
                 }
                 else {
                     # Flag doesn't exist, adding so VM boots in Safe Mode
                     Log-Output "#05 - Configuring safeboot flag for $bcdPath" | Tee-Object -FilePath $logFile -Append
                     bcdedit /store $bcdPath /set $defaultId safeboot $safeBootVersion
+                    $safeModeSwitch = "on"
                 }
+            }
+
+            # If DC and enabling Safe Mode, set the SecurityLayer key to 0
+            if ($isDC -and $safeModeSwitch -eq "on") {
+                # Modify the Registry                
+                $propertyValue = 0
+                $propertyName = "SecurityLayer"
+                $propPath = "HKLM:\BROKENSYSTEM\$($controlSetText)\Control\Terminal Server\WinStations\RDP-Tcp"                        
+
+                # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
+                If ($propertyType -eq "") {
+                    $propertyType = "dword"
+                }
+
+                if (Test-Path $propPath) {
+                    $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
+                }
+                else {
+                    # If the path for the new key doesn't exist, create it as well
+                    New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop
+                }
+
+                # Update the SecurityLayer key
+                $previousValueOfKey = Get-ItemPropertyValue -Path $propPath -Name $propertyName
+                if ($previousValueOfKey -ne 0) {
+                    Log-Output "Modifying Registry key $($propPath) -> $($propertyName) to be $($propertyValue) for login, please reset back to previous value $($previousValueOfKey) after mitigation applied" | Tee-Object -FilePath $logFile -Append
+                    $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+                }
+                else {
+                    Log-Output "Registry key $($propPath) -> $($propertyName) already set to $($propertyValue) for login" | Tee-Object -FilePath $logFile -Append
+                }
+            }
+
+            # Unload hive
+            if ($regLoaded) {
+                Log-Output "Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
+                [gc]::Collect()
+                reg unload "HKLM\BROKENSYSTEM"
             }
 
             if ($guestHyperVVirtualMachine) {
@@ -245,7 +258,7 @@ catch {
     }
 
     # Log failure scenario
-    Log-Error "END: could not start/stop Safe Mode, BCD store may need to be repaired" | Tee-Object -FilePath $logFile -Append
+    Log-Error "END: could not start/stop Safe Mode, BCD store may need to be repaired or could not shut down nested Hyper-V VM" | Tee-Object -FilePath $logFile -Append
     throw $_
     return $STATUS_ERROR
 }
