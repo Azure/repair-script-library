@@ -76,7 +76,7 @@ try {
         }
     }
     else {
-        Log-Output "#01 - No nested guest VM, flipping safeboot switch anyways" | Tee-Object -FilePath $logFile -Append
+        Log-Output "#01 - No running nested guest VM, flipping safeboot switch anyways" | Tee-Object -FilePath $logFile -Append
     }
 
     # Make sure the disk is online
@@ -133,7 +133,7 @@ try {
             $isRegPath = Test-Path $regPath
         
             # If Registry path found and we're enabling safe mode, check if DC
-            if ($isRegPath -and ($safeModeIndicator -eq $false)) {
+            if ($isRegPath -and ($safeModeSwitch -ne "Off")) {
         
                 Log-Output "Load requested Registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
         
