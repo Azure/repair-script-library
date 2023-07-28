@@ -1,10 +1,14 @@
 ######################################################################################################
 <#
 # .SYNOPSIS
-#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. v0.1.0
+#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM.
 #
 # .DESCRIPTION
-#   https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/reset-local-password-without-agent
+#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. This is useful if you need to troubleshoot an Azure VM but do not have a local account with administrative privelegs. This script is intended to be run as part of the Azure VM repair workflow. It will create a local user account on the nested Hyper-V server and add it to the local administrators group. The user account 'azure-recoveryID' will be created with a partially randomized password unless the user specifies a username and password. Both the username and password requirements will match the regular requirements for Azure VMs. Custom usernames must not match the username of an account already on the server. The password will be written to the Azure VM repair log file in plain text so would not recommending the use of a known secure password. The user account and generated files should be deleted by the user when the Azure VM repair workflow completes. 
+
+Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/reset-local-password-without-agent 
+
+Username/password requirements: https://learn.microsoft.com/en-us/azure/virtual-machines/windows/faq#what-are-the-username-requirements-when-creating-a-vm-
 #
 # .EXAMPLE
 #	<# Create default troubleshooting user #>
@@ -14,7 +18,7 @@
 #   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair --parameters username=trblAcct password=welcomeToAzure!1
 #
 # .NOTES
-#   Author: Ryan McCallum
+#   Author: Ryan McCallum (inspired by Ahmed Fouad)
 #
 # .VERSION
 #   v0.1: Initial commit
@@ -185,11 +189,11 @@ try {
 
             if ($guestHyperVVirtualMachine) {
                 # Bring disk offline
-                Log-Output "#06 - Bringing disk offline" | Tee-Object -FilePath $logFile -Append
+                Log-Output "#05 - Bringing disk offline" | Tee-Object -FilePath $logFile -Append
                 $disk | set-disk -IsOffline $true -ErrorAction Stop
 
                 # Start Hyper-V VM
-                Log-Output "#07 - Starting VM" | Tee-Object -FilePath $logFile -Append
+                Log-Output "#06 - Starting VM" | Tee-Object -FilePath $logFile -Append
                 start-vm $guestHyperVVirtualMachine -ErrorAction Stop
             }
 
