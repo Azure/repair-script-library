@@ -1,4 +1,4 @@
-#########################################################################################################
+######################################################################################################
 <#
 # .SYNOPSIS
 #   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. v0.1.0
@@ -11,24 +11,24 @@
 #   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair
 #
 #	<# Create custom troubleshooting user #>
-#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair --parameters username=trblAcct password=welcomeToAzure!1 DC=$true
+#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair --parameters username=trblAcct password=welcomeToAzure!1
 #
 # .NOTES
 #   Author: Ryan McCallum
-
+#
 # .VERSION
 #   v0.1: Initial commit
 #>
-#########################################################################################################
+#######################################################################################################
 
 Param(
-    [Parameter(Mandatory = $false)][ValidatePattern("^((?!(1|123|a|actuser|adm|admin|admin1|admin2|administrator|aspnet|backup|console|david|guest|john|owner|root|server|sql|support_388945a0|support|sys|test|test1|test2|test3|user|user1|user2|nul|con|com[1-9]|lpt[1-9])([a-zA-Z0-9]|[^/[\]:|+=;,?*%@])){1,19}$")][string]$username, 
-    [Parameter(Mandatory = $false)][ValidatePattern("^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{12,123}$")][ValidateScript({ $_ -notin @('password', 'password123', '123456', 'admin', 'administrator', 'admin123', 'letmein', 'welcome', 'qwerty', 'abc123', 'monkey', '123123', 'password1', 'adminadmin', 'sunshine', 'master', 'hannah', 'qazwsx', 'charlie', 'superman', 'iloveyou', 'princess', 'adminadmin123', 'login', 'admin1234', 'welcome123', 'adminadminadmin', 'adminadminadmin123') })][string]$password
+    [Parameter(Mandatory = $false)][ValidatePattern("^(([a-zA-Z0-9]|[^/[\]:|+=;,?*%@])){1,19}$")][ValidateScript({ $_ -notin @('1','123','a','actuser','adm','admin','admin1','admin2','administrator','aspnet','backup','console','david','guest','john','owner','root','server','sql','support_388945a0','support','sys','test','test1','test2','test3','user','user1','user2','user3','user4','user5','nul','con','com','lpt') })][string]$username, 
+    [Parameter(Mandatory = $false)][ValidatePattern("^.{12,123}$")][ValidateScript({ $_ -notin @('password', 'pa$$word','pa$$w0rd','pa$$word123','pa$$w0rd123', 'password123', '123456', 'admin', 'administrator', 'admin123', 'letmein', 'welcome', 'qwerty', 'abc123','abc@123', 'monkey', '123123', 'password1', 'adminadmin', 'sunshine', 'master', 'hannah', 'qazwsx', 'charlie', 'superman', 'iloveyou', 'princess', 'adminadmin123', 'login', 'admin1234', 'welcome123', 'adminadminadmin', 'adminadminadmin123','Password!', 'Password1', 'Password22', 'iloveyou!'); $lowercaseMatch = $_ -match "[a-z]+"; $uppercaseMatch = $_ -match "[A-Z]+"; $digitMatch = $_ -match "\d+"; $specialCharMatch = $_ -match "[ `~!@#$%^&*()=+_\[\]{}\|;:.\/'"",<>?]+"; $conditionsMet = ($lowercaseMatch, $uppercaseMatch, $digitMatch, $specialCharMatch) | Measure-Object -Sum | Select-Object -ExpandProperty Sum; return $conditionsMet -gt 2;  })][string]$password
 )
     
 # Initialize script
-# . .\src\windows\common\setup\init.ps1
-# . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
+ . .\src\windows\common\setup\init.ps1
+ . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
 # Declare variables
 $scriptStartTime = get-date -f yyyyMMddHHmmss
