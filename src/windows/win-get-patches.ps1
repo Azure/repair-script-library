@@ -101,28 +101,13 @@ try {
             Log-Output "#04 - Found OS directory at $($drive), getting patches..." | Tee-Object -FilePath $logFile -Append
             cmd /c "dism /image:$($drive):\ /get-packages /format:list" | Out-File -FilePath $logFile -Append
             # cmd /c "dism /image:$($drive):\ /get-packages /format:table" | Tee-Object -FilePath $logFile -Append
-            $packages = (Get-WindowsPackage -path "$($drive):").packagename
+            $packages = (Get-WindowsPackage -path "$($drive):").packagename | ft -AutoSize
 
-            $modifiedPackages = @()
-            foreach ($package in $packages) {
-                if ($package.Length -gt 60) {
-                    while ($package.Length -gt 60) {
-                        $portion = $package.Substring(0, 60)
-                        $modifiedPackages += $portion                        
-                        $package = $package.Substring(60)
-                    }
-                    $modifiedPackages += $package
-                    $modifiedPackages += "`n"                    
-                }
-                else {
-                    $modifiedPackages += $package
-                    $modifiedPackages += "`n"
-                }
-            }
-            $modifiedPackages
-            Log-Output "Only displaying package names for brevity"
-            Log-Output "Lines that are separated by a space are part of the same package, but were split for formatting purposes"
-            Log-Output "If you need to remove a package with az vm repair 'win-remove-patch' script, use the full joined package name, including the version number, e.g. 'Package_for_KB1234567~31bf3856ad364e35~amd64~~17763.2090.1.3'"
+            Write-Output "`n"
+            Write-Output $packages
+            Write-Output "`n"
+
+            Log-Output "Only displaying package names for brevity"            
             Log-Output "Full DISM output is on the Rescue VM in $($logFile)"
             return $STATUS_SUCCESS
         }
