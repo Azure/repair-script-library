@@ -97,8 +97,8 @@ try {
 
         # If on the OS directory, continue script
         if ( $isOsPath ) {
-            Log-Output "#04 - Found OS directory at $($drive), getting patches" | Tee-Object -FilePath $logFile -Append
-            cmd /c "dism /image:$($drive):\ /get-packages" | Tee-Object -FilePath $logFile -Append
+            Log-Output "#04 - Found OS directory at $($drive), getting patches..." | Tee-Object -FilePath $logFile -Append
+            cmd /c "dism /image:$($drive):\ /get-packages /format:list" | Tee-Object -FilePath $logFile -Append
             return $STATUS_SUCCESS
         }
     }
