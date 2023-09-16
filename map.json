@@ -103,5 +103,15 @@
 		"id" : "win-remove-patch",
 		"path" : "src/windows/win-remove-patch.ps1",
 		"description" : "Remove an installed Windows patch for the nested Hyper-V server on a Rescue VM using DISM. This will be helpful if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates."
+	},
+	{
+		"id" : "win-get-apps",
+		"path" : "src/windows/win-get-apps.ps1",
+		"description" : "Get installed Windows applications for the nested Hyper-V machine."
+	},
+	{
+		"id" : "win-remove-patch",
+		"path" : "src/windows/win-remove-app.ps1",
+		"description" : "Remove an installed Windows application from the nested Hyper-V machine."
 	}
 ]
