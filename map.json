@@ -110,7 +110,7 @@
 		"description" : "Get installed Windows applications for the nested Hyper-V machine."
 	},
 	{
-		"id" : "win-remove-patch",
+		"id" : "win-remove-app",
 		"path" : "src/windows/win-remove-app.ps1",
 		"description" : "Remove an installed Windows application from the nested Hyper-V machine."
 	}
