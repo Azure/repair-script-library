@@ -3,6 +3,9 @@
 # .SYNOPSIS
 #   Get installed Windows applications for the nested Hyper-V machine.
 #
+# .DESCRIPTION
+#   Get installed Windows applications for the nested Hyper-V machine. This will be helpful if the attached OS disk is from a VM where uninstalling the apps is difficult. When complete, the script will output uninstallable apps and their QUS (Quiet Uninstall String) to the terminal. Copy the QUS to the win-remove-app script to attempt silent uninstall from nested VM.
+#
 # .EXAMPLE
 #	<# Get installed apps #>
 #   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-get-apps' --verbose --run-on-repair
@@ -96,7 +99,7 @@ try {
         # If on the OS directory, continue script
         if ( $isOsPath ) {
 
-            Log-Output '#04 - getting MSI installed apps from registry' | Tee-Object -FilePath $logFile -Append    
+            Log-Output '#04 - getting apps from registry that can be quietly uninstalled' | Tee-Object -FilePath $logFile -Append    
             
             # Check if partition has Registry path
             $regPath = $drive + ':\Windows\System32\config\'
@@ -123,12 +126,13 @@ try {
 
                 $installedAppsList = $uninstallableApps | Select-Object @{Name="App";Expression={ if ($_.DisplayName) { $_.DisplayName } }}, @{Name="QUS";Expression={ if ($_.UninstallString -like "*MsiExec.exe*") { $_.PSChildName } elseif ( $_.QuietUninstallString ) { $_.QuietUninstallString } else { "No quiet uninstall string, must be uninstalled from live system" } } } | Where-Object { $_.App } | Format-List
 
-                $uninstallableApps | Out-File -FilePath $logFile -Append
+                $installedApps | ForEach-Object { $_; "================================================" } | Out-File -FilePath $logFile -Append
 
                 Write-Output "`n"
                 Write-Output $installedAppsList
                 Write-Output "`n"
 
+                Log-Output "Copy QUS (Quiet Uninstall String) to win-remove-app script to attempt silent uninstall from nested VM" | Tee-Object -FilePath $logFile -Append
                 Log-Output "Full output is on the Rescue VM in $($logFile)"
 
                 # Unload hive
