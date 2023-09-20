@@ -107,21 +107,26 @@ try {
                 Log-Output "Load SOFTWARE registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
          
                 # Load hive into Rescue VM's registry from attached disk
-                cmd /c { reg load "HKLM\BROKENSOFTWARE" "$($drive):\Windows\System32\config\SOFTWARE" }
-                $regLoaded = $true
-
-                 
+                reg load 'HKLM\BROKENSOFTWARE' "$($drive):\Windows\System32\config\SOFTWARE"
+                if( $? -eq $false ) {
+                    Log-Error "Failed to load registry hive from $($drive), aborting" | Tee-Object -FilePath $logFile -Append
+                    return $STATUS_ERROR
+                } else {
+                    Log-Output "Registry hive loaded successfully" | Tee-Object -FilePath $logFile -Append
+                    $regLoaded = $true
+                } 
+                                 
                 # Get the list of installed applications
                 $installedApps = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
 
-                $installedAppsMSI = $installedApps | Where-Object { $_.UninstallString -like "*MsiExec.exe*" }
+                $uninstallableApps = $installedApps | Where-Object { ($_.UninstallString -like "*MsiExec.exe*") -or ($_.QuietUninstallString -ne "" ) }
 
-                $installedAppsTable = $($installedAppsMSI | Format-Table DisplayName, PSChildName -AutoSize)
+                $installedAppsList = $uninstallableApps | Select-Object @{Name="App";Expression={ if ($_.DisplayName) { $_.DisplayName } }}, @{Name="QUS";Expression={ if ($_.UninstallString -like "*MsiExec.exe*") { $_.PSChildName } elseif ( $_.QuietUninstallString ) { $_.QuietUninstallString } else { "No quiet uninstall string, must be uninstalled from live system" } } } | Where-Object { $_.App } | Format-List
 
-                $installedAppsTable | Tee-Object -FilePath $logFile -Append
+                $uninstallableApps | Out-File -FilePath $logFile -Append
 
                 Write-Output "`n"
-                Write-Output $installedAppsTable
+                Write-Output $installedAppsList
                 Write-Output "`n"
 
                 Log-Output "Full output is on the Rescue VM in $($logFile)"
@@ -130,7 +135,7 @@ try {
                 if ($regLoaded) {
                     Log-Output "#05 - Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
                     [gc]::Collect()
-                    cmd /c "reg unload 'HKLM\BROKENSOFTWARE'"
+                    reg unload 'HKLM\BROKENSOFTWARE'
                 }            
             } else {
                 Log-Output "No registry path found on $($drive), skipping" | Tee-Object -FilePath $logFile -Append
