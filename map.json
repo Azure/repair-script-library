@@ -107,7 +107,7 @@
 	{
 		"id" : "win-get-apps",
 		"path" : "src/windows/win-get-apps.ps1",
-		"description" : "Get installed Windows applications for the nested Hyper-V machine."
+		"description" : "Get Windows applications for the nested Hyper-V machine that can be uninstalled."
 	},
 	{
 		"id" : "win-remove-app",
