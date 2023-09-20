@@ -110,8 +110,7 @@ try {
         # If on the OS directory, continue script
         if ( $isOsPath ) {
 
-            Log-Output '#04 - updating local policy files' | Tee-Object -FilePath $logFile -Append    
-            
+            Log-Output '#04 - updating local policy files' | Tee-Object -FilePath $logFile -Append                
                        
             # Setup policy files
             $groupPolicyPath = $drive + ':\Windows\System32\GroupPolicy'

@@ -111,16 +111,10 @@ try {
          
                 # Load hive into Rescue VM's registry from attached disk
                 reg load 'HKLM\BROKENSOFTWARE' "$($drive):\Windows\System32\config\SOFTWARE"
-                if( $? -eq $false ) {
-                    Log-Error "Failed to load registry hive from $($drive), aborting" | Tee-Object -FilePath $logFile -Append
-                    return $STATUS_ERROR
-                } else {
-                    Log-Output "Registry hive loaded successfully" | Tee-Object -FilePath $logFile -Append
                     $regLoaded = $true
-                } 
                                  
                 # Get the list of installed applications
-                $installedApps = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                $installedApps = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"  | sort-object DisplayName
 
                 $uninstallableApps = $installedApps | Where-Object { ($_.UninstallString -like "*MsiExec.exe*") -or ($_.QuietUninstallString -ne "" ) }
 
