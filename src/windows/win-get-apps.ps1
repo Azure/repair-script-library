@@ -116,8 +116,8 @@ try {
                 # Get the list of installed applications
                 $installedApps = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"  | sort-object DisplayName
 
-                $uninstallableApps = $installedApps | Where-Object { ($_.UninstallString -like "*MsiExec.exe*") -or ($_.QuietUninstallString -ne "" ) }
-
+                $uninstallableApps = $installedApps | Where-Object { ($_.UninstallString -like "*MsiExec.exe*") -or (![String]::IsNullOrWhiteSpace($_.QuietUninstallString) ) }
+                
                 $installedAppsList = $uninstallableApps | Select-Object @{Name="App";Expression={ if ($_.DisplayName) { $_.DisplayName } }}, @{Name="QUS";Expression={ if ($_.UninstallString -like "*MsiExec.exe*") { $_.PSChildName } elseif ( $_.QuietUninstallString ) { $_.QuietUninstallString } else { "No quiet uninstall string, must be uninstalled from live system" } } } | Where-Object { $_.App } | Format-List
 
                 $installedApps | ForEach-Object { $_; "================================================" } | Out-File -FilePath $logFile -Append
