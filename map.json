@@ -61,8 +61,8 @@
 	},
 	{
 		"id" : "linux-alar-fki",
-		"path" : "src/linux/linux-alar-fki.sh",
-		"description" : "alar-fki allows to recover a failed VM. Three recover scenarios are possible: fstab, initrd and kernel. NOTE: use option --run-on-repair. Se the docu for more details: https://github.com/Azure/repair-script-library/blob/master/src/linux/common/helpers/alar/README.md"
+		"path" : "src/linux/linux-alar2.sh",
+		"description" : "This ID is deprectated. Please use 'linux-alar2' instead. For backward compatibility it will use the linux-alar2 ID automatically."
 	},
     	{
 		"id" : "linux-alar2",
@@ -88,5 +88,20 @@
 		"id" : "win-collect-attached-disk-logs",
 		"path" : "src/windows/win-collect-attached-disk-logs.ps1",
 		"description" : "Collect OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk."
+	},
+	{
+		"id" : "win-create-troubleshooting-user",
+		"path" : "src/windows/win-create-troubleshooting-user.ps1",
+		"description" : "Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account."
+	},
+	{
+		"id" : "win-get-patches",
+		"path" : "src/windows/win-get-patches.ps1",
+		"description" : "Get installed Windows patches for the nested Hyper-V server on a Rescue VM using DISM."
+	},
+	{
+		"id" : "win-remove-patch",
+		"path" : "src/windows/win-remove-patch.ps1",
+		"description" : "Remove an installed Windows patch for the nested Hyper-V server on a Rescue VM using DISM. This will be helpful if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates."
 	}
 ]
