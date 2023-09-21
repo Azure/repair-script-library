@@ -1,4 +1,4 @@
-######################################################################################################
+﻿######################################################################################################
 <#
 # .SYNOPSIS
 #   Get installed Windows applications for the nested Hyper-V machine.
@@ -17,28 +17,25 @@
 #   v0.1: Initial commit
 #>
 #######################################################################################################
-    
+
 # Initialize script
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
 # Declare variables
 $scriptStartTime = get-date -f yyyyMMddHHmmss
-$scriptPath = split-path -path $MyInvocation.MyCommand.Path -parent
 $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0]
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 $scriptStartTime | Tee-Object -FilePath $logFile -Append
-Log-Output "START: Running script win-get-apps" | Tee-Object -FilePath $logFile -Append
+Log-Output "START: Running script $($scriptName)" | Tee-Object -FilePath $logFile -Append
 
 try {
-    
+
     # Make sure guest VM is shut down if it exists
     $features = get-windowsfeature -ErrorAction Stop
-    $hyperv = $features | where Name -eq 'Hyper-V'
-    $hypervTools = $features | where Name -eq 'Hyper-V-Tools'
-    $hypervPowerShell = $features | where Name -eq 'Hyper-V-Powershell'
-    $dhcp = $features | where Name -eq 'DHCP'
-    $rsatDhcp = $features | where Name -eq 'RSAT-DHCP'
+    $hyperv = $features | Where-Object Name -eq 'Hyper-V'
+    $hypervTools = $features | Where-Object Name -eq 'Hyper-V-Tools'
+    $hypervPowerShell = $features | Where-Object Name -eq 'Hyper-V-Powershell'
 
     if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Installed) {
         $guestHyperVVirtualMachine = Get-VM
@@ -99,25 +96,25 @@ try {
         # If on the OS directory, continue script
         if ( $isOsPath ) {
 
-            Log-Output '#04 - getting apps from registry that can be quietly uninstalled' | Tee-Object -FilePath $logFile -Append    
-            
+            Log-Output '#04 - getting apps from registry that can be quietly uninstalled' | Tee-Object -FilePath $logFile -Append
+
             # Check if partition has Registry path
             $regPath = $drive + ':\Windows\System32\config\'
             $isRegPath = Test-Path $regPath
-         
+
             if ($isRegPath) {
-         
+
                 Log-Output "Load SOFTWARE registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
-         
+
                 # Load hive into Rescue VM's registry from attached disk
                 reg load 'HKLM\BROKENSOFTWARE' "$($drive):\Windows\System32\config\SOFTWARE"
                     $regLoaded = $true
-                                 
+
                 # Get the list of installed applications
                 $installedApps = Get-ItemProperty "HKLM:\BROKENSOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"  | sort-object DisplayName
 
                 $uninstallableApps = $installedApps | Where-Object { ($_.UninstallString -like "*MsiExec.exe*") -or (![String]::IsNullOrWhiteSpace($_.QuietUninstallString) ) }
-                
+
                 $installedAppsList = $uninstallableApps | Select-Object @{Name="App";Expression={ if ($_.DisplayName) { $_.DisplayName } }}, @{Name="QUS";Expression={ if ($_.UninstallString -like "*MsiExec.exe*") { $_.PSChildName } elseif ( $_.QuietUninstallString ) { $_.QuietUninstallString } else { "No quiet uninstall string, must be uninstalled from live system" } } } | Where-Object { $_.App } | Format-List
 
                 $installedApps | ForEach-Object { $_; "================================================" } | Out-File -FilePath $logFile -Append
@@ -134,12 +131,12 @@ try {
                     Log-Output "#05 - Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
                     [gc]::Collect()
                     reg unload 'HKLM\BROKENSOFTWARE'
-                }            
+                }
             } else {
                 Log-Output "No registry path found on $($drive), skipping" | Tee-Object -FilePath $logFile -Append
             }
 
-            Log-Output "END: List Apps" | Tee-Object -FilePath $logFile -Append            
+            Log-Output "END: List Apps" | Tee-Object -FilePath $logFile -Append
             return $STATUS_SUCCESS
         } else {
             Log-Output "No OS directory found on $($drive), skipping" | Tee-Object -FilePath $logFile -Append

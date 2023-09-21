@@ -1,4 +1,4 @@
-######################################################################################################
+﻿######################################################################################################
 <#
 # .SYNOPSIS
 #   Remove an installed Windows application from the nested Hyper-V machine.
@@ -25,7 +25,7 @@
 Param(
     [Parameter(Mandatory = $true)][string]$uninstallString = ''
 )
-    
+
 # Initialize script
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
@@ -39,17 +39,15 @@ $scriptStartTime | Tee-Object -FilePath $logFile -Append
 $uninstallString = $uninstallString.Trim()
 $uninstallScript = if ($uninstallString -like "{*}" ) { "msiexec /x $($uninstallString) REMOVE=ALL REBOOT=R /quiet /qn /forcerestart /l* $($logfile)" } else { $uninstallString }
 
-Log-Output "START: Running script win-remove-app" | Tee-Object -FilePath $logFile -Append
+Log-Output "START: Running script $($scriptName)" | Tee-Object -FilePath $logFile -Append
 
 try {
-    
+
     # Make sure guest VM is shut down if it exists
     $features = get-windowsfeature -ErrorAction Stop
-    $hyperv = $features | where Name -eq 'Hyper-V'
-    $hypervTools = $features | where Name -eq 'Hyper-V-Tools'
-    $hypervPowerShell = $features | where Name -eq 'Hyper-V-Powershell'
-    $dhcp = $features | where Name -eq 'DHCP'
-    $rsatDhcp = $features | where Name -eq 'RSAT-DHCP'
+    $hyperv = $features | Where-Object Name -eq 'Hyper-V'
+    $hypervTools = $features | Where-Object Name -eq 'Hyper-V-Tools'
+    $hypervPowerShell = $features | Where-Object Name -eq 'Hyper-V-Powershell'
 
     if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Installed) {
         $guestHyperVVirtualMachine = Get-VM
@@ -110,8 +108,8 @@ try {
         # If on the OS directory, continue script
         if ( $isOsPath ) {
 
-            Log-Output '#04 - updating local policy files' | Tee-Object -FilePath $logFile -Append                
-                       
+            Log-Output '#04 - updating local policy files' | Tee-Object -FilePath $logFile -Append
+
             # Setup policy files
             $groupPolicyPath = $drive + ':\Windows\System32\GroupPolicy'
             [string]$gpt = 'gpt.ini'
@@ -120,64 +118,64 @@ try {
             [string]$ScriptINIPath = $groupPolicyPath + "\Machine\Scripts\$($ini)"
             [string]$scriptName = 'FixAzureVM.cmd'
             [string]$scriptPath = $groupPolicyPath + "\Machine\Scripts\Startup\$($scriptName)"
-            
+
             # check if they already exist and rename
             if (Test-Path -Path $gptPath -ErrorAction SilentlyContinue) {
-                Log-Output "Renaming $($gptPath) to '$($gpt).bak'" | Tee-Object -FilePath $logFile -Append  
+                Log-Output "Renaming $($gptPath) to '$($gpt).bak'" | Tee-Object -FilePath $logFile -Append
                 try {
                     Rename-Item -Path $gptPath -NewName "$($gpt).bak" -ErrorAction Stop
-                } 
-                catch {                    
+                }
+                catch {
                     $gptBakCount = (Get-ChildItem -Path $gptPath -Filter "$($gpt).bak*" -ErrorAction SilentlyContinue).Count
                     Rename-Item -Path $gptPath -NewName "$($gpt).bak$($gptBakCount + 1)"
                 }
                 finally {
-                    $gptPathRenamed = $true              
-                }                     
+                    $gptPathRenamed = $true
+                }
             }
             if (Test-Path -Path $ScriptINIPath -ErrorAction SilentlyContinue) {
                 Log-Output "Renaming $($ScriptINIPath) to '$($ini).bak'" | Tee-Object -FilePath $logFile -Append
                 try {
                     Rename-Item -Path $ScriptINIPath -NewName "$($ini).bak" -ErrorAction Stop
-                } 
-                catch {                    
+                }
+                catch {
                     $iniBakCount = (Get-ChildItem -Path $ScriptINIPath -Filter "$($ini).bak*" -ErrorAction SilentlyContinue).Count
                     Rename-Item -Path $ScriptINIPath -NewName "$($ini).bak$($iniBakCount + 1)"
                 }
                 finally {
-                    $ScriptINIPathRenamed = $true              
+                    $ScriptINIPathRenamed = $true
                 }
             }
             if (Test-Path -Path $scriptPath -ErrorAction SilentlyContinue) {
-                
+
                 Log-Output "Renaming $($scriptPath) to '$($scriptName).bak'" | Tee-Object -FilePath $logFile -Append
                 try {
                     Rename-Item -Path $scriptPath -NewName "$($scriptName).bak" -ErrorAction Stop
-                } 
-                catch {                    
+                }
+                catch {
                     $scriptBakCount = (Get-ChildItem -Path $scriptPath -Filter "$($scriptName).bak*" -ErrorAction SilentlyContinue).Count
                     Rename-Item -Path $scriptPath -NewName "$($scriptName).bak$($scriptBakCount + 1)"
                 }
                 finally {
-                    $scriptPathRenamed = $true              
+                    $scriptPathRenamed = $true
                 }
             }
 
-            # Create new gpt file 
+            # Create new gpt file
             New-Item -Path $gptPath -ItemType File -Force
             [string]$gptNewContent = "[General]`ngPCFunctionalityVersion=2
          gPCMachineExtensionNames=[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B6664F-4972-11D1-A7CA-0000F87571E3}]
-         Version=1" 
-            Add-Content -Path $gptPath -Value $gptNewContent -Force -Encoding Default 
+         Version=1"
+            Add-Content -Path $gptPath -Value $gptNewContent -Force -Encoding Default
 
-            #Create new script.ini file  
+            #Create new script.ini file
             new-item -Path $ScriptINIPath -Force
             [string]$scriptINIContent = "[Startup]
          0CmdLine=$($scriptName)`n0Parameters="
             Add-Content -Path $ScriptINIPath -Value $scriptINIContent -Force -Encoding Default
-            
-            #Create the script file 
-            New-Item -Path $scriptPath -Force            
+
+            #Create the script file
+            New-Item -Path $scriptPath -Force
             Add-Content -Path $scriptPath -Value $uninstallScript -Force -Encoding Default
 
             if ($guestHyperVVirtualMachine) {
@@ -195,7 +193,7 @@ try {
             Log-Output "Remove the following files after troubleshooting has been completed: " | Tee-Object -FilePath $logFile -Append
             Log-Output "$($gptPath)$(if ($gptPathRenamed) { " and rename $($gptPath).bak to $($gptPath) " })" | Tee-Object -FilePath $logFile -Append
             Log-Output "$($ScriptINIPath)$(if ($ScriptINIPathRenamed) { " and rename $($ScriptINIPath).bak to $($ScriptINIPath) " })" | Tee-Object -FilePath $logFile -Append
-            Log-Output "$($scriptPath)$(if ($scriptPathRenamed) { " and rename $($scriptPath).bak to $($scriptPath) " })" | Tee-Object -FilePath $logFile -Append                   
+            Log-Output "$($scriptPath)$(if ($scriptPathRenamed) { " and rename $($scriptPath).bak to $($scriptPath) " })" | Tee-Object -FilePath $logFile -Append
             return $STATUS_SUCCESS
         } else {
             Log-Output "No OS directory found on $($drive), skipping" | Tee-Object -FilePath $logFile -Append
