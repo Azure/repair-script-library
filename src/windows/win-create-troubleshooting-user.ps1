@@ -4,7 +4,7 @@
 #   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM.
 #
 # .DESCRIPTION
-#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. This is useful if you need to troubleshoot an Azure VM but do not have a local account with administrative privelegs. This script is intended to be run as part of the Azure VM repair workflow. It will create a local user account on the nested Hyper-V server and add it to the local administrators group. The user account 'azure-recoveryID' will be created with a partially randomized password unless the user specifies a username and password. Both the username and password requirements will match the regular requirements for Azure VMs. Custom usernames must not match the username of an account already on the server. The password will be written to the Azure VM repair log file in plain text so would not recommending the use of a known secure password. The user account and generated files should be deleted by the user when the Azure VM repair workflow completes. 
+#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. This is useful if you need to troubleshoot an Azure VM but do not have a local account with administrative privileges. This script is intended to be run as part of the Azure VM repair workflow. It will create a local user account on the nested Hyper-V server and add it to the local administrators group. The user account 'azure-recoveryID' will be created with a partially randomized password unless the user specifies a username and password. Both the username and password requirements will match the regular requirements for Azure VMs. Custom usernames must not match the username of an account already on the server. The password will be written to the Azure VM repair log file in plain text so would not recommending the use of a known secure password. The user account and generated files should be deleted by the user when the Azure VM repair workflow completes. 
 
 Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/reset-local-password-without-agent 
 
@@ -15,12 +15,13 @@ Username/password requirements: https://learn.microsoft.com/en-us/azure/virtual-
 #   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair
 #
 #	<# Create custom troubleshooting user #>
-#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair --parameters username=trblAcct password=welcomeToAzure!1
+#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair --parameters username='trblAcct' password='welcomeToAzure!1'
 #
 # .NOTES
 #   Author: Ryan McCallum (inspired by Ahmed Fouad)
 #
 # .VERSION
+#   v0.2: Removed encoding params
 #   v0.1: Initial commit
 #>
 #######################################################################################################
@@ -172,20 +173,20 @@ try {
             [string]$gptNewContent = "[General]`ngPCFunctionalityVersion=2
          gPCMachineExtensionNames=[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B6664F-4972-11D1-A7CA-0000F87571E3}]
          Version=1" 
-            Add-Content -Path $gptPath -Value $gptNewContent -Force -Encoding Default 
+            Add-Content -Path $gptPath -Value $gptNewContent -Force
 
             #Create new script.ini file  
             new-item -Path $ScriptINIPath -Force
             [string]$scriptINIContent = "[Startup]
          0CmdLine=$($scriptName)`n0Parameters="
-            Add-Content -Path $ScriptINIPath -Value $scriptINIContent -Force -Encoding Default
+            Add-Content -Path $ScriptINIPath -Value $scriptINIContent -Force
             
             #Create the script file 
             New-Item -Path $scriptPath -Force
             [string]$scriptcontent = "net user " + $username + " " + $password + " /add /Y
        net localgroup administrators " + $username + " /add
        net localgroup 'remote desktop users' " + $username + " /add" 
-            Add-Content -Path $scriptPath -Value $scriptcontent -Force -Encoding Default
+            Add-Content -Path $scriptPath -Value $scriptcontent -Force
 
             if ($guestHyperVVirtualMachine) {
                 # Bring disk offline
