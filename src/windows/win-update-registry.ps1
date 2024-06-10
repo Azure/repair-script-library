@@ -1,12 +1,12 @@
 ﻿#########################################################################################################
 <#
 # .SYNOPSIS
-#  Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk. v0.2.0
+#  Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk. v0.2.1
 #
 # .NOTES
 #   Author: Ryan McCallum
 #   Sources:
-        https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty?view=powershell-7.1
+        https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty
 #
 # .PARAMETER rootKey
 #   [Optional] "HKLM" by default. Add shortcut version for other hives if using another hive (e.g. HKEY_CURRENT_USER would be HKCU).
@@ -32,7 +32,7 @@
 # .PARAMETER propertyType
 #   [Optional] Add the type of the property that we are adding or updating. Necessary if a new value,
 #   not necessary if updating already existing value. Follows the naming convention of the following doc:
-#       https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty?view=powershell-7.1
+#       https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty
 #
 # .PARAMETER propertyValue
 #   Add the value of the property/entry that we are adding or updating.
@@ -40,8 +40,7 @@
 # .EXAMPLE
 #   <# This will run Set-ItemProperty -Path "HKLM:\brokenSystemF\ControlSet001\Control\Terminal Server" -name fDenyTSConnections -type DWORD -Value 0 #>
 #   <# Where brokenSystemF is the System hive from the attached OS disk's F: partition #>
-#   az vm repair run -g sourceRG -n problemVM --run-id win-update-registry --run-on-repair --parameters rootKey=HKLM hive=SYSTEM controlSet=1
-#     relativePath='Control\Terminal` Server' propertyName=fDenyTSConnections propertyValue=0 propertyType=dword
+#   az vm repair run -g sourceRG -n problemVM --run-id win-update-registry --run-on-repair --parameters rootKey=HKLM hive=SYSTEM controlSet=1 relativePath='Control\Terminal` Server' propertyName=fDenyTSConnections propertyValue=0 propertyType=dword
 #
 #>
 #########################################################################################################
@@ -118,11 +117,15 @@ try {
                 }
                 else {
                     $controlSetText = ""
-                    Log-Output "Not using a SYSTEM hive" | Tee-Object -FilePath $logFile -Append
+                    Log-Output "Not using a SYSTEM hive, using $($hive)" | Tee-Object -FilePath $logFile -Append
                 }
 
-                # Modify the Registry
+                # Report the key
                 $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
+                Log-Output "Checking registry for $($propPath)" | Tee-Object -FilePath $logFile -Append
+                Get-ItemProperty -Path $propPath -Name $propertyName -ErrorAction Continue -WarningAction Continue | Tee-Object -FilePath $logFile -Append
+
+                # Modify the Registry
                 Log-Output "Modify Registry key $($propPath)" | Tee-Object -FilePath $logFile -Append
 
                 # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
@@ -135,14 +138,6 @@ try {
                 }
                 else {
                     # If the path for the new key doesn't exist, create it as well
-                    New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop
-                }
-                if (Test-Path $propPath) {
-                    $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
-                }
-                else {
-                    # If the path for the new key doesn't exist, create it as well
-                    $propertyType = "dword"
                     New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop | Out-Null
                 }
             }
