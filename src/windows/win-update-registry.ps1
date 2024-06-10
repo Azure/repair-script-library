@@ -70,11 +70,24 @@ $scriptStartTime | Tee-Object -FilePath $logFile -Append
 # Start
 Log-Output "START: Running script win-update-registry.ps1" | Tee-Object -FilePath $logFile -Append
 
-
 try {
     # Declaring variables
     $fixedDrives = @()
     $modifiedKey = @()
+
+    # Make sure guest VM is shut down
+    $guestHyperVVirtualMachine = Get-VM
+    $guestHyperVVirtualMachineName = $guestHyperVVirtualMachine.VMName
+    if ($guestHyperVVirtualMachine) {
+        if ($guestHyperVVirtualMachine.State -eq 'Running') {
+            Log-Output "Stopping nested guest VM $guestHyperVVirtualMachineName" | Tee-Object -FilePath $logFile -Append
+            Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
+        }
+    }
+    else {
+        Log-Output "No running nested guest VM, continuing" | Tee-Object -FilePath $logFile -Append
+    }
+
 
     # Make sure the disk is online
     Log-Output "Bringing partition(s) online if present" | Tee-Object -FilePath $logFile -Append
