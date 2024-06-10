@@ -48,7 +48,7 @@
 # Set the Parameters for the script
 Param(
     [Parameter(Mandatory = $false)][ValidateSet("HKLM", "HKCC", "HKCR", "HKCU", "HKU")][string]$rootKey = "HKLM",
-    [Parameter(Mandatory = $false)][ValidateSet("SYSTEM", "SOFTWARE", "SAM", "SECURITY", "HARDWARE", "DEFAULT")][string]$hive = "System",
+    [Parameter(Mandatory = $false)][string]$hive = "System",
     [Parameter(Mandatory = $false)][ValidateSet("String", "ExpandString", "Binary", "DWord", "MultiString", "Qword", "Unknown")][string]$propertyType = "",
     [Parameter(Mandatory = $false)][ValidateSet(1, 2)] [Int]$controlSet,
     [Parameter(Mandatory = $true)][string]$relativePath = "",
