@@ -76,12 +76,17 @@ try {
     $modifiedKey = @()
 
     # Make sure guest VM is shut down
-    $guestHyperVVirtualMachine = Get-VM
+    $guestHyperVVirtualMachine = Get-VM -ErrorAction Continue -WarningAction Continue
     $guestHyperVVirtualMachineName = $guestHyperVVirtualMachine.VMName
     if ($guestHyperVVirtualMachine) {
         if ($guestHyperVVirtualMachine.State -eq 'Running') {
             Log-Output "Stopping nested guest VM $guestHyperVVirtualMachineName" | Tee-Object -FilePath $logFile -Append
-            Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
+            try{
+                Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
+            } catch{
+                Log-Warning "Failed to stop nested guest VM $($guestHyperVVirtualMachineName), will continue script but may have limited success" | Tee-Object -FilePath $logFile -Append
+            }
+
         }
     }
     else {
