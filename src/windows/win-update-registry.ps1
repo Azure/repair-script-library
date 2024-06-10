@@ -60,7 +60,17 @@ Param(
 # Initialize script
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
-Log-Output "START: Running script win-update-registry.ps1"
+
+# Declare variables
+$scriptStartTime = Get-Date -f yyyyMMddHHmmss
+$scriptPath = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
+$scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
+$logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
+$scriptStartTime | Tee-Object -FilePath $logFile -Append
+
+# Start
+Log-Output "START: Running script win-update-registry.ps1" | Tee-Object -FilePath $logFile -Append
+
 
 try {
     # Declaring variables
@@ -68,7 +78,7 @@ try {
     $modifiedKey = @()
 
     # Make sure the disk is online
-    Log-Output "Bringing partition(s) online if present"
+    Log-Output "Bringing partition(s) online if present" | Tee-Object -FilePath $logFile -Append
     $disk = Get-Disk -ErrorAction Stop | Where-Object { $_.FriendlyName -eq 'Msft Virtual Disk' }
     $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
 
@@ -77,7 +87,7 @@ try {
     $partitionGroup = $partitionlist | Group-Object DiskNumber
     $fixedDrives = $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter
 
-    Log-Output "Determine if partition has Registry hives"
+    Log-Output "Determine if partition has Registry hives" | Tee-Object -FilePath $logFile -Append
 
     # Scan all collected partitions to determine if OS partition
     ForEach ($drive in $fixedDrives) {
@@ -90,28 +100,30 @@ try {
             # If Registry path found, continue script
             if ($isRegPath) {
 
-                Log-Output "Load requested Registry hive from $($drive)"
+                Log-Output "Load requested Registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
 
                 # Load hive into Rescue VM's registry from attached disk
-                reg load "$($rootKey)\broken$($hive)$($drive)" "$($drive):\Windows\System32\config\$($hive)"
+                cmd /c "reg load $($rootKey)\broken$($hive)$($drive) $($drive):\Windows\System32\config\$($hive)" | Tee-Object -FilePath $logFile -Append
 
                 # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
                 if ($hive -eq "system") {
-                    Log-Output "Using a System registry, getting specified Control Set"
+                    Log-Output "Using a SYSTEM hive, getting specified Control Set" | Tee-Object -FilePath $logFile -Append
                     $controlSetText = "ControlSet00"
                     if ($controlSet -eq "") {
                         $controlSet = (Get-ItemProperty -Path "$($rootKey):\broken$($hive)$($drive)\Select" -Name Current).Current
                     }
                     $controlSetText += $controlSet
+                    Log-Output "Using $($controlSetText)" | Tee-Object -FilePath $logFile -Append
                     $controlSetText += "\"
                 }
                 else {
                     $controlSetText = ""
+                    Log-Output "Not using a SYSTEM hive" | Tee-Object -FilePath $logFile -Append
                 }
 
                 # Modify the Registry
                 $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
-                Log-Output "Modify Registry key $($propPath)"
+                Log-Output "Modify Registry key $($propPath)" | Tee-Object -FilePath $logFile -Append
 
                 # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
                 If ($propertyType -eq "") {
@@ -125,41 +137,44 @@ try {
                     # If the path for the new key doesn't exist, create it as well
                     New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop
                 }
-                    if (Test-Path $propPath) {
-                        $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
-                    }
-                    else {
-                        # If the path for the new key doesn't exist, create it as well
-                        $propertyType = "dword"
-                        New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop | Out-Null
-                    }
+                if (Test-Path $propPath) {
+                    $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
                 }
-
-                # Update the key
-                $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
-                Log-Output $modifiedKey
-
-                # Unload hive
-                Log-Output "Unload attached disk registry hive on $($drive)"
-                [gc]::Collect()
-                reg unload "$($rootKey)\broken$($hive)$($drive)"
+                else {
+                    # If the path for the new key doesn't exist, create it as well
+                    $propertyType = "dword"
+                    New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop | Out-Null
+                }
             }
-            else {
-                Log-Warning "No Registry found on $($drive)"
-            }
+
+            # Update the key
+            $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+            Log-Output $modifiedKey
+
+            # Unload hive
+            Log-Output "Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
+            [gc]::Collect()
+            cmd /c "reg unload $($rootKey)\broken$($hive)$($drive)"
         }
         else {
-            Log-Warning "Could not parse drive: $($drive)"
+            Log-Warning "No Registry found on $($drive)" | Tee-Object -FilePath $logFile -Append
         }
     }
-    Log-Output "END: Script Successful, modified key:"
-    Log-Output $modifiedKey
-    return $STATUS_SUCCESS
-}
+    else {
+        Log-Warning "Could not parse drive: $($drive)" | Tee-Object -FilePath $logFile -Append
+    }
 
-# Log failure scenario
+    Log-Output "END: Script Successful, modified key:" | Tee-Object -FilePath $logFile -Append
+    Log-Output $modifiedKey | Tee-Object -FilePath $logFile -Append
+    return $STATUS_SUCCESS
+
+}
 catch {
-    Log-Error "END: Script failed"
+    Log-Error "END: Script failed with error: $_" | Tee-Object -FilePath $logFile -Append
     throw $_
     return $STATUS_ERROR
+}
+finally {
+    $scriptEndTime = Get-Date -f yyyyMMddHHmmss
+    $scriptEndTime | Tee-Object -FilePath $logFile -Append
 }
