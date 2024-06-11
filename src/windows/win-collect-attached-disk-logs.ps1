@@ -7,8 +7,8 @@
 #   Azure support can normally collect relevant OS logs from an Azure VM by running one of the following:
 #       - C:\WindowsAzure\GuestAgent_2.7.41491.<VERSION>\CollectGuestLogs.exe
 #       - C:\WindowsAzure\Packages\CollectGuestLogs.exe
-#       - invoke-expression (get-childitem -Path c:\windowsazure -Filter CollectGuestLogs.exe -Recurse
-#		| sort LastAccessTime -desc | select -first 1).FullName
+#       - invoke-expression (get-childitem -Path c:\windowsazure -Filter CollectGuestLogs.exe -Recurse 
+#		| sort LastAccessTime -desc | select -first 1).FullName       
 #   This will generate a zipped archive of the relevant guest logs. However, this cannot be used if the
 #   guest OS is inaccessible (e.g. refusing to boot) or the package is missing. The alternative way to
 #   grab the logs in this situation is to clone the OS disk of the problem VM and attach the clone to a

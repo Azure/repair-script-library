@@ -113,5 +113,10 @@
 		"id" : "win-remove-app",
 		"path" : "src/windows/win-remove-app.ps1",
 		"description" : "Remove an installed Windows application from the nested Hyper-V machine."
+	},
+	{
+		"id": "win-update-registry",
+		"path": "src/windows/win-update-registry.ps1",
+		"description": "Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk."
 	}
 ]
