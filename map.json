@@ -105,6 +105,16 @@
 		"description" : "Remove an installed Windows patch for the nested Hyper-V server on a Rescue VM using DISM. This will be helpful if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates."
 	},
 	{
+		"id" : "win-get-apps",
+		"path" : "src/windows/win-get-apps.ps1",
+		"description" : "Get Windows applications for the nested Hyper-V machine that can be uninstalled from the Rescue VM."
+	},
+	{
+		"id" : "win-remove-app",
+		"path" : "src/windows/win-remove-app.ps1",
+		"description" : "Remove an installed Windows application from the nested Hyper-V machine."
+	},
+	{
 		"id": "win-update-registry",
 		"path": "src/windows/win-update-registry.ps1",
 		"description": "Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk."
