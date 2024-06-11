@@ -81,9 +81,10 @@ try {
     if ($guestHyperVVirtualMachine) {
         if ($guestHyperVVirtualMachine.State -eq 'Running') {
             Log-Output "Stopping nested guest VM $guestHyperVVirtualMachineName" | Tee-Object -FilePath $logFile -Append
-            try{
+            try {
                 Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
-            } catch{
+            }
+            catch {
                 Log-Warning "Failed to stop nested guest VM $($guestHyperVVirtualMachineName), will continue script but may have limited success" | Tee-Object -FilePath $logFile -Append
             }
 
@@ -92,7 +93,6 @@ try {
     else {
         Log-Output "No running nested guest VM, continuing" | Tee-Object -FilePath $logFile -Append
     }
-
 
     # Make sure the disk is online
     Log-Output "Bringing partition(s) online if present" | Tee-Object -FilePath $logFile -Append
@@ -120,67 +120,85 @@ try {
                 Log-Output "Load requested Registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
 
                 # Load hive into Rescue VM's registry from attached disk
-                cmd /c "reg load $($rootKey)\broken$($hive)$($drive) $($drive):\Windows\System32\config\$($hive)" | Tee-Object -FilePath $logFile -Append
+                try {
 
-                # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
-                if ($hive -eq "system") {
-                    Log-Output "Using a SYSTEM hive, getting specified Control Set" | Tee-Object -FilePath $logFile -Append
-                    $controlSetText = "ControlSet00"
-                    if ($controlSet -eq "") {
-                        $controlSet = (Get-ItemProperty -Path "$($rootKey):\broken$($hive)$($drive)\Select" -Name Current).Current
+                    cmd /c "reg load $($rootKey)\broken$($hive)$($drive) $($drive):\Windows\System32\config\$($hive)" | Tee-Object -FilePath $logFile -Append
+
+                    # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
+                    if ($hive -eq "system") {
+                        Log-Output "Using a SYSTEM hive, getting specified Control Set" | Tee-Object -FilePath $logFile -Append
+                        $controlSetText = "ControlSet00"
+                        if ($controlSet -eq "") {
+                            $controlSet = (Get-ItemProperty -Path "$($rootKey):\broken$($hive)$($drive)\Select" -Name Current).Current
+                        }
+                        $controlSetText += $controlSet
+                        Log-Output "Using $($controlSetText)" | Tee-Object -FilePath $logFile -Append
+                        $controlSetText += "\"
                     }
-                    $controlSetText += $controlSet
-                    Log-Output "Using $($controlSetText)" | Tee-Object -FilePath $logFile -Append
-                    $controlSetText += "\"
-                }
-                else {
-                    $controlSetText = ""
-                    Log-Output "Not using a SYSTEM hive, using $($hive)" | Tee-Object -FilePath $logFile -Append
-                }
+                    else {
+                        $controlSetText = ""
+                        Log-Output "Not using a SYSTEM hive, using $($hive)" | Tee-Object -FilePath $logFile -Append
+                    }
 
-                # Report the key
-                $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
-                Log-Output "Checking registry for $($propPath)" | Tee-Object -FilePath $logFile -Append
-                Get-ItemProperty -Path $propPath -Name $propertyName -ErrorAction Continue -WarningAction Continue | Tee-Object -FilePath $logFile -Append
+                    # Report the key
+                    $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
+                    Log-Output "Checking registry for $($propPath)" | Tee-Object -FilePath $logFile -Append
+                    Get-ItemProperty -Path $propPath -Name $propertyName -ErrorAction Continue -WarningAction Continue | Tee-Object -FilePath $logFile -Append
 
-                # Modify the Registry
-                Log-Output "Modify Registry key $($propPath)" | Tee-Object -FilePath $logFile -Append
+                    # Modify the Registry
+                    Log-Output "Modify Registry key $($propPath)" | Tee-Object -FilePath $logFile -Append
 
-                # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
-                If ($propertyType -eq "") {
-                    $propertyType = "dword"
+                    # Use the same Property Type if reg key exists and no param is passed in, otherwise use DWord
+                    If ($propertyType -eq "") {
+                        $propertyType = "dword"
+                    }
+
+                    if (Test-Path $propPath) {
+                        if (($propertyType -ne "") -and ($propertyType -ne "dword")) {
+                            try {
+                                $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
+                            }
+                            catch {
+                                Log-Error "EXCEPTION - Unable to set property type: $_" | Tee-Object -FilePath $logFile -Append
+                                # throw $_
+                                # return $STATUS_ERROR
+                            }
+
+                        }
+                    }
+                    else {
+                        # If the path for the new key doesn't exist, create it as well
+                        New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop | Tee-Object -FilePath $logFile -Append
+                    }
+                    # Update the key
+                    $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
+                    Log-Output $modifiedKey
                 }
-
-                if (Test-Path $propPath) {
-                    $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
+                catch {
+                    Log-Error "EXCEPTION - Unable to operate on loaded registry hive due to error: $_" | Tee-Object -FilePath $logFile -Append
+                    throw $_
+                    return $STATUS_ERROR
                 }
-                else {
-                    # If the path for the new key doesn't exist, create it as well
-                    New-Item -Path $propPath -Force -ErrorAction Stop -WarningAction Stop | Out-Null
+                finally {
+                    # Unload hive
+                    Log-Output "Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
+                    [gc]::Collect()
+                    cmd /c "reg unload $($rootKey)\broken$($hive)$($drive)" | Tee-Object -FilePath $logFile -Append
                 }
             }
-
-            # Update the key
-            $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -type $propertyType -Value $propertyValue -Force -ErrorAction Stop -WarningAction Stop -PassThru
-            Log-Output $modifiedKey
-
-            # Unload hive
-            Log-Output "Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
-            [gc]::Collect()
-            cmd /c "reg unload $($rootKey)\broken$($hive)$($drive)"
         }
         else {
             Log-Warning "No Registry found on $($drive)" | Tee-Object -FilePath $logFile -Append
         }
     }
-    else {
-        Log-Warning "Could not parse drive: $($drive)" | Tee-Object -FilePath $logFile -Append
+
+    Log-Output "END: Script Complete" | Tee-Object -FilePath $logFile -Append
+
+    if (![string]::IsNullOrEmpty($modifiedKey)) {
+        Log-Output "Modified key:" | Tee-Object -FilePath $logFile -Append
+        Log-Output $modifiedKey | Tee-Object -FilePath $logFile -Append
     }
-
-    Log-Output "END: Script Successful, modified key:" | Tee-Object -FilePath $logFile -Append
-    Log-Output $modifiedKey | Tee-Object -FilePath $logFile -Append
     return $STATUS_SUCCESS
-
 }
 catch {
     Log-Error "END: Script failed with error: $_" | Tee-Object -FilePath $logFile -Append
