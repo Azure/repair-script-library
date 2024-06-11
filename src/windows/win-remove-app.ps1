@@ -1,39 +1,34 @@
-######################################################################################################
+﻿######################################################################################################
 <#
 # .SYNOPSIS
-#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM.
+#   Remove an installed Windows application from the nested Hyper-V machine.
 #
 # .DESCRIPTION
-#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. This is useful if you need to troubleshoot an Azure VM but do not have a local account with administrative privileges. This script is intended to be run as part of the Azure VM repair workflow. It will create a local user account on the nested Hyper-V server and add it to the local administrators group. The user account 'azure-recoveryID' will be created with a partially randomized password unless the user specifies a username and password. Both the username and password requirements will match the regular requirements for Azure VMs. Custom usernames must not match the username of an account already on the server. The password will be written to the Azure VM repair log file in plain text so would not recommending the use of a known secure password. The user account and generated files should be deleted by the user when the Azure VM repair workflow completes. 
-
-Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/reset-local-password-without-agent 
-
-Username/password requirements: https://learn.microsoft.com/en-us/azure/virtual-machines/windows/faq#what-are-the-username-requirements-when-creating-a-vm-
+#   Remove an installed Windows application from the nested Hyper-V machine.This will be helpful if the attached OS disk is from a VM where uninstalling the apps is difficult. When complete, the script will output uninstallable apps and their QUS (Quiet Uninstall String) to the terminal. Copy the QUS to the win-remove-app script to attempt silent uninstall from nested VM.
 #
 # .EXAMPLE
-#	<# Create default troubleshooting user #>
-#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair
+#	<# Get installed apps #>
+#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-get-apps' --verbose --run-on-repair
 #
-#	<# Create custom troubleshooting user #>
-#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-create-troubleshooting-user' --verbose --run-on-repair --parameters username='trblAcct' password='welcomeToAzure!1'
+#	<# Remove app based on QUS output #>
+#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-remove-app' --parameters uninstallString='{BEF2B9D6-4D36-3799-ADC8-F61F1926092C}' --verbose --run-on-repair
+#   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-remove-app' --parameters uninstallString='"C:\Program Files\Microsoft VS Code\unins000.exe" /SILENT' --verbose --run-on-repair
 #
 # .NOTES
-#   Author: Ryan McCallum (inspired by Ahmed Fouad)
+#   Author: Ryan McCallum
 #
 # .VERSION
-#   v0.2: Removed encoding params
 #   v0.1: Initial commit
 #>
 #######################################################################################################
 
 Param(
-    [Parameter(Mandatory = $false)][ValidatePattern("^(([a-zA-Z0-9]|[^/[\]:|+=;,?*%@])){1,19}$")][ValidateScript({ $_ -notin @('1','123','a','actuser','adm','admin','admin1','admin2','administrator','aspnet','backup','console','david','guest','john','owner','root','server','sql','support_388945a0','support','sys','test','test1','test2','test3','user','user1','user2','user3','user4','user5','nul','con','com','lpt') })][string]$username, 
-    [Parameter(Mandatory = $false)][ValidatePattern("^.{12,123}$")][ValidateScript({ $notReserved = $_ -notin @('password', 'pa$$word', 'pa$$w0rd', 'pa$$word123', 'pa$$w0rd123', 'password123', '123456', 'admin', 'administrator', 'admin123', 'letmein', 'welcome', 'qwerty', 'abc123', 'abc@123', 'monkey', '123123', 'password1', 'adminadmin', 'sunshine', 'master', 'hannah', 'qazwsx', 'charlie', 'superman', 'iloveyou', 'princess', 'adminadmin123', 'login', 'admin1234', 'welcome123', 'adminadminadmin', 'adminadminadmin123', 'Password!', 'Password1', 'Password22', 'iloveyou!');  $lowercaseMatch = $_ -cmatch "[a-z]+";  $uppercaseMatch = $_ -cmatch "[A-Z]+";  $digitMatch = $_ -match "[0-9]+";  $specialCharMatch = $_ -match "\W";  $conditionsMet = ($lowercaseMatch, $uppercaseMatch, $digitMatch, $specialCharMatch) | Measure-Object -Sum | Select-Object -ExpandProperty Sum; return $notReserved  -and ($conditionsMet -gt 2) })][string]$password
+    [Parameter(Mandatory = $true)][string]$uninstallString = ''
 )
-    
+
 # Initialize script
- . .\src\windows\common\setup\init.ps1
- . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
+. .\src\windows\common\setup\init.ps1
+. .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
 # Declare variables
 $scriptStartTime = get-date -f yyyyMMddHHmmss
@@ -41,23 +36,18 @@ $scriptPath = split-path -path $MyInvocation.MyCommand.Path -parent
 $scriptName = (split-path -path $MyInvocation.MyCommand.Path -leaf).Split('.')[0]
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 $scriptStartTime | Tee-Object -FilePath $logFile -Append
-if (!$username) {
-    $username = 'azure-recoveryID'
-}
-if (!$password) {
-    $password = "@zurE$(-join ((48..57) + (65..90) + (97..122) | Get-Random -Count 8 | ForEach-Object {[char]$_}))"
-}
-Log-Output "START: Running script win-create-troubleshooting-user" | Tee-Object -FilePath $logFile -Append
+$uninstallString = $uninstallString.Trim()
+$uninstallScript = if ($uninstallString -like "{*}" ) { "msiexec /x $($uninstallString) REMOVE=ALL REBOOT=R /quiet /qn /forcerestart /l* $($logfile)" } else { $uninstallString }
+
+Log-Output "START: Running script $($scriptName)" | Tee-Object -FilePath $logFile -Append
 
 try {
-    
+
     # Make sure guest VM is shut down if it exists
     $features = get-windowsfeature -ErrorAction Stop
-    $hyperv = $features | where Name -eq 'Hyper-V'
-    $hypervTools = $features | where Name -eq 'Hyper-V-Tools'
-    $hypervPowerShell = $features | where Name -eq 'Hyper-V-Powershell'
-    $dhcp = $features | where Name -eq 'DHCP'
-    $rsatDhcp = $features | where Name -eq 'RSAT-DHCP'
+    $hyperv = $features | Where-Object Name -eq 'Hyper-V'
+    $hypervTools = $features | Where-Object Name -eq 'Hyper-V-Tools'
+    $hypervPowerShell = $features | Where-Object Name -eq 'Hyper-V-Powershell'
 
     if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Installed) {
         $guestHyperVVirtualMachine = Get-VM
@@ -71,6 +61,9 @@ try {
         else {
             Log-Output "#01 - No running nested guest VM, continuing script" | Tee-Object -FilePath $logFile -Append
         }
+    }
+    else {
+        Log-Output "#01 - No Hyper-V installed, continuing script" | Tee-Object -FilePath $logFile -Append
     }
 
     # Make sure the disk is online
@@ -115,8 +108,8 @@ try {
         # If on the OS directory, continue script
         if ( $isOsPath ) {
 
-            Log-Output '#04 - updating local policy files' | Tee-Object -FilePath $logFile -Append         
-                        
+            Log-Output '#04 - updating local policy files' | Tee-Object -FilePath $logFile -Append
+
             # Setup policy files
             $groupPolicyPath = $drive + ':\Windows\System32\GroupPolicy'
             [string]$gpt = 'gpt.ini'
@@ -125,68 +118,65 @@ try {
             [string]$ScriptINIPath = $groupPolicyPath + "\Machine\Scripts\$($ini)"
             [string]$scriptName = 'FixAzureVM.cmd'
             [string]$scriptPath = $groupPolicyPath + "\Machine\Scripts\Startup\$($scriptName)"
-            
+
             # check if they already exist and rename
             if (Test-Path -Path $gptPath -ErrorAction SilentlyContinue) {
-                Log-Output "Renaming $($gptPath) to '$($gpt).bak'" | Tee-Object -FilePath $logFile -Append  
+                Log-Output "Renaming $($gptPath) to '$($gpt).bak'" | Tee-Object -FilePath $logFile -Append
                 try {
                     Rename-Item -Path $gptPath -NewName "$($gpt).bak" -ErrorAction Stop
-                } 
-                catch {                    
+                }
+                catch {
                     $gptBakCount = (Get-ChildItem -Path $gptPath -Filter "$($gpt).bak*" -ErrorAction SilentlyContinue).Count
                     Rename-Item -Path $gptPath -NewName "$($gpt).bak$($gptBakCount + 1)"
                 }
                 finally {
-                    $gptPathRenamed = $true              
-                }                     
+                    $gptPathRenamed = $true
+                }
             }
             if (Test-Path -Path $ScriptINIPath -ErrorAction SilentlyContinue) {
                 Log-Output "Renaming $($ScriptINIPath) to '$($ini).bak'" | Tee-Object -FilePath $logFile -Append
                 try {
                     Rename-Item -Path $ScriptINIPath -NewName "$($ini).bak" -ErrorAction Stop
-                } 
-                catch {                    
+                }
+                catch {
                     $iniBakCount = (Get-ChildItem -Path $ScriptINIPath -Filter "$($ini).bak*" -ErrorAction SilentlyContinue).Count
                     Rename-Item -Path $ScriptINIPath -NewName "$($ini).bak$($iniBakCount + 1)"
                 }
                 finally {
-                    $ScriptINIPathRenamed = $true              
+                    $ScriptINIPathRenamed = $true
                 }
             }
             if (Test-Path -Path $scriptPath -ErrorAction SilentlyContinue) {
-                
+
                 Log-Output "Renaming $($scriptPath) to '$($scriptName).bak'" | Tee-Object -FilePath $logFile -Append
                 try {
                     Rename-Item -Path $scriptPath -NewName "$($scriptName).bak" -ErrorAction Stop
-                } 
-                catch {                    
+                }
+                catch {
                     $scriptBakCount = (Get-ChildItem -Path $scriptPath -Filter "$($scriptName).bak*" -ErrorAction SilentlyContinue).Count
                     Rename-Item -Path $scriptPath -NewName "$($scriptName).bak$($scriptBakCount + 1)"
                 }
                 finally {
-                    $scriptPathRenamed = $true              
+                    $scriptPathRenamed = $true
                 }
             }
 
-            # Create new gpt file 
+            # Create new gpt file
             New-Item -Path $gptPath -ItemType File -Force
             [string]$gptNewContent = "[General]`ngPCFunctionalityVersion=2
          gPCMachineExtensionNames=[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B6664F-4972-11D1-A7CA-0000F87571E3}]
-         Version=1" 
-            Add-Content -Path $gptPath -Value $gptNewContent -Force
+         Version=1"
+            Add-Content -Path $gptPath -Value $gptNewContent -Force -Encoding Default
 
-            #Create new script.ini file  
+            #Create new script.ini file
             new-item -Path $ScriptINIPath -Force
             [string]$scriptINIContent = "[Startup]
          0CmdLine=$($scriptName)`n0Parameters="
-            Add-Content -Path $ScriptINIPath -Value $scriptINIContent -Force
-            
-            #Create the script file 
+            Add-Content -Path $ScriptINIPath -Value $scriptINIContent -Force -Encoding Default
+
+            #Create the script file
             New-Item -Path $scriptPath -Force
-            [string]$scriptcontent = "net user " + $username + " " + $password + " /add /Y
-       net localgroup administrators " + $username + " /add
-       net localgroup 'remote desktop users' " + $username + " /add" 
-            Add-Content -Path $scriptPath -Value $scriptcontent -Force
+            Add-Content -Path $scriptPath -Value $uninstallScript -Force -Encoding Default
 
             if ($guestHyperVVirtualMachine) {
                 # Bring disk offline
@@ -198,15 +188,15 @@ try {
                 start-vm $guestHyperVVirtualMachine -ErrorAction Stop
             }
 
-            Log-Output "END: Start the nested VM and login with the troubleshooting account:" | Tee-Object -FilePath $logFile -Append
-            Log-Output "USERNAME: $($username)" | Tee-Object -FilePath $logFile -Append
-            Log-Output "PASSWORD: $($password)" | Tee-Object -FilePath $logFile -Append
-            Log-Output "Remove the account and the following files after troubleshooting has been completed: " | Tee-Object -FilePath $logFile -Append
+            Log-Output "END: Start the nested VM and login to confirm the app with string $($uninstallString) is removed" | Tee-Object -FilePath $logFile -Append
+            Log-Output "The server may reboot to complete the uninstallation" | Tee-Object -FilePath $logFile -Append
+            Log-Output "Remove the following files after troubleshooting has been completed: " | Tee-Object -FilePath $logFile -Append
             Log-Output "$($gptPath)$(if ($gptPathRenamed) { " and rename $($gptPath).bak to $($gptPath) " })" | Tee-Object -FilePath $logFile -Append
             Log-Output "$($ScriptINIPath)$(if ($ScriptINIPathRenamed) { " and rename $($ScriptINIPath).bak to $($ScriptINIPath) " })" | Tee-Object -FilePath $logFile -Append
-            Log-Output "$($scriptPath)$(if ($scriptPathRenamed) { " and rename $($scriptPath).bak to $($scriptPath) " })" | Tee-Object -FilePath $logFile -Append            
-
+            Log-Output "$($scriptPath)$(if ($scriptPathRenamed) { " and rename $($scriptPath).bak to $($scriptPath) " })" | Tee-Object -FilePath $logFile -Append
             return $STATUS_SUCCESS
+        } else {
+            Log-Output "No OS directory found on $($drive), skipping" | Tee-Object -FilePath $logFile -Append
         }
     }
 }
