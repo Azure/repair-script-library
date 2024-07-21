@@ -56,7 +56,7 @@ forEach ( $partition in $partitionlist )
 }
 
 if ($actionTaken) {
-    Log-Info "Successfully cleaned up crowdstrike files"
+    Log-Info "Successfully cleaned up crowdstrike files and loaded/unloaded the registry hives"
 } else {
     Log-Warning "No bad crowdstrike files found"
 }
