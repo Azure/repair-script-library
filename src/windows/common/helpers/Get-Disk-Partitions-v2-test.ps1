@@ -1,6 +1,6 @@
 function Get-Disk-Partitions()
 {
-	$partitionlist = $null
+	$partitionlist = @()
 	$disklist = get-wmiobject Win32_diskdrive |Where-Object {$_.model -like 'Microsoft Virtual Disk'} 
 	ForEach ($disk in $disklist)
 	{
