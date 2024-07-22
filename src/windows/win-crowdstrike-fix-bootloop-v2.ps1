@@ -24,7 +24,7 @@ function CleanUpRegtransmsAndTxrblfFiles
     }
 
     # On Server 2016 and newer, we know that the logs will never replay their changes successfully and so their contents aren't useful.
-    # We can safely remove these files.
+    # We can safely remove these files in this case.
     if ($currentBuild -ge 14393) # 14393 is the build number of Windows 2016. 
     {
         Log-Info "Trying to Delete regtrans-ms and txr.blf files under config\TxR..."
