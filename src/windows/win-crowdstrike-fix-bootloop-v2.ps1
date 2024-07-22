@@ -4,6 +4,50 @@
 $partitionlist = Get-Disk-Partitions
 $actionTaken = $false
 
+function CleanUpRegtransmsAndTxrblfFiles 
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$GuidSuffix,
+        [Parameter(Mandatory = $true)]
+        [string]$DriveLetter
+    )
+
+    Log-Info "Deleting regtrans-ms and txr.blf files under config\TxR for Windows Server 2016 or newer version..."
+    Log-Info "Checking Windows Build number..."
+    $regKey = "HKLM:\temp_software_hive_$GuidSuffix\Microsoft\Windows NT\CurrentVersion"
+    $currentBuild = (Get-ItemProperty $regKey -Name CurrentBuild).CurrentBuild
+    Log-Info "CurrentBuild: $currentBuild"
+    if ($currentBuild -ge 14393) 
+    {
+        Log-Info "Trying to Delete regtrans-ms and txr.blf files under config\TxR..."
+        $regtransmsFiles = "$driveLetter\Windows\system32\config\TxR\*.TxR.*.regtrans-ms"
+        try {
+            Remove-Item $regtransmsFiles  -ErrorAction Stop
+             Log-Error "regtrans-ms files under config\TxR removed"
+        }
+        catch {
+            Log-Error "Remove regtrans-ms files under config\TxR failed: Error: $_"
+        }
+
+        $txrBlfFiles = "$driveLetter\Windows\system32\config\TxR\*.TxR.blf"
+        try {
+            Remove-Item $txrBlfFiles  -ErrorAction Stop
+             Log-Error "txr.blf files under config\TxR removed"
+        }
+        catch {
+            Log-Error "Remove txr.blf files under config\TxR failed: Error: $_"
+        }
+        
+    } 
+    else 
+    {
+        Log-Info "Skip deleting regtrans-ms and txr.blf files under config\TxR"
+    }
+
+
+}
+
 forEach ( $partition in $partitionlist )
 {
     $driveLetter = ($partition.DriveLetter + ":")
@@ -30,6 +74,11 @@ forEach ( $partition in $partitionlist )
                 Log-Error "Load registry hive $regKey from $regFile failed with error: $result"
             } else {
                 Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
+
+                if ($regKey -eq "HKLM\temp_software_hive_$guidSuffix") {
+                    CleanUpRegtransmsAndTxrblfFiles($guidSuffix, $driveLetter)
+                }
+
                 Log-Info "Unloading registry hive $regKey..."
                 $result = reg unload $regKey 2>&1
                 if ($LASTEXITCODE -ne 0) {
