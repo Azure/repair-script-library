@@ -80,7 +80,7 @@ forEach ( $partition in $partitionlist )
                 Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
 
                 if ($regKey -eq "HKLM\temp_software_hive_$guidSuffix") {
-                    CleanUpRegtransmsAndTxrblfFiles($guidSuffix, $driveLetter)
+                    CleanUpRegtransmsAndTxrblfFiles -GuidSuffix $guidSuffix -DriveLetter $driveLetter
                 }
 
                 Log-Info "Unloading registry hive $regKey..."
