@@ -69,8 +69,8 @@ forEach ( $partition in $partitionlist )
         Log-Info "Loading/unloading registry hives from data disk..."
         $guidSuffix = "f85afa50-13cc-48e0-8a29-90603a43cfe2" # get a guid online as the reg key suffix in case the reg key name already exist
         $regKeyToFile = @{
-            "HKLM\temp_system_hive_$guidSuffix" = "$driverletter\windows\system32\config\system"
-            "HKLM\temp_software_hive_$guidSuffix" = "$driverletter\windows\system32\config\software"
+            "HKLM\temp_system_hive_$guidSuffix" = "$driveLetter\windows\system32\config\system"
+            "HKLM\temp_software_hive_$guidSuffix" = "$driveLetter\windows\system32\config\software"
         }
 
         foreach ($regKey in $regKeyToFile.Keys)
