@@ -41,15 +41,12 @@ function CleanUpRegtransmsAndTxrblfFiles
         catch 
         {
             Log-Error "Remove txr.blf files under config\TxR failed: Error: $_"
-        }
-        
+        } 
     } 
     else 
     {
         Log-Info "Skip deleting regtrans-ms and txr.blf files under config\TxR"
     }
-
-
 }
 
 forEach ( $partition in $partitionlist )
