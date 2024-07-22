@@ -22,20 +22,24 @@ function CleanUpRegtransmsAndTxrblfFiles
     {
         Log-Info "Trying to Delete regtrans-ms and txr.blf files under config\TxR..."
         $regtransmsFiles = "$DriveLetter\Windows\system32\config\TxR\*.TxR.*.regtrans-ms"
-        try {
+        try 
+        {
             Remove-Item $regtransmsFiles  -ErrorAction Stop
              Log-Info "regtrans-ms files under config\TxR removed"
         }
-        catch {
+        catch 
+        {
             Log-Error "Remove regtrans-ms files under config\TxR failed: Error: $_"
         }
 
         $txrBlfFiles = "$DriveLetter\Windows\system32\config\TxR\*.TxR.blf"
-        try {
+        try 
+        {
             Remove-Item $txrBlfFiles  -ErrorAction Stop
             Log-Info "txr.blf files under config\TxR removed"
         }
-        catch {
+        catch 
+        {
             Log-Error "Remove txr.blf files under config\TxR failed: Error: $_"
         }
         
