@@ -21,7 +21,7 @@ function CleanUpRegtransmsAndTxrblfFiles
     if ($currentBuild -ge 14393) 
     {
         Log-Info "Trying to Delete regtrans-ms and txr.blf files under config\TxR..."
-        $regtransmsFiles = "$driveLetter\Windows\system32\config\TxR\*.TxR.*.regtrans-ms"
+        $regtransmsFiles = "$DriveLetter\Windows\system32\config\TxR\*.TxR.*.regtrans-ms"
         try {
             Remove-Item $regtransmsFiles  -ErrorAction Stop
              Log-Error "regtrans-ms files under config\TxR removed"
@@ -30,7 +30,7 @@ function CleanUpRegtransmsAndTxrblfFiles
             Log-Error "Remove regtrans-ms files under config\TxR failed: Error: $_"
         }
 
-        $txrBlfFiles = "$driveLetter\Windows\system32\config\TxR\*.TxR.blf"
+        $txrBlfFiles = "$DriveLetter\Windows\system32\config\TxR\*.TxR.blf"
         try {
             Remove-Item $txrBlfFiles  -ErrorAction Stop
              Log-Error "txr.blf files under config\TxR removed"
