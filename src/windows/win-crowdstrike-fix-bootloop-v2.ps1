@@ -18,13 +18,20 @@ function CleanUpRegtransmsAndTxrblfFiles
     $regKey = "HKLM:\temp_software_hive_$GuidSuffix\Microsoft\Windows NT\CurrentVersion"
     $currentBuild = (Get-ItemProperty $regKey -Name CurrentBuild).CurrentBuild
     Log-Info "CurrentBuild: $currentBuild"
-    if ($currentBuild -ge 14393) 
+    if ($null -eq $currentBuild) {
+        Log-Error "Failed to retrieve the Build Number of the Windows System from the mounted data disk"
+        return
+    }
+
+    # On Server 2016 and newer, we know that the logs will never replay their changes successfully and so their contents aren't useful.
+    # We can safely remove these files.
+    if ($currentBuild -ge 14393) # 14393 is the build number of Windows 2016. 
     {
         Log-Info "Trying to Delete regtrans-ms and txr.blf files under config\TxR..."
         $regtransmsFiles = "$DriveLetter\Windows\system32\config\TxR\*.TxR.*.regtrans-ms"
         try 
         {
-            Remove-Item $regtransmsFiles  -ErrorAction Stop
+            Remove-Item $regtransmsFiles  -ErrorAction Stop -Force
              Log-Info "regtrans-ms files under config\TxR removed"
         }
         catch 
@@ -35,7 +42,7 @@ function CleanUpRegtransmsAndTxrblfFiles
         $txrBlfFiles = "$DriveLetter\Windows\system32\config\TxR\*.TxR.blf"
         try 
         {
-            Remove-Item $txrBlfFiles  -ErrorAction Stop
+            Remove-Item $txrBlfFiles  -ErrorAction Stop -Force
             Log-Info "txr.blf files under config\TxR removed"
         }
         catch 
