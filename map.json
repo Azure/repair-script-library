@@ -127,6 +127,6 @@
 	{
 		"id": "win-crowdstrike-fix-bootloop-v2",
 		"path": "src/windows/win-crowdstrike-fix-bootloop-v2.ps1",
-		"description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files and load/unload the registry hives"
+		"description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\\TxR folder"
 	}
 ]
