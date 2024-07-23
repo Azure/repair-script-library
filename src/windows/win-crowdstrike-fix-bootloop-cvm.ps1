@@ -1,5 +1,5 @@
 . .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions-v2-test.ps1
+. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
 
 $partitionlist = Get-Disk-Partitions
 $actionTaken = $false
