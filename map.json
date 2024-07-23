@@ -133,5 +133,10 @@
 		"id": "win-crowdstrike-fix-bootloop-cvm",
 		"path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
+	},
+	{
+		"id": "win-crowdstrike-fix-bootloop-v3",
+		"path": "src/windows/win-crowdstrike-fix-bootloop-v3.ps1",
+		"description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\\TxR folder"
 	}
 ]
