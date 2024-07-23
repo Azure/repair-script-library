@@ -2,8 +2,6 @@
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
 $partitionlist = Get-Disk-Partitions
-$driveLetters = $partitionlist.DriveLetter
-Log-Info "Found drive letters: $driveLetters"
 $actionTaken = $false
 
 function CleanUpRegtransmsAndTxrblfFiles 
