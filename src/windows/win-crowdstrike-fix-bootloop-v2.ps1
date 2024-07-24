@@ -10,6 +10,7 @@ function RemoveCrowdStrikeFiles
         [Object[]]$Partitionlist
     )
 
+    Log-Info "Removing any corrupt crowdstrike files..."
     $crowdStrikeFileRemoved = $false
     forEach ( $partition in $partitionlist )
     {
