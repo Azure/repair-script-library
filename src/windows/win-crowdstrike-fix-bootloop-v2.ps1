@@ -1,10 +1,115 @@
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
 
-$partitionlist = Get-Disk-Partitions
-$driveLetters = $partitionlist.DriveLetter
-Log-Info "Found drive letters: $driveLetters"
-$actionTaken = $false
+
+
+function RemoveCrowdStrikeFiles
+{
+    param(
+    [Parameter(Mandatory = $true)]
+        [Object[]]$Partitionlist
+    )
+
+    $crowdStrikeFileRemoved = $false
+    forEach ( $partition in $partitionlist )
+    {
+        $driveLetter = $partition.DriveLetter
+        if ($driveLetter) {
+            $driveLetter = ($driveLetter + ":")
+            Log-Info "Check Drive letter: $driveLetter"
+            $corruptFiles = "$driveLetter\Windows\System32\drivers\CrowdStrike\C-00000291*.sys"
+
+            if (Test-Path -Path $corruptFiles) {
+                Log-Info "Found crowdstrike files to cleanup at $corruptFiles, removing..."
+                Remove-Item $corruptFiles
+                Log-Info "Corrupt crowdstrike files are removed."
+                $crowdStrikeFileRemoved = $true
+            }
+        }
+    }
+
+    if ($crowdStrikeFileRemoved) {
+        Log-Info "Successfully cleaned up crowdstrike files"
+    } else {
+        Log-Warning "No bad crowdstrike files found"
+    }
+}
+
+function LoadUnloadRegistryHives
+{
+    param(
+    [Parameter(Mandatory = $true)]
+        [Object[]]$Partitionlist
+    )
+    Log-Info "Loading/unloading Registry Hives from registry config files..."
+    Log-Info "Getting system drive..."
+    $systemDrive = $Env:SYSTEMDRIVE
+    Log-Info "System drive is: $systemDrive"
+
+    $registryConfigFileFound = $false
+    forEach ( $partition in $partitionlist )
+    {
+        $driveLetter = $partition.DriveLetter
+        if ($driveLetter) {
+            $driveLetter = ($driveLetter + ":")
+            Log-Info "Check Drive letter: $driveLetter"
+            if ($driveLetter -ne $systemDrive) {
+                Log-Info "Found non system drive: $driveLetter"
+
+                Log-Info "Checking if registry config files exist from $driveLetter ..."
+                $configExixst = $false
+                $guidSuffix = "f85afa50-13cc-48e0-8a29-90603a43cfe1" # get a guid online as the reg key suffix in case the reg key name already exist
+                $regKeyToFile = @{
+                    "HKLM\temp_system_hive_$guidSuffix" = "$driveLetter\windows\system32\config\system"
+                    "HKLM\temp_software_hive_$guidSuffix" = "$driveLetter\windows\system32\config\software"
+                }
+
+                foreach ($regKey in $regKeyToFile.Keys)
+                {
+                    $regFile = $regKeyToFile[$regKey]
+                    if (Test-Path -Path $regFile) {
+                        Log-Info "Found registry config file at $regFile."
+                        $configExixst = $true
+
+                        Log-Info "Loading registry hive $regKey from $regFile..."
+                        $result = reg load $regKey $regFile 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            Log-Error "Load registry hive $regKey from $regFile failed with error: $result"
+                        } else {
+                            Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
+    
+                            if ($regKey -eq "HKLM\temp_software_hive_$guidSuffix") {
+                                CleanUpRegtransmsAndTxrblfFiles -GuidSuffix $guidSuffix -DriveLetter $driveLetter
+                            }
+    
+                            Log-Info "Unloading registry hive $regKey..."
+                            $result = reg unload $regKey 2>&1
+                            if ($LASTEXITCODE -ne 0) {
+                                Log-Error "Unload registry hive $regKey failed with error: $result"
+                            } else {
+                                Log-Info "Unload registry hive $regKey succeeded with message: $result"
+                            }
+                        }
+
+                        $registryConfigFileFound = $true
+                    }
+                }
+                if (!$configExixst) {
+                    Log-Info "Registry config files don't exist from $driveLetter"
+                }
+            }  
+            else {
+                Log-Info "Skip system drive: $driveLetter"
+            }
+        }
+    }
+
+    if ($registryConfigFileFound) {
+        Log-Info "Registry Hives load/unload: done"
+    } else {
+        Log-Warning "No registry config files found"
+    }
+}
 
 function CleanUpRegtransmsAndTxrblfFiles 
 {
@@ -58,56 +163,12 @@ function CleanUpRegtransmsAndTxrblfFiles
     }
 }
 
-forEach ( $partition in $partitionlist )
-{
-    $driveLetter = ($partition.DriveLetter + ":")
-    $corruptFiles = "$driveLetter\Windows\System32\drivers\CrowdStrike\C-00000291*.sys"
+$partitionlist = Get-Disk-Partitions
+$driveLetters = $partitionlist.DriveLetter
+Log-Info "Found drive letters: $driveLetters"
 
-    if (Test-Path -Path $corruptFiles) {
-        Log-Info "Found crowdstrike files to cleanup, removing..."
-        Remove-Item $corruptFiles
-        Log-Info "Corrupt crowdstrike files are removed."
+RemoveCrowdStrikeFiles -Partitionlist $partitionlist
+LoadUnloadRegistryHives -Partitionlist $partitionlist
 
-        Log-Info "Loading/unloading registry hives from data disk..."
-        $guidSuffix = "f85afa50-13cc-48e0-8a29-90603a43cfe2" # get a guid online as the reg key suffix in case the reg key name already exist
-        $regKeyToFile = @{
-            "HKLM\temp_system_hive_$guidSuffix" = "$driveLetter\windows\system32\config\system"
-            "HKLM\temp_software_hive_$guidSuffix" = "$driveLetter\windows\system32\config\software"
-        }
-
-        foreach ($regKey in $regKeyToFile.Keys)
-        {
-            $regFile = $regKeyToFile[$regKey]
-            Log-Info "Loading registry hive $regKey from $regFile..."
-            $result = reg load $regKey $regFile 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Log-Error "Load registry hive $regKey from $regFile failed with error: $result"
-            } else {
-                Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
-
-                if ($regKey -eq "HKLM\temp_software_hive_$guidSuffix") {
-                    CleanUpRegtransmsAndTxrblfFiles -GuidSuffix $guidSuffix -DriveLetter $driveLetter
-                }
-
-                Log-Info "Unloading registry hive $regKey..."
-                $result = reg unload $regKey 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    Log-Error "Unload registry hive $regKey failed with error: $result"
-                } else {
-                    Log-Info "Unload registry hive $regKey succeeded with message: $result"
-                }
-            }
-        }
-
-        Log-Info "Registry hives load/unload: done."
-        $actionTaken = $true
-    }
-}
-
-if ($actionTaken) {
-    Log-Info "Successfully cleaned up crowdstrike files and loaded/unloaded the registry hives"
-} else {
-    Log-Warning "No bad crowdstrike files found"
-}
 
 return $STATUS_SUCCESS
