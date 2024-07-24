@@ -63,7 +63,7 @@ function LoadUnloadRegistryHives
                 Log-Info "Found non system drive: $driveLetter"
 
                 Log-Info "Checking if registry config files exist from $driveLetter ..."
-                $configExixst = $false
+                $configExist = $false
                 $guidSuffix = "f85afa50-13cc-48e0-8a29-90603a43cfe1" # get a guid online as the reg key suffix in case the reg key name already exist
                 $regKeyToFile = @{
                     "HKLM\temp_system_hive_$guidSuffix" = "$driveLetter\windows\system32\config\system"
@@ -75,12 +75,12 @@ function LoadUnloadRegistryHives
                     $regFile = $regKeyToFile[$regKey]
                     if (Test-Path -Path $regFile) {
                         Log-Info "Found registry config file at $regFile."
-                        $configExixst = $true
+                        $configExist = $true
 
                         Log-Info "Loading registry hive $regKey from $regFile..."
                         $result = reg load $regKey $regFile 2>&1
                         if ($LASTEXITCODE -ne 0) {
-                            Log-Error "Load registry hive $regKey from $regFile failed with error: $result"
+                            Log-Error "Load registry hive $regKey from $regFile failed with exit code $LASTEXITCODE. Error: $result"
                         } else {
                             Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
     
@@ -92,7 +92,7 @@ function LoadUnloadRegistryHives
                             Log-Info "Unloading registry hive $regKey..."
                             $result = reg unload $regKey 2>&1
                             if ($LASTEXITCODE -ne 0) {
-                                Log-Error "Unload registry hive $regKey failed with error: $result"
+                                Log-Error "Unload registry hive $regKey failed with exit code $LASTEXITCODE. Error: $result"
                             } else {
                                 Log-Info "Unload registry hive $regKey succeeded with message: $result"
                             }
@@ -101,7 +101,7 @@ function LoadUnloadRegistryHives
                         $registryConfigFileFound = $true
                     }
                 }
-                if (!$configExixst) {
+                if (!$configExist) {
                     Log-Info "Registry config files don't exist from $driveLetter"
                 }
             }  
