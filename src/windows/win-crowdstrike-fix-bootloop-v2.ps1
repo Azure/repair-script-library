@@ -2,7 +2,8 @@
 . .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
 
 
-
+# Check if corrupt CrowdStrike files exist in each drive letter
+# Remove any corrupt CrowdStrike files
 function RemoveCrowdStrikeFiles
 {
     param(
@@ -15,7 +16,7 @@ function RemoveCrowdStrikeFiles
     forEach ( $partition in $partitionlist )
     {
         $driveLetter = $partition.DriveLetter
-        if ($driveLetter) {
+        if ($driveLetter) { # Skip partitions without drive letter
             $driveLetter = ($driveLetter + ":")
             Log-Info "Check Drive letter: $driveLetter"
             $corruptFiles = "$driveLetter\Windows\System32\drivers\CrowdStrike\C-00000291*.sys"
@@ -36,6 +37,8 @@ function RemoveCrowdStrikeFiles
     }
 }
 
+# Check if registry config files exist in each non system drive letter.
+# if registry config files exist in the non system drive letter, load it to the registry hive and then unload it.
 function LoadUnloadRegistryHives
 {
     param(
@@ -43,6 +46,8 @@ function LoadUnloadRegistryHives
         [Object[]]$Partitionlist
     )
     Log-Info "Loading/unloading Registry Hives from registry config files..."
+
+    # System Drive (which is usually C:) should be skipped as it is from the OS disk rather than the Data disk
     Log-Info "Getting system drive..."
     $systemDrive = $Env:SYSTEMDRIVE
     Log-Info "System drive is: $systemDrive"
@@ -51,10 +56,10 @@ function LoadUnloadRegistryHives
     forEach ( $partition in $partitionlist )
     {
         $driveLetter = $partition.DriveLetter
-        if ($driveLetter) {
+        if ($driveLetter) { # Skip partitions without drive letter
             $driveLetter = ($driveLetter + ":")
             Log-Info "Check Drive letter: $driveLetter"
-            if ($driveLetter -ne $systemDrive) {
+            if ($driveLetter -ne $systemDrive) { # Skip OS disk
                 Log-Info "Found non system drive: $driveLetter"
 
                 Log-Info "Checking if registry config files exist from $driveLetter ..."
@@ -80,6 +85,7 @@ function LoadUnloadRegistryHives
                             Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
     
                             if ($regKey -eq "HKLM\temp_software_hive_$guidSuffix") {
+                                # Delete regtrans-ms and txr.blf files under config\TxR for Windows Server 2016 or newer version
                                 CleanUpRegtransmsAndTxrblfFiles -GuidSuffix $guidSuffix -DriveLetter $driveLetter
                             }
     
@@ -112,6 +118,7 @@ function LoadUnloadRegistryHives
     }
 }
 
+# Delete regtrans-ms and txr.blf files under config\TxR for Windows Server 2016 or newer version
 function CleanUpRegtransmsAndTxrblfFiles 
 {
     param(
