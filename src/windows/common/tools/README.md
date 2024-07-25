@@ -12,3 +12,15 @@ Notes:
 Kdbgctrl.exe is part of the Debugging Tools for Windows. The preview version of the SDK contains a switch called -sd (Set Dump) used to change the dump configuration without requiring the reboot. You can find the preview version of the Debugging Tools for Windows here: https://docs.microsoft.com/en-us/windows-insider/flight-hub/  
   
 For more information on KDbgCtrl see https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/using-kdbgctrl
+
+
+File Name: chkreg.exe  
+Description: Check and fix corrupt registry database
+Created By: Microsoft Corporation  
+Target Architecture: x64  
+File Version: beta  
+File Size: 82.0KB 
+SHA 256 Hash: F8D6FE3560039E776CFB174E784061552EF75C1C2EE1386351183D7681EEADD8  
+
+Notes:
+This tool fixes specific registry corruptions and allows you to load the registry hive on a Rescue VM. 
