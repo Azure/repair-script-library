@@ -83,17 +83,15 @@ function LoadUnloadRegistryHives
                         if ($LASTEXITCODE -ne 0) {
                             Log-Error "Load registry hive $regKey from $regFile failed with exit code $LASTEXITCODE. Error: $result"
                             if ($result -Match "corrupt") {
-                                
-                                
                                 try {
                                     FixRegistryCorruptions -RegFile $regFile
                                     Log-Info "Corrupt registry config file $regFile fixed, loading registry hive one more time..."
                                     $result = reg load $regKey $regFile 2>&1
                                     if ($LASTEXITCODE -ne 0) {
-                                        Log-Error "Load registry hive $regKey from $regFile failed with exit code $LASTEXITCODE. Error: $result"
+                                        Log-Error "Load registry hive $regKey from $regFile after ChkReg fix failed with exit code $LASTEXITCODE. Error: $result"
                                     }
                                     else {
-                                        Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
+                                        Log-Info "Load registry hive $regKey from $regFile after ChkReg fix succeeded with message: $result"
                                         $succeeded = $true
                                     }
                                 }
