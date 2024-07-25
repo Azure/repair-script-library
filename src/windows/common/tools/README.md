@@ -20,7 +20,7 @@ Created By: Microsoft Corporation
 Target Architecture: x64  
 File Version: beta  
 File Size: 82.0KB 
-SHA 256 Hash: F8D6FE3560039E776CFB174E784061552EF75C1C2EE1386351183D7681EEADD8  
+SHA 256 Hash: B1C4DD291C1C93EF9F6DD36DCCACCEE27156A0F55BAACA5A89DE8A97A6001754  
 
 Notes:
 This tool fixes specific registry corruptions and allows you to load the registry hive on a Rescue VM. 

@@ -239,8 +239,6 @@ function FixRegistryCorruptions
     else {
          Log-Info "Skip fixing registry config file with chkreg.exe as original config file backup failed"
     }
-
-    
 }
 
 $partitionlist = Get-Disk-Partitions
