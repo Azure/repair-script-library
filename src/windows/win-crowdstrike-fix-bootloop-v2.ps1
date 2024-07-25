@@ -203,22 +203,32 @@ function FixRegistryCorruptions
     Log-Info "Making a backup of the original registry config file..."
     $timestamp = Get-Date -Format "yyyyMMddTHHmmssffffZ"
     $backupFileName = "$RegFile.backup-$timestamp"
+    $copySucceeded = $false
     try {
         Copy-Item $RegFile -Destination $backupFileName -ErrorAction Stop
         Log-Info "Original registry config file $RegFile is backed up at $backupFileName"
+        $copySucceeded = $true
     } 
     catch {
         Log-Error "Copy $RegFile to $backupFileName failed: Error: $_"
     }
 
-    $result = cmd /c $PSScriptRoot\common\tools\chkreg.exe /F $RegFile /R `2>`&1
-    if ($LASTEXITCODE -ne 0) {
-        Log-Error "chkreg.exe execution on $RegFile failed with error code: $LASTEXITCODE. Error: $result"
-        throw "chkreg.exe execution on $RegFile failed with error code: $LASTEXITCODE. Error: $result"
-    }
+    if ($copySucceeded) {
+        Log-Info "Start fixing registry config file with chkreg.exe as original config file backup succeeded..."
+        $result = cmd /c $PSScriptRoot\common\tools\chkreg.exe /F $RegFile /R `2>`&1
+        if ($LASTEXITCODE -ne 0) {
+            Log-Error "chkreg.exe execution on $RegFile failed with error code: $LASTEXITCODE. Error: $result"
+            throw "chkreg.exe execution on $RegFile failed with error code: $LASTEXITCODE. Error: $result"
+        }
+        else {
+            Log-Info "chkreg.exe execution on $RegFile succeeded with message: $result"
+        }
+    } 
     else {
-        Log-Info "chkreg.exe execution on $RegFile succeeded with message: $result"
+         Log-Info "Skip fixing registry config file with chkreg.exe as riginal config file backup failed"
     }
+
+    
 }
 
 $partitionlist = Get-Disk-Partitions
