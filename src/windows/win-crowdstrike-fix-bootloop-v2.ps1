@@ -202,11 +202,23 @@ function FixRegistryCorruptions
     Log-Info "Attempting to fix registry config file with chkreg.exe..."
     Log-Info "Making a backup of the original registry config file..."
     $timestamp = Get-Date -Format "yyyyMMddTHHmmssffffZ"
-    $backupFileName = "$RegFile.backup-$timestamp"
     $copySucceeded = $false
     try {
+        $backupFileName = "$RegFile.backup-$timestamp"
         Copy-Item $RegFile -Destination $backupFileName -ErrorAction Stop
         Log-Info "Original registry config file $RegFile is backed up at $backupFileName"
+        $regFileLog1 = "$RegFile.LOG1"
+        $regFileLog1Backup = "$regFileLog1.backup-$timestamp"
+        if (Test-Path $regFileLog1) {
+            Copy-Item $regFileLog1 -Destination $regFileLog1Backup -ErrorAction Stop
+            Log-Info "Original registry config file $regFileLog1 is backed up at $regFileLog1Backup"
+        }
+        $regFileLog2 = "$RegFile.LOG2"
+        $regFileLog2Backup = "$regFileLog2.backup-$timestamp"
+        if (Test-Path $regFileLog2) {
+            Copy-Item $regFileLog2 -Destination $regFileLog2Backup -ErrorAction Stop
+            Log-Info "Original registry config file $regFileLog2 is backed up at $regFileLog2Backup"
+        }
         $copySucceeded = $true
     } 
     catch {
