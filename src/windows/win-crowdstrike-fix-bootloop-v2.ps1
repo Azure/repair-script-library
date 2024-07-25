@@ -63,7 +63,7 @@ function LoadUnloadRegistryHives
                 Log-Info "Found non system drive: $driveLetter"
 
                 Log-Info "Checking if registry config files exist from $driveLetter ..."
-                $configExist = $false
+                $configExistInDrive = $false
                 $guidSuffix = "f85afa50-13cc-48e0-8a29-90603a43cfe1" # get a guid online as the reg key suffix in case the reg key name already exist
                 $regKeyToFile = @{
                     "HKLM\temp_system_hive_$guidSuffix" = "$driveLetter\windows\system32\config\system"
@@ -75,15 +75,48 @@ function LoadUnloadRegistryHives
                     $regFile = $regKeyToFile[$regKey]
                     if (Test-Path -Path $regFile) {
                         Log-Info "Found registry config file at $regFile."
-                        $configExist = $true
+                        $configExistInDrive = $true
 
                         Log-Info "Loading registry hive $regKey from $regFile..."
+                        $succeeded = $false
                         $result = reg load $regKey $regFile 2>&1
                         if ($LASTEXITCODE -ne 0) {
                             Log-Error "Load registry hive $regKey from $regFile failed with exit code $LASTEXITCODE. Error: $result"
-                        } else {
+                            if ($result -Match "corrupt") {
+                                Log-Info "Making a backup of the original registry config file..."
+                                $timestamp = Get-Date -Format "yyyyMMddTHHmmssffffZ"
+                                $backupFileName = "$regFile.backup-$timestamp"
+                                try {
+                                    Copy-Item $regFile -Destination $backupFileName -ErrorAction Stop
+                                    Log-Info "Original registry config file $regFile is backed up at $backupFileName"
+                                } 
+                                catch {
+                                    Log-Error "Copy $regFile to $backupFileName failed: Error: $_"
+                                }
+                                
+                                try {
+                                    FixRegistryCorruptions -RegFile $regFile
+                                    Log-Info "Corrupt registry config file $regFile fixed, loading registry hive one more time..."
+                                    $result = reg load $regKey $regFile 2>&1
+                                    if ($LASTEXITCODE -ne 0) {
+                                        Log-Error "Load registry hive $regKey from $regFile failed with exit code $LASTEXITCODE. Error: $result"
+                                    }
+                                    else {
+                                        Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
+                                        $succeeded = $true
+                                    }
+                                }
+                                catch {
+                                    Log-Error "$_"
+                                }                                
+                            } 
+                        } 
+                        else {
                             Log-Info "Load registry hive $regKey from $regFile succeeded with message: $result"
-    
+                            $succeeded = $true
+                        }
+                        
+                        if ($succeeded) {
                             if ($regKey -eq "HKLM\temp_software_hive_$guidSuffix") {
                                 # Delete regtrans-ms and txr.blf files under config\TxR for Windows Server 2016 or newer version
                                 CleanUpRegtransmsAndTxrblfFiles -GuidSuffix $guidSuffix -DriveLetter $driveLetter
@@ -101,7 +134,7 @@ function LoadUnloadRegistryHives
                         $registryConfigFileFound = $true
                     }
                 }
-                if (!$configExist) {
+                if (!$configExistInDrive) {
                     Log-Info "Registry config files don't exist from $driveLetter"
                 }
             }  
@@ -168,6 +201,23 @@ function CleanUpRegtransmsAndTxrblfFiles
     else 
     {
         Log-Info "Skip deleting regtrans-ms and txr.blf files under config\TxR"
+    }
+}
+
+function FixRegistryCorruptions
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RegFile
+    )
+    Log-Info "Attempting to fix registry config file with chkreg.exe..."
+    $result = cmd /c $PSScriptRoot\common\tools\chkreg.exe /F $RegFile /R `2>`&1
+    if ($LASTEXITCODE -ne 0) {
+        Log-Error "chkreg.exe execution on $RegFile failed with error code: $LASTEXITCODE. Error: $result"
+        throw "chkreg.exe execution on $RegFile failed with error code: $LASTEXITCODE. Error: $result"
+    }
+    else {
+        Log-Info "chkreg.exe execution on $RegFile succeeded with message: $result"
     }
 }
 
