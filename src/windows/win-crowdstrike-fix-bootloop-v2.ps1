@@ -222,7 +222,7 @@ function FixRegistryCorruptions
         $copySucceeded = $true
     } 
     catch {
-        Log-Error "Copy $RegFile to $backupFileName failed: Error: $_"
+        Log-Error "Copy $RegFile and related files failed: Error: $_"
     }
 
     if ($copySucceeded) {
