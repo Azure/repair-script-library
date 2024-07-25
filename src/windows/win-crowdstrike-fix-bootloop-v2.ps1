@@ -83,16 +83,7 @@ function LoadUnloadRegistryHives
                         if ($LASTEXITCODE -ne 0) {
                             Log-Error "Load registry hive $regKey from $regFile failed with exit code $LASTEXITCODE. Error: $result"
                             if ($result -Match "corrupt") {
-                                Log-Info "Making a backup of the original registry config file..."
-                                $timestamp = Get-Date -Format "yyyyMMddTHHmmssffffZ"
-                                $backupFileName = "$regFile.backup-$timestamp"
-                                try {
-                                    Copy-Item $regFile -Destination $backupFileName -ErrorAction Stop
-                                    Log-Info "Original registry config file $regFile is backed up at $backupFileName"
-                                } 
-                                catch {
-                                    Log-Error "Copy $regFile to $backupFileName failed: Error: $_"
-                                }
+                                
                                 
                                 try {
                                     FixRegistryCorruptions -RegFile $regFile
@@ -211,6 +202,17 @@ function FixRegistryCorruptions
         [string]$RegFile
     )
     Log-Info "Attempting to fix registry config file with chkreg.exe..."
+    Log-Info "Making a backup of the original registry config file..."
+    $timestamp = Get-Date -Format "yyyyMMddTHHmmssffffZ"
+    $backupFileName = "$RegFile.backup-$timestamp"
+    try {
+        Copy-Item $RegFile -Destination $backupFileName -ErrorAction Stop
+        Log-Info "Original registry config file $RegFile is backed up at $backupFileName"
+    } 
+    catch {
+        Log-Error "Copy $RegFile to $backupFileName failed: Error: $_"
+    }
+
     $result = cmd /c $PSScriptRoot\common\tools\chkreg.exe /F $RegFile /R `2>`&1
     if ($LASTEXITCODE -ne 0) {
         Log-Error "chkreg.exe execution on $RegFile failed with error code: $LASTEXITCODE. Error: $result"
