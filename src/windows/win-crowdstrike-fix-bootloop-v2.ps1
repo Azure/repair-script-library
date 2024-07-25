@@ -225,7 +225,7 @@ function FixRegistryCorruptions
         }
     } 
     else {
-         Log-Info "Skip fixing registry config file with chkreg.exe as riginal config file backup failed"
+         Log-Info "Skip fixing registry config file with chkreg.exe as original config file backup failed"
     }
 
     
