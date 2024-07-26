@@ -199,7 +199,7 @@ function FixRegistryCorruptions
         [Parameter(Mandatory = $true)]
         [string]$RegFile
     )
-    Log-Info "Attempting to fix registry config file with chkreg.exe..."
+    Log-Info "Attempting to backup the original registry config file and fix registry config file with chkreg.exe..."
     Log-Info "Making a backup of the original registry config file..."
     $timestamp = Get-Date -Format "yyyyMMddTHHmmssffffZ"
     $copySucceeded = $false
@@ -237,7 +237,8 @@ function FixRegistryCorruptions
         }
     } 
     else {
-         Log-Info "Skip fixing registry config file with chkreg.exe as original config file backup failed"
+         Log-Error "Fixing registry config file with chkreg.exe is skipped as original config file backup failed"
+         throw "Fixing registry config file with chkreg.exe is skipped as original config file backup failed"
     }
 }
 
