@@ -122,6 +122,8 @@ else
         $return = install-windowsfeature -name Hyper-V -IncludeManagementTools -ErrorAction Stop
     }
     catch {
+        # Handle the exception here
+        Write-Host "An error occurred: $_"
         throw $_
         return $STATUS_ERROR
     }
