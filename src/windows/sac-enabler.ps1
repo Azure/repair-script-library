@@ -1,5 +1,13 @@
 # Welcome to the AUTO SAC ENABLER(SERIAL ACCESS CONSOLE) by Daniel Muñoz L!
 # Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
+# 
+# .SUMMARY
+#   Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs.
+#   Reconfigures the Boot Configuration Data settings to allow EMS access.
+# 
+# .RESOLVES
+#   Serial Console access is not enabled from the Windows guest OS.
+
 out-null
 cmd /c color 0A
 $host.UI.RawUI.WindowTitle = "                                                                                  --== AUTO SAC ENABLER by Daniel Muñoz L ==--"
