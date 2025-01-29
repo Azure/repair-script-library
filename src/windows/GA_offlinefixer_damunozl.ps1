@@ -1,5 +1,16 @@
 # Welcome to the VM Azure Agent Offline fixer by Daniel Muñoz L!
 # Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
+# .SUMMARY
+#   Fixes integrity of files and registry from windows guest agent offline.
+#   Backs up registry. Copies installation folder and registry values related to Windows Guest Agent to attached disk.
+#   Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/install-vm-agent-offline 
+# 
+# .RESOLVES
+#   The server needs to use the Guest Agent (e.g. for a password reset) but the user is currently unable to because 
+#   the Guest Agent is not installed. After performing this fix, the Guest Agent will effectively be installed on the attached OS disk as well.
+#   The Azure Virtual Machine Agent (VM Agent) provides useful features, such as local administrator password reset and script pushing.
+
+
 out-null
 cmd /c color 0A
 $host.UI.RawUI.WindowTitle = "                                                                                  --== VMAgent Offline Fixer by Daniel Muñoz L ==--"
