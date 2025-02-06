@@ -1,3 +1,16 @@
+# .SUMMARY
+#   Enables nested hyperV using attached data disk as OS disk.
+#   Installs Hyper-V if not installed and quits. If it is installed (e.g. from a prior run), it creates 
+#   a Hyper-V VM and configures the attached OS disk to be the primary disk so the OS is accessible in Hyper-V. 
+#   Configures NAT so nested guest VM has external network connectivity.
+# 
+# .RESOLVES
+#   Recommended for non-boot scenarios to provide easy access to the problem server's registry, BCD store, 
+#   OS files, etc for remediation, especially when the server cannot be accessed normally via RDP.
+#   If your Windows virtual machine (VM) in Azure encounters a boot or disk error, you may need to repair the disk offline. 
+#   A common example would be a failed application update that prevents the VM from being able to boot successfully.
+
+
 Param([Parameter(Mandatory=$false)][string]$gen)
 
 . .\src\windows\common\setup\init.ps1
