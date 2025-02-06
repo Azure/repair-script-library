@@ -5,7 +5,10 @@
 #
 # .DESCRIPTION
 #   Remove an installed Windows application from the nested Hyper-V machine.This will be helpful if the attached OS disk is from a VM where uninstalling the apps is difficult. When complete, the script will output uninstallable apps and their QUS (Quiet Uninstall String) to the terminal. Copy the QUS to the win-remove-app script to attempt silent uninstall from nested VM.
-#
+#   Check if Hyper-V guest VM is shut down and if not, powers it down. Brings disk online to create policy files with steps to automatically uninstall a particular software. Then starts the nested server in Hyper-V. The final log file suggests the user monitor the Hyper-V server to see if the software is removed with recommendations to remove related files after troubleshooting has completed.
+# .RESOLVES
+#   Certain software may sometimes be difficult to uninstall, especially when RDP access is prevented by the software. This script helps remove the software from the system while in a Rescue VM.
+# 
 # .EXAMPLE
 #	<# Get installed apps #>
 #   az vm repair run -g 'sourceRG' -n 'sourceVM' --run-id 'win-get-apps' --verbose --run-on-repair
