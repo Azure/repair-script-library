@@ -5,8 +5,13 @@
 #
 # .DESCRIPTION
 #   Get installed Windows patches for the nested Hyper-V server on a Rescue VM using DISM. This will be helpful if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates.
+#   Collects patches on the attached OS disk using DISM to verify which ones have successfully installed and which ones are failing to install. Prints them to the console and saves them to the rescue VM as a text file.
 
 Public doc: https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-operating-system-package-servicing-command-line-options?view=windows-11#get-packages
+
+# .RESOLVES
+#   Collecting patches that fail to install is difficult when the OS refuses to boot. This will be helpful to run on the repair VM if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates as the 
+#   failing package can then be manually passed to win-remove-patch.
 
 #
 # .EXAMPLE
