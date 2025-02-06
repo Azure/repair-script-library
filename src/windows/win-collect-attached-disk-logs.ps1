@@ -3,6 +3,10 @@
 # .SYNOPSIS
 #   Collect Windows OS logs from an OS disk attached to a Rescue VM as an Azure Data Disk. v0.6.0
 #
+# .RESOLVES
+#   We are unable to collect logs automatically using CollectGuestLogs.exe when the OS is not booting. 
+#   This script collects the logs from the broken VM's OS disk when it is attached to a rescue VM.
+#   
 # .DESCRIPTION
 #   Azure support can normally collect relevant OS logs from an Azure VM by running one of the following:
 #       - C:\WindowsAzure\GuestAgent_2.7.41491.<VERSION>\CollectGuestLogs.exe
