@@ -2,9 +2,22 @@
 <#
 # .SYNOPSIS
 #   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM.
+#   Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account.
 #
 # .DESCRIPTION
-#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. This is useful if you need to troubleshoot an Azure VM but do not have a local account with administrative privileges. This script is intended to be run as part of the Azure VM repair workflow. It will create a local user account on the nested Hyper-V server and add it to the local administrators group. The user account 'azure-recoveryID' will be created with a partially randomized password unless the user specifies a username and password. Both the username and password requirements will match the regular requirements for Azure VMs. Custom usernames must not match the username of an account already on the server. The password will be written to the Azure VM repair log file in plain text so would not recommending the use of a known secure password. The user account and generated files should be deleted by the user when the Azure VM repair workflow completes. 
+#   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM. This is useful if you need to troubleshoot an Azure VM but do not have a local account with administrative privileges. 
+#   This script is intended to be run as part of the Azure VM repair workflow. It will create a local user account on the nested Hyper-V server and add it to the local administrators group. 
+#   The user account 'azure-recoveryID' will be created with a partially randomized password unless the user specifies a username and password. Both the username and password requirements will match 
+#   the regular requirements for Azure VMs. Custom usernames must not match the username of an account already on the server. The password will be written to the Azure VM repair log file in plain text so would not 
+#   recommending the use of a known secure password. The user account and generated files should be deleted by the user when the Azure VM repair workflow completes. 
+
+#   Check if Hyper-V guest VM is shut down and if not, powers it down. Brings disk online to create policy files with steps to automatically provision 
+#   a new administrative local user the next time the server starts. Then starts the nested server in Hyper-V. 
+#   The final log file states the username and password of the new account with recommendations to remove related files after troubleshooting has completed.
+
+# .RESOLVES
+#   There are troubleshooting scenarios when a user may nest a VM in Hyper-V to access the OS, but they do not have an accessible local admin account to successfully log into it. 
+#   They may have forgotten the local admin password or only had a domain account that is not accessible on the nested VM. This script will create a new account for the sole purpose of further troubleshooting.
 
 Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/reset-local-password-without-agent 
 
