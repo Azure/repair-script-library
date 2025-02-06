@@ -5,6 +5,10 @@
 #
 # .DESCRIPTION
 #   Remove an installed Windows patch for the nested Hyper-V server on a Rescue VM using DISM. This will be helpful if the attached OS disk is from a VM that is in a nonboot state due to corrupted/failing updates.
+#   Accepts a single string parameter from a user that matches a package specified from win-get-patches. Uses DISM to remove that package from the attached OS disk.
+
+# .RESOLVES
+#   Removing problematic patches can be difficult when the OS refuses to boot. This will be helpful to run on the repair VM after win-get-patches to attempt removal.
 
 Public doc: https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-operating-system-package-servicing-command-line-options?view=windows-11#remove-package
 
