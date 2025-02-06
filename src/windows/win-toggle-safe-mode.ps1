@@ -12,6 +12,13 @@
 #   clone the VM into a Hyper-V environment using Nested Virtualization and toggle Safe Boot. The user
 #   may then access their VM in Safe Mode via the Rescue VM or revert Safe Mode on their Azure VM. They
 #   may then swap the disk using the `az vm repair restore` functionality.
+#   
+#   Check if Hyper-V guest VM is shut down and if not, powers it down. Brings disk online to check safe mode state. Can toggle Safe Mode 
+#   state for the guest VM. Can also enable Directory Services Restore Mode for Domain Controllers.
+#
+# .RESOLVES
+#   VMs in safe mode prevent TermService from starting, disallowing RDP connectivity. This script corrects safe mode boot for VMs to restore RDP connectivity.
+#   Can also easily allow nested VMs to enter safe mode for a user's requirements while still being accessible from Hyper-V console.
 #
 #   Testing:
 #       1. Copied scripts to newly created Windows Server 2019 Datacenter (Gen 1)
@@ -38,6 +45,7 @@
 #   Author: Ryan McCallum
 #
 # .VERSION
+    v0.4: [Feb 2025] - Update the description.
     v0.3: [July 2023] - Detect if a Domain Controller from the attached OS drive's imported registry
 #   v0.2: [Feb 2023] - run with the -DC switch to initiate DSRM (Directory Services Recovery Mode) for Domain Controllers
 #   v0.1: Initial commit
