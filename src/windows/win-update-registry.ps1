@@ -3,6 +3,13 @@
 # .SYNOPSIS
 #  Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk. v0.2.1
 #
+# .DESCRIPTION
+#   Load the specified registry hive of the attached OS disk(s). Pass parameters intended to modify a particular registry value for each attached disk.
+#
+# .RESOLVES
+#   During situations where the same registry value needs to be modified on multiple disks to correct non-boot issues caused by misconfiguration, it may be helpful 
+#   to attach each disk and run this script to quickly make the modification on each disk.
+#
 # .NOTES
 #   Author: Ryan McCallum
 #   Sources:
