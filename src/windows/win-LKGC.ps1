@@ -1,5 +1,17 @@
 # Welcome to the AUTO LKGC(Last Known Good Configuration) by Daniel Muñoz L!
 # Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
+# .SUMMARY
+#   Last Known Good Configuration enabler offline from rescue VM.
+#   Increment Last Known Good Configuration registry values by 1.
+#   Public docs: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/start-vm-last-known-good, 
+#     https://support.microsoft.com/en-us/topic/you-receive-error-stop-error-code-0x0000007b-inaccessible-boot-device-after-you-install-windows-updates-7cc844e4-4daf-a71c-cd23-f99b50d53e31
+# 
+# .RESOLVES
+#   If Windows is not booting correctly due to recently installed software or related changes, modifying the LKGC values 
+#   can revert the changes to attempt a successful boot.
+#   If you've recently installed new software or changed some Windows settings, and your Azure Windows virtual machine (VM) stops booting correctly, 
+#   you might have to start the VM by using the Last Known Good Configuration for troubleshooting. 
+
 out-null
 cmd /c color 0A
 $host.UI.RawUI.WindowTitle = "                                                                                  --== AUTO LKGC by Daniel Muñoz L ==--"

@@ -1,3 +1,14 @@
+# .SUMMARY
+#   Runs sfc to fix system file corruption.
+#   Run dism.exe on attached drive to revert pending OS actions and restore OS health. 
+#   Run sfc.exe scan to replace corrupted system files with a cached copy. Reconfigures the Boot Configuration Data settings 
+#   to disable booting into the recovery console. Replace the current system reg hive with the backup (if the system supports it).
+# 
+# .RESOLVES
+#   Run Deployment Image Servicing and Management tool (DISM) and the System File Checker tool (SFC) to scan your system files and 
+#   restore any corrupted or missing files to correct critical Windows System files that are corrupt or missing.
+
+
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 

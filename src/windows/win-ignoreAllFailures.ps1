@@ -1,3 +1,13 @@
+# .SUMMARY
+#   Ignore errors if there is a failed boot, failed shutdown, or failed checkpoint. The computer will attempt to boot normally after an error occurs.
+#   Reconfigures the Boot Configuration Data settings so the boot status policy is set to IgnoreAllFailures. 
+# 
+# .RESOLVES
+#   If the server is booting into the Windows Error Recovery console or the Automatic Repair console, it may fail to recover the system 
+#   and will obscure the actual boot error. This script disables this per recommendation.
+#   
+
+
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 

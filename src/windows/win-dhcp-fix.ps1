@@ -1,6 +1,15 @@
 # Welcome to the DHCP SERVICE fixer by Daniel Muñoz L!
 # Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
-# REF: https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/troubleshoot-rdp-dhcp-disabled#attach-the-os-disk-to-a-recovery-vm
+# Public docs: https://docs.microsoft.com/en-us/troubleshoot/azure/virtual-machines/troubleshoot-rdp-dhcp-disabled#attach-the-os-disk-to-a-recovery-vm
+# 
+# .SUMMARY
+#   Backs up registry. Updates registry values for enabling DHCP service.
+# 
+# .RESOLVES
+#   Dynamic Host Configuration Protocol (DHCP) client service refuses to start due to misconfiguration. You cannot make an RDP connection a VM in Azure 
+#   because the DHCP Client service is disabled in the VM. When you check the screenshot in the Boot diagnostics in the Azure portal, you see the VM boots 
+#   normally and waits for credentials in the login screen. You remotely view the event logs in the VM by using Event Viewer. 
+#   You see that the DHCP Client Service isn't started or fails to start.
 
 out-null
 cmd /c color 0A

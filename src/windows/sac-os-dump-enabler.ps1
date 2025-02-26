@@ -1,5 +1,15 @@
 # Welcome to the AUTO SAC(SERIAL ACCESS CONSOLE) AND OS DUMP ENABLER by Daniel Muñoz L!!
 # Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
+# 
+# .DESCRIPTION
+#   Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs and enables os dump collector as well on main OS drive.
+#   Reconfigures the Boot Configuration Data settings to allow EMS access. Backs up registry. Updates registry values for configuring a complete memory dump.
+#   Public docs: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/serial-console-windows#enable-serial-console-functionality-for-windows-server, 
+#     https://learn.microsoft.com/en-us/azure/virtual-machines/windows/prepare-for-upload-vhd-image#verify-the-vm 
+# 
+# .RESOLVES
+#   Serial Console access is not enabled from the Windows guest OS. Recommended memory dump settings are not configured for Azure VMs.   
+
 out-null
 cmd /c color 0A
 $host.UI.RawUI.WindowTitle = "                                                                                  --== AUTO SAC AND OS DUMP ENABLER by Daniel Muñoz L ==--"

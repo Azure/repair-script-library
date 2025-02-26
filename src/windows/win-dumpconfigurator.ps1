@@ -4,7 +4,17 @@
 
     Prerequisites (Links below):     
     Kdbgctrl.exe (From the Debugging Tools for Windows.)
- 
+
+    Changes the dump configuration of a VM while it's running without the need to reboot it. 
+    Which is to say, you can change the dump configuration from Kernel to Full without a reboot.
+    Easily create a DedicatedDump File for an online VM needing a memory dump so the page file does not have to be modified. 
+    Modifies the dump type of a server without needing a restart using the kdbgctrl.exe application.
+
+.RESOLVES
+  Normally, modifying dump settings to debug an issue requires 
+  1) a restart for the settings to apply and 
+  2) changing the page file settings so the server accommodates the size of the dump. 
+  This script easily handles both issues to make dump collection easier so the VM does not need to restart or have the Page file modified.
  
 .NOTES
     Name: win-dumpconfigurator.ps1
