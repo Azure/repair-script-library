@@ -1,4 +1,4 @@
-<#
+#
 # .SUMMARY
 #   Most recent version of this fix. Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, 
 #   loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\TxR folder.
@@ -9,7 +9,7 @@
 #
 # .PUBLIC DOCS
 #   https://techcommunity.microsoft.com/blog/azurecompute/recovery-options-for-azure-virtual-machines-vm-affected-by-crowdstrike-falcon-ag/4196798
-#>
+#
 
 . .\src\windows\common\setup\init.ps1
 . .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1

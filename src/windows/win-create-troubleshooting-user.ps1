@@ -1,5 +1,5 @@
 ######################################################################################################
-<#
+#
 # .SYNOPSIS
 #   Create a troubleshooting user for a nested Hyper-V server on a Rescue VM.
 #   Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account.
@@ -18,10 +18,8 @@
 # .RESOLVES
 #   There are troubleshooting scenarios when a user may nest a VM in Hyper-V to access the OS, but they do not have an accessible local admin account to successfully log into it. 
 #   They may have forgotten the local admin password or only had a domain account that is not accessible on the nested VM. This script will create a new account for the sole purpose of further troubleshooting.
-
-Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/reset-local-password-without-agent 
-
-Username/password requirements: https://learn.microsoft.com/en-us/azure/virtual-machines/windows/faq#what-are-the-username-requirements-when-creating-a-vm-
+#   Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/reset-local-password-without-agent 
+#   Username/password requirements: https://learn.microsoft.com/en-us/azure/virtual-machines/windows/faq#what-are-the-username-requirements-when-creating-a-vm-
 #
 # .EXAMPLE
 #	<# Create default troubleshooting user #>
@@ -36,7 +34,7 @@ Username/password requirements: https://learn.microsoft.com/en-us/azure/virtual-
 # .VERSION
 #   v0.2: Removed encoding params
 #   v0.1: Initial commit
-#>
+#
 #######################################################################################################
 
 Param(

@@ -1,5 +1,5 @@
 ﻿#########################################################################################################
-<#
+#
 # .SYNOPSIS
 #  Modify the registry on an OS disk attached to a Rescue VM as an Azure Data Disk. v0.2.1
 #
@@ -13,7 +13,7 @@
 # .NOTES
 #   Author: Ryan McCallum
 #   Sources:
-        https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty
+#        https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-itemproperty
 #
 # .PARAMETER rootKey
 #   [Optional] "HKLM" by default. Add shortcut version for other hives if using another hive (e.g. HKEY_CURRENT_USER would be HKCU).
@@ -49,7 +49,7 @@
 #   <# Where brokenSystemF is the System hive from the attached OS disk's F: partition #>
 #   az vm repair run -g sourceRG -n problemVM --run-id win-update-registry --run-on-repair --parameters rootKey=HKLM hive=SYSTEM controlSet=1 relativePath='Control\Terminal` Server' propertyName=fDenyTSConnections propertyValue=0 propertyType=dword
 #
-#>
+#
 #########################################################################################################
 
 # Set the Parameters for the script
