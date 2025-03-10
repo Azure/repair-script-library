@@ -1,5 +1,6 @@
+#!/bin/bash
 ﻿#########################################################################################################
-<#
+#
 # .SYNOPSIS
 #   alar2 allows recovering a failed VM. Various actions are available like: fstab, initrd, and kernel. NOTE: use option --run-on-repair. 
 # 
@@ -16,12 +17,8 @@
 #   serial console and grub serial are not configured well
 #   GRUB/EFI installation or configuration damaged
 #   Disk full causing a non-boot scenario, specifically related to auditd configurations.
-#>
+#
 #########################################################################################################
-
-
-#!/bin/bash
-
 wget https://raw.githubusercontent.com/Azure/ALAR/main/src/run-alar.sh
 chmod 700 run-alar.sh
 ./run-alar.sh $@
