@@ -1,5 +1,5 @@
 #########################################################################################################
-<#
+#
 # .SYNOPSIS
 #   Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode
 #   if you require it (e.g. to uninstall certain software).
@@ -49,7 +49,7 @@
     v0.3: [July 2023] - Detect if a Domain Controller from the attached OS drive's imported registry
 #   v0.2: [Feb 2023] - run with the -DC switch to initiate DSRM (Directory Services Recovery Mode) for Domain Controllers
 #   v0.1: Initial commit
-#>
+#
 #########################################################################################################
 
 # Set the Parameters for the script
