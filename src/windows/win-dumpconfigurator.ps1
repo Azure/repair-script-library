@@ -1,5 +1,5 @@
 #
-#.SYNOPSIS
+# .SYNOPSIS
 #    This script will change the dump configuration without requiring a reboot.
 #    Prerequisites (Links below):     
 #    Kdbgctrl.exe (From the Debugging Tools for Windows.)
@@ -19,7 +19,7 @@
 #    Version: 1.1
 #    Created: 2021-Mar-1
 # 
-#.EXAMPLE
+# .EXAMPLE
 #    ./win-dumpconfigurator.ps1 -DumpType full -DumpFile C:\Dumps\Memory.dmp -DedicatedDumpFile D:\dd.sys
 # .LINK
 #    Debugging Tools for Windows -- https://docs.microsoft.com/en-us/windows-insider/flight-hub/
