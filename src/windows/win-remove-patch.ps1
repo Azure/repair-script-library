@@ -1,5 +1,5 @@
 ######################################################################################################
-<#
+#
 # .SYNOPSIS
 #   Remove an installed Windows patch for the nested Hyper-V server on a Rescue VM.
 #
@@ -9,9 +9,7 @@
 
 # .RESOLVES
 #   Removing problematic patches can be difficult when the OS refuses to boot. This will be helpful to run on the repair VM after win-get-patches to attempt removal.
-
-Public doc: https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-operating-system-package-servicing-command-line-options?view=windows-11#remove-package
-
+# Public doc: https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-operating-system-package-servicing-command-line-options?view=windows-11#remove-package
 #
 # .PARAMETER packageName
 #   Name of package that we are uninstalling. Run 'win-get-patches' to get a list of installed/pending packages. Enter
@@ -28,7 +26,7 @@ Public doc: https://learn.microsoft.com/en-us/windows-hardware/manufacture/deskt
 #
 # .VERSION
 #   v0.1: Initial commit
-#>
+#
 #######################################################################################################
 
 # Set the Parameters for the script
