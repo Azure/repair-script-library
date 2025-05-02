@@ -40,9 +40,9 @@ Log functions:
 - There is a way to test local scripts with the CLI 'vm repair run' command
 ```
 # Run directly on the VM
-az vm repair run -g MyResourceGroup -n MySourceWinVM --custom-run-file /folder/file.ps1 --verbose
+az vm repair run -g MyResourceGroup -n MySourceWinVM --custom-script-file /folder/file.ps1 --verbose
 # Run on linked repair VM
-az vm repair run -g MyResourceGroup -n MyWinVM --custom-run-file /folder/file.ps1 --run-on-repair --verbose
+az vm repair run -g MyResourceGroup -n MyWinVM --custom-script-file /folder/file.ps1 --run-on-repair --verbose
 ```
 - Note that <b>parameter passing does not work</b> for local testing yet and script will throw error if done so.
 
