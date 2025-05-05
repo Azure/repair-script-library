@@ -47,4 +47,4 @@ az vm repair run -g MyResourceGroup -n MyWinVM --custom-script-file /folder/file
 - Note that <b>parameter passing does not work</b> for local testing yet and script will throw error if done so.
 
 # Contact
-- caiddev@microsoft.com
+- VMRepairDev@service.microsoft.com
