@@ -30,8 +30,10 @@
 #
 # .NOTES
 #   Author: Ryan McCallum (inspired by Ahmed Fouad)
+# 	Testing: Brought script to PowerShell ISE locally. Imported content of ".\src\windows\common\setup\init.ps1", ".\src\windows\common\helpers\Logger.ps1", and ".\src\windows\common\helpers\Get-Disk-Partitions.ps1" in same file and commented out lines initializing init.ps1 and Get-Disk-Partitions.ps1.
 #
 # .VERSION
+#   v0.3: Do not log temporary account password to vm-repair output log, only to local log file on desktop
 #   v0.2: Removed encoding params
 #   v0.1: Initial commit
 #
@@ -64,11 +66,9 @@ try {
     
     # Make sure guest VM is shut down if it exists
     $features = get-windowsfeature -ErrorAction Stop
-    $hyperv = $features | where Name -eq 'Hyper-V'
-    $hypervTools = $features | where Name -eq 'Hyper-V-Tools'
-    $hypervPowerShell = $features | where Name -eq 'Hyper-V-Powershell'
-    $dhcp = $features | where Name -eq 'DHCP'
-    $rsatDhcp = $features | where Name -eq 'RSAT-DHCP'
+    $hyperv = $features | Where-Object Name -eq 'Hyper-V'
+    $hypervTools = $features | Where-Object Name -eq 'Hyper-V-Tools'
+    $hypervPowerShell = $features | Where-Object Name -eq 'Hyper-V-Powershell'
 
     if ($hyperv.Installed -and $hypervTools.Installed -and $hypervPowerShell.Installed) {
         $guestHyperVVirtualMachine = Get-VM
@@ -211,7 +211,8 @@ try {
 
             Log-Output "END: Start the nested VM and login with the troubleshooting account:" | Tee-Object -FilePath $logFile -Append
             Log-Output "USERNAME: $($username)" | Tee-Object -FilePath $logFile -Append
-            Log-Output "PASSWORD: $($password)" | Tee-Object -FilePath $logFile -Append
+            Out-File -FilePath $logFile -InputObject "PASSWORD: $($password)" -Force -Append -ErrorAction Stop
+            Log-Output "PASSWORD is saved in $logFile" | Tee-Object -FilePath $logFile -Append
             Log-Output "Remove the account and the following files after troubleshooting has been completed: " | Tee-Object -FilePath $logFile -Append
             Log-Output "$($gptPath)$(if ($gptPathRenamed) { " and rename $($gptPath).bak to $($gptPath) " })" | Tee-Object -FilePath $logFile -Append
             Log-Output "$($ScriptINIPath)$(if ($ScriptINIPathRenamed) { " and rename $($ScriptINIPath).bak to $($ScriptINIPath) " })" | Tee-Object -FilePath $logFile -Append
