@@ -64,13 +64,7 @@ try {
             Log-Info "Dirty bit NOT set for $drive. Skipping chkdsk."
         }
     }
-
-    # 4. Capture BCD Store "After"
-    if (Test-Path $bcdPath) {
-        $bcdAfter = bcdedit /store $bcdPath /enum | Out-String
-        Log-Output "--- BCD AFTER REPAIR ---`n$bcdAfter"
-    }
-
+    
     Log-Output "Completed disk verification on Disk $diskNumber."
     Write-Output $STATUS_SUCCESS
     exit 0
