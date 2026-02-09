@@ -1,81 +1,125 @@
-# Welcome to the AUTO SAC ENABLER(SERIAL ACCESS CONSOLE) by Daniel Muñoz L!
-# Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
-# 
+# Welcome to the VM SAC and Boot Menu Configuration Fixer by Tony Mocanu!
 # .SUMMARY
-#   Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs.
-#   Reconfigures the Boot Configuration Data settings to allow EMS access.
+#    Enables Serial Console (SAC), EMS, and the Boot Menu for an offline VM.
+#    Modifies the BCD store and the SYSTEM registry hive to ensure the VM is accessible via Serial.
+#    Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/serial-console-grub-menu-windows
 # 
 # .RESOLVES
-#   Serial Console access is not enabled from the Windows guest OS.
+#    Resolves cases where the VM is stuck at a "Recovery" screen or blue screen that can't be seen.
+#    Enabling SAC allows an admin to use the Serial Console to run CMD, restart services, or debug.
 
-out-null
-cmd /c color 0A
-$host.UI.RawUI.WindowTitle = "                                                                                  --== AUTO SAC ENABLER by Daniel Muñoz L ==--"
+# --- INLINED HELPERS ---
+$STATUS_SUCCESS = '[STATUS]::SUCCESS'
+$STATUS_ERROR = '[STATUS]::ERROR'
+Function Log-Info    { Param([PSObject[]]$message) Write-Output "[Info $(Get-Date)]$message" }
+Function Log-Output  { Param([PSObject[]]$message) Write-Output "[Output $(Get-Date)]$message" }
+Function Log-Error   { Param([PSObject[]]$message) Write-Output "[Error $(Get-Date)]$message" }
 
-# Rescue OS variable
-$diska='C'
-
-# FINDER FOR FAULTY OS DISK
-$diskarray = "Q","W","E","R","T","Y","U","I","O","P","S","D","F","G","H","J","K","L","Z","X","V","N","M"
-$diskb="000"
-foreach ($diskt in $diskarray)
-{
-   if (Test-Path -Path "$($diskt):\Windows") {$diskb=$diskt} 
-}
-
-# IN CASE OF FINDER FAILURE WITH MITIGATION REASURE IF OS DISK EXIST AND IS MOUNTED AS DATADISK BEFORE PROCEDING
-if ($diskb -eq "000") {write-output "SCRIPT COULD NOT FIND A RESCUE OS DISK ATTACHED, EXITING";start-sleep 10;Exit}
-
-# DETECT IF GEN2
-$partboot='777'
-$diskd='000'
-$disknumber=$_
-
-Get-WmiObject Win32_DiskDrive | ForEach-Object {
-  $disk = $_
-  $partitions = "ASSOCIATORS OF " +
-                "{Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} " +
-                "WHERE AssocClass = Win32_DiskDriveToDiskPartition"
-  Get-WmiObject -Query $partitions | ForEach-Object {
-    $partition = $_
-    $drives = "ASSOCIATORS OF " +
-              "{Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} " +
-              "WHERE AssocClass = Win32_LogicalDiskToPartition"
-    Get-WmiObject -Query $drives | ForEach-Object {
-      New-Object -Type PSCustomObject -Property @{
-        X = $_.DeviceID
-        Y  = $partition.diskindex
-      }
+# Optimized BCD export to prevent log cutoff
+Function Export-BCDState {
+    Param($bcdPath, $label)
+    Log-Output ">>> CHECKING BCD SETTINGS ($label) <<<"
+    if (Test-Path $bcdPath) {
+        $bcdData = bcdedit /store "$bcdPath" /enum
+        # Filter for only relevant SAC/Boot settings to save space in the Azure output buffer
+        $bcdData | Where-Object { $_ -match "displaybootmenu|timeout|ems|emssettings|bootloadersettings" } | ForEach-Object { Log-Output $_.Trim() }
+    } else {
+        Log-Error "BCD path not found: $bcdPath"
     }
-  }
-} > "$($diskb):\txtemp"
-
-Select-String -Pattern "$($diskb)" -Path "$($diskb):\txtemp" -List -CaseSensitive | select-object -First 1 | %{$disknumber=$_.Line.Split('')[0]}
-
-get-partition -disknumber $disknumber > "$($diskb):\txtempvar"
-Select-String -Pattern "System" -Path "$($diskb):\txtempvar" -list -SimpleMatch | select-object -First 1 | %{$partboot=$_.Line.Split('')[0]}
-Get-Partition -DiskNumber $disknumber -PartitionNumber $partboot | Set-Partition -NewDriveLetter z
-
-	if (Test-Path -Path "Z:\efi\Microsoft") {write-output "VM is GEN2";$diskd="Z:\efi\Microsoft\boot\bcd"}
-
-# DETECT IF GEN1
-if ($diskd -eq '000')
-{
-	foreach ($diskt in $diskarray)
-	{
-	   	if (Test-Path -Path "$($diskt):\boot\bcd")
-      	{write-output "VM is GEN1";$diskd="$($diskt):\boot\bcd"}
-	}
 }
 
-# SAC ENABLE
-bcdedit /store "$($diskd)" /set "{bootmgr}" displaybootmenu yes
-bcdedit /store "$($diskd)" /set "{bootmgr}" timeout 5
-bcdedit /store "$($diskd)" /set "{bootmgr}" bootems yes
-bcdedit /store "$($diskd)" /ems "{default}" ON
-bcdedit /store "$($diskd)" /emssettings EMSPORT:1 EMSBAUDRATE:115200
+Function Export-RegKey {
+    Param($KeyPath)
+    $fullPath = "Registry::HKEY_LOCAL_MACHINE\$KeyPath"
+    if (Test-Path $fullPath) {
+        Log-Output "--- Displaying Key: HKLM:\$KeyPath ---"
+        $data = Get-ItemProperty -Path $fullPath | 
+                Select-Object * -ExcludeProperty PSPath, PSParentPath, PSChildName, PSDrive, PSProvider | 
+                Format-List | Out-String
+        $data.Split("`n") | ForEach-Object { if ($_ -match '\S') { Log-Output $_.Trim() } }
+    }
+}
 
-Remove-Item -force "$($diskb):\txtempvar"
+try {
+    # 1. Identify Target Drive
+    $targetOSDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { 
+        $_.Root -ne "$($env:SystemDrive)\" -and (Test-Path (Join-Path $_.Root "Windows\System32\config\SYSTEM")) 
+    }).Root | Select-Object -First 1
 
-write-output "          ---------------          SCRIPT FINISHED PROPERLY, CHANGES APPLIED          ---------------          "
-start-sleep 10
+    if (-not $targetOSDrive) { throw "Target OS disk not found." }
+
+    # 2. Locate BCD Store
+    $bcdPath = ""
+    $possiblePaths = @(
+        "$( $targetOSDrive )Boot\BCD",
+        "$( $targetOSDrive )EFI\Microsoft\Boot\BCD"
+    )
+
+    foreach ($path in $possiblePaths) {
+        if (Test-Path $path) { $bcdPath = $path; break }
+    }
+
+    if (-not $bcdPath) {
+        Log-Info "Searching for System Reserved partition..."
+        $sysPart = Get-Partition | Where-Object { $_.GptType -eq "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}" -or $_.IsActive } | Select-Object -First 1
+        if ($sysPart) {
+            $driveLetter = "Z"
+            Set-Partition -InputObject $sysPart -NewDriveLetter $driveLetter
+            $bcdPath = "${driveLetter}:\Boot\BCD"
+            if (-not (Test-Path $bcdPath)) { $bcdPath = "${driveLetter}:\EFI\Microsoft\Boot\BCD" }
+        }
+    }
+
+    if (-not (Test-Path $bcdPath)) { throw "Could not locate BCD store." }
+
+    # 3. VERIFY BEFORE
+    Export-BCDState $bcdPath "BEFORE"
+
+    # 4. Apply Configuration
+    Log-Info "Applying BCD configuration for Serial Console..."
+    bcdedit /store "$bcdPath" /set "{bootmgr}" displaybootmenu yes
+    bcdedit /store "$bcdPath" /set "{bootmgr}" timeout 10
+    bcdedit /store "$bcdPath" /set "{bootmgr}" bootems yes
+    bcdedit /store "$bcdPath" /ems "{default}" ON
+    bcdedit /store "$bcdPath" /emssettings EMSPORT:1 EMSBAUDRATE:115200
+
+    # 5. VERIFY AFTER
+    Export-BCDState $bcdPath "AFTER"
+
+    # 6. Registry Backup & BootStatusPolicy
+    $systemHive = Join-Path $targetOSDrive "Windows\System32\config\SYSTEM"
+    $backupPath = "$systemHive.bak_$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Log-Info "Backing up hive to: $backupPath"
+    Copy-Item -Path $systemHive -Destination $backupPath -Force
+
+    Log-Output "****************************************************************"
+    Log-Output "CAUTION: A backup of the SYSTEM hive was created at:"
+    Log-Output "$backupPath"
+    Log-Output "****************************************************************"
+
+    reg load HKLM\REPAIR_SYSTEM "$systemHive" | Out-Null
+    $currentSet = (Get-ItemProperty -Path "HKLM:\REPAIR_SYSTEM\Select").Current
+    $regPath = "REPAIR_SYSTEM\ControlSet00$currentSet\Control"
+
+    Log-Output ">>> CAPTURING REGISTRY (BEFORE) <<<"
+    Export-RegKey $regPath
+
+    Log-Info "Setting BootStatusPolicy to 1..."
+    Set-ItemProperty -Path "HKLM:\$regPath" -Name "BootStatusPolicy" -Value 1 -Type DWord
+
+    Log-Output ">>> CAPTURING REGISTRY (AFTER) <<<"
+    Export-RegKey $regPath
+
+    reg unload HKLM\REPAIR_SYSTEM | Out-Null
+
+    if (Get-PSDrive Z -ErrorAction SilentlyContinue) { Remove-PartitionAccessPath -DriveLetter Z -AccessPath "Z:\" }
+    
+    Log-Output "Success: SAC and Boot Menu settings are now persistent."
+    Write-Output $STATUS_SUCCESS
+}
+catch {
+    Log-Error "Failure: $($_.Exception.Message)"
+    reg unload HKLM\REPAIR_SYSTEM 2>$null
+    Write-Output $STATUS_ERROR
+    exit 1
+}
