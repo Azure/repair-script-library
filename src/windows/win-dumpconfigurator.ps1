@@ -23,7 +23,7 @@ Function Export-RegKey {
     $fullPath = "Registry::HKEY_LOCAL_MACHINE\$KeyPath"
     if (Test-Path $fullPath) {
         $val = Get-ItemProperty -Path $fullPath -Name $ValueName -ErrorAction SilentlyContinue
-        if ($val) { Log-Output "$ValueName : $($val.$ValueName)" }
+        if ($null -ne $val.$ValueName) { Log-Output "$ValueName : $($val.$ValueName)" }
         else { Log-Output "$ValueName : NOT FOUND" }
     }
 }
@@ -32,7 +32,6 @@ Function Export-BCDState {
     Param($bcdPath, $label)
     Log-Output ">>> CHECKING BCD SETTINGS ($label) <<<"
     if (Test-Path $bcdPath) {
-        # Checking for recovery and boot policy settings
         bcdedit /store "$bcdPath" /enum | Where-Object { $_ -match "recoveryenabled|bootstatuspolicy" } | ForEach-Object { Log-Output $_.Trim() }
     }
 }
@@ -52,13 +51,12 @@ try {
     Log-Info "Backup created: SYSTEM.bak_$timeStamp"
 
     # 3. Load Hive
-    Log-Info "Loading SYSTEM hive..."
     reg load HKLM\OFFLINE_SYSTEM "$systemHive" | Out-Null
     
     $currentSetNum = (Get-ItemProperty -Path "HKLM:\OFFLINE_SYSTEM\Select").Current
     $controlSet = "ControlSet00$currentSetNum"
 
-    # Registry Paths per BSOD Troubleshooting Guide
+    # Registry Paths for BSOD Troubleshooting
     $ccPath = "OFFLINE_SYSTEM\$controlSet\Control\CrashControl"
     $ctrlPath = "OFFLINE_SYSTEM\$controlSet\Control"
     $mmPath = "OFFLINE_SYSTEM\$controlSet\Control\Session Manager\Memory Management"
@@ -66,39 +64,43 @@ try {
     # --- AUDIT BEFORE ---
     Log-Output ">>> AUDITING BSOD SETTINGS (BEFORE) <<<"
     Export-RegKey $ccPath "CrashDumpEnabled"
+    Export-RegKey $ccPath "NMICrashDump"
     Export-RegKey $ctrlPath "BootStatusPolicy"
     Export-RegKey $mmPath "ExistingPageFiles"
 
     # 4. Apply Changes
-    Log-Info "Applying BSOD mitigation settings..."
+    Log-Info "Updating registry for BSOD mitigation and NMI support..."
     
-    # A. Enable Kernel Memory Dump (1) and Overwrite (1)
+    if (!(Test-Path "HKLM:\$ccPath")) { New-Item -Path "HKLM:\$ccPath" -Force | Out-Null }
+    
+    # A. Set Kernel Dump, NMI, and Overwrite
     Set-ItemProperty -Path "HKLM:\$ccPath" -Name "CrashDumpEnabled" -Value 1 -Type DWord
+    Set-ItemProperty -Path "HKLM:\$ccPath" -Name "NMICrashDump" -Value 1 -Type DWord
     Set-ItemProperty -Path "HKLM:\$ccPath" -Name "Overwrite" -Value 1 -Type DWord
+    Set-ItemProperty -Path "HKLM:\$ccPath" -Name "DumpFile" -Value "%SystemRoot%\MEMORY.DMP" -Type ExpandString
 
     # B. Set Boot Status Policy to IgnoreAllFailures (1)
-    # This prevents the VM from stopping at the recovery menu after a crash
     Set-ItemProperty -Path "HKLM:\$ctrlPath" -Name "BootStatusPolicy" -Value 1 -Type DWord
 
-    # C. Ensure PageFile is set to C: (Prevents dump failures)
+    # C. Set PageFile to C:
+    if (!(Test-Path "HKLM:\$mmPath")) { New-Item -Path "HKLM:\$mmPath" -Force | Out-Null }
     Set-ItemProperty -Path "HKLM:\$mmPath" -Name "ExistingPageFiles" -Value "\??\C:\pagefile.sys" -Type MultiString
 
     # --- AUDIT AFTER ---
     Log-Output ">>> VERIFYING UPDATED SETTINGS (AFTER) <<<"
     Export-RegKey $ccPath "CrashDumpEnabled"
+    Export-RegKey $ccPath "NMICrashDump"
     Export-RegKey $ctrlPath "BootStatusPolicy"
     Export-RegKey $mmPath "ExistingPageFiles"
 
-    # 5. BCD Settings for BSOD Loops
+    # 5. BCD Settings
     $bcdPath = ""
     $possibleBcds = @("$( $targetDrive )Boot\BCD", "$( $targetDrive )EFI\Microsoft\Boot\BCD")
     foreach ($p in $possibleBcds) { if (Test-Path $p) { $bcdPath = $p; break } }
 
     if ($bcdPath) {
         Export-BCDState $bcdPath "BEFORE"
-        # Disable the recovery screen that blocks boot
         bcdedit /store "$bcdPath" /set "{default}" recoveryenabled No
-        # Optional: Set boot status policy in BCD as well
         bcdedit /store "$bcdPath" /set "{default}" bootstatuspolicy IgnoreAllFailures
         Export-BCDState $bcdPath "AFTER"
     }
@@ -107,7 +109,7 @@ try {
     Set-Location C:\
     [GC]::Collect()
     [GC]::WaitForPendingFinalizers()
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 5
     reg unload HKLM\OFFLINE_SYSTEM | Out-Null
 
     Log-Output "Success: BSOD mitigation settings applied to $targetDrive."
