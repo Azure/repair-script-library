@@ -1,92 +1,121 @@
+# Welcome to the Azure VHD Preparation/Verification Fixer by Tony Mocanu!
 #
-# .SYNOPSIS
-#    This script will change the dump configuration without requiring a reboot.
-#    Prerequisites (Links below):     
-#    Kdbgctrl.exe (From the Debugging Tools for Windows.)
-#    Changes the dump configuration of a VM while it's running without the need to reboot it. 
-#    Which is to say, you can change the dump configuration from Kernel to Full without a reboot.
-#    Easily create a DedicatedDump File for an online VM needing a memory dump so the page file does not have to be modified. 
-#    Modifies the dump type of a server without needing a restart using the kdbgctrl.exe application.
-
-# .RESOLVES
-#  Normally, modifying dump settings to debug an issue requires 
-#  1) a restart for the settings to apply and 
-#  2) changing the page file settings so the server accommodates the size of the dump. 
-#  This script easily handles both issues to make dump collection easier so the VM does not need to restart or have the Page file modified.
-# .NOTES
-#    Name: win-dumpconfigurator.ps1
-#    Author: Microsoft CSS
-#    Version: 1.1
-#    Created: 2021-Mar-1
+# .SUMMARY
+#    Configures an offline Windows VHD to troubleshoot and mitigate Blue Screen (BSOD) errors.
+#    Sets Memory Dump settings, Boot Status Policy, and disables Recovery Mode.
+#    Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/troubleshoot-common-blue-screen-error
 # 
-# .EXAMPLE
-#    ./win-dumpconfigurator.ps1 -DumpType full -DumpFile C:\Dumps\Memory.dmp -DedicatedDumpFile D:\dd.sys
-# .LINK
-#    Debugging Tools for Windows -- https://docs.microsoft.com/en-us/windows-insider/flight-hub/
-#
-Param(
-[parameter()] [switch]$OneDump,
-[parameter()] [ValidateSet("active", "automatic", "full", "kernel", "mini" )] [string]$DumpType,
-[parameter()] [string]$DumpFile,
-[parameter()] [string]$DedicatedDumpFile)
+# .RESOLVES
+#    - BSOD loops by forcing the OS to ignore boot failures (BootStatusPolicy)
+#    - Missing crash data by enabling Kernel Memory Dumps (CrashControl)
+#    - Stuck "Blue Screen" menus by disabling BCD recovery (recoveryenabled)
+#    - Memory management issues by ensuring a valid PageFile path
 
-# Initialize script
-. .\src\windows\common\setup\init.ps1
+# --- INLINED HELPERS ---
+$STATUS_SUCCESS = '[STATUS]::SUCCESS'
+$STATUS_ERROR = '[STATUS]::ERROR'
+Function Log-Info    { Param([PSObject[]]$message) Write-Output "[Info $(Get-Date)]$message" }
+Function Log-Output  { Param([PSObject[]]$message) Write-Output "[Output $(Get-Date)]$message" }
+Function Log-Error   { Param([PSObject[]]$message) Write-Output "[Error $(Get-Date)]$message" }
 
-if (!$DumpType) 
-{
-    Write-Host "DumpType, VMname, and Resource group *MUST* all be specified. "
-    Write-Output "Valid dump types include active, automatic, full, kernel, or mini."
-    break
+Function Export-RegKey {
+    Param($KeyPath, $ValueName)
+    $fullPath = "Registry::HKEY_LOCAL_MACHINE\$KeyPath"
+    if (Test-Path $fullPath) {
+        $val = Get-ItemProperty -Path $fullPath -Name $ValueName -ErrorAction SilentlyContinue
+        if ($val) { Log-Output "$ValueName : $($val.$ValueName)" }
+        else { Log-Output "$ValueName : NOT FOUND" }
+    }
 }
 
-## Add any registry prereqs to the script
-## For example, if you want to use a DedicatedDumpFile, you'll need to make sure the key exists.
-$CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
-$CrashDumpEnabledValue = "CrashDumpEnabled"
-$CrashDumpEnabledData = (Get-ItemProperty -Path $CrashCtrlPath).$CrashDumpEnabledValue
-
-$DDFileLength = $DedicatedDumpFile.Length
-$DumpFileLenth = $DumpFile.Length
-
-if (!$CrashDumpEnabledData) 
-{
-    Log-Output "Getting the value of $CrashDumpEnabledValue failed. Verify the key is present and contains a value. The default value should be 7."
-    Log-Output "Unable to continue, exiting..."
-    exit 
+Function Export-BCDState {
+    Param($bcdPath, $label)
+    Log-Output ">>> CHECKING BCD SETTINGS ($label) <<<"
+    if (Test-Path $bcdPath) {
+        # Checking for recovery and boot policy settings
+        bcdedit /store "$bcdPath" /enum | Where-Object { $_ -match "recoveryenabled|bootstatuspolicy" } | ForEach-Object { Log-Output $_.Trim() }
+    }
 }
 
-if ($DumpFileLenth -gt 0) 
-{    
-    Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
-}
+try {
+    # 1. Identify Target Drive
+    $targetDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { 
+        $_.Root -ne "$($env:SystemDrive)\" -and (Test-Path (Join-Path $_.Root "Windows\System32\config\SYSTEM")) 
+    }).Root | Select-Object -First 1
 
-if ($DDFileLength -gt 0) 
-{
-    if ($DedicatedDumpFile -eq "delete") 
-    {
-        if ([bool]((Get-itemproperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl").DedicatedDumpFile)) 
-        {
-            Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile
-        }
+    if (-not $targetDrive) { throw "Target OS disk not found." }
+    $systemHive = Join-Path $targetDrive "Windows\System32\config\SYSTEM"
 
-    }else
-    {
-        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile
+    # 2. Backups
+    $timeStamp = Get-Date -Format 'yyyyMMddHHmmss'
+    Copy-Item $systemHive -Destination "$systemHive.bak_$timeStamp" -Force
+    Log-Info "Backup created: SYSTEM.bak_$timeStamp"
+
+    # 3. Load Hive
+    Log-Info "Loading SYSTEM hive..."
+    reg load HKLM\OFFLINE_SYSTEM "$systemHive" | Out-Null
+    
+    $currentSetNum = (Get-ItemProperty -Path "HKLM:\OFFLINE_SYSTEM\Select").Current
+    $controlSet = "ControlSet00$currentSetNum"
+
+    # Registry Paths per BSOD Troubleshooting Guide
+    $ccPath = "OFFLINE_SYSTEM\$controlSet\Control\CrashControl"
+    $ctrlPath = "OFFLINE_SYSTEM\$controlSet\Control"
+    $mmPath = "OFFLINE_SYSTEM\$controlSet\Control\Session Manager\Memory Management"
+
+    # --- AUDIT BEFORE ---
+    Log-Output ">>> AUDITING BSOD SETTINGS (BEFORE) <<<"
+    Export-RegKey $ccPath "CrashDumpEnabled"
+    Export-RegKey $ctrlPath "BootStatusPolicy"
+    Export-RegKey $mmPath "ExistingPageFiles"
+
+    # 4. Apply Changes
+    Log-Info "Applying BSOD mitigation settings..."
+    
+    # A. Enable Kernel Memory Dump (1) and Overwrite (1)
+    Set-ItemProperty -Path "HKLM:\$ccPath" -Name "CrashDumpEnabled" -Value 1 -Type DWord
+    Set-ItemProperty -Path "HKLM:\$ccPath" -Name "Overwrite" -Value 1 -Type DWord
+
+    # B. Set Boot Status Policy to IgnoreAllFailures (1)
+    # This prevents the VM from stopping at the recovery menu after a crash
+    Set-ItemProperty -Path "HKLM:\$ctrlPath" -Name "BootStatusPolicy" -Value 1 -Type DWord
+
+    # C. Ensure PageFile is set to C: (Prevents dump failures)
+    Set-ItemProperty -Path "HKLM:\$mmPath" -Name "ExistingPageFiles" -Value "\??\C:\pagefile.sys" -Type MultiString
+
+    # --- AUDIT AFTER ---
+    Log-Output ">>> VERIFYING UPDATED SETTINGS (AFTER) <<<"
+    Export-RegKey $ccPath "CrashDumpEnabled"
+    Export-RegKey $ctrlPath "BootStatusPolicy"
+    Export-RegKey $mmPath "ExistingPageFiles"
+
+    # 5. BCD Settings for BSOD Loops
+    $bcdPath = ""
+    $possibleBcds = @("$( $targetDrive )Boot\BCD", "$( $targetDrive )EFI\Microsoft\Boot\BCD")
+    foreach ($p in $possibleBcds) { if (Test-Path $p) { $bcdPath = $p; break } }
+
+    if ($bcdPath) {
+        Export-BCDState $bcdPath "BEFORE"
+        # Disable the recovery screen that blocks boot
+        bcdedit /store "$bcdPath" /set "{default}" recoveryenabled No
+        # Optional: Set boot status policy in BCD as well
+        bcdedit /store "$bcdPath" /set "{default}" bootstatuspolicy IgnoreAllFailures
+        Export-BCDState $bcdPath "AFTER"
     }
 
-}
+    # 6. Unload & Cleanup
+    Set-Location C:\
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Start-Sleep -Seconds 2
+    reg unload HKLM\OFFLINE_SYSTEM | Out-Null
 
-# This is to clear the CrashDumpEnabled Key before kdbgctrl.exe sets it. This is helpful in scenarios where you want to 
-# use a DedicatedDump File but you do not wish to change the dump type.
-Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
-$kdbgctrl_return =   .\src\windows\common\tools\kdbgctrl.exe -sd $DumpType
-if ($OneDump -eq "True")
-{
- # Restore orignal CrashDumpEnabled value. This is helpful when you might not want to leave a system configured for a 
- # complete dump because of the downtime involved in writing out the dump. Which is to say, change the dump configuration
- # for the next bugcheck only.
-    Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $CrashDumpEnabledValue
+    Log-Output "Success: BSOD mitigation settings applied to $targetDrive."
+    Write-Output $STATUS_SUCCESS
 }
-Log-Output $kdbgctrl_return
-return $STATUS_SUCCESS
+catch {
+    Log-Error "Failure: $($_.Exception.Message)"
+    reg unload HKLM\OFFLINE_SYSTEM 2>$null
+    Write-Output $STATUS_ERROR
+    exit 1
+}
