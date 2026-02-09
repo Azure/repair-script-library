@@ -1,85 +1,130 @@
-# Welcome to the VM Azure Agent Offline fixer by Daniel Muñoz L!
-# Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
+# Welcome to the VM Azure Agent Offline fixer by Tony Mocanu!
 # .SUMMARY
-#   Fixes integrity of files and registry from windows guest agent offline.
-#   Backs up registry. Copies installation folder and registry values related to Windows Guest Agent to attached disk.
-#   Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/install-vm-agent-offline 
+#    Fixes integrity of files and registry from windows guest agent offline.
+#    Backs up registry. Copies installation folder and registry values related to Windows Guest Agent to attached disk.
+#    Public doc: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/install-vm-agent-offline 
 # 
 # .RESOLVES
-#   The server needs to use the Guest Agent (e.g. for a password reset) but the user is currently unable to because 
-#   the Guest Agent is not installed. After performing this fix, the Guest Agent will effectively be installed on the attached OS disk as well.
-#   The Azure Virtual Machine Agent (VM Agent) provides useful features, such as local administrator password reset and script pushing.
+#    The server needs to use the Guest Agent (e.g. for a password reset) but the user is currently unable to because 
+#    the Guest Agent is not installed. After performing this fix, the Guest Agent will effectively be installed on the attached OS disk as well.
+#    The Azure Virtual Machine Agent (VM Agent) provides useful features, such as local administrator password reset and script pushing.
 
+# --- INLINED HELPERS ---
+$STATUS_SUCCESS = '[STATUS]::SUCCESS'
+$STATUS_ERROR = '[STATUS]::ERROR'
+Function Log-Info { Param([PSObject[]]$message) Write-Output "[Info $(Get-Date)]$message" }
+Function Log-Output { Param([PSObject[]]$message) Write-Output "[Output $(Get-Date)]$message" }
+Function Log-Error { Param([PSObject[]]$message) Write-Output "[Error $(Get-Date)]$message" }
 
-out-null
-cmd /c color 0A
-$host.UI.RawUI.WindowTitle = "                                                                                  --== VMAgent Offline Fixer by Daniel Muñoz L ==--"
-
-# Rescue OS variable
-$diska='c'
-
-# FINDER FOR FAULTY OS DRIVE
-$diskarray = "d","q","w","e","r","t","y","u","i","o","p","s","f","g","h","j","k","l","z","x","v","n","m"
-$diskb="000"
-foreach ($diskt in $diskarray)
-{
-   if (Test-Path -Path "$($diskt):\Windows")
-   {
-    $diskb=$diskt
-    } 
+Function Export-RegKey {
+    Param($KeyPath)
+    $fullPath = "Registry::HKEY_LOCAL_MACHINE\$KeyPath"
+    if (Test-Path $fullPath) {
+        Log-Output "--- Displaying Key: HKLM:\$KeyPath ---"
+        # Format-List ensures all properties (ImagePath, Start, etc.) are visible
+        $data = Get-ItemProperty -Path $fullPath | 
+                Select-Object * -ExcludeProperty PSPath, PSParentPath, PSChildName, PSDrive, PSProvider | 
+                Format-List | Out-String
+        
+        $data.Split("`n") | ForEach-Object { if ($_ -match '\S') { Log-Output $_.Trim() } }
+    } else {
+        Log-Output "Key HKLM:\$KeyPath does not exist."
+    }
 }
 
-# IN CASE OF FINDER FAILURE
-if ($diskb -eq "000") {write-output "SCRIPT COULD NOT FIND A RESCUE OS DISK ATTACHED, EXITING";start-sleep 10;Exit}
+try {
+    # 1. Identify Target Drive
+    $targetDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { 
+        $_.Root -ne "$($env:SystemDrive)\" -and (Test-Path (Join-Path $_.Root "Windows\System32\config\SYSTEM")) 
+    }).Root | Select-Object -First 1
 
-# HIVE LOADER
-# A Backup of the BROKENSYSTEM was taken and left on $($diskb):\ as regbackupbeforeGAchanges just in case!
-reg load "HKLM\BROKENSYSTEM" "$($diskb):\Windows\System32\config\SYSTEM"
-reg export "HKLM\BROKENSYSTEM" "$($diskb):\regbackupbeforeGAchanges" /y
+    if (-not $targetDrive) { throw "Target OS disk not found." }
 
-# EXPORTING GOOD VMAGENT REGS FROM RESCUE VM
-reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WindowsAzureGuestAgent" "$($diskb):\WAGA.reg" /y
-# Telemetry service was merged into rdagent so you can expect an error from wats
-reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\WindowsAzureTelemetryService" "$($diskb):\WATS.reg"  /y
-reg export "HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\RdAgent" "$($diskb):\RdAgent.reg" /y
+    # 2. CREATE SYSTEM HIVE BACKUP & LOG CAUTION
+    $systemHiveDir = Join-Path $targetDrive "Windows\System32\config"
+    $systemHive = Join-Path $systemHiveDir "SYSTEM"
+    $backupName = "SYSTEM.bak_$(Get-Date -Format 'yyyyMMddHHmmss')"
+    $backupPath = Join-Path $systemHiveDir $backupName
+    
+    Log-Info "Backing up SYSTEM hive to $backupPath"
+    Copy-Item -Path $systemHive -Destination $backupPath -Force
 
-# MODIFYING REG FILES WITH GOOD REG KEYS
-# WAAGENT MODIFICATIONS
-(gc "$($diskb):\waga.reg") -replace 'LocalSystem', 'notyet' | Out-File "$($diskb):\waga.reg"
-(gc "$($diskb):\waga.reg") -replace 'system', 'BROKENSYSTEM' | Out-File "$($diskb):\waga.reg"
-(gc "$($diskb):\waga.reg") -replace 'notyet', 'localsystem' | Out-File "$($diskb):\waga.reg"
+    # --- THE CAUTION NOTE ---
+    Log-Output "****************************************************************"
+    Log-Output "CAUTION: A backup of the SYSTEM hive was created at:"
+    Log-Output "$backupPath"
+    Log-Output "If this repair is successful and the backup is no longer needed,"
+    Log-Output "please manually delete this file from the guest OS."
+    Log-Output "****************************************************************"
 
-# TELEMETRY MODIFICATIONS
-# Telemetry service was merged into rdagent so an error might be expected from wats key
-(gc "$($diskb):\wats.reg") -replace 'LocalSystem', 'notyet' | Out-File "$($diskb):\wats.reg"
-(gc "$($diskb):\wats.reg") -replace 'system', 'BROKENSYSTEM' | Out-File "$($diskb):\wats.reg"
-(gc "$($diskb):\wats.reg") -replace 'notyet', 'localsystem' | Out-File "$($diskb):\wats.reg"
+    # 3. Copy Agent Folder
+    $localAzurePath = "C:\WindowsAzure"
+    $latestAgentFolder = Get-ChildItem -Path $localAzurePath -Filter "GuestAgent_*" | 
+                         Sort-Object Name -Descending | Select-Object -First 1
+    
+    if (-not $latestAgentFolder) { throw "Could not find GuestAgent folder on Repair VM." }
+    
+    $destPath = Join-Path $targetDrive "WindowsAzure"
+    if (!(Test-Path $destPath)) { New-Item -ItemType Directory -Path $destPath | Out-Null }
+    
+    Log-Info "Copying $($latestAgentFolder.Name) to target disk."
+    Copy-Item -Path $latestAgentFolder.FullName -Destination $destPath -Recurse -Force
 
-# RDAGENT MODIFICATIONS
-(gc "$($diskb):\RdAgent.reg") -replace 'LocalSystem', 'notyet' | Out-File "$($diskb):\RdAgent.reg"
-(gc "$($diskb):\RdAgent.reg") -replace 'system', 'BROKENSYSTEM' | Out-File "$($diskb):\RdAgent.reg"
-(gc "$($diskb):\RdAgent.reg") -replace 'notyet', 'localsystem' | Out-File "$($diskb):\RdAgent.reg"
+    # 4. Load Hive
+    Log-Info "Loading hive into HKLM\BROKENSYSTEM"
+    reg load HKLM\BROKENSYSTEM "$systemHive" | Out-Null
 
-# ADDING REG FILES IN %diskb% DRIVE
-regedit /s "$($diskb):\WATS.reg"
-regedit /s "$($diskb):\WAGA.reg"
-regedit /s "$($diskb):\RdAgent.reg"
+    $currentSetNum = (Get-ItemProperty -Path "HKLM:\BROKENSYSTEM\Select").Current
+    $targetServicesBase = "BROKENSYSTEM\ControlSet00$currentSetNum\Services"
 
-# BACKUP TAKEN ON FOLDER $($diskb):\WindowsazurefaultyGAbackup"
-mkdir "$($diskb):\WindowsazurefaultyGAbackup"
-xcopy "$($diskb):\WindowsAzure" "$($diskb):\WindowsazurefaultyGAbackup" /e /h /y
+    # 5. Export Initial (Before)
+    Log-Output ">>> CAPTURING INITIAL REGISTRY STATE (BEFORE) <<<"
+    Export-RegKey "$targetServicesBase\RdAgent"
+    Export-RegKey "$targetServicesBase\WindowsAzureGuestAgent"
 
-# RESTORING VMAgent BIN FILES
-del "$($diskb):\WindowsAzure" -force -recurse
-mkdir "$($diskb):\WindowsAzure"
-xcopy "$($diska):\WindowsAzure" "$($diskb):\WindowsAzure" /e /h /y
-del "$($diskb):\WindowsAzure\logs" -force -recurse
+    # 6. Mirroring Logic
+    $servicesToMirror = @("RdAgent", "WindowsAzureGuestAgent")
+    $targetImagePathValue = "C:\WindowsAzure\$($latestAgentFolder.Name)\WaAppAgent.exe"
 
-# Unloading HIVE"
-reg.exe unload "HKLM\BROKENSYSTEM"
-del "$($diskb):\rdagent.reg" -force
-del "$($diskb):\waga.reg" -force
-del "$($diskb):\wats.reg" -force
+    foreach ($serviceName in $servicesToMirror) {
+        Log-Info "Mirroring service: $serviceName"
+        $sourceKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Services\$serviceName")
+        $destKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($targetServicesBase, $true).CreateSubKey($serviceName)
 
-write-output "   --------------   SCRIPT FINISHED PROPERLY, BACKUP OF PREVIOUS GA IS IN ROOT AS WindowsazurefaultyGAbackup folder and registry backup as regbackupbeforeGAchanges   --------------   "
-start-sleep 10
+        if ($sourceKey) {
+            foreach ($valueName in $sourceKey.GetValueNames()) {
+                $val = $sourceKey.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $kind = $sourceKey.GetValueKind($valueName)
+                
+                if ($valueName -eq "ImagePath") {
+                    $destKey.SetValue($valueName, $targetImagePathValue, $kind)
+                } else {
+                    $destKey.SetValue($valueName, $val, $kind)
+                }
+            }
+            $sourceKey.Close()
+            $destKey.Close()
+        }
+    }
+
+    # 7. Export Updated (After)
+    Log-Output ">>> CAPTURING UPDATED REGISTRY STATE (AFTER) <<<"
+    Export-RegKey "$targetServicesBase\RdAgent"
+    Export-RegKey "$targetServicesBase\WindowsAzureGuestAgent"
+
+    # 8. Cleanup
+    Set-Location C:\
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Start-Sleep -Seconds 2
+    reg unload HKLM\BROKENSYSTEM | Out-Null
+
+    Write-Output $STATUS_SUCCESS
+    exit 0
+}
+catch {
+    Log-Error "Failure: $($_.Exception.Message)"
+    reg unload HKLM\BROKENSYSTEM 2>$null
+    Write-Output $STATUS_ERROR
+    exit 1
+}
