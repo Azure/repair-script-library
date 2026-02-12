@@ -1,92 +1,112 @@
-#
-# .SYNOPSIS
-#    This script will change the dump configuration without requiring a reboot.
-#    Prerequisites (Links below):     
-#    Kdbgctrl.exe (From the Debugging Tools for Windows.)
-#    Changes the dump configuration of a VM while it's running without the need to reboot it. 
-#    Which is to say, you can change the dump configuration from Kernel to Full without a reboot.
-#    Easily create a DedicatedDump File for an online VM needing a memory dump so the page file does not have to be modified. 
-#    Modifies the dump type of a server without needing a restart using the kdbgctrl.exe application.
+<#
+.SYNOPSIS
+    Configures a Windows VM to generate a Full Memory Dump without requiring a reboot.
+    
+.DESCRIPTION
+    This script performs the following actions:
+    1. Audits current crash control settings (CrashDumpEnabled, NMICrashDump, BootStatusPolicy).
+    2. Enables NMICrashDump to allow Azure Portal NMI triggering.
+    3. Sets BootStatusPolicy to 'IgnoreShutdownFailures' to ensure automatic reboot after a crash.
+    4. Configures a Dedicated Dump File (optional) to ensure space for the dump.
+    5. Uses kdbgctrl.exe to apply the 'Full' dump configuration to the live kernel immediately.
+    6. Restores original settings if the -OneDump switch is used.
 
-# .RESOLVES
-#  Normally, modifying dump settings to debug an issue requires 
-#  1) a restart for the settings to apply and 
-#  2) changing the page file settings so the server accommodates the size of the dump. 
-#  This script easily handles both issues to make dump collection easier so the VM does not need to restart or have the Page file modified.
-# .NOTES
-#    Name: win-dumpconfigurator.ps1
-#    Author: Microsoft CSS
-#    Version: 1.1
-#    Created: 2021-Mar-1
-# 
-# .EXAMPLE
-#    ./win-dumpconfigurator.ps1 -DumpType full -DumpFile C:\Dumps\Memory.dmp -DedicatedDumpFile D:\dd.sys
-# .LINK
-#    Debugging Tools for Windows -- https://docs.microsoft.com/en-us/windows-insider/flight-hub/
-#
-Param(
-[parameter()] [switch]$OneDump,
-[parameter()] [ValidateSet("active", "automatic", "full", "kernel", "mini" )] [string]$DumpType,
-[parameter()] [string]$DumpFile,
-[parameter()] [string]$DedicatedDumpFile)
+.PARAMETER OneDump
+    Switch to restore the original CrashDumpEnabled value after the kernel has been updated.
+    Useful for single-event debugging.
 
-# Initialize script
+.PARAMETER DumpType
+    The type of dump to configure (e.g., full, kernel, mini, active, automatic).
+
+.PARAMETER DumpFile
+    The target path for the final .dmp file. Defaults to %SystemRoot%\MEMORY.DMP.
+
+.PARAMETER DedicatedDumpFile
+    The path to a dedicated dump file (e.g., D:\dd.sys) to preserve space on the OS drive.
+
+.EXAMPLE
+    az vm repair run --parameters dumptype=full DedicatedDumpFile="D:\dd.sys"
+
+.NOTES
+    Name: win-dumpconfigurator.ps1
+    Version: 1.2
+    Author: Tony.Mocanu@Microsoft.com
+#>
+
+# Initialize standard library logic
 . .\src\windows\common\setup\init.ps1
 
-if (!$DumpType) 
-{
-    Write-Host "DumpType, VMname, and Resource group *MUST* all be specified. "
-    Write-Output "Valid dump types include active, automatic, full, kernel, or mini."
-    break
+function Get-AuditSnapshot {
+    param($Title)
+    $Path = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
+    $MMPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+    $RelPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability"
+    
+    $PFile = (Get-ItemProperty -Path $MMPath -ErrorAction SilentlyContinue).ExistingPageFiles
+    $NMI = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).NMICrashDump
+    $BSP = (Get-ItemProperty -Path $RelPath -ErrorAction SilentlyContinue).BootStatusPolicy
+    
+    Log-Output ">>> $Title <<<"
+    Log-Output "DumpFile           : $((Get-ItemProperty -Path $Path).DumpFile)"
+    Log-Output "CrashDumpEnabled   : $((Get-ItemProperty -Path $Path).CrashDumpEnabled)"
+    Log-Output "NMICrashDump       : $(if($null -eq $NMI){"NOT FOUND"}else{$NMI})"
+    Log-Output "BootStatusPolicy   : $(if($null -eq $BSP){"NOT FOUND"}else{$BSP})"
+    Log-Output "ExistingPageFiles  : $(if($null -eq $PFile){"NOT FOUND"}else{$PFile})"
 }
 
-## Add any registry prereqs to the script
-## For example, if you want to use a DedicatedDumpFile, you'll need to make sure the key exists.
-$CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
-$CrashDumpEnabledValue = "CrashDumpEnabled"
-$CrashDumpEnabledData = (Get-ItemProperty -Path $CrashCtrlPath).$CrashDumpEnabledValue
+Param(
+    [parameter()] [switch]$OneDump,
+    [parameter()] [ValidateSet("active", "automatic", "full", "kernel", "mini" )] [string]$DumpType,
+    [parameter()] [string]$DumpFile,
+    [parameter()] [string]$DedicatedDumpFile
+)
 
-$DDFileLength = $DedicatedDumpFile.Length
-$DumpFileLenth = $DumpFile.Length
+try {
+    # 1. AUDIT BEFORE
+    Get-AuditSnapshot "AUDITING SETTINGS (BEFORE)"
 
-if (!$CrashDumpEnabledData) 
-{
-    Log-Output "Getting the value of $CrashDumpEnabledValue failed. Verify the key is present and contains a value. The default value should be 7."
-    Log-Output "Unable to continue, exiting..."
-    exit 
-}
+    $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
+    $initialValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
 
-if ($DumpFileLenth -gt 0) 
-{    
-    Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
-}
+    # 2. SET AZURE PORTAL PREREQUISITES
+    Set-ItemProperty -Path $CrashCtrlPath -Name NMICrashDump -Value 1 -Type DWord
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability" -Name BootStatusPolicy -Value 1 -Type DWord
 
-if ($DDFileLength -gt 0) 
-{
-    if ($DedicatedDumpFile -eq "delete") 
-    {
-        if ([bool]((Get-itemproperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl").DedicatedDumpFile)) 
-        {
-            Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile
-        }
-
-    }else
-    {
-        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile
+    # 3. APPLY PATHS
+    if ($DumpFile) { 
+        Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile 
+    } else {
+        Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value "%SystemRoot%\MEMORY.DMP"
     }
 
-}
+    if ($DedicatedDumpFile -eq "delete") { 
+        Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -ErrorAction SilentlyContinue 
+    }
+    elseif ($DedicatedDumpFile) { 
+        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile 
+    }
 
-# This is to clear the CrashDumpEnabled Key before kdbgctrl.exe sets it. This is helpful in scenarios where you want to 
-# use a DedicatedDump File but you do not wish to change the dump type.
-Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
-$kdbgctrl_return =   .\src\windows\common\tools\kdbgctrl.exe -sd $DumpType
-if ($OneDump -eq "True")
-{
- # Restore orignal CrashDumpEnabled value. This is helpful when you might not want to leave a system configured for a 
- # complete dump because of the downtime involved in writing out the dump. Which is to say, change the dump configuration
- # for the next bugcheck only.
-    Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $CrashDumpEnabledValue
+    # 4. RUN KDBGCTRL TO APPLY LIVE KERNEL CHANGES
+    Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
+    $toolPath = ".\src\windows\common\tools\kdbgctrl.exe"
+    & $toolPath -sd $DumpType | Log-Output
+
+    # 5. RESTORE ORIGINAL IF ONEDUMP USED
+    if ($OneDump) { 
+        Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $initialValue 
+    }
+
+    # 6. AUDIT AFTER
+    Get-AuditSnapshot "VERIFYING UPDATED SETTINGS (AFTER)"
+    
+    $finalDumpPath = (Get-ItemProperty -Path $CrashCtrlPath).DumpFile
+    Log-Output "Success: VM is now configured for a Full Memory Dump."
+    Log-Output "The final dump will be generated at: $finalDumpPath"
+    Log-Output "Use the NMI button in the Azure Portal to trigger the crash."
+    
+    return $STATUS_SUCCESS
 }
-Log-Output $kdbgctrl_return
-return $STATUS_SUCCESS
+catch {
+    Log-Output "Failure: $($_.Exception.Message)"
+    return $STATUS_ERROR
+}
