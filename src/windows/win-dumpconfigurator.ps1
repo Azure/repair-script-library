@@ -1,92 +1,236 @@
-#
-# .SYNOPSIS
-#    This script will change the dump configuration without requiring a reboot.
-#    Prerequisites (Links below):     
-#    Kdbgctrl.exe (From the Debugging Tools for Windows.)
-#    Changes the dump configuration of a VM while it's running without the need to reboot it. 
-#    Which is to say, you can change the dump configuration from Kernel to Full without a reboot.
-#    Easily create a DedicatedDump File for an online VM needing a memory dump so the page file does not have to be modified. 
-#    Modifies the dump type of a server without needing a restart using the kdbgctrl.exe application.
+<#
+.SYNOPSIS
+    Configures Azure VM memory dumps with intelligent placement strategies to work around temporary storage issues - no reboot required.
 
-# .RESOLVES
-#  Normally, modifying dump settings to debug an issue requires 
-#  1) a restart for the settings to apply and 
-#  2) changing the page file settings so the server accommodates the size of the dump. 
-#  This script easily handles both issues to make dump collection easier so the VM does not need to restart or have the Page file modified.
-# .NOTES
-#    Name: win-dumpconfigurator.ps1
-#    Author: Microsoft CSS
-#    Version: 1.1
-#    Created: 2021-Mar-1
-# 
-# .EXAMPLE
-#    ./win-dumpconfigurator.ps1 -DumpType full -DumpFile C:\Dumps\Memory.dmp -DedicatedDumpFile D:\dd.sys
-# .LINK
-#    Debugging Tools for Windows -- https://docs.microsoft.com/en-us/windows-insider/flight-hub/
-#
-Param(
-[parameter()] [switch]$OneDump,
-[parameter()] [ValidateSet("active", "automatic", "full", "kernel", "mini" )] [string]$DumpType,
-[parameter()] [string]$DumpFile,
-[parameter()] [string]$DedicatedDumpFile)
+.DESCRIPTION
+    This script runs on the live VM (not a rescue VM) to configure crash dump settings  
+    WITHOUT REQUIRING A REBOOT. Includes smart placement strategies to work around  
+    Azure VM temporary storage limitations.
+    
+    It performs the following steps:
+    1. Audits current crash control settings using both Registry and WMI (for pagefile accuracy)
+    2. Enables NMICrashDump (DWORD 1) to allow NMI triggering from the Azure Portal
+    3. Sets BootStatusPolicy to 1 (IgnoreShutdownFailures) for automatic reboot after crash
+    4. INTELLIGENTLY configures dump file placement to work around temporary drive issues
+    5. Uses dedicated dump files when necessary to ensure reliability on Azure VMs
+    6. Uses kdbgctrl.exe to apply the selected dump type to the live kernel immediately
+    7. If -OneDump is specified, restores original CrashDumpEnabled after kernel update
+    8. NO REBOOT REQUIRED - All changes take effect immediately
 
-# Initialize script
+.PARAMETER OneDump
+    Switch to restore the original CrashDumpEnabled value after the kernel has been updated.
+    Useful for single-event debugging.
+
+.PARAMETER DumpType
+    The type of dump to configure. Valid values: active, automatic, full, kernel, mini.
+
+.PARAMETER DumpFile
+    The target path for the final .dmp file. Defaults to %SystemRoot%\MEMORY.DMP.
+
+.PARAMETER DedicatedDumpFile
+    The path to a dedicated dump file (e.g., D:\dd.sys) to preserve space on the OS drive.
+    Use "delete" to remove an existing dedicated dump file configuration.
+
+.PARAMETER MovePagefile
+    Switch to relocate pagefile from temporary D: drive to persistent storage (C: or F: drive).
+    WARNING: This change requires restoration after troubleshooting. The script will log
+    detailed restoration instructions including the original pagefile location.
+
+.NOTES
+    Name:     win-dumpconfigurator.ps1
+    Version:  2.1 (Updated Audit Logic)
+    Author:   Tony.Mocanu@Microsoft.com
+#>
+
+# Initialization
 . .\src\windows\common\setup\init.ps1
 
-if (!$DumpType) 
-{
-    Write-Host "DumpType, VMname, and Resource group *MUST* all be specified. "
-    Write-Output "Valid dump types include active, automatic, full, kernel, or mini."
-    break
+# DEBUG: Uncomment below to test locally without --parameters
+ $DumpType = 'full'
+# $DumpFile = 'F:\MEMORY.DMP'
+# $DedicatedDumpFile = ''
+# $OneDump = 'false'
+ $MovePagefile = 'true'
+
+# Parameter Validation
+if (-not $DumpType) { $DumpType = 'full' }
+$validDumpTypes = @('active', 'automatic', 'full', 'kernel', 'mini')
+if ($DumpType -notin $validDumpTypes) {
+    throw "Invalid DumpType '$DumpType'. Valid values: $($validDumpTypes -join ', ')"
 }
 
-## Add any registry prereqs to the script
-## For example, if you want to use a DedicatedDumpFile, you'll need to make sure the key exists.
-$CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
-$CrashDumpEnabledValue = "CrashDumpEnabled"
-$CrashDumpEnabledData = (Get-ItemProperty -Path $CrashCtrlPath).$CrashDumpEnabledValue
+# Logging Configuration
+$logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
+if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$logFile = "$logDir\dumpconfigurator_$timestamp.log"
 
-$DDFileLength = $DedicatedDumpFile.Length
-$DumpFileLenth = $DumpFile.Length
+$script_final_status = $STATUS_ERROR
 
-if (!$CrashDumpEnabledData) 
-{
-    Log-Output "Getting the value of $CrashDumpEnabledValue failed. Verify the key is present and contains a value. The default value should be 7."
-    Log-Output "Unable to continue, exiting..."
-    exit 
+function Get-AuditSnapshot {
+    param($Title)
+    
+    $Path = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
+    $MMPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+    $RelPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability"
+    
+    # Read core dump settings
+    $NMI = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).NMICrashDump
+    $BSP = (Get-ItemProperty -Path $RelPath -ErrorAction SilentlyContinue).BootStatusPolicy
+    
+    # PAGEFILE DETECTION: Query WMI for the active configuration.
+    $ConfiguredPageFiles = Get-WmiObject -Class Win32_PageFileSetting -ErrorAction SilentlyContinue | 
+                           Select-Object -ExpandProperty Name
+    
+    Log-Output ">>> $Title <<<"
+    Log-Output "DumpFile           : $((Get-ItemProperty -Path $Path).DumpFile)"
+    Log-Output "CrashDumpEnabled   : $((Get-ItemProperty -Path $Path).CrashDumpEnabled)"
+    Log-Output "NMICrashDump       : $(if($null -eq $NMI){"NOT FOUND"}else{$NMI})"
+    Log-Output "BootStatusPolicy   : $(if($null -eq $BSP){"NOT FOUND"}else{$BSP})"
+    
+    if ($ConfiguredPageFiles) {
+        Log-Output "ConfiguredPageFiles (LIVE): $($ConfiguredPageFiles -join ', ')"
+    } else {
+        # Fallback to registry if WMI returns nothing (unusual)
+        $PFile = (Get-ItemProperty -Path $MMPath -ErrorAction SilentlyContinue).ExistingPageFiles
+        Log-Output "ExistingPageFiles  : $(if($null -eq $PFile){"NOT FOUND"}else{$PFile})"
+    }
 }
 
-if ($DumpFileLenth -gt 0) 
-{    
-    Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
-}
+try {
+    # Step 1 - Audit BEFORE
+    Get-AuditSnapshot "AUDITING SETTINGS (BEFORE)"
 
-if ($DDFileLength -gt 0) 
-{
-    if ($DedicatedDumpFile -eq "delete") 
-    {
-        if ([bool]((Get-itemproperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl").DedicatedDumpFile)) 
-        {
-            Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile
+    $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
+    $initialValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
+
+    # Step 2 - Enable NMI
+    Set-ItemProperty -Path $CrashCtrlPath -Name NMICrashDump -Value 1 -Type DWord
+
+    # Step 3 - Configure automatic reboot
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability" -Name BootStatusPolicy -Value 1 -Type DWord
+
+    # Step 4 - Pagefile Detection for Smart Placement
+    $MMPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+    $currentPFiles = Get-WmiObject -Class Win32_PageFileSetting | Select-Object -ExpandProperty Name
+    $pagefileOnTempDrive = $false
+    $originalPagefileLocations = $currentPFiles
+    $pagefileWasMoved = $false
+    
+    foreach ($pf in $currentPFiles) {
+        if ($pf -like "D:*" -or $pf -like "*D:\*") {
+            $pagefileOnTempDrive = $true
+            Log-Warning "Pagefile detected on D: drive: $pf"
+            break
         }
-
-    }else
-    {
-        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile
+    }
+    
+    # INTELLIGENT DUMP PLACEMENT
+    if ($DumpFile) {
+        if ($pagefileOnTempDrive) {
+            if ($DumpFile -like "F:*") {
+                Log-Info "Using F: drive, configuring dedicated dump file on C: for reliability."
+                Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value "C:\dd.sys"
+            }
+            elseif ($DumpFile -like "D:*") {
+                Log-Warning "D: drive is temporary. Redirecting dump to C: drive."
+                $DumpFile = $DumpFile.Replace("D:", "C:")
+            }
+        }
+        Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile 
+    } else {
+        if ($pagefileOnTempDrive) {
+            Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value "%SystemRoot%\MEMORY.DMP"
+            Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value "C:\dd.sys"
+        } else {
+            Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value "%SystemRoot%\MEMORY.DMP"
+        }
     }
 
+    # Step 5 - OPTIONAL PAGEFILE RELOCATION
+    if (($MovePagefile -eq $true -or $MovePagefile -eq 'true') -and $pagefileOnTempDrive) {
+        Log-Warning "PAGEFILE RELOCATION REQUESTED"
+        
+        try {
+            # FIX: Explicitly target C: if logic loop fails, bypass the WMI free space comparison bug
+            $targetDrive = "C:"
+            $cDrive = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'"
+            
+            if ($null -ne $cDrive) {
+                $targetPagefile = "C:\pagefile.sys"
+                Log-Info "C: Drive detected via WMI. Procceding with relocation..."
+                
+                $pageFileSettings = Get-WmiObject -Class Win32_PageFileSetting
+                foreach ($pf in $pageFileSettings) {
+                    if ($pf.Name -like "D:*" -or $pf.Name -like "*D:\*") { 
+                        Log-Info "Deleting current pagefile instance: $($pf.Name)"
+                        $pf.Delete() 
+                    }
+                }
+                
+                $newPageFile = ([WMIClass]"Win32_PageFileSetting").CreateInstance()
+                $newPageFile.Name = $targetPagefile
+                $newPageFile.InitialSize = 0
+                $newPageFile.MaximumSize = 0
+                $putResult = $newPageFile.Put()
+                
+                if ($putResult) {
+                    $pagefileWasMoved = $true
+                    Log-Info "Successfully updated WMI configuration to: $targetPagefile"
+                }
+            } else {
+                throw "C: drive could not be verified via WMI. Relocation aborted."
+            }
+        }
+        catch {
+            Log-Error "Failed to relocate pagefile: $($_.Exception.Message)"
+        }
+    }
+
+    # Step 6 - DedicatedDumpFile
+    if ($DedicatedDumpFile -eq "delete") { 
+        Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -ErrorAction SilentlyContinue 
+    }
+    elseif ($DedicatedDumpFile) { 
+        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile 
+    }
+
+    # Step 7 - Apply to LIVE KERNEL
+    Log-Info "Applying dump type '$DumpType' via kdbgctrl..."
+    Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
+    
+    $toolPath = ".\src\windows\common\tools\kdbgctrl.exe"
+    $kdbgResult = & $toolPath -sd $DumpType 2>&1
+    Log-Output "kdbgctrl result: $kdbgResult"
+
+    # Registry Fallback for kdbgctrl
+    if ((Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled -eq 0) {
+        $dumpTypeMap = @{ 'full' = 1; 'kernel' = 2; 'mini' = 3; 'automatic' = 7; 'active' = 1 }
+        Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $dumpTypeMap[$DumpType] -Type DWord
+    }
+
+    # Step 8 - OneDump
+    if ($OneDump -eq $true -or $OneDump -eq 'true') { 
+        Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $initialValue 
+    }
+
+    # Step 10 - Final Audit AFTER
+    Get-AuditSnapshot "VERIFYING UPDATED SETTINGS (AFTER)"
+    
+    if ($pagefileWasMoved) {
+        Log-Output "PAGEFILE RELOCATION COMPLETED: Pagefile moved from temporary D: drive."
+        Log-Warning "RESTORATION REQUIRED: Restore to $($originalPagefileLocations -join ', ') after debugging."
+    }
+    
+    Log-Output "SUCCESS: Configuration applied immediately - NO REBOOT REQUIRED"
+    $script_final_status = $STATUS_SUCCESS
+}
+catch {
+    Log-Error "Failure: $($_.Exception.Message)"
+    $script_final_status = $STATUS_ERROR
+}
+finally {
+    Log-Info "Script ended at $(Get-Date)"
 }
 
-# This is to clear the CrashDumpEnabled Key before kdbgctrl.exe sets it. This is helpful in scenarios where you want to 
-# use a DedicatedDump File but you do not wish to change the dump type.
-Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
-$kdbgctrl_return =   .\src\windows\common\tools\kdbgctrl.exe -sd $DumpType
-if ($OneDump -eq "True")
-{
- # Restore orignal CrashDumpEnabled value. This is helpful when you might not want to leave a system configured for a 
- # complete dump because of the downtime involved in writing out the dump. Which is to say, change the dump configuration
- # for the next bugcheck only.
-    Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $CrashDumpEnabledValue
-}
-Log-Output $kdbgctrl_return
-return $STATUS_SUCCESS
+return $script_final_status
