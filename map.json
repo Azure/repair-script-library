@@ -133,5 +133,10 @@
 		"id": "win-crowdstrike-fix-bootloop-cvm",
 		"path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
+	},
+	{
+		"id": "linux-grub-repair",
+		"path": "src/linux/linux-grub-repair.sh",
+		"description": "Automates GRUB re-installation on a failed Linux VM. Auto-detects GEN1 vs GEN2 and runs 'grubfix' (GEN1) or 'efifix' (GEN2) via ALAR2 to reinstall the GRUB bootloader and regenerate grub.cfg. NOTE: use option --run-on-repair."
 	}
 ]
