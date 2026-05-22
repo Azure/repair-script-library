@@ -21,7 +21,7 @@
 	},
 	{
 		"id" : "win-GA-fix",
-		"path" : "src/windows/GA_offlinefixer_damunozl.ps1",
+		"path" : "src/windows/GA_offlinefixer.ps1",
 		"description" : "Fixes integrity of files and registry from windows guest agent offline"
 	},
 	{
