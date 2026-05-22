@@ -1,81 +1,82 @@
-# Welcome to the AUTO SAC ENABLER(SERIAL ACCESS CONSOLE) by Daniel Muñoz L!
-# Contact me Daniel Muñoz L : damunozl@microsoft.com if questions.
-# 
-# .SUMMARY
-#   Enables serial access console offline from a rescue VM on GEN1 and GEN2 windows VMs.
-#   Reconfigures the Boot Configuration Data settings to allow EMS access.
-# 
-# .RESOLVES
-#   Serial Console access is not enabled from the Windows guest OS.
+<#
+.SYNOPSIS
+    Enables Special Administration Console (SAC) and Serial Console boot settings.
+.DESCRIPTION
+    Configures BCD to enable the boot menu, set a timeout, and turn on EMS/SAC 
+    to allow serial console access to the VM.
+	Created by Tony.Mocanu@Microsoft.com
+#>
 
-out-null
-cmd /c color 0A
-$host.UI.RawUI.WindowTitle = "                                                                                  --== AUTO SAC ENABLER by Daniel Muñoz L ==--"
+# 1. Initialize script and helper functions
+. .\src\windows\common\setup\init.ps1
+. .\src\windows\common\helpers\Get-Disk-Partitions.ps1
 
-# Rescue OS variable
-$diska='C'
+# 2. Set Log Path to Public Desktop
+$logFile = "C:\Users\Public\Desktop\sac-enabler-log.txt"
 
-# FINDER FOR FAULTY OS DISK
-$diskarray = "Q","W","E","R","T","Y","U","I","O","P","S","D","F","G","H","J","K","L","Z","X","V","N","M"
-$diskb="000"
-foreach ($diskt in $diskarray)
+# 3. Execution Logic
+$partitionlist = Get-Disk-Partitions
+Log-Info '#03 - Enumerate partitions to enable SAC' | Tee-Object -FilePath $logFile -Append
+
+foreach ( $partitionGroup in $partitionlist | group DiskNumber )
 {
-   if (Test-Path -Path "$($diskt):\Windows") {$diskb=$diskt} 
-}
+    $isBcdPath = $false
+    $bcdPath = ''
+    $isOsPath = $false
 
-# IN CASE OF FINDER FAILURE WITH MITIGATION REASURE IF OS DISK EXIST AND IS MOUNTED AS DATADISK BEFORE PROCEDING
-if ($diskb -eq "000") {write-output "SCRIPT COULD NOT FIND A RESCUE OS DISK ATTACHED, EXITING";start-sleep 10;Exit}
-
-# DETECT IF GEN2
-$partboot='777'
-$diskd='000'
-$disknumber=$_
-
-Get-WmiObject Win32_DiskDrive | ForEach-Object {
-  $disk = $_
-  $partitions = "ASSOCIATORS OF " +
-                "{Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} " +
-                "WHERE AssocClass = Win32_DiskDriveToDiskPartition"
-  Get-WmiObject -Query $partitions | ForEach-Object {
-    $partition = $_
-    $drives = "ASSOCIATORS OF " +
-              "{Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} " +
-              "WHERE AssocClass = Win32_LogicalDiskToPartition"
-    Get-WmiObject -Query $drives | ForEach-Object {
-      New-Object -Type PSCustomObject -Property @{
-        X = $_.DeviceID
-        Y  = $partition.diskindex
-      }
+    # Discovery Logic (Matches your BCD logic for consistency)
+    ForEach ($drive in $partitionGroup.Group | select -ExpandProperty DriveLetter )
+    {      
+        if ( -not $isBcdPath )
+        {
+            $bcdPath = $drive + ':\boot\bcd'
+            $isBcdPath = Test-Path $bcdPath
+            if ( -not $isBcdPath )
+            {
+                $bcdPath = $drive + ':\efi\microsoft\boot\bcd'
+                $isBcdPath = Test-Path $bcdPath
+            } 
+        }        
+        if (-not $isOsPath)
+        {
+            $isOsPath = Test-Path ($drive + ':\windows\system32\winload.exe')
+        }
     }
-  }
-} > "$($diskb):\txtemp"
 
-Select-String -Pattern "$($diskb)" -Path "$($diskb):\txtemp" -List -CaseSensitive | select-object -First 1 | %{$disknumber=$_.Line.Split('')[0]}
+    # 4. Apply SAC Changes if BCD is found
+    if ( $isBcdPath -and $isOsPath )
+    {
+        # Capture the target ID (usually {default})
+        $bcdout = bcdedit /store $bcdPath /enum bootmgr /v
+        $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
+        
+        if ($defaultLine -match '\{([^}]+)\}') {
+            $defaultId = $matches[0]
 
-get-partition -disknumber $disknumber > "$($diskb):\txtempvar"
-Select-String -Pattern "System" -Path "$($diskb):\txtempvar" -list -SimpleMatch | select-object -First 1 | %{$partboot=$_.Line.Split('')[0]}
-Get-Partition -DiskNumber $disknumber -PartitionNumber $partboot | Set-Partition -NewDriveLetter z
+            Log-Output "--- BCD BEFORE SAC ENABLE ---" | Tee-Object -FilePath $logFile -Append
+            $beforeBcd = bcdedit /store $bcdPath /enum $defaultId
+            foreach ($line in $beforeBcd) { if ($line.Trim()) { Log-Output $line | Tee-Object -FilePath $logFile -Append } }
 
-	if (Test-Path -Path "Z:\efi\Microsoft") {write-output "VM is GEN2";$diskd="Z:\efi\Microsoft\boot\bcd"}
+            Log-Info "Applying SAC and EMS configurations..." | Tee-Object -FilePath $logFile -Append
 
-# DETECT IF GEN1
-if ($diskd -eq '000')
-{
-	foreach ($diskt in $diskarray)
-	{
-	   	if (Test-Path -Path "$($diskt):\boot\bcd")
-      	{write-output "VM is GEN1";$diskd="$($diskt):\boot\bcd"}
-	}
+            # Core Logic from Original Script
+            bcdedit /store $bcdPath /set "{bootmgr}" displaybootmenu yes | Out-Null
+            bcdedit /store $bcdPath /set "{bootmgr}" timeout 5 | Out-Null
+            bcdedit /store $bcdPath /set "{bootmgr}" bootems yes | Out-Null
+            bcdedit /store $bcdPath /ems $defaultId ON | Out-Null
+            $res = bcdedit /store $bcdPath /emssettings EMSPORT:1 EMSBAUDRATE:115200
+
+            Log-Output "Result: $res" | Tee-Object -FilePath $logFile -Append
+
+            # --- AFTER CHANGE (Line-by-Line Logging) ---
+            Log-Output "--- BCD AFTER SAC ENABLE ---" | Tee-Object -FilePath $logFile -Append
+            $afterBcd = bcdedit /store $bcdPath /enum $defaultId
+            foreach ($line in $afterBcd) { if ($line.Trim()) { Log-Output $line | Tee-Object -FilePath $logFile -Append } }
+            
+            return $STATUS_SUCCESS
+        }
+    }
 }
 
-# SAC ENABLE
-bcdedit /store "$($diskd)" /set "{bootmgr}" displaybootmenu yes
-bcdedit /store "$($diskd)" /set "{bootmgr}" timeout 5
-bcdedit /store "$($diskd)" /set "{bootmgr}" bootems yes
-bcdedit /store "$($diskd)" /ems "{default}" ON
-bcdedit /store "$($diskd)" /emssettings EMSPORT:1 EMSBAUDRATE:115200
-
-Remove-Item -force "$($diskb):\txtempvar"
-
-write-output "          ---------------          SCRIPT FINISHED PROPERLY, CHANGES APPLIED          ---------------          "
-start-sleep 10
+Log-Error "FAILED: Script could not find a valid OS disk to enable SAC." | Tee-Object -FilePath $logFile -Append
+return $STATUS_ERROR
