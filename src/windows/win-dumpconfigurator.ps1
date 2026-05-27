@@ -36,10 +36,21 @@
     WARNING: This change requires restoration after troubleshooting. The script will log
     detailed restoration instructions including the original pagefile location.
 
-.NOTES
+.VERSION
     Name:     win-dumpconfigurator.ps1
-    Version:  2.1 (Updated Audit Logic)
+    Version:  1.2 (Improved kdbgctrl output handling and verification)
     Author:   Tony.Mocanu@Microsoft.com
+
+.VERSION
+    v1.2: [May 2026] - Updated script (current)
+                       - Filtered non-actionable kdbgctrl noise from user-facing output.
+                       - Added explicit before/after human-readable dump configuration logging.
+                       - Added strict post-apply verification and status failure on validation mismatch.
+    v1.1: [May 2026] - Updated script
+                       - Added intelligent dump placement for Azure temporary storage scenarios.
+                       - Added optional pagefile relocation from D: to C: for dump reliability.
+                       - Added WMI-based live pagefile auditing and no-reboot workflow.
+    v1.0: Initial commit. First working version of the script.
 #>
 
 # Initialization
@@ -67,6 +78,57 @@ $logFile = "$logDir\dumpconfigurator_$timestamp.log"
 
 $script_final_status = $STATUS_ERROR
 
+function Get-DumpTypeLabel {
+    param($Value)
+
+    if ($null -eq $Value) { return "NOT FOUND" }
+
+    $intValue = [int]$Value
+    switch ($intValue) {
+        0 { return "Disabled/None (0)" }
+        1 { return "Complete/Full (1)" }
+        2 { return "Kernel (2)" }
+        3 { return "Small/Minidump (3)" }
+        7 { return "Automatic (7)" }
+        default { return "Unknown ($intValue)" }
+    }
+}
+
+function Filter-KdbgctrlOutput {
+    param($OutputLines)
+
+    $noisePatterns = @(
+        "Dump type from system registry is Invalid",
+        "lastError after QueryDosDevice call is 3"
+    )
+
+    $allLines = @($OutputLines | ForEach-Object { "$($_)".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $filtered = @()
+    $suppressed = @()
+
+    foreach ($line in $allLines) {
+        $isNoise = $false
+        foreach ($pattern in $noisePatterns) {
+            if ($line -like "*$pattern*") {
+                $isNoise = $true
+                break
+            }
+        }
+
+        if ($isNoise) {
+            $suppressed += $line
+        } else {
+            $filtered += $line
+        }
+    }
+
+    return @{
+        All        = $allLines
+        Filtered   = $filtered
+        Suppressed = $suppressed
+    }
+}
+
 function Get-AuditSnapshot {
     param($Title)
     
@@ -83,8 +145,10 @@ function Get-AuditSnapshot {
                            Select-Object -ExpandProperty Name
     
     Log-Output ">>> $Title <<<"
+    $crashDumpEnabled = (Get-ItemProperty -Path $Path).CrashDumpEnabled
+
     Log-Output "DumpFile           : $((Get-ItemProperty -Path $Path).DumpFile)"
-    Log-Output "CrashDumpEnabled   : $((Get-ItemProperty -Path $Path).CrashDumpEnabled)"
+    Log-Output "CrashDumpEnabled   : $(Get-DumpTypeLabel -Value $crashDumpEnabled)"
     Log-Output "NMICrashDump       : $(if($null -eq $NMI){"NOT FOUND"}else{$NMI})"
     Log-Output "BootStatusPolicy   : $(if($null -eq $BSP){"NOT FOUND"}else{$BSP})"
     
@@ -103,6 +167,12 @@ try {
 
     $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
     $initialValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
+    $dumpTypeMap = @{ 'full' = 1; 'kernel' = 2; 'mini' = 3; 'automatic' = 7; 'active' = 1 }
+    $requestedDumpValue = $dumpTypeMap[$DumpType]
+    $verificationFailed = $false
+
+    Log-Output "Current dump configuration: $(Get-DumpTypeLabel -Value $initialValue)"
+    Log-Output "Requested dump type: $DumpType ($(Get-DumpTypeLabel -Value $requestedDumpValue))"
 
     # Step 2 - Enable NMI
     Set-ItemProperty -Path $CrashCtrlPath -Name NMICrashDump -Value 1 -Type DWord
@@ -201,11 +271,36 @@ try {
     
     $toolPath = ".\src\windows\common\tools\kdbgctrl.exe"
     $kdbgResult = & $toolPath -sd $DumpType 2>&1
-    Log-Output "kdbgctrl result: $kdbgResult"
+    $kdbgExitCode = $LASTEXITCODE
+    $parsedKdbg = Filter-KdbgctrlOutput -OutputLines $kdbgResult
+
+    if ($parsedKdbg.Suppressed.Count -gt 0) {
+        Log-Debug "Suppressed non-actionable kdbgctrl messages: $($parsedKdbg.Suppressed -join ' | ')"
+    }
+
+    if ($kdbgExitCode -ne 0) {
+        $verificationFailed = $true
+        Log-Error "kdbgctrl failed with exit code $kdbgExitCode. Output: $($parsedKdbg.Filtered -join ' | ')"
+    }
+    else {
+        $successMatched = $false
+        foreach ($line in $parsedKdbg.Filtered) {
+            if ($line -match '(?i)success|successfully updated dump settings') {
+                $successMatched = $true
+                break
+            }
+        }
+
+        if ($successMatched) {
+            Log-Output "Successfully updated dump settings to '$DumpType' via kdbgctrl."
+        }
+        elseif ($parsedKdbg.Filtered.Count -gt 0) {
+            Log-Warning "kdbgctrl completed with unexpected output: $($parsedKdbg.Filtered -join ' | ')"
+        }
+    }
 
     # Registry Fallback for kdbgctrl
     if ((Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled -eq 0) {
-        $dumpTypeMap = @{ 'full' = 1; 'kernel' = 2; 'mini' = 3; 'automatic' = 7; 'active' = 1 }
         Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $dumpTypeMap[$DumpType] -Type DWord
     }
 
@@ -216,14 +311,32 @@ try {
 
     # Step 10 - Final Audit AFTER
     Get-AuditSnapshot "VERIFYING UPDATED SETTINGS (AFTER)"
+
+    $currentDumpValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
+    if ($OneDump -eq $true -or $OneDump -eq 'true') {
+        Log-Output "OneDump requested. CrashDumpEnabled restored to $(Get-DumpTypeLabel -Value $currentDumpValue)."
+    }
+    elseif ($currentDumpValue -ne $requestedDumpValue) {
+        $verificationFailed = $true
+        Log-Error "Dump configuration verification failed. Expected $(Get-DumpTypeLabel -Value $requestedDumpValue), found $(Get-DumpTypeLabel -Value $currentDumpValue)."
+    }
+    else {
+        Log-Output "Verified dump configuration: $(Get-DumpTypeLabel -Value $currentDumpValue)."
+    }
     
     if ($pagefileWasMoved) {
         Log-Output "PAGEFILE RELOCATION COMPLETED: Pagefile moved from temporary D: drive."
         Log-Warning "RESTORATION REQUIRED: Restore to $($originalPagefileLocations -join ', ') after debugging."
     }
     
-    Log-Output "SUCCESS: Configuration applied immediately - NO REBOOT REQUIRED"
-    $script_final_status = $STATUS_SUCCESS
+    if ($verificationFailed) {
+        Log-Error "Configuration completed with one or more validation errors."
+        $script_final_status = $STATUS_ERROR
+    }
+    else {
+        Log-Output "SUCCESS: Configuration applied immediately - NO REBOOT REQUIRED"
+        $script_final_status = $STATUS_SUCCESS
+    }
 }
 catch {
     Log-Error "Failure: $($_.Exception.Message)"
