@@ -57,11 +57,11 @@
 . .\src\windows\common\setup\init.ps1
 
 # DEBUG: Uncomment below to test locally without --parameters
- $DumpType = 'full'
+# $DumpType = 'full'
 # $DumpFile = 'F:\MEMORY.DMP'
 # $DedicatedDumpFile = ''
 # $OneDump = 'false'
- $MovePagefile = 'true'
+# $MovePagefile = 'true'
 
 # Parameter Validation
 if (-not $DumpType) { $DumpType = 'full' }
