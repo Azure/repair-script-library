@@ -1,7 +1,6 @@
 <#
-.VERSION
-    v1.1: [Apr 2026] - Enhanced CIM logic for disk enumeration and partition discovery
-    v1.0: Initial commit - Sets BCD boot status policy to IgnoreAllFailures to break Automatic Repair loops
+.SYNOPSIS
+    win-ignoreAllFailures.ps1 (v1.2) - Sets BCD bootstatuspolicy to IgnoreAllFailures to break Automatic Repair loops.
 
 .DESCRIPTION
     This script runs from a rescue VM to modify the BCD store on an attached faulty OS disk.
@@ -18,9 +17,17 @@
 
 .NOTES
     Name:    win-ignoreAllFailures.ps1
-    Version: 1.1
+    Version: 1.2
     Author:  Tony.Mocanu@Microsoft.com
 
+.VERSION
+    v1.2: [May 2026] - Updated the script (current)
+                       - Added guarded nested VM handling to prevent Get-VM failures when Hyper-V module is unavailable.
+                       - Switched partition discovery from inline CIM enumeration to shared Get-Disk-Partitions-v2 helper.
+                       - Added .SYNOPSIS header and aligned metadata versioning/documentation with current script behavior.
+    v1.1: [Apr 2026] - Enhanced CIM logic for disk enumeration and partition discovery
+    v1.0: Initial commit - Sets BCD boot status policy to IgnoreAllFailures to break Automatic Repair loops
+        
 .SCENARIO_RECREATION
     To recreate a testable scenario on a rescue VM with an attached OS disk:
     1. Create a test VM in Azure and attach its OS disk to a rescue VM.
@@ -52,6 +59,7 @@ bcdedit /store <bcdpath> /enum {default}
 
 # Initialization (no Param() block to avoid ParserErrors on legacy PowerShell engines)
 . .\src\windows\common\setup\init.ps1
+. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
 
 $logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
 if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
@@ -77,21 +85,32 @@ function Get-NextFreeDriveLetter {
 
 try {
     Log-Info "Starting IgnoreAllFailures script..." | Tee-Object -FilePath $logFile -Append
-    
-    # Internal CIM Logic to replace the helper script
-    $physicalDisks = Get-CimInstance -ClassName Win32_DiskDrive
-    $partitionlist = foreach ($disk in $physicalDisks) {
-        $partitions = Get-CimInstance -Query "Associators of {Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} Where AssocClass=Win32_DiskDriveToDiskPartition"
-        foreach ($partition in $partitions) {
-            $logicalDisks = Get-CimInstance -Query "Associators of {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} Where AssocClass=Win32_LogicalDiskToPartition"
-            foreach ($logicalDisk in $logicalDisks) {
-                [PSCustomObject]@{
-                    DiskNumber  = $disk.Index
-                    DriveLetter = $logicalDisk.DeviceID.Replace(':', '')
+
+    # Stop nested guest VM if running
+    # Guard Get-VM if Hyper-V module is not available
+    try {
+        if (Get-Module -ListAvailable -Name Hyper-V) {
+            $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+            if ($guestHyperVVirtualMachine) {
+                if ($guestHyperVVirtualMachine.State -eq 'Running') {
+                    Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)" | Tee-Object -FilePath $logFile -Append
+                    try {
+                        Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
+                    }
+                    catch {
+                        Log-Warning "Failed to stop nested guest VM, will continue but may have limited success" | Tee-Object -FilePath $logFile -Append
+                    }
                 }
             }
+        } else {
+            Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation." | Tee-Object -FilePath $logFile -Append
         }
     }
+    catch {
+        Log-Warning "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+    }
+    
+    $partitionlist = Get-Disk-Partitions
 
     $rescueDrive = $env:SystemDrive -replace ':', ''
     Log-Info "Starting deep scan for BCD files..." | Tee-Object -FilePath $logFile -Append
