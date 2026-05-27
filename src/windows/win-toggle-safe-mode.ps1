@@ -39,14 +39,15 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --verbose --run-on-repair
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=on --verbose --run-on-repair
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off --verbose --run-on-repair
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off DC=$true --verbose --run-on-repair
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-toggle-safe-mode --parameters safeModeSwitch=off DC=yes --verbose --run-on-repair
 #
 # .NOTES
 #   Author: Ryan McCallum
 #
 # .VERSION
-    v0.4: [Feb 2025] - Update the description.
-    v0.3: [July 2023] - Detect if a Domain Controller from the attached OS drive's imported registry
+#   v0.5: [Nov 2025] - Update the script to work with Gen2 Azure VMs and change DC switch to a string for AZ CLI compatibility
+#   v0.4: [Feb 2025] - Update the description.
+#   v0.3: [July 2023] - Detect if a Domain Controller from the attached OS drive's imported registry
 #   v0.2: [Feb 2023] - run with the -DC switch to initiate DSRM (Directory Services Recovery Mode) for Domain Controllers
 #   v0.1: Initial commit
 #
@@ -55,7 +56,7 @@
 # Set the Parameters for the script
 Param(
     [Parameter(Mandatory = $false)][ValidateSet("On", "Off", IgnoreCase = $true)][string]$safeModeSwitch = '',
-    [Parameter(Mandatory = $false)][switch]$DC
+    [Parameter(Mandatory = $false)][ValidateSet("Yes", "No", IgnoreCase = $true)][string]$DC = ''
 )
 
 # Initialize script
@@ -70,7 +71,7 @@ $regLoaded = $false
 $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 $scriptStartTime | Tee-Object -FilePath $logFile -Append
 
-Log-Output "START: Running script win-toggle-safe-mode $(if ($DC) { 'on Domain Controller' })" | Tee-Object -FilePath $logFile -Append
+Log-Output "START: Running script win-toggle-safe-mode $(if ($DC -eq 'yes') { 'on Domain Controller' })" | Tee-Object -FilePath $logFile -Append
 
 try {
 
@@ -104,25 +105,51 @@ try {
         $bcdPath = ''
         $isOsPath = $false
         $osPath = ''
+        $osDrive = ''
 
         # Scan all partitions of a disk for bcd store and os file location
-        ForEach ($drive in $partitionGroup.Group | select -ExpandProperty DriveLetter ) {
+
+        # Build a list of candidate roots: drive letters (C, D, ...) and, if no letter,
+        # the first access path (typically a volume GUID like \\?\Volume{...}\).
+        $driveCandidates = @()
+        foreach ($partition in $partitionGroup.Group) {
+            if ($partition.DriveLetter) {
+                $driveCandidates += $partition.DriveLetter
+            }
+            elseif ($partition.AccessPaths) {
+                $driveCandidates += ($partition.AccessPaths | Select-Object -First 1)
+            }
+        }
+
+        ForEach ($drive in $driveCandidates) {
+
+            # Normalise root path for both drive letters and volume GUID access paths
+            if ($drive -match '^[A-Za-z]$') {
+                $root = "$drive`:"
+            }
+            else {
+                $root = $drive.TrimEnd('\')
+            }
+
             # Check if no bcd store was found on the previous partition already
             if ( -not $isBcdPath ) {
-                $bcdPath = $drive + ':\boot\bcd'
+                $bcdPath = "${root}\boot\bcd"
                 $isBcdPath = Test-Path $bcdPath
 
                 # If no bcd was found yet at the default location look for the uefi location too
                 if ( -not $isBcdPath ) {
-                    $bcdPath = $drive + ':\efi\microsoft\boot\bcd'
+                    $bcdPath = "${root}\efi\microsoft\boot\bcd"
                     $isBcdPath = Test-Path $bcdPath
                 }
             }
 
             # Check if os loader was found on the previous partition already
             if (-not $isOsPath) {
-                $osPath = $drive + ':\windows\system32\winload.exe'
+                $osPath = "${root}\windows\system32\winload.exe"
                 $isOsPath = Test-Path $osPath
+                if ($isOsPath) {
+                    $osDrive = $drive
+                }
             }
         }
 
@@ -136,17 +163,17 @@ try {
             $defaultId = '{' + $defaultLine.ToString().Split('{}')[1] + '}'
             $safeModeIndicator = $bcdout | Select-String 'safeboot' | select -First 1
 
-            # Check if partition has Registry path
-            $regPath = $drive + ':\Windows\System32\config\'
+            # Check if partition has Registry path (use OS partition that contained winload.exe)
+            $regPath = $osDrive + ':\Windows\System32\config\'
             $isRegPath = Test-Path $regPath
         
             # If Registry path found and we're enabling safe mode, check if DC
             if ($isRegPath -and ($safeModeSwitch -ne "Off")) {
         
-                Log-Output "Load requested Registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
+                Log-Output "Load requested Registry hive from $($osDrive)" | Tee-Object -FilePath $logFile -Append
         
                 # Load hive into Rescue VM's registry from attached disk
-                reg load "HKLM\BROKENSYSTEM" "$($drive):\Windows\System32\config\SYSTEM"
+                reg load "HKLM\BROKENSYSTEM" "$($osDrive):\Windows\System32\config\SYSTEM"
                 $regLoaded = $true
         
                 # Verify the active Control Set if using the System registry and if not already defined (1 is ControlSet001, 2 is ControlSet002)
@@ -172,7 +199,7 @@ try {
                 }               
             }
             
-            $safeBootVersion = If ($DC -or $isDC) { "dsrepair" } Else { "network" }
+            $safeBootVersion = If ($DC -eq 'yes' -or $isDC) { "dsrepair" } Else { "network" }
 
             if ($safeModeSwitch -eq "on") {
                 # Setting flag so VM boots in Safe Mode
@@ -233,7 +260,7 @@ try {
 
             # Unload hive
             if ($regLoaded) {
-                Log-Output "Unload attached disk registry hive on $($drive)" | Tee-Object -FilePath $logFile -Append
+                Log-Output "Unload attached disk registry hive on $($osDrive)" | Tee-Object -FilePath $logFile -Append
                 [gc]::Collect()
                 reg unload "HKLM\BROKENSYSTEM"
             }
@@ -245,7 +272,7 @@ try {
 
                 # Start Hyper-V VM
                 Log-Output "#07 - Starting VM" | Tee-Object -FilePath $logFile -Append
-                start-vm $guestHyperVVirtualMachine -ErrorAction Stop
+                start-vm $guestHyperVVirtualMachine -ErrorAction SilentlyContinue #Sometimes the repair VM doesn't have enough memory to power it on
             }
 
             Log-Output "END: Please verify status of Safe Mode using MSCONFIG.exe (GUI) or BCDEDIT /enum (shell)" | Tee-Object -FilePath $logFile -Append
@@ -257,12 +284,8 @@ catch {
 
     if ($guestHyperVVirtualMachine) {
         # Bring disk offline again
-        Log-Output "#05 - Bringing disk offline to restart Hyper-V VM" | Tee-Object -FilePath $logFile -Append
+        Log-Output "#99 - Bringing disk offline to restart Hyper-V VM" | Tee-Object -FilePath $logFile -Append
         $disk | set-disk -IsOffline $true -ErrorAction Stop
-
-        # Start Hyper-V VM again
-        Log-Output "#06 - Starting VM" | Tee-Object -FilePath $logFile -Append
-        start-vm $guestHyperVVirtualMachine -ErrorAction Stop
     }
 
     # Log failure scenario
