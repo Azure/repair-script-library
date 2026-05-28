@@ -10,7 +10,7 @@
     It performs the following steps:
     1. Audits current crash control settings using both Registry and WMI (for pagefile accuracy)
     2. Enables NMICrashDump (DWORD 1) to allow NMI triggering from the Azure Portal
-    3. Sets BootStatusPolicy to 1 (IgnoreShutdownFailures) for automatic reboot after crash
+    3. Optionally configures automatic reboot after crash (use -ConfigureAutomaticReboot to enable)
     4. INTELLIGENTLY configures dump file placement to work around temporary drive issues
     5. Uses dedicated dump files when necessary to ensure reliability on Azure VMs
     6. Uses kdbgctrl.exe to apply the selected dump type to the live kernel immediately
@@ -36,13 +36,22 @@
     WARNING: This change requires restoration after troubleshooting. The script will log
     detailed restoration instructions including the original pagefile location.
 
+.PARAMETER ConfigureAutomaticReboot
+    Switch to configure automatic reboot after system crash (BootStatusPolicy=1).
+    By default, automatic reboot is NOT configured. Enable this parameter to opt-in.
+    Useful for production systems, but may not be desired on Citrix VMs or other
+    specialized environments.
+
 .VERSION
     Name:     win-dumpconfigurator.ps1
     Version:  1.2 (Improved kdbgctrl output handling and verification)
-    Author:   Tony.Mocanu@Microsoft.com
+    Author:   Michael.Smith@microsoft.com for v1.0, Tony.Mocanu@Microsoft.com for the rest.
 
 .VERSION
     v1.2: [May 2026] - Updated script (current)
+                       - Added Michael.Smith@microsoft.com as co-author (v1.0 creator)
+                       - Changed log file location to $env:PUBLIC\Desktop for uniformity with other scripts
+                       - Made automatic reboot configuration optional via -ConfigureAutomaticReboot parameter
                        - Filtered non-actionable kdbgctrl noise from user-facing output.
                        - Added explicit before/after human-readable dump configuration logging.
                        - Added strict post-apply verification and status failure on validation mismatch.
@@ -71,10 +80,8 @@ if ($DumpType -notin $validDumpTypes) {
 }
 
 # Logging Configuration
-$logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
-if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = "$logDir\dumpconfigurator_$timestamp.log"
+$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
+$logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 
 $script_final_status = $STATUS_ERROR
 
@@ -177,8 +184,14 @@ try {
     # Step 2 - Enable NMI
     Set-ItemProperty -Path $CrashCtrlPath -Name NMICrashDump -Value 1 -Type DWord
 
-    # Step 3 - Configure automatic reboot
-    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability" -Name BootStatusPolicy -Value 1 -Type DWord
+    # Step 3 - Configure automatic reboot (optional)
+    if ($ConfigureAutomaticReboot -eq $true -or $ConfigureAutomaticReboot -eq 'true') {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability" -Name BootStatusPolicy -Value 1 -Type DWord
+        Log-Info "Automatic reboot on crash configured (BootStatusPolicy=1)."
+    }
+    else {
+        Log-Info "Automatic reboot on crash NOT configured. Use -ConfigureAutomaticReboot to enable."
+    }
 
     # Step 4 - Pagefile Detection for Smart Placement
     $MMPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
