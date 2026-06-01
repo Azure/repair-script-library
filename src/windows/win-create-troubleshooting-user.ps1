@@ -46,7 +46,7 @@ Param(
     
 # Initialize script
  . .\src\windows\common\setup\init.ps1
- . .\src\windows\common\helpers\Get-Disk-Partitions.ps1
+ . .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
 
 # Declare variables
 $scriptStartTime = get-date -f yyyyMMddHHmmss
