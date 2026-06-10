@@ -67,13 +67,22 @@
 
 # DEBUG: Uncomment below to test locally without --parameters
 # $DumpType = 'full'
-# $DumpFile = 'F:\MEMORY.DMP'
-# $DedicatedDumpFile = ''
+# $DumpFile = '%SystemRoot%\Memory.dmp'
+# $DedicatedDumpFile = 'Z:\dd.sys'
 # $OneDump = 'false'
 # $MovePagefile = 'true'
 
+# Normalize incoming parameter names (vm-repair commonly passes lowercase names).
+if (-not $DumpType -and $dumptype) { $DumpType = $dumptype }
+if (-not $DumpFile -and $dumpfile) { $DumpFile = $dumpfile }
+if (-not $DedicatedDumpFile -and $dedicateddumpfile) { $DedicatedDumpFile = $dedicateddumpfile }
+if (-not $OneDump -and $onedump) { $OneDump = $onedump }
+if (-not $MovePagefile -and $movepagefile) { $MovePagefile = $movepagefile }
+if (-not $ConfigureAutomaticReboot -and $configureautomaticreboot) { $ConfigureAutomaticReboot = $configureautomaticreboot }
+
 # Parameter Validation
-if (-not $DumpType) { $DumpType = 'full' }
+$userProvidedDumpType = -not [string]::IsNullOrWhiteSpace("$DumpType")
+if (-not $userProvidedDumpType) { $DumpType = 'full' }
 $validDumpTypes = @('active', 'automatic', 'full', 'kernel', 'mini')
 if ($DumpType -notin $validDumpTypes) {
     throw "Invalid DumpType '$DumpType'. Valid values: $($validDumpTypes -join ', ')"
@@ -154,7 +163,11 @@ function Get-AuditSnapshot {
     Log-Output ">>> $Title <<<"
     $crashDumpEnabled = (Get-ItemProperty -Path $Path).CrashDumpEnabled
 
-    Log-Output "DumpFile           : $((Get-ItemProperty -Path $Path).DumpFile)"
+    $currentDumpFile = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).DumpFile
+    $currentDedicatedDumpFile = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).DedicatedDumpFile
+
+    Log-Output "DumpFile           : $(if([string]::IsNullOrWhiteSpace("$currentDumpFile")){"NOT FOUND"}else{$currentDumpFile})"
+    Log-Output "DedicatedDumpFile  : $(if([string]::IsNullOrWhiteSpace("$currentDedicatedDumpFile")){"NOT FOUND"}else{$currentDedicatedDumpFile})"
     Log-Output "CrashDumpEnabled   : $(Get-DumpTypeLabel -Value $crashDumpEnabled)"
     Log-Output "NMICrashDump       : $(if($null -eq $NMI){"NOT FOUND"}else{$NMI})"
     Log-Output "BootStatusPolicy   : $(if($null -eq $BSP){"NOT FOUND"}else{$BSP})"
@@ -180,6 +193,8 @@ try {
 
     Log-Output "Current dump configuration: $(Get-DumpTypeLabel -Value $initialValue)"
     Log-Output "Requested dump type: $DumpType ($(Get-DumpTypeLabel -Value $requestedDumpValue))"
+    Log-Output "Requested DumpFile: $(if([string]::IsNullOrWhiteSpace("$DumpFile")){"NOT SPECIFIED"}else{$DumpFile})"
+    Log-Output "Requested DedicatedDumpFile: $(if([string]::IsNullOrWhiteSpace("$DedicatedDumpFile")){"NOT SPECIFIED"}else{$DedicatedDumpFile})"
 
     # Step 2 - Enable NMI
     Set-ItemProperty -Path $CrashCtrlPath -Name NMICrashDump -Value 1 -Type DWord
@@ -209,22 +224,18 @@ try {
     }
     
     # INTELLIGENT DUMP PLACEMENT
+    # Respect explicit user-provided values exactly as passed.
     if ($DumpFile) {
-        if ($pagefileOnTempDrive) {
-            if ($DumpFile -like "F:*") {
-                Log-Info "Using F: drive, configuring dedicated dump file on C: for reliability."
-                Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value "C:\dd.sys"
-            }
-            elseif ($DumpFile -like "D:*") {
-                Log-Warning "D: drive is temporary. Redirecting dump to C: drive."
-                $DumpFile = $DumpFile.Replace("D:", "C:")
-            }
-        }
-        Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile 
-    } else {
+        Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
+        Log-Info "Applied user-provided DumpFile: $DumpFile"
+    }
+    else {
         if ($pagefileOnTempDrive) {
             Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value "%SystemRoot%\MEMORY.DMP"
-            Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value "C:\dd.sys"
+            # Only apply fallback DedicatedDumpFile when user did not provide a value.
+            if (-not $DedicatedDumpFile) {
+                Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value "C:\dd.sys"
+            }
         } else {
             Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value "%SystemRoot%\MEMORY.DMP"
         }
@@ -273,9 +284,11 @@ try {
     # Step 6 - DedicatedDumpFile
     if ($DedicatedDumpFile -eq "delete") { 
         Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -ErrorAction SilentlyContinue 
+        Log-Info "Applied user request: DedicatedDumpFile deleted."
     }
     elseif ($DedicatedDumpFile) { 
         Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile 
+        Log-Info "Applied user-provided DedicatedDumpFile: $DedicatedDumpFile"
     }
 
     # Step 7 - Apply to LIVE KERNEL
@@ -336,6 +349,10 @@ try {
     else {
         Log-Output "Verified dump configuration: $(Get-DumpTypeLabel -Value $currentDumpValue)."
     }
+
+    $effectiveCrashControl = Get-ItemProperty -Path $CrashCtrlPath -ErrorAction SilentlyContinue
+    Log-Output "Effective DumpFile: $($effectiveCrashControl.DumpFile)"
+    Log-Output "Effective DedicatedDumpFile: $($effectiveCrashControl.DedicatedDumpFile)"
     
     if ($pagefileWasMoved) {
         Log-Output "PAGEFILE RELOCATION COMPLETED: Pagefile moved from temporary D: drive."
