@@ -44,6 +44,32 @@ az vm repair -h
 az vm repair <command> -h
 ```
 
+## Troubleshooting
+
+### `ValueError: cannot remove local variables from FrameLocalsProxy`
+
+**Symptoms:** Running any `az vm repair` command (e.g., `az vm repair create`) fails with:
+```
+ValueError: cannot remove local variables from FrameLocalsProxy
+```
+
+**Cause:** This error occurs when using Python 3.13 or later. In Python 3.13, `frame.f_locals` returns a `FrameLocalsProxy` object instead of a plain `dict`. The older version of the `vm-repair` extension attempted to delete an item directly from this proxy object, which is not supported.
+
+**Fix:** Update the `vm-repair` extension to version **2.1.3** or later:
+```
+az extension update -n vm-repair
+```
+
+If the extension is not installed yet:
+```
+az extension add -n vm-repair
+```
+
+Verify the installed version:
+```
+az extension show -n vm-repair --query version
+```
+
 # Contributing
 
 **Adding new scripts**: https://github.com/Azure/repair-script-library/blob/master/doc/adding_new_scripts.md
