@@ -80,31 +80,24 @@
 
 Param(
     [Parameter(Mandatory = $false)]
-    [Alias('dumptype')]
     [string]$DumpType = '',
 
     [Parameter(Mandatory = $false)]
-    [Alias('dumpfile')]
     [string]$DumpFile = '',
 
     [Parameter(Mandatory = $false)]
-    [Alias('dedicateddumpfile')]
     [string]$DedicatedDumpFile = '',
 
     [Parameter(Mandatory = $false)]
-    [Alias('onedump')]
     [string]$OneDump = 'false',
 
     [Parameter(Mandatory = $false)]
-    [Alias('movepagefile')]
     [string]$MovePagefile = 'false',
 
     [Parameter(Mandatory = $false)]
-    [Alias('configureautomaticreboot')]
     [string]$ConfigureAutomaticReboot = 'false',
 
     [Parameter(Mandatory = $false)]
-    [Alias('enabledebugdefaults')]
     [string]$EnableDebugDefaults = 'false'
 )
 
