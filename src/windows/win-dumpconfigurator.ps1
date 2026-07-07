@@ -8,14 +8,15 @@
     Azure VM temporary storage limitations.
     
     It performs the following steps:
-    1. Audits current crash control settings using both Registry and WMI (for pagefile accuracy)
+    1. Audits current crash control settings using both Registry and CIM (for pagefile accuracy)
     2. Enables NMICrashDump (DWORD 1) to allow NMI triggering from the Azure Portal
     3. Optionally configures automatic reboot after crash (use -ConfigureAutomaticReboot to enable)
     4. INTELLIGENTLY configures dump file placement to work around temporary drive issues
     5. Uses dedicated dump files when necessary to ensure reliability on Azure VMs
     6. Uses kdbgctrl.exe to apply the selected dump type to the live kernel immediately
     7. If -OneDump is specified, restores original CrashDumpEnabled after kernel update
-    8. NO REBOOT REQUIRED - All changes take effect immediately
+    8. Validates C: drive free space (minimum 20%) before pagefile relocation to prevent VM crashes
+    9. NO REBOOT REQUIRED - All changes take effect immediately
 
 .PARAMETER OneDump
     Switch to restore the original CrashDumpEnabled value after the kernel has been updated.
@@ -42,13 +43,28 @@
     Useful for production systems, but may not be desired on Citrix VMs or other
     specialized environments.
 
+.PARAMETER EnableDebugDefaults
+    Applies local test defaults only when set to true and only for values not provided
+    by runtime parameters.
+
 .VERSION
     Name:     win-dumpconfigurator.ps1
-    Version:  1.2 (Improved kdbgctrl output handling and verification)
+    Version:  1.3 (Critical fixes, safety enhancements, and PowerShell 7 compatibility)
     Author:   Michael.Smith@microsoft.com for v1.0, Tony.Mocanu@Microsoft.com for the rest.
 
 .VERSION
-    v1.2: [May 2026] - Updated script (current)
+    v1.3: [July 2026] - CRITICAL FIXES & SAFETY ENHANCEMENTS (current)
+                       - FIXED: Changed [switch] parameters to [string] for CLI compatibility
+                       - FIXED: Added early parameter validation to catch invalid parameters before execution
+                       - FIXED: Migrated all Get-WmiObject to Get-CimInstance (PowerShell 7 compatibility)
+                       - FIXED: Added guard for empty $DumpFile path
+                       - FIXED: Corrected typo 'Procceding' → 'Proceeding'
+                       - FIXED: Added missing Step 9 in output (numbering now 1-11)
+                       - IMPROVED: Better error messaging for invalid parameters via CLI
+                       - IMPROVED: Added comprehensive warnings about pagefile relocation destructiveness
+                       - IMPROVED: Added C: drive free space validation before relocation (20% minimum required)
+                       - IMPROVED: Added local test defaults documentation for local testing without CLI parameters
+    v1.2: [May 2026] - Updated script
                        - Added Michael.Smith@microsoft.com as co-author (v1.0 creator)
                        - Changed log file location to $env:PUBLIC\Desktop for uniformity with other scripts
                        - Made automatic reboot configuration optional via -ConfigureAutomaticReboot parameter
@@ -58,19 +74,42 @@
     v1.1: [May 2026] - Updated script
                        - Added intelligent dump placement for Azure temporary storage scenarios.
                        - Added optional pagefile relocation from D: to C: for dump reliability.
-                       - Added WMI-based live pagefile auditing and no-reboot workflow.
+                       - Added CIM-based live pagefile auditing and no-reboot workflow.
     v1.0: Initial commit. First working version of the script.
 #>
 
+Param(
+    [Parameter(Mandatory = $false)]
+    [Alias('dumptype')]
+    [string]$DumpType = '',
+
+    [Parameter(Mandatory = $false)]
+    [Alias('dumpfile')]
+    [string]$DumpFile = '',
+
+    [Parameter(Mandatory = $false)]
+    [Alias('dedicateddumpfile')]
+    [string]$DedicatedDumpFile = '',
+
+    [Parameter(Mandatory = $false)]
+    [Alias('onedump')]
+    [string]$OneDump = 'false',
+
+    [Parameter(Mandatory = $false)]
+    [Alias('movepagefile')]
+    [string]$MovePagefile = 'false',
+
+    [Parameter(Mandatory = $false)]
+    [Alias('configureautomaticreboot')]
+    [string]$ConfigureAutomaticReboot = 'false',
+
+    [Parameter(Mandatory = $false)]
+    [Alias('enabledebugdefaults')]
+    [string]$EnableDebugDefaults = 'false'
+)
+
 # Initialization
 . .\src\windows\common\setup\init.ps1
-
-# DEBUG: Uncomment below to test locally without --parameters
-# $DumpType = 'full'
-# $DumpFile = '%SystemRoot%\Memory.dmp'
-# $DedicatedDumpFile = 'Z:\dd.sys'
-# $OneDump = 'false'
-# $MovePagefile = 'true'
 
 # Normalize incoming parameter names (vm-repair commonly passes lowercase names).
 if (-not $DumpType -and $dumptype) { $DumpType = $dumptype }
@@ -79,13 +118,46 @@ if (-not $DedicatedDumpFile -and $dedicateddumpfile) { $DedicatedDumpFile = $ded
 if (-not $OneDump -and $onedump) { $OneDump = $onedump }
 if (-not $MovePagefile -and $movepagefile) { $MovePagefile = $movepagefile }
 if (-not $ConfigureAutomaticReboot -and $configureautomaticreboot) { $ConfigureAutomaticReboot = $configureautomaticreboot }
+if (-not $EnableDebugDefaults -and $enabledebugdefaults) { $EnableDebugDefaults = $enabledebugdefaults }
 
-# Parameter Validation
-$userProvidedDumpType = -not [string]::IsNullOrWhiteSpace("$DumpType")
-if (-not $userProvidedDumpType) { $DumpType = 'full' }
+# Optional local-only defaults for troubleshooting without --parameters.
+$debugDefaultsEnabled = $EnableDebugDefaults -eq $true -or $EnableDebugDefaults -eq 'true'
+if ($debugDefaultsEnabled) {
+    if (-not $DumpType) { $DumpType = 'full' }
+    if (-not $DumpFile) { $DumpFile = '%SystemRoot%\Memory.dmp' }
+    if (-not $DedicatedDumpFile) { $DedicatedDumpFile = 'Z:\dd.sys' }
+    if (-not $OneDump) { $OneDump = 'false' }
+    if (-not $MovePagefile) { $MovePagefile = 'true' }
+    Log-Info "EnableDebugDefaults is active. Applying local fallback defaults for missing parameters."
+}
+
+# === PARAMETER VALIDATION (EARLY FAIL) ===
+# Validate all parameters BEFORE any operations
 $validDumpTypes = @('active', 'automatic', 'full', 'kernel', 'mini')
-if ($DumpType -notin $validDumpTypes) {
-    throw "Invalid DumpType '$DumpType'. Valid values: $($validDumpTypes -join ', ')"
+
+# 1. Validate DumpType if provided
+$userProvidedDumpType = -not [string]::IsNullOrWhiteSpace("$DumpType")
+if (-not $userProvidedDumpType) { 
+    $DumpType = 'full' 
+} else {
+    if ($DumpType -notin $validDumpTypes) {
+        throw "Invalid DumpType '$DumpType'. Valid values: $($validDumpTypes -join ', '). Check your --parameters syntax."
+    }
+}
+
+# 2. Validate OneDump is boolean-compatible
+if ($OneDump -notin @('true', 'false', $true, $false, '')) {
+    throw "Invalid OneDump '$OneDump'. Must be 'true' or 'false'."
+}
+
+# 3. Validate MovePagefile is boolean-compatible
+if ($MovePagefile -notin @('true', 'false', $true, $false, '')) {
+    throw "Invalid MovePagefile '$MovePagefile'. Must be 'true' or 'false'."
+}
+
+# 4. Validate ConfigureAutomaticReboot is boolean-compatible
+if ($ConfigureAutomaticReboot -notin @('true', 'false', $true, $false, '')) {
+    throw "Invalid ConfigureAutomaticReboot '$ConfigureAutomaticReboot'. Must be 'true' or 'false'."
 }
 
 # Logging Configuration
@@ -156,8 +228,8 @@ function Get-AuditSnapshot {
     $NMI = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).NMICrashDump
     $BSP = (Get-ItemProperty -Path $RelPath -ErrorAction SilentlyContinue).BootStatusPolicy
     
-    # PAGEFILE DETECTION: Query WMI for the active configuration.
-    $ConfiguredPageFiles = Get-WmiObject -Class Win32_PageFileSetting -ErrorAction SilentlyContinue | 
+    # PAGEFILE DETECTION: Query CIM for the active configuration.
+    $ConfiguredPageFiles = Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue | 
                            Select-Object -ExpandProperty Name
     
     Log-Output ">>> $Title <<<"
@@ -210,7 +282,7 @@ try {
 
     # Step 4 - Pagefile Detection for Smart Placement
     $MMPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-    $currentPFiles = Get-WmiObject -Class Win32_PageFileSetting | Select-Object -ExpandProperty Name
+    $currentPFiles = Get-CimInstance -ClassName Win32_PageFileSetting | Select-Object -ExpandProperty Name
     $pagefileOnTempDrive = $false
     $originalPagefileLocations = $currentPFiles
     $pagefileWasMoved = $false
@@ -244,17 +316,35 @@ try {
     # Step 5 - OPTIONAL PAGEFILE RELOCATION
     if (($MovePagefile -eq $true -or $MovePagefile -eq 'true') -and $pagefileOnTempDrive) {
         Log-Warning "PAGEFILE RELOCATION REQUESTED"
+        Log-Warning "⚠️  IMPORTANT: Pagefile relocation from D: to C: is DESTRUCTIVE and NOT EASILY REVERSIBLE:"
+        Log-Warning "    1. If C: drive runs out of space, the VM may crash"
+        Log-Warning "    2. To restore pagefile to D: after troubleshooting, manual intervention or script re-run is required"
+        Log-Warning "    3. Ensure C: drive has sufficient free space (recommend minimum 50% free) before proceeding"
+        Log-Warning "    4. For production VMs, consider scheduling this change during maintenance window"
         
         try {
-            # FIX: Explicitly target C: if logic loop fails, bypass the WMI free space comparison bug
+            # FIX: Explicitly target C: if logic loop fails, bypass the CIM free space comparison bug
             $targetDrive = "C:"
-            $cDrive = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'"
+            $cDrive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
             
             if ($null -ne $cDrive) {
                 $targetPagefile = "C:\pagefile.sys"
-                Log-Info "C: Drive detected via WMI. Procceding with relocation..."
                 
-                $pageFileSettings = Get-WmiObject -Class Win32_PageFileSetting
+                # Validate C: drive has sufficient free space
+                $cDriveFreeSpaceGB = [math]::Round($cDrive.FreeSpace / 1GB, 2)
+                $cDriveTotalSpaceGB = [math]::Round($cDrive.Size / 1GB, 2)
+                $cDriveFreePercent = [math]::Round(($cDrive.FreeSpace / $cDrive.Size) * 100, 0)
+                
+                Log-Info "C: Drive space status: $cDriveFreeSpaceGB GB free of $cDriveTotalSpaceGB GB ($cDriveFreePercent% free)"
+                
+                if ($cDriveFreePercent -lt 20) {
+                    Log-Error "C: Drive free space is below 20% ($cDriveFreePercent%). Relocation aborted to prevent VM crash."
+                    throw "Insufficient C: drive free space. Minimum 20% recommended, current: $cDriveFreePercent%"
+                }
+                
+                Log-Info "C: Drive detected via CIM. Proceeding with relocation..."
+                
+                $pageFileSettings = Get-CimInstance -ClassName Win32_PageFileSetting
                 foreach ($pf in $pageFileSettings) {
                     if ($pf.Name -like "D:*" -or $pf.Name -like "*D:\*") { 
                         Log-Info "Deleting current pagefile instance: $($pf.Name)"
@@ -273,7 +363,7 @@ try {
                     Log-Info "Successfully updated WMI configuration to: $targetPagefile"
                 }
             } else {
-                throw "C: drive could not be verified via WMI. Relocation aborted."
+                throw "C: drive could not be verified via CIM. Relocation aborted."
             }
         }
         catch {
@@ -291,7 +381,14 @@ try {
         Log-Info "Applied user-provided DedicatedDumpFile: $DedicatedDumpFile"
     }
 
-    # Step 7 - Apply to LIVE KERNEL
+    # Step 7 - Guard for empty DumpFile (ensure valid path before kdbgctrl)
+    if ([string]::IsNullOrEmpty($DumpFile)) {
+        Log-Warning "DumpFile is empty. Using Windows default: %SystemRoot%\\MEMORY.DMP"
+        $DumpFile = "%SystemRoot%\\MEMORY.DMP"
+        Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
+    }
+
+    # Step 8 - Apply to LIVE KERNEL
     Log-Info "Applying dump type '$DumpType' via kdbgctrl..."
     Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
     
@@ -330,12 +427,15 @@ try {
         Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $dumpTypeMap[$DumpType] -Type DWord
     }
 
-    # Step 8 - OneDump
+    # Step 9 - OneDump
     if ($OneDump -eq $true -or $OneDump -eq 'true') { 
         Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $initialValue 
     }
 
-    # Step 10 - Final Audit AFTER
+    # Step 10 - Verification Summary
+    Log-Info "Dump configuration task completed."
+
+    # Step 11 - Final Audit AFTER
     Get-AuditSnapshot "VERIFYING UPDATED SETTINGS (AFTER)"
 
     $currentDumpValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
