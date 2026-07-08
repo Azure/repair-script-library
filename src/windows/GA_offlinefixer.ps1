@@ -23,15 +23,15 @@
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.3: [May 2026] - Updated the script (current)
+    v1.4: [May 2026] - Updated the script (current)
                        - Aligned nested VM detection with win-LKGC guard pattern.
                        - Skips Get-VM safely when Hyper-V module is unavailable.
-    v1.2: [May 2026] - Updated the script again (current)
+    v1.3: [May 2026] - Updated the script again (current)
                        - Fixed breaking exception when the Hyper-V module is not installed on the host.
                        - Added explicit checking via Get-Module before executing nested VM discovery.
-    v1.1: [May 2026] - Updated the script
+    v1.2: [May 2026] - Updated the script
                        - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
-    v1.0: Initial commit. This was the version 1.0 of the script.
+    v0.1: Initial commit. This was the version 1.0 of the script.
 
 .SCENARIO_RECREATION
     To recreate a testable broken Guest Agent scenario on a rescue VM with an attached OS disk:
@@ -78,9 +78,50 @@ $logFile = "$logDir\GA_offlinefixer_$timestamp.log"
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
+$serviceStates = @{}  # Track original service states for restoration
+
+# VM Metadata Capture for Telemetry
+$vmMetadata = @{
+    OSVersion = $null
+    VMSku = $null
+    Region = $null
+    HostName = $env:COMPUTERNAME
+}
 
 try {
-    Log-Info "Starting VMAgent Offline Fixer..." | Tee-Object -FilePath $logFile -Append
+    # Capture OS version from rescue VM
+    try {
+        $osInfo = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if ($osInfo) {
+            $vmMetadata.OSVersion = "$($osInfo.Caption) $($osInfo.Version)"
+        }
+    }
+    catch {
+        # Silent fail - metadata is optional
+    }
+
+    # Attempt to capture Azure VM metadata from Instance Metadata Service
+    try {
+        $imdHeaders = @{Metadata = $true }
+        $imdUri = "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+        $imdResponse = Invoke-RestMethod -Uri $imdUri -Headers $imdHeaders -ErrorAction SilentlyContinue
+        if ($imdResponse) {
+            $vmMetadata.VMSku = $imdResponse.compute.vmSize
+            $vmMetadata.Region = $imdResponse.compute.location
+        }
+    }
+    catch {
+        # Silent fail - metadata is optional, may not be available in all environments
+    }
+
+    # Create metadata context string for logging
+    $metadataContext = "[Host:$($vmMetadata.HostName)"
+    if ($vmMetadata.Region) { $metadataContext += " Region:$($vmMetadata.Region)" }
+    if ($vmMetadata.VMSku) { $metadataContext += " SKU:$($vmMetadata.VMSku)" }
+    if ($vmMetadata.OSVersion) { $metadataContext += " OS:$($vmMetadata.OSVersion)" }
+    $metadataContext += "]"
+
+    Log-Info "Starting VMAgent Offline Fixer... $metadataContext" | Tee-Object -FilePath $logFile -Append
 
     # Stop nested guest VM if running
     # Guard Get-VM if Hyper-V module is not available
@@ -127,8 +168,19 @@ try {
 
     # Stop services that scan/index attached disks and lock hive files
     Log-Info "Stopping services that may lock disk files..." | Tee-Object -FilePath $logFile -Append
-    Stop-Service WSearch -Force -ErrorAction SilentlyContinue 2>$null
-    Stop-Service WinDefend -Force -ErrorAction SilentlyContinue 2>$null
+    foreach ($svc in @('WSearch', 'WinDefend')) {
+        try {
+            $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($svcObj) {
+                $serviceStates[$svc] = $svcObj.Status
+                Log-Info "Captured original state of $svc : $($svcObj.Status)" | Tee-Object -FilePath $logFile -Append
+                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            Log-Warning "Failed to capture state of $svc : $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+    }
 
     [System.GC]::Collect()
     [System.GC]::WaitForPendingFinalizers()
@@ -150,6 +202,7 @@ try {
     $partitionlist = Get-Disk-Partitions
     $rescueDrive = $env:SystemDrive -replace ':', ''
     $fixedDisks = @()
+    $failedDisks = @()  # Track disks that failed copy-back
 
     foreach ($partition in $partitionlist) {
         if (-not $partition.DriveLetter) { continue }
@@ -167,6 +220,7 @@ try {
         $hiveName = "BROKENSYSTEM_$diskb"
         $hiveSource = "$($diskb):\Windows\System32\config\SYSTEM"
         $hiveCopy = $null
+        $diskProcessedSuccessfully = $false
         & reg.exe unload "HKLM\$hiveName" 2>$null
         [System.GC]::Collect()
         Start-Sleep -Seconds 1
@@ -283,10 +337,12 @@ try {
                 Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
             }
 
+            $diskProcessedSuccessfully = $true
             $fixedDisks += $diskb
         }
         catch {
             Log-Error "Failed to process $($diskb):: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+            $diskProcessedSuccessfully = $false
         }
         finally {
             # Step 8 - Release handles and safely unload the registry hive
@@ -312,18 +368,34 @@ try {
                     Log-Info "Copying modified hive back to $hiveSource..." | Tee-Object -FilePath $logFile -Append
                     try {
                         Copy-Item -Path $hiveCopy -Destination $hiveSource -Force -ErrorAction Stop
+                        Log-Info "Successfully copied modified hive back to $($diskb):" | Tee-Object -FilePath $logFile -Append
                     }
                     catch {
                         Log-Error "Failed to copy modified hive back to $($diskb):: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+                        $diskProcessedSuccessfully = $false
+                        $failedDisks += $diskb
                     }
                 }
                 Remove-Item $hiveCopy -Force -ErrorAction SilentlyContinue
             }
+
+            # Remove from fixed list if processing failed
+            if (-not $diskProcessedSuccessfully) {
+                $fixedDisks = @($fixedDisks | Where-Object { $_ -ne $diskb })
+                if ($diskb -notin $failedDisks) {
+                    $failedDisks += $diskb
+                }
+            }
         }
     }
 
+    if ($failedDisks.Count -gt 0) {
+        Log-Error "Copy-back operation failed on disks: $($failedDisks -join ', ')" | Tee-Object -FilePath $logFile -Append
+        throw "Hive copy-back failed on one or more disks: $($failedDisks -join ', '). Please review logs."
+    }
+
     if ($fixedDisks.Count -gt 0) {
-        Log-Output "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ')" | Tee-Object -FilePath $logFile -Append
+        Log-Output "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Metadata: Host=$($vmMetadata.HostName), Region=$($vmMetadata.Region), SKU=$($vmMetadata.VMSku)" | Tee-Object -FilePath $logFile -Append
         $script_final_status = $STATUS_SUCCESS
     }
     else {
@@ -337,6 +409,27 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    # Log execution metadata for Application Insights correlation
+    if ($vmMetadata.Region -or $vmMetadata.VMSku -or $vmMetadata.OSVersion) {
+        Log-Info "Execution Context - Host: $($vmMetadata.HostName), Region: $($vmMetadata.Region), SKU: $($vmMetadata.VMSku), OS: $($vmMetadata.OSVersion)" | Tee-Object -FilePath $logFile -Append
+    }
+
+    # Restore original service states
+    Log-Info "Restoring original service states..." | Tee-Object -FilePath $logFile -Append
+    foreach ($svc in $serviceStates.Keys) {
+        try {
+            $originalState = $serviceStates[$svc]
+            Log-Info "Restoring $svc to state: $originalState" | Tee-Object -FilePath $logFile -Append
+            if ($originalState -eq 'Running') {
+                Start-Service -Name $svc -ErrorAction SilentlyContinue
+            }
+            # If original state was Stopped, service remains stopped (already stopped)
+        }
+        catch {
+            Log-Warning "Failed to restore $svc to state $originalState : $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+    }
+
     Log-Info "Execution ended at $(Get-Date)" | Tee-Object -FilePath $logFile -Append
 }
 
