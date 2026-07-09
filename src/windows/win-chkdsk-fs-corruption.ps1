@@ -92,6 +92,7 @@ try {
         Log-Info "Hyper-V module/cmdlets not available on this host -> skipping nested VM discovery"
     }
 
+    # --- Partition Enumeration and CHKDSK ---
     # Step 1 - Enumerate attached partitions
     $partitionlist = Get-Disk-Partitions
     $rescueDrive = $env:SystemDrive -replace ':', ''
@@ -108,8 +109,8 @@ try {
                     continue
                 }
 
-                $letter = $partition.DriveLetter
-                if ($letter -notmatch ":") { $letter = "$letter" + ":" }
+                # Format drive letter with colon (Get-Disk-Partitions returns single character)
+                $letter = "$($partition.DriveLetter):"
                 
                 Log-Info "Checking drive: $letter"
                 
@@ -123,8 +124,16 @@ try {
                     
                     # Capture all chkdsk output
                     $chkdskResults = chkdsk $letter /f 2>&1
+                    $chkdskExitCode = $LASTEXITCODE
+
+                    # Check for unfixable corruption (exit code 3)
+                    if ($chkdskExitCode -eq 3) {
+                        Log-Error "CHKDSK reported unfixable corruption on $letter (exit code 3) - disk may require replacement"
+                        $script_final_status = $STATUS_ERROR
+                    }
 
                     # Write full output to log file only (not stdout) for detailed review
+                    # Using Add-Content instead of Tee-Object to keep detailed logs separate from stdout summary
                     foreach ($line in $chkdskResults) {
                         $str = $line.ToString()
                         if ($str.Trim()) {
