@@ -1,14 +1,16 @@
 <#
 .SYNOPSIS
-    Enables Special Administration Console (SAC) and Serial Console boot settings.
+    Enables SAC and Serial Console boot settings on attached Windows disks, including BIOS and UEFI layouts.
 
 .DESCRIPTION
     This script runs from a rescue VM to enable SAC/EMS on an attached OS disk's BCD store.
     It performs the following steps:
     1. Enumerates attached partitions via Get-Disk-Partitions to locate the BCD store and OS loader.
+       OS detection accepts either winload.exe or winload.efi.
     1a. For Gen2 disks where the EFI partition has no drive letter, uses diskpart to
         temporarily assign one so the BCD store can be accessed.
     2. Identifies the default boot entry GUID from the BCD bootmgr displayorder.
+       If the default entry cannot be determined, the script logs an explicit warning.
     3. Logs the BCD configuration before any changes are made.
     4. Enables the boot menu with a 5-second timeout (displaybootmenu, timeout).
     5. Enables Boot EMS on the boot manager (bootems yes).
@@ -113,6 +115,7 @@ $logFile = "$logDir\sac-enabler_$timestamp.log"
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
+$failureReason = 'Script could not find a valid OS disk to enable SAC.'
 
 try {
     # Check if the Hyper-V module is available before performing nested VM checks
@@ -138,14 +141,14 @@ try {
     $rescueDrive = $env:SystemDrive -replace ':', ''
     Log-Info 'Enumerating partitions to enable SAC...' | Tee-Object -FilePath $logFile -Append
 
-    foreach ( $partitionGroup in $partitionlist | group DiskNumber )
+    foreach ( $partitionGroup in $partitionlist | Group-Object DiskNumber )
     {
         $isBcdPath = $false
         $bcdPath = ''
         $isOsPath = $false
 
         # Scan each drive for BCD store and Windows OS loader
-        ForEach ($drive in $partitionGroup.Group | select -ExpandProperty DriveLetter )
+        ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter )
         {
             # Skip the rescue VM's own OS drive
             if ($drive -eq $rescueDrive) { continue }
@@ -162,7 +165,9 @@ try {
             }        
             if (-not $isOsPath)
             {
-                $isOsPath = Test-Path ($drive + ':\windows\system32\winload.exe')
+                $winloadExePath = $drive + ':\windows\system32\winload.exe'
+                $winloadEfiPath = $drive + ':\windows\system32\winload.efi'
+                $isOsPath = (Test-Path $winloadExePath) -or (Test-Path $winloadEfiPath)
             }
         }
 
@@ -230,9 +235,14 @@ try {
         {
             # Step 2 - Identify the default boot entry GUID
             $bcdout = bcdedit /store $bcdPath /enum bootmgr /v
-            $defaultLine = $bcdout | Select-String 'displayorder' | select -First 1
-            
-            if ($defaultLine -match '\{([^}]+)\}') {
+            $defaultLine = $bcdout | Select-String 'displayorder' | Select-Object -First 1
+
+            if (-not $defaultLine)
+            {
+                $failureReason = "Could not locate a displayorder entry in boot manager output for $bcdPath."
+                Log-Warning "Could not locate a displayorder entry in boot manager output for $bcdPath. Unable to determine the default boot entry." | Tee-Object -FilePath $logFile -Append
+            }
+            elseif ($defaultLine -match '\{([^}]+)\}') {
                 $defaultId = $matches[0]
 
                 # Step 3 - Log BCD configuration before changes
@@ -257,6 +267,11 @@ try {
                 
                 $script_final_status = $STATUS_SUCCESS
             }
+            else
+            {
+                $failureReason = "Displayorder entry was found but no boot entry GUID could be parsed for $bcdPath."
+                Log-Warning "Displayorder entry was found but no boot entry GUID could be parsed for $bcdPath. Raw line: $($defaultLine.Line)" | Tee-Object -FilePath $logFile -Append
+            }
         }
 
         # Clean up temporary EFI drive letter if one was assigned
@@ -269,7 +284,7 @@ try {
     }
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
-        Log-Error "FAILED: Script could not find a valid OS disk to enable SAC." | Tee-Object -FilePath $logFile -Append
+        Log-Error "FAILED: $failureReason" | Tee-Object -FilePath $logFile -Append
     }
 }
 catch {
