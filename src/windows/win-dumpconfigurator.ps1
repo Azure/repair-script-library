@@ -110,7 +110,7 @@ Param(
 )
 
 # Initialization
-$initScriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'src\windows\common\setup\init.ps1'
+$initScriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\setup\init.ps1'
 if (-not (Test-Path -Path $initScriptPath -PathType Leaf)) {
     Write-Error "Missing required dependency: $initScriptPath"
     return 1
@@ -447,7 +447,7 @@ try {
     Log-Info "Applying dump type '$DumpType' via kdbgctrl..."
     Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
     
-    $toolPath = Join-Path -Path $PSScriptRoot -ChildPath 'src\windows\common\tools\kdbgctrl.exe'
+    $toolPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\tools\kdbgctrl.exe'
     if (-not (Test-Path -Path $toolPath -PathType Leaf)) {
         throw "Missing required dependency: $toolPath"
     }
