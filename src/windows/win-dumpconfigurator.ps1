@@ -47,6 +47,14 @@
     Applies local test defaults only when set to true and only for values not provided
     by runtime parameters.
 
+.EXAMPLE
+    .\win-dumpconfigurator.ps1 -DumpType kernel -DumpFile "%SystemRoot%\MEMORY.DMP" -ConfigureAutomaticReboot true
+    Configures kernel dump collection and enables automatic reboot after a crash.
+
+.EXAMPLE
+    .\win-dumpconfigurator.ps1 -DumpType full -DedicatedDumpFile "delete" -OneDump true
+    Applies full dump for a single capture cycle and removes an existing dedicated dump file setting.
+
 .VERSION
     Name:     win-dumpconfigurator.ps1
     Version:  1.3 (Critical fixes, safety enhancements, and PowerShell 7 compatibility)
@@ -89,20 +97,37 @@ Param(
     [string]$DedicatedDumpFile = '',
 
     [Parameter(Mandatory = $false)]
-    [string]$OneDump = 'false',
+    [string]$OneDump = '',
 
     [Parameter(Mandatory = $false)]
-    [string]$MovePagefile = 'false',
+    [string]$MovePagefile = '',
 
     [Parameter(Mandatory = $false)]
-    [string]$ConfigureAutomaticReboot = 'false',
+    [string]$ConfigureAutomaticReboot = '',
 
     [Parameter(Mandatory = $false)]
-    [string]$EnableDebugDefaults = 'false'
+    [string]$EnableDebugDefaults = ''
 )
 
 # Initialization
-. .\src\windows\common\setup\init.ps1
+$initScriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'src\windows\common\setup\init.ps1'
+if (-not (Test-Path -Path $initScriptPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initScriptPath"
+    return 1
+}
+
+. $initScriptPath
+
+# LOCAL TEST DEFAULTS: Uncomment the variables below to test locally without --parameters
+# You can either:
+#   1. Uncomment individual variables and run the script
+#   2. Uncomment ONLY $EnableDebugDefaults='true' to activate all defaults
+# Example:
+#   $DumpType = 'full'
+#   $OneDump = 'false'
+#   $MovePagefile = 'false'
+#   $EnableDebugDefaults = 'true
+# Then run: .\win-dumpconfigurator.ps1
 
 # Normalize incoming parameter names (vm-repair commonly passes lowercase names).
 if (-not $DumpType -and $dumptype) { $DumpType = $dumptype }
@@ -112,6 +137,12 @@ if (-not $OneDump -and $onedump) { $OneDump = $onedump }
 if (-not $MovePagefile -and $movepagefile) { $MovePagefile = $movepagefile }
 if (-not $ConfigureAutomaticReboot -and $configureautomaticreboot) { $ConfigureAutomaticReboot = $configureautomaticreboot }
 if (-not $EnableDebugDefaults -and $enabledebugdefaults) { $EnableDebugDefaults = $enabledebugdefaults }
+
+# Normalize boolean-like string parameters for consistent downstream checks.
+$OneDump = "$OneDump".Trim().ToLowerInvariant()
+$MovePagefile = "$MovePagefile".Trim().ToLowerInvariant()
+$ConfigureAutomaticReboot = "$ConfigureAutomaticReboot".Trim().ToLowerInvariant()
+$EnableDebugDefaults = "$EnableDebugDefaults".Trim().ToLowerInvariant()
 
 # Optional local-only defaults for troubleshooting without --parameters.
 $debugDefaultsEnabled = $EnableDebugDefaults -eq $true -or $EnableDebugDefaults -eq 'true'
@@ -153,10 +184,6 @@ if ($ConfigureAutomaticReboot -notin @('true', 'false', $true, $false, '')) {
     throw "Invalid ConfigureAutomaticReboot '$ConfigureAutomaticReboot'. Must be 'true' or 'false'."
 }
 
-# Logging Configuration
-$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
-$logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
-
 $script_final_status = $STATUS_ERROR
 
 function Get-DumpTypeLabel {
@@ -175,7 +202,7 @@ function Get-DumpTypeLabel {
     }
 }
 
-function Filter-KdbgctrlOutput {
+function Get-KdbgctrlOutputSummary {
     param($OutputLines)
 
     $noisePatterns = @(
@@ -251,6 +278,15 @@ try {
     Get-AuditSnapshot "AUDITING SETTINGS (BEFORE)"
 
     $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
+    $crashControlBackupPath = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\CrashControl-backup-{0}.reg" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $backupResult = & reg.exe export "HKLM\SYSTEM\CurrentControlSet\Control\CrashControl" $crashControlBackupPath /y 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Log-Info "Created registry backup: $crashControlBackupPath"
+    }
+    else {
+        Log-Warning "Could not create registry backup. Output: $($backupResult -join ' | ')"
+    }
+
     $initialValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
     $dumpTypeMap = @{ 'full' = 1; 'kernel' = 2; 'mini' = 3; 'automatic' = 7; 'active' = 1 }
     $requestedDumpValue = $dumpTypeMap[$DumpType]
@@ -279,14 +315,20 @@ try {
     $pagefileOnTempDrive = $false
     $originalPagefileLocations = $currentPFiles
     $pagefileWasMoved = $false
+    $pagefileScanProcessed = 0
+    $pagefileScanTempMatches = 0
     
     foreach ($pf in $currentPFiles) {
+        $pagefileScanProcessed++
+        Log-Debug "Detected pagefile setting: $pf"
         if ($pf -like "D:*" -or $pf -like "*D:\*") {
             $pagefileOnTempDrive = $true
+            $pagefileScanTempMatches++
             Log-Warning "Pagefile detected on D: drive: $pf"
             break
         }
     }
+    Log-Info "Pagefile scan summary: processed=$pagefileScanProcessed tempDriveMatches=$pagefileScanTempMatches"
     
     # INTELLIGENT DUMP PLACEMENT
     # Respect explicit user-provided values exactly as passed.
@@ -317,7 +359,6 @@ try {
         
         try {
             # FIX: Explicitly target C: if logic loop fails, bypass the CIM free space comparison bug
-            $targetDrive = "C:"
             $cDrive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
             
             if ($null -ne $cDrive) {
@@ -338,20 +379,41 @@ try {
                 Log-Info "C: Drive detected via CIM. Proceeding with relocation..."
                 
                 $pageFileSettings = Get-CimInstance -ClassName Win32_PageFileSetting
+                $pagefileDeleteProcessed = 0
+                $pagefileDeleteDeleted = 0
+                $pagefileDeleteFailed = 0
+                $pagefileDeleteSkipped = 0
+
                 foreach ($pf in $pageFileSettings) {
-                    if ($pf.Name -like "D:*" -or $pf.Name -like "*D:\*") { 
-                        Log-Info "Deleting current pagefile instance: $($pf.Name)"
-                        $pf.Delete() 
+                    $pagefileDeleteProcessed++
+                    if ($pf.Name -like "D:*" -or $pf.Name -like "*D:\*") {
+                        try {
+                            Log-Info "Deleting current pagefile instance: $($pf.Name)"
+                            $pf | Remove-CimInstance -ErrorAction Stop
+                            $pagefileDeleteDeleted++
+                        }
+                        catch {
+                            $pagefileDeleteFailed++
+                            Log-Warning "Failed to delete pagefile instance '$($pf.Name)': $($_.Exception.Message)"
+                        }
+                    }
+                    else {
+                        $pagefileDeleteSkipped++
                     }
                 }
-                
-                $newPageFile = ([WMIClass]"Win32_PageFileSetting").CreateInstance()
-                $newPageFile.Name = $targetPagefile
-                $newPageFile.InitialSize = 0
-                $newPageFile.MaximumSize = 0
-                $putResult = $newPageFile.Put()
-                
-                if ($putResult) {
+                Log-Info "Pagefile delete summary: processed=$pagefileDeleteProcessed deleted=$pagefileDeleteDeleted skipped=$pagefileDeleteSkipped failed=$pagefileDeleteFailed"
+
+                if ($pagefileDeleteFailed -gt 0) {
+                    throw "One or more D: pagefile entries could not be removed. See logs for details."
+                }
+
+                $newPageFile = New-CimInstance -ClassName Win32_PageFileSetting -Property @{
+                    Name = $targetPagefile
+                    InitialSize = 0
+                    MaximumSize = 0
+                } -ErrorAction Stop
+
+                if ($null -ne $newPageFile) {
                     $pagefileWasMoved = $true
                     Log-Info "Successfully updated WMI configuration to: $targetPagefile"
                 }
@@ -385,10 +447,13 @@ try {
     Log-Info "Applying dump type '$DumpType' via kdbgctrl..."
     Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
     
-    $toolPath = ".\src\windows\common\tools\kdbgctrl.exe"
+    $toolPath = Join-Path -Path $PSScriptRoot -ChildPath 'src\windows\common\tools\kdbgctrl.exe'
+    if (-not (Test-Path -Path $toolPath -PathType Leaf)) {
+        throw "Missing required dependency: $toolPath"
+    }
     $kdbgResult = & $toolPath -sd $DumpType 2>&1
     $kdbgExitCode = $LASTEXITCODE
-    $parsedKdbg = Filter-KdbgctrlOutput -OutputLines $kdbgResult
+    $parsedKdbg = Get-KdbgctrlOutputSummary -OutputLines $kdbgResult
 
     if ($parsedKdbg.Suppressed.Count -gt 0) {
         Log-Debug "Suppressed non-actionable kdbgctrl messages: $($parsedKdbg.Suppressed -join ' | ')"
@@ -463,6 +528,9 @@ try {
 }
 catch {
     Log-Error "Failure: $($_.Exception.Message)"
+    if ($crashControlBackupPath -and (Test-Path -Path $crashControlBackupPath -PathType Leaf)) {
+        Log-Warning "Rollback available. To restore previous CrashControl values, run: reg import `"$crashControlBackupPath`""
+    }
     $script_final_status = $STATUS_ERROR
 }
 finally {
