@@ -17,6 +17,29 @@
     This resolves non-boot issues caused by registry misconfiguration (e.g., enabling RDP,
     changing service startup type, disabling problematic drivers).
 
+.PARAMETER rootKey
+    Root registry hive for offline mount. Valid values: HKLM, HKCC, HKCR, HKCU, HKU.
+
+.PARAMETER hive
+    Offline hive file name under Windows\System32\config (for example: SYSTEM, SOFTWARE).
+
+.PARAMETER controlSet
+    Optional control set number for SYSTEM hive updates. Valid values: 1 or 2.
+    If omitted for SYSTEM hive, the script uses Select\Current.
+
+.PARAMETER relativePath
+    Registry path relative to the loaded offline hive root.
+
+.PARAMETER propertyName
+    Registry property name to create or update.
+
+.PARAMETER propertyValue
+    Registry property value to write.
+
+.PARAMETER propertyType
+    Registry value type. Valid values: String, ExpandString, Binary, DWord, MultiString, Qword, Unknown.
+    If omitted, defaults to DWord.
+
 .NOTES
     Name:    win-update-registry.ps1
     Author:  Tony Mocanu / Tony.Mocanu@Microsoft.com
@@ -29,7 +52,7 @@
                        - Updated helper import to Get-Disk-Partitions-v2 and aligned partition processing flow.
                        - Added rescue OS drive exclusion to avoid modifying the running rescue VM hive.
                        - Added per-partition reg load failure handling (skip bad partition, continue others).
-                       - Added structured step-by-step logging, timestamped CSE log output, and final status tracking.
+                       - Added structured step-by-step logging, timestamped desktop log output, and final status tracking.
                        - Improved error handling to continue processing partitions safely and report aggregate result.
     v1.0: Initial version
 
@@ -55,7 +78,7 @@ reg unload HKLM\TESTBREAK
 
 .VERIFICATION
     1. Check the log file for success:
-Get-ChildItem "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension\update-registry_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
+Get-ChildItem "$([Environment]::GetFolderPath('Desktop'))\update-registry_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
     Expected: "Successfully modified registry key" and return code 0 ($STATUS_SUCCESS).
     2. Manually reload the hive and confirm the value was written (replace F with the attached disk letter):
 reg load HKLM\VERIFY F:\Windows\System32\config\SYSTEM
@@ -66,8 +89,21 @@ reg unload HKLM\VERIFY
 #>
 
 # Initialization (no Param() block to avoid ParserErrors and argument transformation failures)
-. .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
+$initPath = Join-Path $PSScriptRoot 'src\windows\common\setup\init.ps1'
+$diskPartitionsHelperPath = Join-Path $PSScriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
+
+if (-not (Test-Path -LiteralPath $initPath)) {
+    Write-Error "Missing required helper: $initPath"
+    return 1
+}
+
+if (-not (Test-Path -LiteralPath $diskPartitionsHelperPath)) {
+    Write-Error "Missing required helper: $diskPartitionsHelperPath"
+    return 1
+}
+
+. $initPath
+. $diskPartitionsHelperPath
 
 # DEBUG: Uncomment below to test locally without --parameters
 # $rootKey = 'HKLM'
@@ -118,17 +154,66 @@ if ($null -eq $propertyValue) {
 }
 
 # Log Configuration
-$logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
-if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+$logDir = [Environment]::GetFolderPath('Desktop')
+if ([string]::IsNullOrWhiteSpace($logDir) -or -not (Test-Path -LiteralPath $logDir)) {
+    $logDir = 'C:\Users\Public\Desktop'
+    if (-not (Test-Path -LiteralPath $logDir)) {
+        $null = New-Item -ItemType Directory -Path $logDir -Force
+    }
+}
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$logDir\update-registry_$timestamp.log"
+
+function Write-DesktopLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Level,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        $Message
+    )
+
+    $text = if ($null -eq $Message) { '' } else { ($Message | Out-String).TrimEnd() }
+    $line = "$(Get-Date -Format o) [$Level] $text"
+    Add-Content -Path $logFile -Value $line
+}
+
+function Write-InfoLog {
+    param([string]$Message)
+    Log-Info $Message
+    Write-DesktopLog -Level 'INFO' -Message $Message
+}
+
+function Write-WarningLog {
+    param([string]$Message)
+    Log-Warning $Message
+    Write-DesktopLog -Level 'WARN' -Message $Message
+}
+
+function Write-ErrorLog {
+    param([string]$Message)
+    Log-Error $Message
+    Write-DesktopLog -Level 'ERROR' -Message $Message
+}
+
+function Write-OutputLog {
+    param([AllowNull()]$Message)
+    Log-Output $Message
+    Write-DesktopLog -Level 'OUTPUT' -Message $Message
+}
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
 
 try {
-    Log-Info "START: Running script win-update-registry.ps1" | Tee-Object -FilePath $logFile -Append
-    Log-Info "Parameters: rootKey=$rootKey, hive=$hive, controlSet=$controlSet, relativePath=$relativePath, propertyName=$propertyName, propertyValue=$propertyValue, propertyType=$propertyType" | Tee-Object -FilePath $logFile -Append
+    Write-InfoLog "START: Running script win-update-registry.ps1"
+    Write-InfoLog "Log file path: $logFile"
+    Write-InfoLog "Parameters: rootKey=$rootKey, hive=$hive, controlSet=$controlSet, relativePath=$relativePath, propertyName=$propertyName, propertyValue=$propertyValue, propertyType=$propertyType"
+
+    $processedCount = 0
+    $skippedCount = 0
+    $failedCount = 0
+    $changedCount = 0
 
     # Step 1 - Stop nested guest VM if running
     # Guard Get-VM if Hyper-V module is not available
@@ -138,93 +223,109 @@ try {
             if ($guestHyperVVirtualMachine) {
                 $guestHyperVVirtualMachineName = $guestHyperVVirtualMachine.VMName
                 if ($guestHyperVVirtualMachine.State -eq 'Running') {
-                    Log-Info "Stopping nested guest VM $guestHyperVVirtualMachineName" | Tee-Object -FilePath $logFile -Append
+                    Write-InfoLog "Stopping nested guest VM $guestHyperVVirtualMachineName"
                     try {
                         Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                     }
                     catch {
-                        Log-Warning "Failed to stop nested guest VM $guestHyperVVirtualMachineName, will continue but may have limited success" | Tee-Object -FilePath $logFile -Append
+                        Write-WarningLog "Failed to stop nested guest VM $guestHyperVVirtualMachineName, will continue but may have limited success"
                     }
                 }
             }
             else {
-                Log-Info "No running nested guest VM, continuing" | Tee-Object -FilePath $logFile -Append
+                Write-InfoLog "No running nested guest VM, continuing"
             }
         }
         else {
-            Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation." | Tee-Object -FilePath $logFile -Append
+            Write-InfoLog "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
         }
     }
     catch {
-        Log-Warning "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        Write-WarningLog "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)"
     }
 
     # Step 2 - Bring the attached disk online and enumerate partitions via Get-Disk-Partitions
     $partitionlist = Get-Disk-Partitions
 
     if ($null -eq $partitionlist -or $partitionlist.Count -eq 0) {
-        Log-Error "No partitions found on attached disk." | Tee-Object -FilePath $logFile -Append
+        Write-ErrorLog "No partitions found on attached disk."
         $script_final_status = $STATUS_ERROR
     }
     else {
         # Step 3 - Locate the Windows partition by checking for the registry config path
-        Log-Info "Scanning partitions for Windows registry hives" | Tee-Object -FilePath $logFile -Append
+        Write-InfoLog "Scanning partitions for Windows registry hives"
 
         foreach ($partition in $partitionlist) {
             if (-not $partition -or -not $partition.DriveLetter) { continue }
 
             $drive = $partition.DriveLetter
+            $processedCount++
 
             # Skip the rescue VM's own OS drive (its hives are locked by the running OS)
             $rescueDrive = $env:SystemDrive -replace ':', ''
             if ($drive -eq $rescueDrive) {
-                Log-Info "Skipping rescue VM system drive $drive (own OS)" | Tee-Object -FilePath $logFile -Append
+                Write-InfoLog "Skipping rescue VM system drive $drive (own OS)"
+                $skippedCount++
                 continue
             }
 
             $regPath = $drive + ':\Windows\System32\config\'
             if (-not (Test-Path $regPath)) {
-                Log-Info "No Registry found on $drive, skipping" | Tee-Object -FilePath $logFile -Append
+                Write-InfoLog "No Registry found on $drive, skipping"
+                $skippedCount++
                 continue
             }
 
             # Step 4 - Load requested registry hive from attached disk
-            Log-Info "Loading $hive hive from $($drive):" | Tee-Object -FilePath $logFile -Append
-            $loadResult = cmd /c "reg load $($rootKey)\broken$($hive)$($drive) $($drive):\Windows\System32\config\$($hive)" 2>&1
-            Log-Output "reg load result: $loadResult" | Tee-Object -FilePath $logFile -Append
+            Write-InfoLog "Loading $hive hive from $($drive):"
+            $loadResult = & reg.exe load "$($rootKey)\broken$($hive)$($drive)" "$($drive):\Windows\System32\config\$($hive)" 2>&1 | Out-String
+            $loadExitCode = $LASTEXITCODE
+            Write-OutputLog "reg load exit code: $loadExitCode"
+            Write-OutputLog "reg load output: $loadResult"
 
             # If reg load failed, skip this partition entirely
-            if ($loadResult -match 'ERROR') {
-                Log-Warning "Failed to load $hive hive from $($drive), skipping partition: $loadResult" | Tee-Object -FilePath $logFile -Append
+            if ($loadExitCode -ne 0) {
+                Write-WarningLog "Failed to load $hive hive from $($drive), skipping partition"
+                $failedCount++
                 continue
             }
 
+            $hiveSourcePath = "$($drive):\Windows\System32\config\$($hive)"
+            $backupFile = Join-Path $logDir "backup-$hive-$drive-$timestamp.hiv"
+            $restoreRequired = $false
+
             try {
+                if (-not (Test-Path -LiteralPath $hiveSourcePath)) {
+                    throw "Hive file not found for backup: $hiveSourcePath"
+                }
+                Copy-Item -LiteralPath $hiveSourcePath -Destination $backupFile -Force -ErrorAction Stop
+                Write-InfoLog "Created hive backup before modification: $backupFile"
+
                 # Step 5 - Determine the active ControlSet if using the SYSTEM hive
                 if ($hive -eq "system") {
-                    Log-Info "Using a SYSTEM hive, determining Control Set" | Tee-Object -FilePath $logFile -Append
+                    Write-InfoLog "Using a SYSTEM hive, determining Control Set"
                     $controlSetText = "ControlSet00"
                     if (-not $controlSet -or $controlSet -eq "") {
                         $controlSet = (Get-ItemProperty -Path "$($rootKey):\broken$($hive)$($drive)\Select" -Name Current).Current
                     }
                     $controlSetText += $controlSet
-                    Log-Info "Using $controlSetText" | Tee-Object -FilePath $logFile -Append
+                    Write-InfoLog "Using $controlSetText"
                     $controlSetText += "\"
                 }
                 else {
                     $controlSetText = ""
-                    Log-Info "Not using a SYSTEM hive, targeting $hive directly" | Tee-Object -FilePath $logFile -Append
+                    Write-InfoLog "Not using a SYSTEM hive, targeting $hive directly"
                 }
 
                 # Step 6 - Read current value of the specified property
                 $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
-                Log-Info "Target registry path: $propPath" | Tee-Object -FilePath $logFile -Append
+                Write-InfoLog "Target registry path: $propPath"
                 $currentValue = Get-ItemProperty -Path $propPath -Name $propertyName -ErrorAction SilentlyContinue
                 if ($currentValue) {
-                    Log-Output "Current value of '$propertyName': $($currentValue.$propertyName)" | Tee-Object -FilePath $logFile -Append
+                    Write-OutputLog "Current value of '$propertyName': $($currentValue.$propertyName)"
                 }
                 else {
-                    Log-Info "Property '$propertyName' not found at path (will be created)" | Tee-Object -FilePath $logFile -Append
+                    Write-InfoLog "Property '$propertyName' not found at path (will be created)"
                 }
 
                 # Step 7 - Create path if needed, then set the property value
@@ -236,45 +337,90 @@ try {
                             $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
                         }
                         catch {
-                            Log-Warning "Unable to detect existing property type, using '$propertyType': $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+                            Write-WarningLog "Unable to detect existing property type, using '$propertyType': $($_.Exception.Message)"
                         }
                     }
                 }
                 else {
-                    Log-Info "Registry path does not exist, creating: $propPath" | Tee-Object -FilePath $logFile -Append
+                    Write-InfoLog "Registry path does not exist, creating: $propPath"
                     New-Item -Path $propPath -Force -ErrorAction Stop | Out-Null
                 }
 
                 $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -Type $propertyType -Value $propertyValue -Force -ErrorAction Stop -PassThru
-                Log-Output "Successfully modified registry key" | Tee-Object -FilePath $logFile -Append
-                Log-Output $modifiedKey | Tee-Object -FilePath $logFile -Append
+                Write-OutputLog "Successfully modified registry key"
+                Write-OutputLog "Updated '$propertyName' to '$propertyValue' (type '$propertyType') at '$propPath'"
+                Write-OutputLog $modifiedKey
 
                 $script_final_status = $STATUS_SUCCESS
+                $changedCount++
             }
             catch {
-                Log-Error "Failed to modify registry hive on $($drive): $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+                Write-ErrorLog "Failed to modify registry hive on $($drive): $($_.Exception.Message)"
+                Write-ErrorLog "Will attempt rollback from backup after unloading hive."
                 $script_final_status = $STATUS_ERROR
+                $failedCount++
+                $restoreRequired = $true
             }
             finally {
                 # Step 8 - Unload the registry hive cleanly
-                Log-Info "Unloading registry hive from $($drive)" | Tee-Object -FilePath $logFile -Append
-                [gc]::Collect()
-                $unloadResult = cmd /c "reg unload $($rootKey)\broken$($hive)$($drive)" 2>&1
-                Log-Output "reg unload result: $unloadResult" | Tee-Object -FilePath $logFile -Append
+                Write-InfoLog "Unloading registry hive from $($drive)"
+                $unloadSuccess = $false
+                for ($attempt = 1; $attempt -le 3; $attempt++) {
+                    [gc]::Collect()
+                    $unloadResult = & reg.exe unload "$($rootKey)\broken$($hive)$($drive)" 2>&1 | Out-String
+                    $unloadExitCode = $LASTEXITCODE
+                    Write-OutputLog "reg unload attempt $attempt exit code: $unloadExitCode"
+                    Write-OutputLog "reg unload attempt $attempt output: $unloadResult"
+
+                    if ($unloadExitCode -eq 0) {
+                        $unloadSuccess = $true
+                        break
+                    }
+
+                    if ($attempt -lt 3) {
+                        Write-WarningLog "Unload attempt $attempt failed for drive $drive. Retrying."
+                    }
+                }
+
+                if (-not $unloadSuccess) {
+                    Write-ErrorLog "Failed to unload hive after retries for drive $drive"
+                    $failedCount++
+                    $script_final_status = $STATUS_ERROR
+                }
+
+                if ($restoreRequired -and $backupFile) {
+                    if ($unloadSuccess) {
+                        try {
+                            Copy-Item -LiteralPath $backupFile -Destination $hiveSourcePath -Force -ErrorAction Stop
+                            Write-WarningLog "Rollback applied from backup: $backupFile"
+                        }
+                        catch {
+                            Write-ErrorLog "Rollback failed for drive $drive using backup '$backupFile': $($_.Exception.Message)"
+                            $script_final_status = $STATUS_ERROR
+                        }
+                    }
+                    else {
+                        Write-ErrorLog "Rollback skipped because hive unload did not succeed for drive $drive"
+                    }
+                }
             }
         }
 
+        Write-InfoLog "Summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
+
         if ($script_final_status -ne $STATUS_SUCCESS) {
-            Log-Error "No registry modification was applied on any partition" | Tee-Object -FilePath $logFile -Append
+            Write-ErrorLog "No registry modification was applied on any partition"
         }
     }
 }
 catch {
-    Log-Error "An unexpected error occurred: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+    Write-ErrorLog "An unexpected error occurred: $($_.Exception.Message)"
     $script_final_status = $STATUS_ERROR
 }
 finally {
-    Log-Info "Script ended at $(Get-Date)" | Tee-Object -FilePath $logFile -Append
+    Write-InfoLog "Final status: $script_final_status"
+    Write-InfoLog "Script ended at $(Get-Date)"
+    Write-InfoLog "Log file path: $logFile"
 }
 
 return $script_final_status
