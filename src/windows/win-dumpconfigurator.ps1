@@ -523,6 +523,7 @@ try {
     }
     else {
         Log-Output "SUCCESS: Configuration applied immediately - NO REBOOT REQUIRED"
+        Log-Info "Desktop log file: $logFilePath"
         $script_final_status = $STATUS_SUCCESS
     }
 }
