@@ -103,19 +103,95 @@ bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
     The temporary letter is removed after processing.
 #>
 
-# Initialization
-. .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
+# Initialization (path-validated)
+$initPath = Join-Path $PSScriptRoot 'src\windows\common\setup\init.ps1'
+$diskPartitionsPath = Join-Path $PSScriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
 
-# Log Configuration
-$logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
-if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+if (-not (Test-Path -LiteralPath $initPath)) {
+    Write-Error "Required helper not found: $initPath"
+    return 1
+}
+
+. $initPath
+
+if (-not (Test-Path -LiteralPath $diskPartitionsPath)) {
+    Log-Error "Required helper not found: $diskPartitionsPath"
+    return $STATUS_ERROR
+}
+
+. $diskPartitionsPath
+
+# Log Configuration (desktop log standard)
+$desktopPath = [Environment]::GetFolderPath('Desktop')
+if ([string]::IsNullOrWhiteSpace($desktopPath)) {
+    $desktopPath = Join-Path $env:PUBLIC 'Desktop'
+}
+
+$logDir = Join-Path $desktopPath 'RepairLogs'
+if (-not (Test-Path -LiteralPath $logDir)) {
+    $null = New-Item -ItemType Directory -Path $logDir -Force
+}
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = "$logDir\sac-enabler_$timestamp.log"
+$logFile = Join-Path $logDir "sac-enabler_$timestamp.log"
+
+if (-not (Test-Path -LiteralPath $logFile)) {
+    $null = New-Item -Path $logFile -ItemType File -Force
+}
+
+function Write-DesktopLogLine {
+    param([string]$Message)
+
+    if ($null -ne $Message) {
+        Add-Content -LiteralPath $logFile -Value ("[{0}] {1}" -f (Get-Date -Format 's'), $Message)
+    }
+}
+
+$script:_origLogInfo = (Get-Command Log-Info -ErrorAction SilentlyContinue).ScriptBlock
+$script:_origLogWarning = (Get-Command Log-Warning -ErrorAction SilentlyContinue).ScriptBlock
+$script:_origLogError = (Get-Command Log-Error -ErrorAction SilentlyContinue).ScriptBlock
+$script:_origLogOutput = (Get-Command Log-Output -ErrorAction SilentlyContinue).ScriptBlock
+
+if ($script:_origLogInfo) {
+    function Log-Info {
+        param([string]$Message)
+        & $script:_origLogInfo $Message
+        Write-DesktopLogLine "[INFO] $Message"
+    }
+}
+
+if ($script:_origLogWarning) {
+    function Log-Warning {
+        param([string]$Message)
+        & $script:_origLogWarning $Message
+        Write-DesktopLogLine "[WARN] $Message"
+    }
+}
+
+if ($script:_origLogError) {
+    function Log-Error {
+        param([string]$Message)
+        & $script:_origLogError $Message
+        Write-DesktopLogLine "[ERROR] $Message"
+    }
+}
+
+if ($script:_origLogOutput) {
+    function Log-Output {
+        param([string]$Message)
+        & $script:_origLogOutput $Message
+        Write-DesktopLogLine "[OUTPUT] $Message"
+    }
+}
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
 $failureReason = 'Script could not find a valid OS disk to enable SAC.'
+$processedCount = 0
+$skippedCount = 0
+$failedCount = 0
+$changedCount = 0
+
+Log-Info "Starting SAC enabler. Desktop log: $logFile"
 
 try {
     # Check if the Hyper-V module is available before performing nested VM checks
@@ -123,29 +199,39 @@ try {
         $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
         if ($guestHyperVVirtualMachine) {
             if ($guestHyperVVirtualMachine.State -eq 'Running') {
-                Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)" | Tee-Object -FilePath $logFile -Append
+                Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
                 try {
                     Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                 }
                 catch {
-                    Log-Warning "Failed to stop nested guest VM, will continue but may have limited success" | Tee-Object -FilePath $logFile -Append
+                    Log-Warning "Failed to stop nested guest VM, will continue but may have limited success"
                 }
             }
         }
     } else {
-        Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation." | Tee-Object -FilePath $logFile -Append
+        Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
     }
 
     # Step 1 - Enumerate partitions to locate the BCD store and OS loader
     $partitionlist = Get-Disk-Partitions
     $rescueDrive = $env:SystemDrive -replace ':', ''
-    Log-Info 'Enumerating partitions to enable SAC...' | Tee-Object -FilePath $logFile -Append
+    Log-Info 'Enumerating partitions to enable SAC...'
 
     foreach ( $partitionGroup in $partitionlist | Group-Object DiskNumber )
     {
+        $processedCount++
+        $diskChanged = $false
+        $diskFailed = $false
+        $diskNumber = $partitionGroup.Name
         $isBcdPath = $false
         $bcdPath = ''
         $isOsPath = $false
+        $tempEfiLetter = $null
+        $tempEfiDiskNum = $null
+        $tempEfiPartNum = $null
+        Log-Info "Processing Disk $diskNumber"
+
+        try {
 
         # Scan each drive for BCD store and Windows OS loader
         ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter )
@@ -172,16 +258,13 @@ try {
         }
 
         # Gen2 EFI fallback: if OS found but no BCD, discover unlettered EFI partition
-        $tempEfiLetter = $null
-        $tempEfiDiskNum = $null
-        $tempEfiPartNum = $null
         if (-not $isBcdPath -and $isOsPath)
         {
             $diskNum = [int]$partitionGroup.Name
             $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
             if ($diskNum -ne $rescueDiskNum)
             {
-                Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..." | Tee-Object -FilePath $logFile -Append
+                Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..."
                 $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
                 $efiParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
                     $_.GptType -eq $efiGptType -and (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0)
@@ -200,15 +283,16 @@ try {
                         foreach ($ep in $efiParts)
                         {
                             $pn = $ep.PartitionNumber
-                            Log-Info "Assigning temp letter ${tempLetter}: to Disk $diskNum Partition $pn (EFI)..." | Tee-Object -FilePath $logFile -Append
+                            Log-Info "Assigning temp letter ${tempLetter}: to Disk $diskNum Partition $pn (EFI)..."
                             $dpLines = @("select disk $diskNum", "select partition $pn", "assign letter=$tempLetter")
-                            $dpLines | diskpart | Out-Null
+                            $dpAssignOut = $dpLines | diskpart 2>&1
+                            foreach ($line in @($dpAssignOut)) { if ($line) { Log-Output "[diskpart][assign] $line" } }
                             Start-Sleep -Seconds 2
                             $bcdPath = "${tempLetter}:\efi\microsoft\boot\bcd"
                             $isBcdPath = Test-Path $bcdPath
                             if ($isBcdPath)
                             {
-                                Log-Info "Found Gen2 BCD store at $bcdPath" | Tee-Object -FilePath $logFile -Append
+                                Log-Info "Found Gen2 BCD store at $bcdPath"
                                 $tempEfiLetter = $tempLetter
                                 $tempEfiDiskNum = $diskNum
                                 $tempEfiPartNum = $pn
@@ -216,15 +300,16 @@ try {
                             }
                             else
                             {
-                                Log-Info "No BCD at $bcdPath, removing letter..." | Tee-Object -FilePath $logFile -Append
+                                Log-Info "No BCD at $bcdPath, removing letter..."
                                 $dpRemove = @("select disk $diskNum", "select partition $pn", "remove letter=$tempLetter")
-                                $dpRemove | diskpart | Out-Null
+                                $dpRemoveOut = $dpRemove | diskpart 2>&1
+                                foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
                             }
                         }
                     }
                     else
                     {
-                        Log-Warning "No available drive letter for EFI partition on Disk $diskNum" | Tee-Object -FilePath $logFile -Append
+                        Log-Warning "No available drive letter for EFI partition on Disk $diskNum"
                     }
                 }
             }
@@ -240,59 +325,93 @@ try {
             if (-not $defaultLine)
             {
                 $failureReason = "Could not locate a displayorder entry in boot manager output for $bcdPath."
-                Log-Warning "Could not locate a displayorder entry in boot manager output for $bcdPath. Unable to determine the default boot entry." | Tee-Object -FilePath $logFile -Append
+                Log-Warning "Could not locate a displayorder entry in boot manager output for $bcdPath. Unable to determine the default boot entry."
+                $diskFailed = $true
             }
             elseif ($defaultLine -match '\{([^}]+)\}') {
                 $defaultId = $matches[0]
 
                 # Step 3 - Log BCD configuration before changes
-                Log-Output "--- BCD BEFORE SAC ENABLE ---" | Tee-Object -FilePath $logFile -Append
+                Log-Output "--- BCD BEFORE SAC ENABLE ---"
                 $beforeBcd = bcdedit /store $bcdPath /enum $defaultId
-                foreach ($line in $beforeBcd) { if ($line.Trim()) { Log-Output $line | Tee-Object -FilePath $logFile -Append } }
+                foreach ($line in $beforeBcd) { if ($line.Trim()) { Log-Output $line } }
 
                 # Steps 4-7 - Enable boot menu, Boot EMS, EMS on OS entry, and EMS serial settings
-                Log-Info "Applying SAC and EMS configurations..." | Tee-Object -FilePath $logFile -Append
-                bcdedit /store $bcdPath /set "{bootmgr}" displaybootmenu yes | Out-Null
-                bcdedit /store $bcdPath /set "{bootmgr}" timeout 5 | Out-Null
-                bcdedit /store $bcdPath /set "{bootmgr}" bootems yes | Out-Null
-                bcdedit /store $bcdPath /ems $defaultId ON | Out-Null
-                $res = bcdedit /store $bcdPath /emssettings EMSPORT:1 EMSBAUDRATE:115200
+                Log-Info "Applying SAC and EMS configurations..."
+                $setBootMenuOut = bcdedit /store $bcdPath /set "{bootmgr}" displaybootmenu yes 2>&1
+                foreach ($line in @($setBootMenuOut)) { if ($line) { Log-Output "[bcdedit][displaybootmenu] $line" } }
 
-                Log-Output "Result: $res" | Tee-Object -FilePath $logFile -Append
+                $setTimeoutOut = bcdedit /store $bcdPath /set "{bootmgr}" timeout 5 2>&1
+                foreach ($line in @($setTimeoutOut)) { if ($line) { Log-Output "[bcdedit][timeout] $line" } }
+
+                $setBootEmsOut = bcdedit /store $bcdPath /set "{bootmgr}" bootems yes 2>&1
+                foreach ($line in @($setBootEmsOut)) { if ($line) { Log-Output "[bcdedit][bootems] $line" } }
+
+                $setEmsOut = bcdedit /store $bcdPath /ems $defaultId ON 2>&1
+                foreach ($line in @($setEmsOut)) { if ($line) { Log-Output "[bcdedit][ems] $line" } }
+
+                $setEmsSettingsOut = bcdedit /store $bcdPath /emssettings EMSPORT:1 EMSBAUDRATE:115200 2>&1
+                foreach ($line in @($setEmsSettingsOut)) { if ($line) { Log-Output "[bcdedit][emssettings] $line" } }
 
                 # Step 8 - Log BCD configuration after changes for verification
-                Log-Output "--- BCD AFTER SAC ENABLE ---" | Tee-Object -FilePath $logFile -Append
+                Log-Output "--- BCD AFTER SAC ENABLE ---"
                 $afterBcd = bcdedit /store $bcdPath /enum $defaultId
-                foreach ($line in $afterBcd) { if ($line.Trim()) { Log-Output $line | Tee-Object -FilePath $logFile -Append } }
+                foreach ($line in $afterBcd) { if ($line.Trim()) { Log-Output $line } }
                 
                 $script_final_status = $STATUS_SUCCESS
+                $diskChanged = $true
             }
             else
             {
                 $failureReason = "Displayorder entry was found but no boot entry GUID could be parsed for $bcdPath."
-                Log-Warning "Displayorder entry was found but no boot entry GUID could be parsed for $bcdPath. Raw line: $($defaultLine.Line)" | Tee-Object -FilePath $logFile -Append
+                Log-Warning "Displayorder entry was found but no boot entry GUID could be parsed for $bcdPath. Raw line: $($defaultLine.Line)"
+                $diskFailed = $true
             }
         }
+        else {
+            Log-Info "Disk $diskNumber skipped: no valid BCD + OS loader combination was found."
+        }
+        }
+        catch {
+            $diskFailed = $true
+            $failureReason = "Disk $diskNumber failed with exception: $($_.Exception.Message)"
+            Log-Error $failureReason
+            if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+                Log-Error "Disk $diskNumber failure context: $($_.InvocationInfo.PositionMessage)"
+            }
+        }
+        finally {
 
         # Clean up temporary EFI drive letter if one was assigned
         if ($tempEfiLetter)
         {
-            Log-Info "Removing temp letter ${tempEfiLetter}: from Disk $tempEfiDiskNum Partition $tempEfiPartNum" | Tee-Object -FilePath $logFile -Append
+            Log-Info "Removing temp letter ${tempEfiLetter}: from Disk $tempEfiDiskNum Partition $tempEfiPartNum"
             $dpClean = @("select disk $tempEfiDiskNum", "select partition $tempEfiPartNum", "remove letter=$tempEfiLetter")
-            $dpClean | diskpart | Out-Null
+            $dpCleanOut = $dpClean | diskpart 2>&1
+            foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][cleanup] $line" } }
+        }
+
+        if ($diskChanged) { $changedCount++ }
+        elseif ($diskFailed) { $failedCount++ }
+        else { $skippedCount++ }
         }
     }
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
-        Log-Error "FAILED: $failureReason" | Tee-Object -FilePath $logFile -Append
+        Log-Error "FAILED: $failureReason"
     }
 }
 catch {
-    Log-Error "An error occurred: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+    Log-Error "An error occurred: $($_.Exception.Message)"
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Log-Error "Failure context: $($_.InvocationInfo.PositionMessage)"
+    }
     $script_final_status = $STATUS_ERROR
 }
 finally {
-    Log-Info "Script ended at $(Get-Date)" | Tee-Object -FilePath $logFile -Append
+    Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
+    Log-Info "Desktop log file: $logFile"
+    Log-Info "Script ended at $(Get-Date)"
 }
 
 return $script_final_status
