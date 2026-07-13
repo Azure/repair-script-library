@@ -19,6 +19,12 @@
     Author:  Tony.Mocanu@Microsoft.com
 
 .VERSION
+    v1.4: [Jul 2026] - Production hardening update
+                       - Added helper path validation before dot-sourcing.
+                       - Switched to desktop log file with explicit startup/completion log path.
+                       - Captured critical reg.exe command outputs (no Out-Null suppression).
+                       - Added SYSTEM hive backup + rollback-on-failure behavior.
+                       - Added processed/skipped/failed/changed summary counters.
     v1.3: [May 2026] - Updated the script (current)
                        - Added LKGC_APPLIED log flag (per disk + overall) and corrected final summary message.
     v1.2: [May 2026] - Updated the script
@@ -33,23 +39,79 @@
 #>
 
 # Initialization
-. .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
+$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$initScriptPath = Join-Path $scriptRoot 'src\windows\common\setup\init.ps1'
+$diskPartitionsHelperPath = Join-Path $scriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
+
+if (-not (Test-Path -LiteralPath $initScriptPath)) {
+    Write-Error "Required helper missing: $initScriptPath"
+    return 1
+}
+if (-not (Test-Path -LiteralPath $diskPartitionsHelperPath)) {
+    Write-Error "Required helper missing: $diskPartitionsHelperPath"
+    return 1
+}
+
+. $initScriptPath
+. $diskPartitionsHelperPath
 
 # Log Configuration
-$logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
-if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = "$logDir\LKGC_$timestamp.log"
+$desktopPath = [Environment]::GetFolderPath('Desktop')
+if ([string]::IsNullOrWhiteSpace($desktopPath) -or -not (Test-Path -LiteralPath $desktopPath)) {
+    $desktopPath = 'C:\Users\Public\Desktop'
+    if (-not (Test-Path -LiteralPath $desktopPath)) {
+        $null = New-Item -ItemType Directory -Path $desktopPath -Force
+    }
+}
+
+$desktopLogFile = Join-Path $desktopPath "LKGC_$timestamp.log"
+
+$pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension'
+if (-not (Test-Path -LiteralPath $pluginLogDir)) {
+    $null = New-Item -ItemType Directory -Path $pluginLogDir -Force
+}
+$pluginLogFile = Join-Path $pluginLogDir "LKGC_$timestamp.log"
+
+function Write-RepairLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Info', 'Warning', 'Error', 'Output')]
+        [string]$Level,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    switch ($Level) {
+        'Info'    { Log-Info $Message }
+        'Warning' { Log-Warning $Message }
+        'Error'   { Log-Error $Message }
+        'Output'  { Log-Output $Message }
+    }
+
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+    Add-Content -LiteralPath $desktopLogFile -Value $line
+
+    if ($pluginLogFile -ne $desktopLogFile) {
+        Add-Content -LiteralPath $pluginLogFile -Value $line
+    }
+}
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
 
 # NEW: Track whether LKGC was actually applied anywhere
 $lkgcAppliedAny = $false
+$processedCount = 0
+$skippedCount = 0
+$failedCount = 0
+$changedCount = 0
 
 try {
-    Log-Info "Starting AUTO LKGC Script..." | Tee-Object -FilePath $logFile -Append
+    Write-RepairLog -Level Info -Message "Starting AUTO LKGC Script..."
+    Write-RepairLog -Level Info -Message "Desktop log file path: $desktopLogFile"
+    Write-RepairLog -Level Info -Message "Plugin log file path: $pluginLogFile"
 
     # Stop nested guest VM if running
     # Guard Get-VM if Hyper-V module is not available
@@ -58,21 +120,21 @@ try {
             $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
             if ($guestHyperVVirtualMachine) {
                 if ($guestHyperVVirtualMachine.State -eq 'Running') {
-                    Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)" | Tee-Object -FilePath $logFile -Append
+                    Write-RepairLog -Level Info -Message "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
                     try {
                         Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                     }
                     catch {
-                        Log-Warning "Failed to stop nested guest VM, will continue but may have limited success" | Tee-Object -FilePath $logFile -Append
+                        Write-RepairLog -Level Warning -Message "Failed to stop nested guest VM, will continue but may have limited success"
                     }
                 }
             }
         } else {
-            Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation." | Tee-Object -FilePath $logFile -Append
+            Write-RepairLog -Level Info -Message "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
         }
     }
     catch {
-        Log-Warning "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        Write-RepairLog -Level Warning -Message "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)"
     }
 
     # Step 1 - Enumerate partitions to locate the faulty OS drive(s)
@@ -81,25 +143,48 @@ try {
     $fixedDisks = @()
 
     foreach ($partition in $partitionlist) {
-        if (-not $partition.DriveLetter) { continue }
-
-        # Skip the rescue VM's own OS drive (its hives are locked by the running OS)
-        if ($partition.DriveLetter -eq $rescueDrive) {
-            Log-Info "Skipping rescue VM system drive $rescueDrive (own OS)" | Tee-Object -FilePath $logFile -Append
+        if (-not $partition.DriveLetter) {
+            $skippedCount++
             continue
         }
 
-        if (-not (Test-Path -Path "$($partition.DriveLetter):\Windows")) { continue }
+        # Skip the rescue VM's own OS drive (its hives are locked by the running OS)
+        if ($partition.DriveLetter -eq $rescueDrive) {
+            Write-RepairLog -Level Info -Message "Skipping rescue VM system drive $rescueDrive (own OS)"
+            $skippedCount++
+            continue
+        }
+
+        if (-not (Test-Path -Path "$($partition.DriveLetter):\Windows")) {
+            $skippedCount++
+            continue
+        }
 
         $diskb = $partition.DriveLetter
-        Log-Info "Target OS disk found on letter: $($diskb):" | Tee-Object -FilePath $logFile -Append
+        $processedCount++
+        Write-RepairLog -Level Info -Message "Target OS disk found on letter: $($diskb):"
+
+        $systemHivePath = "$($diskb):\Windows\System32\config\SYSTEM"
+        $systemHiveBackup = "$systemHivePath.LKGC.bak.$timestamp"
+        try {
+            Copy-Item -LiteralPath $systemHivePath -Destination $systemHiveBackup -Force -ErrorAction Stop
+            Write-RepairLog -Level Info -Message "[$diskb] SYSTEM hive backup created: $systemHiveBackup"
+        }
+        catch {
+            $failedCount++
+            Write-RepairLog -Level Error -Message "[$diskb] Failed to create SYSTEM hive backup. Skipping disk. Error: $($_.Exception.Message)"
+            continue
+        }
 
         # Step 2 - Load the SOFTWARE hive to detect the Windows version
         $swHive = "HKLM\BROKENSW_$diskb"
-        & reg.exe unload $swHive 2>$null
+        $swPreUnload = & reg.exe unload $swHive 2>&1
+        Write-RepairLog -Level Info -Message "[$diskb] Pre-load SOFTWARE unload output: $($swPreUnload -join ' | ')"
         $swLoad = & reg.exe load $swHive "$($diskb):\Windows\System32\config\software" 2>&1
+        Write-RepairLog -Level Info -Message "[$diskb] SOFTWARE load output: $($swLoad -join ' | ')"
         if ($LASTEXITCODE -ne 0) {
-            Log-Warning "Failed to load SOFTWARE hive from $($diskb): $swLoad - skipping" | Tee-Object -FilePath $logFile -Append
+            $failedCount++
+            Write-RepairLog -Level Warning -Message "Failed to load SOFTWARE hive from $($diskb): $($swLoad -join ' | ') - skipping"
             continue
         }
 
@@ -107,28 +192,32 @@ try {
         $productName = (Get-ItemProperty -path "registry::$swHive\microsoft\windows nt\currentversion" -ErrorAction SilentlyContinue).ProductName
         $winosver = 0
         if ($productName -match '(\d+)') { $winosver = [int]$matches[1] }
-        & reg.exe unload $swHive 2>$null
+        $swUnload = & reg.exe unload $swHive 2>&1
+        Write-RepairLog -Level Info -Message "[$diskb] SOFTWARE unload output: $($swUnload -join ' | ')"
 
         # Step 3 - Load the SYSTEM hive from the target disk
         $sysHive = "HKLM\BROKENSYS_$diskb"
-        & reg.exe unload $sysHive 2>$null
-        Log-Info "Loading System hive from $($diskb): as $sysHive..." | Tee-Object -FilePath $logFile -Append
+        $sysPreUnload = & reg.exe unload $sysHive 2>&1
+        Write-RepairLog -Level Info -Message "[$diskb] Pre-load SYSTEM unload output: $($sysPreUnload -join ' | ')"
+        Write-RepairLog -Level Info -Message "Loading System hive from $($diskb): as $sysHive..."
         $sysLoad = & reg.exe load $sysHive "$($diskb):\Windows\System32\config\SYSTEM" 2>&1
+        Write-RepairLog -Level Info -Message "[$diskb] SYSTEM load output: $($sysLoad -join ' | ')"
         if ($LASTEXITCODE -ne 0) {
-            Log-Warning "Failed to load SYSTEM hive from $($diskb): $sysLoad - skipping" | Tee-Object -FilePath $logFile -Append
+            $failedCount++
+            Write-RepairLog -Level Warning -Message "Failed to load SYSTEM hive from $($diskb): $($sysLoad -join ' | ') - skipping"
             continue
         }
 
         Start-Sleep -Seconds 2
 
-        # NEW: per-disk flag
-        $lkgcAppliedThisDisk = $false
+        $writeAttempted = $false
+        $restoreRequired = $false
 
         try {
             # Step 4 - Read the current Select key values (BEFORE state)
             $selectPath = "Registry::$sysHive\Select"
             $before = Get-ItemProperty -path $selectPath
-            Log-Info "[$diskb] REGISTRY STATE [BEFORE]: Current=$($before.current), Default=$($before.default), Failed=$($before.failed), LKG=$($before.LastKnownGood)" | Tee-Object -FilePath $logFile -Append
+            Write-RepairLog -Level Info -Message "[$diskb] REGISTRY STATE [BEFORE]: Current=$($before.current), Default=$($before.default), Failed=$($before.failed), LKG=$($before.LastKnownGood)"
 
             # Step 5 - Check whether LKGC has already been applied (version-specific thresholds)
             # FIXED: Require ALL conditions (AND) so we don't skip incorrectly.
@@ -151,12 +240,13 @@ try {
             }
 
             if ($alreadySet) {
-                Log-Warning "[$diskb] LKGC WAS ALREADY SET, NO CHANGES DONE" | Tee-Object -FilePath $logFile -Append
-                Log-Info "[$diskb] LKGC_APPLIED=false" | Tee-Object -FilePath $logFile -Append
+                Write-RepairLog -Level Warning -Message "[$diskb] LKGC WAS ALREADY SET, NO CHANGES DONE"
+                Write-RepairLog -Level Info -Message "[$diskb] LKGC_APPLIED=false"
             }
             else {
                 # Step 6 - Increment all four Select values by 1 to trigger LKGC on next boot
-                Log-Info "[$diskb] Applying LKGC increments..." | Tee-Object -FilePath $logFile -Append
+                Write-RepairLog -Level Info -Message "[$diskb] Applying LKGC increments..."
+                $writeAttempted = $true
                 Set-Itemproperty -path $selectPath -Name 'current' -Type DWORD -value ($before.current + 1)
                 Set-Itemproperty -path $selectPath -Name 'default' -Type DWORD -value ($before.default + 1)
                 Set-Itemproperty -path $selectPath -Name 'failed' -Type DWORD -value ($before.failed + 1)
@@ -164,19 +254,23 @@ try {
 
                 # Step 7 - Log the BEFORE and AFTER registry states for verification
                 $after = Get-ItemProperty -path $selectPath
-                Log-Info "[$diskb] REGISTRY STATE [AFTER]:  Current=$($after.current), Default=$($after.default), Failed=$($after.failed), LKG=$($after.LastKnownGood)" | Tee-Object -FilePath $logFile -Append
+                Write-RepairLog -Level Info -Message "[$diskb] REGISTRY STATE [AFTER]: Current=$($after.current), Default=$($after.default), Failed=$($after.failed), LKG=$($after.LastKnownGood)"
 
                 # NEW: mark applied
-                $lkgcAppliedThisDisk = $true
                 $lkgcAppliedAny = $true
-                Log-Info "[$diskb] LKGC_APPLIED=true" | Tee-Object -FilePath $logFile -Append
+                $changedCount++
+                Write-RepairLog -Level Info -Message "[$diskb] LKGC_APPLIED=true"
             }
 
             $fixedDisks += $diskb
         }
         catch {
-            Log-Error "[$diskb] Failed to process: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
-            Log-Info "[$diskb] LKGC_APPLIED=false" | Tee-Object -FilePath $logFile -Append
+            $failedCount++
+            if ($writeAttempted) {
+                $restoreRequired = $true
+            }
+            Write-RepairLog -Level Error -Message "[$diskb] Failed to process: $($_.Exception.Message)"
+            Write-RepairLog -Level Info -Message "[$diskb] LKGC_APPLIED=false"
         }
         finally {
             # Step 8 - Unload the registry hive cleanly
@@ -186,24 +280,36 @@ try {
 
             $unloaded = $false
             for ($i=1; $i -le 3; $i++) {
-                & reg.exe unload $sysHive 2>&1 | Out-Null
+                $unloadOutput = & reg.exe unload $sysHive 2>&1
+                Write-RepairLog -Level Info -Message "[$diskb] SYSTEM unload attempt $i output: $($unloadOutput -join ' | ')"
                 if ($LASTEXITCODE -eq 0) { $unloaded = $true; break }
-                Log-Warning "Unload attempt $i for $sysHive failed, retrying..." | Tee-Object -FilePath $logFile -Append
+                Write-RepairLog -Level Warning -Message "Unload attempt $i for $sysHive failed, retrying..."
                 Start-Sleep -Seconds 5
             }
             if (-not $unloaded) {
-                Log-Warning "Could not unload $sysHive hive - may need manual cleanup" | Tee-Object -FilePath $logFile -Append
+                Write-RepairLog -Level Warning -Message "Could not unload $sysHive hive - may need manual cleanup"
+            }
+
+            if ($restoreRequired) {
+                try {
+                    Copy-Item -LiteralPath $systemHiveBackup -Destination $systemHivePath -Force -ErrorAction Stop
+                    Write-RepairLog -Level Warning -Message "[$diskb] Restored SYSTEM hive from backup due to failure: $systemHiveBackup"
+                }
+                catch {
+                    Write-RepairLog -Level Error -Message "[$diskb] Failed to restore SYSTEM hive backup. Manual recovery may be required. Error: $($_.Exception.Message)"
+                }
             }
         }
     }
 
-    if ($fixedDisks.Count -gt 0) {
+    if ($processedCount -gt 0) {
         # NEW: final summary reflects whether changes were applied
         if ($lkgcAppliedAny) {
-            Log-Output "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE, LKGC APPLIED on drives: $($fixedDisks -join ', ')" | Tee-Object -FilePath $logFile -Append
+            Write-RepairLog -Level Output -Message "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE, LKGC APPLIED on drives: $($fixedDisks -join ', ')"
         } else {
-            Log-Output "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=FALSE (NO CHANGES REQUIRED), drives processed: $($fixedDisks -join ', ')" | Tee-Object -FilePath $logFile -Append
+            Write-RepairLog -Level Output -Message "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=FALSE (NO CHANGES REQUIRED), drives processed: $($fixedDisks -join ', ')"
         }
+        Write-RepairLog -Level Output -Message "SUMMARY: processed=$processedCount, skipped=$skippedCount, failed=$failedCount, changed=$changedCount"
         $script_final_status = $STATUS_SUCCESS
     }
     else {
@@ -211,11 +317,12 @@ try {
     }
 }
 catch {
-    Log-Error "An unexpected error occurred: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+    Write-RepairLog -Level Error -Message "An unexpected error occurred: $($_.Exception.Message)"
     $script_final_status = $STATUS_ERROR
 }
 finally {
-    Log-Info "Script execution ended at $(Get-Date)" | Tee-Object -FilePath $logFile -Append
+    Write-RepairLog -Level Info -Message "Script execution ended at $(Get-Date)"
+    Write-RepairLog -Level Info -Message "Desktop log file saved at: $desktopLogFile"
 }
 
 return $script_final_status
