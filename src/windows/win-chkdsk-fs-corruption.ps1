@@ -57,8 +57,19 @@ fsutil dirty query F:
 #>
 
 # Initialization
-. .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
+$initPath = Join-Path $PSScriptRoot "src\windows\common\setup\init.ps1"
+if (-not (Test-Path $initPath)) {
+    Write-Error "Required helper not found: $initPath"
+    return 1
+}
+. $initPath
+
+$partitionsHelperPath = Join-Path $PSScriptRoot "src\windows\common\helpers\Get-Disk-Partitions-v2.ps1"
+if (-not (Test-Path $partitionsHelperPath)) {
+    Log-Error "Required helper not found: $partitionsHelperPath"
+    return $STATUS_ERROR
+}
+. $partitionsHelperPath
 
 # Log Configuration
 $logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
@@ -97,23 +108,36 @@ try {
     $partitionlist = Get-Disk-Partitions
     $rescueDrive = $env:SystemDrive -replace ':', ''
 
+    $processedCount = 0
+    $skippedCount   = 0
+    $fixedCount     = 0
+    $failedCount    = 0
+
     if ($null -eq $partitionlist -or $partitionlist.Count -eq 0) {
         Log-Warning "No partitions found to check."
     }
     else {
         foreach ($partition in $partitionlist) {
-            if ($partition -and $partition.DriveLetter) {
-                # Skip the rescue VM's own OS drive
-                if ($partition.DriveLetter -eq $rescueDrive) {
-                    Log-Info "Skipping rescue VM system drive $rescueDrive (own OS)"
-                    continue
-                }
+            if (-not ($partition -and $partition.DriveLetter)) {
+                $skippedCount++
+                continue
+            }
 
+            # Skip the rescue VM's own OS drive
+            if ($partition.DriveLetter -eq $rescueDrive) {
+                Log-Info "Skipping rescue VM system drive $rescueDrive (own OS)"
+                $skippedCount++
+                continue
+            }
+
+            $letter = 'unknown'
+            try {
                 # Format drive letter with colon (Get-Disk-Partitions returns single character)
                 $letter = "$($partition.DriveLetter):"
-                
+                $processedCount++
+
                 Log-Info "Checking drive: $letter"
-                
+
                 # Step 2 - Query the NTFS dirty bit using fsutil
                 $dirtyFlag = fsutil dirty query $letter
                 Log-Output "FSUTIL Output: $dirtyFlag"
@@ -121,7 +145,7 @@ try {
                 # Step 3 - If dirty bit is set, run chkdsk /f to repair file system errors
                 if ($dirtyFlag -notmatch "NOT Dirty") {
                     Log-Warning "$letter dirty bit set -> running chkdsk /f"
-                    
+
                     # Capture all chkdsk output
                     $chkdskResults = chkdsk $letter /f 2>&1
                     $chkdskExitCode = $LASTEXITCODE
@@ -130,6 +154,10 @@ try {
                     if ($chkdskExitCode -eq 3) {
                         Log-Error "CHKDSK reported unfixable corruption on $letter (exit code 3) - disk may require replacement"
                         $script_final_status = $STATUS_ERROR
+                        $failedCount++
+                    }
+                    else {
+                        $fixedCount++
                     }
 
                     # Write full output to log file only (not stdout) for detailed review
@@ -168,9 +196,14 @@ try {
                     Log-Info "$letter dirty bit not set -> skipping"
                 }
             }
+            catch {
+                Log-Error "Failed processing partition $letter : $($_.Exception.Message)"
+                $script_final_status = $STATUS_ERROR
+                $failedCount++
+            }
         }
     }
-    Log-Info "All partitions processed successfully."
+    Log-Info "Partition summary: Processed=$processedCount Skipped=$skippedCount Fixed=$fixedCount Failed=$failedCount"
 }
 catch {
     Log-Error "An error occurred: $($_.Exception.Message)"
