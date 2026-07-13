@@ -53,7 +53,7 @@ Get-ChildItem F:\WindowsAzure\GuestAgent_* | Rename-Item -NewName { $_.Name + '_
 
 .VERIFICATION
     1. Check the log file for success:
-Get-ChildItem "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension\GA_offlinefixer_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
+Get-ChildItem "$env:USERPROFILE\Desktop\GA_offlinefixer_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
     Expected: "VMAgent Fix completed and verified successfully." and return code 0 ($STATUS_SUCCESS).
     2. Reload the SYSTEM hive and verify agent service keys exist (replace F with disk letter):
 reg load HKLM\VERIFY F:\Windows\System32\config\SYSTEM
@@ -67,18 +67,56 @@ Get-ChildItem F:\WindowsAzure\GuestAgent_*
 #>
 
 # Initialization
-. .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
+$initScriptPath = Join-Path $PSScriptRoot "src\windows\common\setup\init.ps1"
+$diskHelperPath = Join-Path $PSScriptRoot "src\windows\common\helpers\Get-Disk-Partitions-v2.ps1"
+
+if (-not (Test-Path -Path $initScriptPath)) {
+    Write-Error "Required helper script not found: $initScriptPath"
+    return 1
+}
+if (-not (Test-Path -Path $diskHelperPath)) {
+    Write-Error "Required helper script not found: $diskHelperPath"
+    return 1
+}
+
+. $initScriptPath
+. $diskHelperPath
 
 # Log Configuration
-$logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
+$logDir = [Environment]::GetFolderPath('Desktop')
 if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$logDir\GA_offlinefixer_$timestamp.log"
 
+function Invoke-CriticalCommand {
+    param(
+        [Parameter(Mandatory=$true)][string]$Command,
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][string]$Description
+    )
+
+    $output = & $Command @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+
+    if ($output) {
+        foreach ($line in @($output)) {
+            Log-Info "$Description :: $line"
+        }
+    }
+
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output = @($output)
+    }
+}
+
 # Status Tracking
 $script_final_status = $STATUS_ERROR
 $serviceStates = @{}  # Track original service states for restoration
+$processedCount = 0
+$skippedCount = 0
+$failedCount = 0
+$changedCount = 0
 
 # VM Metadata Capture for Telemetry
 $vmMetadata = @{
@@ -91,13 +129,13 @@ $vmMetadata = @{
 try {
     # Capture OS version from rescue VM
     try {
-        $osInfo = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
         if ($osInfo) {
             $vmMetadata.OSVersion = "$($osInfo.Caption) $($osInfo.Version)"
         }
     }
     catch {
-        # Silent fail - metadata is optional
+        Log-Warning "OS metadata discovery failed: $($_.Exception.Message)"
     }
 
     # Attempt to capture Azure VM metadata from Instance Metadata Service
@@ -111,7 +149,7 @@ try {
         }
     }
     catch {
-        # Silent fail - metadata is optional, may not be available in all environments
+        Log-Warning "Instance metadata discovery failed: $($_.Exception.Message)"
     }
 
     # Create metadata context string for logging
@@ -121,8 +159,8 @@ try {
     if ($vmMetadata.OSVersion) { $metadataContext += " OS:$($vmMetadata.OSVersion)" }
     $metadataContext += "]"
 
-    Log-Info "Starting VMAgent Offline Fixer... $metadataContext" | Tee-Object -FilePath $logFile -Append
-
+    Log-Info "Starting VMAgent Offline Fixer... $metadataContext"
+    Log-Info "Desktop log file path: $logFile"
     # Stop nested guest VM if running
     # Guard Get-VM if Hyper-V module is not available
     try {
@@ -130,25 +168,25 @@ try {
             $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
             if ($guestHyperVVirtualMachine) {
                 if ($guestHyperVVirtualMachine.State -eq 'Running') {
-                    Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)" | Tee-Object -FilePath $logFile -Append
+                    Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
                     try {
                         Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                     }
                     catch {
-                        Log-Warning "Failed to stop nested guest VM, will continue but may have limited success" | Tee-Object -FilePath $logFile -Append
+                        Log-Warning "Failed to stop nested guest VM, will continue but may have limited success"
                     }
                 }
             }
         } else {
-            Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation." | Tee-Object -FilePath $logFile -Append
+            Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
         }
     }
     catch {
-        Log-Warning "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        Log-Warning "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)"
     }
 
     # Clean up stale hive mounts from previous failed runs
-    Log-Info "Cleaning up any stale registry hive mounts..." | Tee-Object -FilePath $logFile -Append
+    Log-Info "Cleaning up any stale registry hive mounts..."
     foreach ($staleKey in @("BROKENSYSTEM", "BROKENSW")) {
         & reg.exe unload "HKLM\$staleKey" 2>$null
         & reg.exe unload "HKU\$staleKey" 2>$null
@@ -163,22 +201,22 @@ try {
     # Log any externally loaded hives (diagnostic)
     $hklmKeys = & reg.exe query HKLM 2>$null | Where-Object { $_ -match 'BROKEN|OFFLINE|SYSTEM_' }
     $hkuKeys = & reg.exe query HKU 2>$null | Where-Object { $_ -match 'BROKEN|OFFLINE|SYSTEM_' }
-    if ($hklmKeys) { Log-Info "Loaded HKLM hives: $($hklmKeys -join ', ')" | Tee-Object -FilePath $logFile -Append }
-    if ($hkuKeys) { Log-Info "Loaded HKU hives: $($hkuKeys -join ', ')" | Tee-Object -FilePath $logFile -Append }
+    if ($hklmKeys) { Log-Info "Loaded HKLM hives: $($hklmKeys -join ', ')" }
+    if ($hkuKeys) { Log-Info "Loaded HKU hives: $($hkuKeys -join ', ')" }
 
     # Stop services that scan/index attached disks and lock hive files
-    Log-Info "Stopping services that may lock disk files..." | Tee-Object -FilePath $logFile -Append
+    Log-Info "Stopping services that may lock disk files..."
     foreach ($svc in @('WSearch', 'WinDefend')) {
         try {
             $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
             if ($svcObj) {
                 $serviceStates[$svc] = $svcObj.Status
-                Log-Info "Captured original state of $svc : $($svcObj.Status)" | Tee-Object -FilePath $logFile -Append
+                Log-Info "Captured original state of $svc : $($svcObj.Status)"
                 Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
             }
         }
         catch {
-            Log-Warning "Failed to capture state of $svc : $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+            Log-Warning "Failed to capture state of $svc : $($_.Exception.Message)"
         }
     }
 
@@ -186,11 +224,11 @@ try {
     [System.GC]::WaitForPendingFinalizers()
 
     # Cycle non-system disks offline/online to release ALL file handles
-    Log-Info "Cycling attached disks offline/online to release file locks..." | Tee-Object -FilePath $logFile -Append
+    Log-Info "Cycling attached disks offline/online to release file locks..."
     $rescueDiskNum = (Get-Partition -DriveLetter ($env:SystemDrive -replace ':', '') -ErrorAction SilentlyContinue).DiskNumber
     Get-Disk | Where-Object { $_.Number -ne $rescueDiskNum -and $_.OperationalStatus -eq 'Online' } | ForEach-Object {
         $dnum = $_.Number
-        Log-Info "Cycling disk $dnum offline/online..." | Tee-Object -FilePath $logFile -Append
+        Log-Info "Cycling disk $dnum offline/online..."
         Set-Disk -Number $dnum -IsOffline $true -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         Set-Disk -Number $dnum -IsOffline $false -ErrorAction SilentlyContinue
@@ -205,17 +243,18 @@ try {
     $failedDisks = @()  # Track disks that failed copy-back
 
     foreach ($partition in $partitionlist) {
-        if (-not $partition.DriveLetter) { continue }
+        $processedCount++
+        if (-not $partition.DriveLetter) { $skippedCount++; continue }
         # Skip the rescue VM's own OS drive (its hives are locked by the running OS)
         if ($partition.DriveLetter -eq $rescueDrive) {
-            Log-Info "Skipping rescue VM system drive $rescueDrive (own OS)" | Tee-Object -FilePath $logFile -Append
+            Log-Info "Skipping rescue VM system drive $rescueDrive (own OS)"
+            $skippedCount++
             continue
         }
-        if (-not (Test-Path -Path "$($partition.DriveLetter):\Windows")) { continue }
+        if (-not (Test-Path -Path "$($partition.DriveLetter):\Windows")) { $skippedCount++; continue }
 
         $diskb = $partition.DriveLetter
-        Log-Info "Target OS disk found on letter: $($diskb):" | Tee-Object -FilePath $logFile -Append
-
+        Log-Info "Target OS disk found on letter: $($diskb):"
         # Step 2 - Load the SYSTEM registry hive from the target disk
         $hiveName = "BROKENSYSTEM_$diskb"
         $hiveSource = "$($diskb):\Windows\System32\config\SYSTEM"
@@ -224,11 +263,11 @@ try {
         & reg.exe unload "HKLM\$hiveName" 2>$null
         [System.GC]::Collect()
         Start-Sleep -Seconds 1
-        Log-Info "Loading SYSTEM hive from $($diskb): as $hiveName..." | Tee-Object -FilePath $logFile -Append
+        Log-Info "Loading SYSTEM hive from $($diskb): as $hiveName..."
         $loadResult = & reg.exe load "HKLM\$hiveName" $hiveSource 2>&1
         if ($LASTEXITCODE -ne 0) {
             # Retry once after a short wait
-            Log-Warning "First reg load attempt failed for $($diskb):, retrying in 5 seconds..." | Tee-Object -FilePath $logFile -Append
+            Log-Warning "First reg load attempt failed for $($diskb):, retrying in 5 seconds..."
             Start-Sleep -Seconds 5
             [System.GC]::Collect()
             [System.GC]::WaitForPendingFinalizers()
@@ -236,24 +275,24 @@ try {
         }
         if ($LASTEXITCODE -ne 0) {
             # Fallback: use esentutl.exe /y to copy locked hive via Windows Backup API semantics
-            Log-Warning "Direct load failed. Trying esentutl copy fallback for $($diskb):..." | Tee-Object -FilePath $logFile -Append
+            Log-Warning "Direct load failed. Trying esentutl copy fallback for $($diskb):..."
             $hiveCopy = "$env:TEMP\SYSTEM_COPY_$diskb"
             try {
                 $esentResult = & esentutl.exe /y $hiveSource /d $hiveCopy /o 2>&1
                 if ($LASTEXITCODE -eq 0 -and (Test-Path $hiveCopy)) {
-                    Log-Info "Hive copied successfully to $hiveCopy via esentutl" | Tee-Object -FilePath $logFile -Append
+                    Log-Info "Hive copied successfully to $hiveCopy via esentutl"
                     $loadResult = & reg.exe load "HKLM\$hiveName" $hiveCopy 2>&1
                 }
                 else {
-                    Log-Warning "esentutl copy failed for $($diskb): $esentResult" | Tee-Object -FilePath $logFile -Append
+                    Log-Warning "esentutl copy failed for $($diskb): $esentResult"
                 }
             }
             catch {
-                Log-Warning "esentutl fallback failed for $($diskb):: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+                Log-Warning "esentutl fallback failed for $($diskb):: $($_.Exception.Message)"
             }
         }
         if ($LASTEXITCODE -ne 0) {
-            Log-Warning "Failed to load Registry Hive from $($diskb): $loadResult - skipping this partition" | Tee-Object -FilePath $logFile -Append
+            Log-Warning "Failed to load Registry Hive from $($diskb): $loadResult - skipping this partition"
             if ($hiveCopy -and (Test-Path $hiveCopy)) { Remove-Item $hiveCopy -Force -ErrorAction SilentlyContinue }
             continue
         }
@@ -262,10 +301,10 @@ try {
         try {
             # Step 3 - Create a full backup of the loaded hive before making changes
             $backupFile = "$($diskb):\regbackupbeforeGAchanges_$diskb.reg"
-            Log-Info "Backing up full registry hive to $backupFile..." | Tee-Object -FilePath $logFile -Append
-            & reg.exe export "HKLM\$hiveName" $backupFile /y 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Log-Warning "Registry backup failed for $($diskb): -- continuing anyway" | Tee-Object -FilePath $logFile -Append
+            Log-Info "Backing up full registry hive to $backupFile..."
+            $backupResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("export", "HKLM\$hiveName", $backupFile, "/y") -Description "reg export backup ($diskb)"
+            if ($backupResult.ExitCode -ne 0) {
+                throw "Registry backup failed for $($diskb): $($backupResult.Output -join '; ')"
             }
 
             # Step 4 - Identify the primary and backup ControlSets from the Select key
@@ -274,33 +313,42 @@ try {
             $primarySet = "ControlSet00$defaultSetID"
             $otherSet = if ($primarySet -eq "ControlSet001") { "ControlSet002" } else { "ControlSet001" }
 
-            Log-Info "Primary ControlSet identified: $primarySet" | Tee-Object -FilePath $logFile -Append
-
+            Log-Info "Primary ControlSet identified: $primarySet"
             # Step 5 - Export healthy service keys and inject into both ControlSets
             $services = @("WindowsAzureGuestAgent", "WindowsAzureTelemetryService", "RdAgent")
 
             foreach ($service in $services) {
                 $regFile = "$($diskb):\$service.reg"
                 # Export healthy key from the current Rescue VM
-                & reg.exe export "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$service" "$regFile" /y 2>$null
+                $serviceExportResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("export", "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$service", "$regFile", "/y") -Description "reg export service $service"
                 
-                if (Test-Path $regFile) {
+                if ($serviceExportResult.ExitCode -eq 0 -and (Test-Path $regFile)) {
                     $originalContent = Get-Content $regFile
                     
                     # Update Primary Set
-                    Log-Info "Updating $service in $primarySet on $($diskb):..." | Tee-Object -FilePath $logFile -Append
+                    Log-Info "Updating $service in $primarySet on $($diskb):..."
                     $content = $originalContent -replace 'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet', "HKEY_LOCAL_MACHINE\$hiveName\$primarySet"
                     $content | Set-Content $regFile
-                    & reg.exe import $regFile 2>&1 | Out-Null
+                    $primaryImportResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("import", $regFile) -Description "reg import $service into $primarySet ($diskb)"
+                    if ($primaryImportResult.ExitCode -ne 0) {
+                        throw "Failed to import $service into $primarySet for $($diskb): $($primaryImportResult.Output -join '; ')"
+                    }
 
                     # Update Secondary Set (if it exists on disk)
                     if (Test-Path "Registry::HKLM\$hiveName\$otherSet") {
-                        Log-Info "Updating $service in backup $otherSet on $($diskb):..." | Tee-Object -FilePath $logFile -Append
+                        Log-Info "Updating $service in backup $otherSet on $($diskb):..."
                         $content = $originalContent -replace 'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet', "HKEY_LOCAL_MACHINE\$hiveName\$otherSet"
                         $content | Set-Content $regFile
-                        & reg.exe import $regFile 2>&1 | Out-Null
+                        $secondaryImportResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("import", $regFile) -Description "reg import $service into $otherSet ($diskb)"
+                        if ($secondaryImportResult.ExitCode -ne 0) {
+                            throw "Failed to import $service into $otherSet for $($diskb): $($secondaryImportResult.Output -join '; ')"
+                        }
                     }
                     Remove-Item $regFile -Force
+                }
+                else {
+                    $serviceExportText = $serviceExportResult.Output -join '; '
+                    throw ("Failed to export service key for " + $service + " - " + $serviceExportText)
                 }
             }
 
@@ -308,10 +356,10 @@ try {
             $wagaPath = "HKLM\$hiveName\$primarySet\Services\WindowsAzureGuestAgent"
             $afterImagePath = (Get-ItemProperty -Path "Registry::$wagaPath" -ErrorAction SilentlyContinue).ImagePath
             if ([string]::IsNullOrWhiteSpace($afterImagePath)) {
-                Log-Warning "Verification Warning on $($diskb): VMAgent ImagePath is empty after injection." | Tee-Object -FilePath $logFile -Append
+                Log-Warning "Verification Warning on $($diskb): VMAgent ImagePath is empty after injection."
             }
             else {
-                Log-Info "Verification Success on $($diskb):: ImagePath is now $afterImagePath" | Tee-Object -FilePath $logFile -Append
+                Log-Info "Verification Success on $($diskb):: ImagePath is now $afterImagePath"
             }
 
             # Step 7 - Backup existing WindowsAzure folder and replace with rescue VM copy
@@ -320,16 +368,22 @@ try {
             $backupPath = "$($diskb):\WindowsazurefaultyGAbackup"
 
             if (Test-Path $destPath) {
-                Log-Info "Backing up existing WindowsAzure folder on $($diskb): to WindowsazurefaultyGAbackup..." | Tee-Object -FilePath $logFile -Append
+                Log-Info "Backing up existing WindowsAzure folder on $($diskb): to WindowsazurefaultyGAbackup..."
                 if (-not (Test-Path $backupPath)) { $null = New-Item -Path $backupPath -ItemType Directory -Force }
-                & xcopy "$destPath" "$backupPath" /E /Y /H /Q 2>&1 | Out-Null
-                Log-Info "Removing old WindowsAzure folder on $($diskb):..." | Tee-Object -FilePath $logFile -Append
+                $backupCopyResult = Invoke-CriticalCommand -Command "xcopy" -Arguments @("$destPath", "$backupPath", "/E", "/Y", "/H", "/Q") -Description "xcopy backup WindowsAzure ($diskb)"
+                if ($backupCopyResult.ExitCode -ge 2) {
+                    throw "Failed to back up existing WindowsAzure folder on $($diskb): $($backupCopyResult.Output -join '; ')"
+                }
+                Log-Info "Removing old WindowsAzure folder on $($diskb):..."
                 Remove-Item $destPath -Recurse -Force -ErrorAction SilentlyContinue
             }
 
-            Log-Info "Copying full WindowsAzure folder from rescue VM to $($diskb):..." | Tee-Object -FilePath $logFile -Append
+            Log-Info "Copying full WindowsAzure folder from rescue VM to $($diskb):..."
             $null = New-Item -Path $destPath -ItemType Directory -Force
-            & xcopy "$sourcePath" "$destPath" /E /Y /H /Q 2>&1 | Out-Null
+            $restoreCopyResult = Invoke-CriticalCommand -Command "xcopy" -Arguments @("$sourcePath", "$destPath", "/E", "/Y", "/H", "/Q") -Description "xcopy restore WindowsAzure ($diskb)"
+            if ($restoreCopyResult.ExitCode -ge 2) {
+                throw "Failed to copy WindowsAzure folder to $($diskb): $($restoreCopyResult.Output -join '; ')"
+            }
 
             # Remove Logs folder from copied content (not relevant to the target VM)
             $logsPath = "$destPath\Logs"
@@ -339,39 +393,41 @@ try {
 
             $diskProcessedSuccessfully = $true
             $fixedDisks += $diskb
+            $changedCount++
         }
         catch {
-            Log-Error "Failed to process $($diskb):: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+            Log-Error "Failed to process $($diskb):: $($_.Exception.Message)"
             $diskProcessedSuccessfully = $false
+            $failedCount++
         }
         finally {
             # Step 8 - Release handles and safely unload the registry hive
-            Log-Info "Unloading registry hive $hiveName..." | Tee-Object -FilePath $logFile -Append
+            Log-Info "Unloading registry hive $hiveName..."
             [System.GC]::Collect()
             [System.GC]::WaitForPendingFinalizers()
             Start-Sleep -Seconds 3
 
             $unloaded = $false
             for ($i=1; $i -le 3; $i++) {
-                & reg.exe unload "HKLM\$hiveName" 2>&1 | Out-Null
-                if ($LASTEXITCODE -eq 0) { $unloaded = $true; break }
-                Log-Warning "Unload attempt $i for $hiveName failed, retrying..." | Tee-Object -FilePath $logFile -Append
+                $unloadResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("unload", "HKLM\$hiveName") -Description "reg unload $hiveName attempt $i"
+                if ($unloadResult.ExitCode -eq 0) { $unloaded = $true; break }
+                Log-Warning "Unload attempt $i for $hiveName failed, retrying..."
                 Start-Sleep -Seconds 5
             }
             if (-not $unloaded) {
-                Log-Warning "Could not unload $hiveName hive - may need manual cleanup" | Tee-Object -FilePath $logFile -Append
+                Log-Warning "Could not unload $hiveName hive - may need manual cleanup"
             }
 
             # If we used the copy fallback, copy the modified hive back to the original location
             if ($hiveCopy -and (Test-Path $hiveCopy)) {
                 if ($unloaded) {
-                    Log-Info "Copying modified hive back to $hiveSource..." | Tee-Object -FilePath $logFile -Append
+                    Log-Info "Copying modified hive back to $hiveSource..."
                     try {
                         Copy-Item -Path $hiveCopy -Destination $hiveSource -Force -ErrorAction Stop
-                        Log-Info "Successfully copied modified hive back to $($diskb):" | Tee-Object -FilePath $logFile -Append
+                        Log-Info "Successfully copied modified hive back to $($diskb):"
                     }
                     catch {
-                        Log-Error "Failed to copy modified hive back to $($diskb):: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+                        Log-Error "Failed to copy modified hive back to $($diskb):: $($_.Exception.Message)"
                         $diskProcessedSuccessfully = $false
                         $failedDisks += $diskb
                     }
@@ -390,12 +446,13 @@ try {
     }
 
     if ($failedDisks.Count -gt 0) {
-        Log-Error "Copy-back operation failed on disks: $($failedDisks -join ', ')" | Tee-Object -FilePath $logFile -Append
+        Log-Error "Copy-back operation failed on disks: $($failedDisks -join ', ')"
         throw "Hive copy-back failed on one or more disks: $($failedDisks -join ', '). Please review logs."
     }
 
+    Log-Info "Processing summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
     if ($fixedDisks.Count -gt 0) {
-        Log-Output "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Metadata: Host=$($vmMetadata.HostName), Region=$($vmMetadata.Region), SKU=$($vmMetadata.VMSku)" | Tee-Object -FilePath $logFile -Append
+        Log-Output "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Metadata: Host=$($vmMetadata.HostName), Region=$($vmMetadata.Region), SKU=$($vmMetadata.VMSku)"
         $script_final_status = $STATUS_SUCCESS
     }
     else {
@@ -405,32 +462,34 @@ try {
 }
 catch {
     $errorMessage = $_.Exception.Message
-    Log-Error "SCRIPT FAILED: $errorMessage" | Tee-Object -FilePath $logFile -Append
+    Log-Error "SCRIPT FAILED: $errorMessage"
     $script_final_status = $STATUS_ERROR
 }
 finally {
     # Log execution metadata for Application Insights correlation
     if ($vmMetadata.Region -or $vmMetadata.VMSku -or $vmMetadata.OSVersion) {
-        Log-Info "Execution Context - Host: $($vmMetadata.HostName), Region: $($vmMetadata.Region), SKU: $($vmMetadata.VMSku), OS: $($vmMetadata.OSVersion)" | Tee-Object -FilePath $logFile -Append
+        Log-Info "Execution Context - Host: $($vmMetadata.HostName), Region: $($vmMetadata.Region), SKU: $($vmMetadata.VMSku), OS: $($vmMetadata.OSVersion)"
     }
 
     # Restore original service states
-    Log-Info "Restoring original service states..." | Tee-Object -FilePath $logFile -Append
+    Log-Info "Restoring original service states..."
     foreach ($svc in $serviceStates.Keys) {
         try {
             $originalState = $serviceStates[$svc]
-            Log-Info "Restoring $svc to state: $originalState" | Tee-Object -FilePath $logFile -Append
+            Log-Info "Restoring $svc to state: $originalState"
             if ($originalState -eq 'Running') {
                 Start-Service -Name $svc -ErrorAction SilentlyContinue
             }
             # If original state was Stopped, service remains stopped (already stopped)
         }
         catch {
-            Log-Warning "Failed to restore $svc to state $originalState : $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+            Log-Warning "Failed to restore $svc to state $originalState : $($_.Exception.Message)"
         }
     }
 
-    Log-Info "Execution ended at $(Get-Date)" | Tee-Object -FilePath $logFile -Append
+    Log-Info "Execution ended at $(Get-Date)"
+    Log-Info "Desktop log file path: $logFile"
 }
 
 return $script_final_status
+
