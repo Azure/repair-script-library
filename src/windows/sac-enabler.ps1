@@ -73,7 +73,7 @@ bcdedit /store S:\efi\microsoft\boot\bcd /set "{bootmgr}" displaybootmenu no
 
     4. Verify EMS is disabled:
 bcdedit /store F:\boot\bcd /enum "{default}"
-bcdedit /store F:\boot\bcd /enum "{bootmgr}"
+bcdedit /store S:\efi\microsoft\boot\bcd /enum "{default}"
     Expected: ems = No or absent, bootems = No or absent.
     5. Run the script. It should enable ems, bootems, displaybootmenu, and emssettings.
     6. Verify all SAC settings are now enabled (see .VERIFICATION section).
@@ -104,84 +104,99 @@ bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
 #>
 
 # Initialization (path-validated)
-$initPath = Join-Path $PSScriptRoot 'src\windows\common\setup\init.ps1'
-$diskPartitionsPath = Join-Path $PSScriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
+$initPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\setup\init.ps1'
+$diskPartitionsPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
 
-if (-not (Test-Path -LiteralPath $initPath)) {
-    Write-Error "Required helper not found: $initPath"
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initPath"
     return 1
 }
 
 . $initPath
 
-if (-not (Test-Path -LiteralPath $diskPartitionsPath)) {
-    Log-Error "Required helper not found: $diskPartitionsPath"
+if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
+    Log-Error "Missing required dependency: $diskPartitionsPath"
     return $STATUS_ERROR
 }
 
 . $diskPartitionsPath
 
-# Log Configuration (desktop log standard)
-$desktopPath = [Environment]::GetFolderPath('Desktop')
-if ([string]::IsNullOrWhiteSpace($desktopPath)) {
-    $desktopPath = Join-Path $env:PUBLIC 'Desktop'
+# Script-level logging: create a plain text desktop log that mirrors Log-* output.
+$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
+$runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+
+if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
+    New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
 }
 
-$logDir = Join-Path $desktopPath 'RepairLogs'
-if (-not (Test-Path -LiteralPath $logDir)) {
-    $null = New-Item -ItemType Directory -Path $logDir -Force
+if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
+    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
 }
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = Join-Path $logDir "sac-enabler_$timestamp.log"
 
-if (-not (Test-Path -LiteralPath $logFile)) {
-    $null = New-Item -Path $logFile -ItemType File -Force
-}
+$script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
+$script:OriginalLogInfo = (Get-Command Log-Info -CommandType Function).ScriptBlock
+$script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).ScriptBlock
+$script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
+$script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
 
 function Write-DesktopLogLine {
-    param([string]$Message)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Level,
 
-    if ($null -ne $Message) {
-        Add-Content -LiteralPath $logFile -Value ("[{0}] {1}" -f (Get-Date -Format 's'), $Message)
+        [Parameter(Mandatory = $true)]
+        [PSObject[]]$Message
+    )
+
+    try {
+        $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
+        $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
+        Add-Content -Path $logFilePath -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        if ($script:OriginalLogWarning) {
+            & $script:OriginalLogWarning -message "Failed to append to desktop log '$logFilePath': $($_.Exception.Message)"
+        }
+        else {
+            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to desktop log '$logFilePath': $($_.Exception.Message)")
+        }
     }
 }
 
-$script:_origLogInfo = (Get-Command Log-Info -ErrorAction SilentlyContinue).ScriptBlock
-$script:_origLogWarning = (Get-Command Log-Warning -ErrorAction SilentlyContinue).ScriptBlock
-$script:_origLogError = (Get-Command Log-Error -ErrorAction SilentlyContinue).ScriptBlock
-$script:_origLogOutput = (Get-Command Log-Output -ErrorAction SilentlyContinue).ScriptBlock
-
-if ($script:_origLogInfo) {
-    function Log-Info {
-        param([string]$Message)
-        & $script:_origLogInfo $Message
-        Write-DesktopLogLine "[INFO] $Message"
-    }
+function Log-Output {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogOutput -message $message
+    Write-DesktopLogLine -Level 'Output' -Message $message
 }
 
-if ($script:_origLogWarning) {
-    function Log-Warning {
-        param([string]$Message)
-        & $script:_origLogWarning $Message
-        Write-DesktopLogLine "[WARN] $Message"
-    }
+function Log-Info {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogInfo -message $message
+    Write-DesktopLogLine -Level 'Info' -Message $message
 }
 
-if ($script:_origLogError) {
-    function Log-Error {
-        param([string]$Message)
-        & $script:_origLogError $Message
-        Write-DesktopLogLine "[ERROR] $Message"
-    }
+function Log-Warning {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogWarning -message $message
+    Write-DesktopLogLine -Level 'Warning' -Message $message
 }
 
-if ($script:_origLogOutput) {
-    function Log-Output {
-        param([string]$Message)
-        & $script:_origLogOutput $Message
-        Write-DesktopLogLine "[OUTPUT] $Message"
-    }
+function Log-Error {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogError -message $message
+    Write-DesktopLogLine -Level 'Error' -Message $message
 }
+
+function Log-Debug {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogDebug -message $message
+    Write-DesktopLogLine -Level 'Debug' -Message $message
+}
+
+$logFile = $logFilePath
+Log-Info "Desktop plain text log initialized: $logFilePath"
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
