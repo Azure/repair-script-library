@@ -118,25 +118,76 @@ if (-not (Test-Path -Path $initScriptPath -PathType Leaf)) {
 
 . $initScriptPath
 
-# Script-level logging: always create a desktop transcript log for operator visibility.
+# Script-level logging: create a plain text desktop log that mirrors Log-* output.
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
 $logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
-$transcriptStarted = $false
 
 if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
     New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
 }
 
-try {
-    Start-Transcript -Path $logFilePath -Force | Out-Null
-    $transcriptStarted = $true
-    Log-Info "Transcript logging started: $logFilePath"
+if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
+    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
 }
-catch {
-    Log-Warning "Unable to start transcript logging at '$logFilePath': $($_.Exception.Message)"
+
+$script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
+$script:OriginalLogInfo = (Get-Command Log-Info -CommandType Function).ScriptBlock
+$script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).ScriptBlock
+$script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
+$script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
+
+function Write-DesktopLogLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Level,
+
+        [Parameter(Mandatory = $true)]
+        [PSObject[]]$Message
+    )
+
+    try {
+        $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
+        $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
+        Add-Content -Path $logFilePath -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        Write-Output "[Warning $(Get-Date)]Failed to append to desktop log '$logFilePath': $($_.Exception.Message)"
+    }
 }
+
+function Log-Output {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogOutput -message $message
+    Write-DesktopLogLine -Level 'Output' -Message $message
+}
+
+function Log-Info {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogInfo -message $message
+    Write-DesktopLogLine -Level 'Info' -Message $message
+}
+
+function Log-Warning {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogWarning -message $message
+    Write-DesktopLogLine -Level 'Warning' -Message $message
+}
+
+function Log-Error {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogError -message $message
+    Write-DesktopLogLine -Level 'Error' -Message $message
+}
+
+function Log-Debug {
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogDebug -message $message
+    Write-DesktopLogLine -Level 'Debug' -Message $message
+}
+
+Log-Info "Desktop plain text log initialized: $logFilePath"
 
 # LOCAL TEST DEFAULTS: Uncomment the variables below to test locally without --parameters
 # You can either:
@@ -556,14 +607,6 @@ catch {
 }
 finally {
     Log-Info "Script ended at $(Get-Date)"
-    if ($transcriptStarted) {
-        try {
-            Stop-Transcript | Out-Null
-        }
-        catch {
-            Log-Warning "Failed to stop transcript cleanly: $($_.Exception.Message)"
-        }
-    }
 }
 
 return $script_final_status
