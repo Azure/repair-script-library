@@ -118,6 +118,26 @@ if (-not (Test-Path -Path $initScriptPath -PathType Leaf)) {
 
 . $initScriptPath
 
+# Script-level logging: always create a desktop transcript log for operator visibility.
+$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
+$runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+$transcriptStarted = $false
+
+if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
+    New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
+}
+
+try {
+    Start-Transcript -Path $logFilePath -Force | Out-Null
+    $transcriptStarted = $true
+    Log-Info "Transcript logging started: $logFilePath"
+}
+catch {
+    Log-Warning "Unable to start transcript logging at '$logFilePath': $($_.Exception.Message)"
+}
+
 # LOCAL TEST DEFAULTS: Uncomment the variables below to test locally without --parameters
 # You can either:
 #   1. Uncomment individual variables and run the script
@@ -278,7 +298,7 @@ try {
     Get-AuditSnapshot "AUDITING SETTINGS (BEFORE)"
 
     $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
-    $crashControlBackupPath = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\CrashControl-backup-{0}.reg" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $crashControlBackupPath = Join-Path -Path $runOutputDir -ChildPath ("CrashControl-backup-{0}.reg" -f $runTimestamp)
     $backupResult = & reg.exe export "HKLM\SYSTEM\CurrentControlSet\Control\CrashControl" $crashControlBackupPath /y 2>&1
     if ($LASTEXITCODE -eq 0) {
         Log-Info "Created registry backup: $crashControlBackupPath"
@@ -536,6 +556,14 @@ catch {
 }
 finally {
     Log-Info "Script ended at $(Get-Date)"
+    if ($transcriptStarted) {
+        try {
+            Stop-Transcript | Out-Null
+        }
+        catch {
+            Log-Warning "Failed to stop transcript cleanly: $($_.Exception.Message)"
+        }
+    }
 }
 
 return $script_final_status
