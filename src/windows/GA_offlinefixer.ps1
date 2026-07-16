@@ -336,6 +336,12 @@ try {
 
             foreach ($service in $services) {
                 $regFile = "$($diskb):\$service.reg"
+                # Check if service key exists on the rescue VM before attempting export
+                $rescueServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$service"
+                if (-not (Test-Path -Path $rescueServiceKey)) {
+                    Log-Warning "Service '$service' not found on rescue VM registry - skipping (not present on this OS version)"
+                    continue
+                }
                 # Export healthy key from the current Rescue VM
                 $serviceExportResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("export", "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$service", "$regFile", "/y") -Description "reg export service $service"
                 
