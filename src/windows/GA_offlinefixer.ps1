@@ -18,7 +18,7 @@
 
 .NOTES
     Name:    GA_offlinefixer.ps1
-    Version: 1.3
+    Version: 1.4
     Original Author: Daniel Munoz L (damunozl@microsoft.com)
     Modified by: Tony.Mocanu@Microsoft.com
 
@@ -26,6 +26,7 @@
     v1.4: [May 2026] - Updated the script (current)
                        - Aligned nested VM detection with win-LKGC guard pattern.
                        - Skips Get-VM safely when Hyper-V module is unavailable.
+                       - Fixed relative path evaluation bug for helper files.
     v1.3: [May 2026] - Updated the script again (current)
                        - Fixed breaking exception when the Hyper-V module is not installed on the host.
                        - Added explicit checking via Get-Module before executing nested VM discovery.
@@ -67,8 +68,8 @@ Get-ChildItem F:\WindowsAzure\GuestAgent_*
 #>
 
 # Initialization
-$initScriptPath = Join-Path $PSScriptRoot "src\windows\common\setup\init.ps1"
-$diskHelperPath = Join-Path $PSScriptRoot "src\windows\common\helpers\Get-Disk-Partitions-v2.ps1"
+$initScriptPath = Join-Path $PSScriptRoot "common\setup\init.ps1"
+$diskHelperPath = Join-Path $PSScriptRoot "common\helpers\Get-Disk-Partitions-v2.ps1"
 
 if (-not (Test-Path -Path $initScriptPath)) {
     Write-Error "Required helper script not found: $initScriptPath"
@@ -492,4 +493,3 @@ finally {
 }
 
 return $script_final_status
-
