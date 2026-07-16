@@ -68,8 +68,19 @@ Get-ChildItem F:\WindowsAzure\GuestAgent_*
 #>
 
 # Initialization (path-validated)
-$initPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\setup\init.ps1'
-$diskPartitionsPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
+# $PSScriptRoot is empty when RunCommand executes scripts as a ScriptBlock (Invoke-Expression / [ScriptBlock]::Create).
+# Fall back to the call stack, which PowerShell still attributes to the originating file path.
+$resolvedScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    $resolvedScriptRoot = Split-Path -Parent (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
+}
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    Write-Error "Cannot determine script directory: PSScriptRoot is empty and call stack provides no path."
+    return 1
+}
+
+$initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
+$diskPartitionsPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
 
 if (-not (Test-Path -Path $initPath -PathType Leaf)) {
     Write-Error "Missing required dependency: $initPath"
