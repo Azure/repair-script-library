@@ -67,21 +67,23 @@ Get-ChildItem F:\WindowsAzure\GuestAgent_*
     Expected: One or more GuestAgent folders present.
 #>
 
-# Initialization
-$initScriptPath = Join-Path $PSScriptRoot "common\setup\init.ps1"
-$diskHelperPath = Join-Path $PSScriptRoot "common\helpers\Get-Disk-Partitions-v2.ps1"
+# Initialization (path-validated)
+$initPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\setup\init.ps1'
+$diskPartitionsPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
 
-if (-not (Test-Path -Path $initScriptPath)) {
-    Write-Error "Required helper script not found: $initScriptPath"
-    return 1
-}
-if (-not (Test-Path -Path $diskHelperPath)) {
-    Write-Error "Required helper script not found: $diskHelperPath"
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initPath"
     return 1
 }
 
-. $initScriptPath
-. $diskHelperPath
+. $initPath
+
+if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
+    Log-Error "Missing required dependency: $diskPartitionsPath"
+    return $STATUS_ERROR
+}
+
+. $diskPartitionsPath
 
 # Log Configuration
 $logDir = [Environment]::GetFolderPath('Desktop')
