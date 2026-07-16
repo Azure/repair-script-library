@@ -98,6 +98,9 @@ if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
 
 # Log Configuration
 $logDir = [Environment]::GetFolderPath('Desktop')
+if ([string]::IsNullOrWhiteSpace($logDir)) {
+    $logDir = Join-Path $env:PUBLIC 'Desktop'
+}
 if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$logDir\GA_offlinefixer_$timestamp.log"
