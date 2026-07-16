@@ -96,14 +96,63 @@ if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
 
 . $diskPartitionsPath
 
-# Log Configuration
-$logDir = [Environment]::GetFolderPath('Desktop')
-if ([string]::IsNullOrWhiteSpace($logDir)) {
-    $logDir = Join-Path $env:PUBLIC 'Desktop'
+# Log Configuration (desktop log standard)
+$desktopPath = [Environment]::GetFolderPath('Desktop')
+if ([string]::IsNullOrWhiteSpace($desktopPath)) {
+    $desktopPath = Join-Path $env:PUBLIC 'Desktop'
 }
-if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
+
+$logDir = Join-Path $desktopPath 'RepairLogs'
+if (-not (Test-Path -LiteralPath $logDir)) {
+    $null = New-Item -ItemType Directory -Path $logDir -Force
+}
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = "$logDir\GA_offlinefixer_$timestamp.log"
+$logFile = Join-Path $logDir "GA_offlinefixer_$timestamp.log"
+
+if (-not (Test-Path -LiteralPath $logFile)) {
+    $null = New-Item -Path $logFile -ItemType File -Force
+}
+
+function Write-DesktopLogLine {
+    param([string]$Message)
+    if ($null -ne $Message) {
+        Add-Content -LiteralPath $logFile -Value ("[{0}] {1}" -f (Get-Date -Format 's'), $Message)
+    }
+}
+
+$script:_origLogInfo    = (Get-Command Log-Info    -ErrorAction SilentlyContinue).ScriptBlock
+$script:_origLogWarning = (Get-Command Log-Warning -ErrorAction SilentlyContinue).ScriptBlock
+$script:_origLogError   = (Get-Command Log-Error   -ErrorAction SilentlyContinue).ScriptBlock
+$script:_origLogOutput  = (Get-Command Log-Output  -ErrorAction SilentlyContinue).ScriptBlock
+
+if ($script:_origLogInfo) {
+    function Log-Info {
+        param([string]$Message)
+        & $script:_origLogInfo $Message
+        Write-DesktopLogLine "[INFO] $Message"
+    }
+}
+if ($script:_origLogWarning) {
+    function Log-Warning {
+        param([string]$Message)
+        & $script:_origLogWarning $Message
+        Write-DesktopLogLine "[WARN] $Message"
+    }
+}
+if ($script:_origLogError) {
+    function Log-Error {
+        param([string]$Message)
+        & $script:_origLogError $Message
+        Write-DesktopLogLine "[ERROR] $Message"
+    }
+}
+if ($script:_origLogOutput) {
+    function Log-Output {
+        param([string]$Message)
+        & $script:_origLogOutput $Message
+        Write-DesktopLogLine "[OUTPUT] $Message"
+    }
+}
 
 function Invoke-CriticalCommand {
     param(
