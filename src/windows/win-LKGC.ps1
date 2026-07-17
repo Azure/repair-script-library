@@ -38,40 +38,36 @@
     https://support.microsoft.com/en-us/topic/you-receive-error-stop-error-code-0x0000007b-inaccessible-boot-device-after-you-install-windows-updates-7cc844e4-4daf-a71c-cd23-f99b50d53e31
 #>
 
-# Initialization
-$scriptRoot = $null
-if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
-    $scriptRoot = $PSScriptRoot
+# ==============================================================================
+# 1. DEPENDENCY PATH VALIDATION & INITIALIZATION (DEP-01)
+# ==============================================================================
+# $PSScriptRoot can be empty when invoked through ScriptBlock execution.
+# Fall back to call stack script attribution to resolve the originating file directory.
+$resolvedScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    $resolvedScriptRoot = Split-Path -Parent (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
 }
-elseif ($MyInvocation.MyCommand.Path) {
-    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-}
-else {
-    $callerScript = (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
-    if ($callerScript) {
-        $scriptRoot = Split-Path -Parent $callerScript
-    }
-}
-
-if ([string]::IsNullOrWhiteSpace($scriptRoot) -or -not (Test-Path -LiteralPath $scriptRoot -PathType Container)) {
-    Write-Error "Unable to determine script root for dependency resolution. Aborting before helper import."
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    Write-Error "Cannot determine script directory: PSScriptRoot is empty and call stack provides no path."
     return 1
 }
 
-$initScriptPath = Join-Path $scriptRoot 'src\windows\common\setup\init.ps1'
-$diskPartitionsHelperPath = Join-Path $scriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
+$initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
+$partitionsHelperPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
 
-if (-not (Test-Path -LiteralPath $initScriptPath -PathType Leaf)) {
-    Write-Error "Required helper missing: $initScriptPath"
-    return 1
-}
-if (-not (Test-Path -LiteralPath $diskPartitionsHelperPath -PathType Leaf)) {
-    Write-Error "Required helper missing: $diskPartitionsHelperPath"
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initPath"
     return 1
 }
 
-. $initScriptPath
-. $diskPartitionsHelperPath
+. $initPath
+
+if (-not (Test-Path -Path $partitionsHelperPath -PathType Leaf)) {
+    Log-Error "Missing required dependency: $partitionsHelperPath"
+    return $STATUS_ERROR
+}
+
+. $partitionsHelperPath
 
 # Log Configuration
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
