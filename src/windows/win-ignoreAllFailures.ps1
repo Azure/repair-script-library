@@ -62,19 +62,40 @@ bcdedit /store <bcdpath> /enum {default}
 #>
 
 # Initialization (no Param() block to avoid ParserErrors on legacy PowerShell engines)
-# Validate required dependencies before dot-sourcing
-$requiredScripts = @(
-    '.\src\windows\common\setup\init.ps1',
-    '.\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
-)
-foreach ($script in $requiredScripts) {
-    if (-not (Test-Path $script)) {
-        Write-Error "Required dependency not found: $script"
-        exit 1
+# $PSScriptRoot can be empty when invoked through ScriptBlock execution.
+# Fall back to call stack script attribution to resolve the originating file directory.
+$resolvedScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    $originFrame = Get-PSCallStack -ErrorAction SilentlyContinue |
+        Where-Object { $_.ScriptName } |
+        Select-Object -First 1
+
+    if ($originFrame -and $originFrame.ScriptName) {
+        $resolvedScriptRoot = Split-Path -Parent $originFrame.ScriptName
     }
 }
-. .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions-v2.ps1
+
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    Write-Error 'Cannot determine script directory: PSScriptRoot is empty and call stack provides no path.'
+    return 1
+}
+
+$initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
+$partitionsHelperPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
+
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initPath"
+    return 1
+}
+
+. $initPath
+
+if (-not (Test-Path -Path $partitionsHelperPath -PathType Leaf)) {
+    Log-Error "Missing required dependency: $partitionsHelperPath"
+    return $STATUS_ERROR
+}
+
+. $partitionsHelperPath
 
 $desktopPath = [Environment]::GetFolderPath('Desktop')
 if ([string]::IsNullOrWhiteSpace($desktopPath) -or -not (Test-Path $desktopPath)) {
@@ -158,7 +179,7 @@ try {
                         Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                     }
                     catch {
-                        Write-ScriptLog -Level Warning -Message "Failed to stop nested guest VM, will continue but may have limited success"
+                        Write-ScriptLog -Level Warning -Message "Failed to stop nested guest VM $($guestHyperVVirtualMachine.VMName): $($_.Exception.Message). Continuing, but operations may have limited success."
                     }
                 }
             }
