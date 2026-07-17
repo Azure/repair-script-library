@@ -39,15 +39,33 @@
 #>
 
 # Initialization
-$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$scriptRoot = $null
+if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $scriptRoot = $PSScriptRoot
+}
+elseif ($MyInvocation.MyCommand.Path) {
+    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+else {
+    $callerScript = (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
+    if ($callerScript) {
+        $scriptRoot = Split-Path -Parent $callerScript
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($scriptRoot) -or -not (Test-Path -LiteralPath $scriptRoot -PathType Container)) {
+    Write-Error "Unable to determine script root for dependency resolution. Aborting before helper import."
+    return 1
+}
+
 $initScriptPath = Join-Path $scriptRoot 'src\windows\common\setup\init.ps1'
 $diskPartitionsHelperPath = Join-Path $scriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
 
-if (-not (Test-Path -LiteralPath $initScriptPath)) {
+if (-not (Test-Path -LiteralPath $initScriptPath -PathType Leaf)) {
     Write-Error "Required helper missing: $initScriptPath"
     return 1
 }
-if (-not (Test-Path -LiteralPath $diskPartitionsHelperPath)) {
+if (-not (Test-Path -LiteralPath $diskPartitionsHelperPath -PathType Leaf)) {
     Write-Error "Required helper missing: $diskPartitionsHelperPath"
     return 1
 }
@@ -247,10 +265,10 @@ try {
                 # Step 6 - Increment all four Select values by 1 to trigger LKGC on next boot
                 Write-RepairLog -Level Info -Message "[$diskb] Applying LKGC increments..."
                 $writeAttempted = $true
-                Set-Itemproperty -path $selectPath -Name 'current' -Type DWORD -value ($before.current + 1)
-                Set-Itemproperty -path $selectPath -Name 'default' -Type DWORD -value ($before.default + 1)
-                Set-Itemproperty -path $selectPath -Name 'failed' -Type DWORD -value ($before.failed + 1)
-                Set-Itemproperty -path $selectPath -Name 'LastKnownGood' -Type DWORD -value ($before.LastKnownGood + 1)
+                Set-ItemProperty -Path $selectPath -Name 'current' -Type DWORD -Value ($before.current + 1) -ErrorAction Stop
+                Set-ItemProperty -Path $selectPath -Name 'default' -Type DWORD -Value ($before.default + 1) -ErrorAction Stop
+                Set-ItemProperty -Path $selectPath -Name 'failed' -Type DWORD -Value ($before.failed + 1) -ErrorAction Stop
+                Set-ItemProperty -Path $selectPath -Name 'LastKnownGood' -Type DWORD -Value ($before.LastKnownGood + 1) -ErrorAction Stop
 
                 # Step 7 - Log the BEFORE and AFTER registry states for verification
                 $after = Get-ItemProperty -path $selectPath
