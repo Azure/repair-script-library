@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs chkdsk to fix file system corruption on an attached rescue disk.
+    Repairs file system corruption on attached target OS partitions from a rescue VM.
 .DESCRIPTION
     This script runs from a rescue VM to check and repair NTFS file system corruption
     on all partitions of the attached faulty OS disk.
@@ -39,22 +39,32 @@ param()
 # ==============================================================================
 # 1. DEPENDENCY PATH VALIDATION & INITIALIZATION (DEP-01)
 # ==============================================================================
-$initPath = Join-Path -Path $PSScriptRoot -ChildPath "src\windows\common\setup\init.ps1"
-if (-not (Test-Path -Path $initPath -PathType Leaf)) {
-    Write-Error "[Error] Required helper not found: $initPath"
+# $PSScriptRoot can be empty when invoked through ScriptBlock execution.
+# Fall back to call stack script attribution to resolve the originating file directory.
+$resolvedScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    $resolvedScriptRoot = Split-Path -Parent (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
+}
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    Write-Error "Cannot determine script directory: PSScriptRoot is empty and call stack provides no path."
     return 1
 }
+
+$initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
+$partitionsHelperPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
+
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initPath"
+    return 1
+}
+
 . $initPath
 
-$partitionsHelperPath = Join-Path -Path $PSScriptRoot -ChildPath "src\windows\common\helpers\Get-Disk-Partitions-v2.ps1"
 if (-not (Test-Path -Path $partitionsHelperPath -PathType Leaf)) {
-    if (Get-Command Log-Error -ErrorAction SilentlyContinue) {
-        Log-Error "Required helper not found: $partitionsHelperPath"
-    } else {
-        Write-Error "[Error] Required helper not found: $partitionsHelperPath"
-    }
+    Log-Error "Missing required dependency: $partitionsHelperPath"
     return $STATUS_ERROR
 }
+
 . $partitionsHelperPath
 
 # ==============================================================================
@@ -100,11 +110,11 @@ function Write-ScriptLog {
         }
         'OUTPUT' {
             if (Get-Command Log-Output -ErrorAction SilentlyContinue) { Log-Output $Message } 
-            else { Write-Output $formattedMsg }
+            else { Write-Information $formattedMsg -InformationAction Continue }
         }
         Default {
             if (Get-Command Log-Info -ErrorAction SilentlyContinue) { Log-Info $Message } 
-            else { Write-Output $formattedMsg }
+            else { Write-Information $formattedMsg -InformationAction Continue }
         }
     }
 
@@ -131,7 +141,7 @@ try {
                     Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                 }
                 catch {
-                    Write-ScriptLog "Failed to stop nested guest VM, continuing but with limited raw write access risks." "WARNING"
+                    Write-ScriptLog "Failed to stop nested guest VM '$($guestHyperVVirtualMachine.VMName)' via Stop-VM: $($_.Exception.Message). Continuing but with limited raw write access risks." "WARNING"
                 }
             }
         }
@@ -245,6 +255,7 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    Write-ScriptLog "Final script status: $script_final_status" "INFO"
     Write-ScriptLog "Script finalized. Destination log package details: $logFile" "INFO"
 }
 
