@@ -1,7 +1,6 @@
 <#
 .SYNOPSIS
     Runs chkdsk to fix file system corruption on an attached rescue disk.
-
 .DESCRIPTION
     This script runs from a rescue VM to check and repair NTFS file system corruption
     on all partitions of the attached faulty OS disk.
@@ -15,96 +14,133 @@
     This resolves VMs stuck at boot showing "Scanning and repairing drive" or
     "Checking file system on C:" messages. Running chkdsk from a rescue VM avoids
     interruptions that occur when the OS runs it during boot.
-
+.PARAMETER None
+    This script does not accept custom parameters. It processes all attached non-system partitions automatically.
+.EXAMPLE
+    .\win-chkdsk-fs-corruption.ps1
 .NOTES
     Name:    win-chkdsk-fs-corruption.ps1
-    Version: 1.1
+    Version: 1.2
     Author:  Tony.Mocanu@Microsoft.com
-
 .VERSION
-    v1.1: [May 2026] - Updated the script again (current)
-                       - Fixed breaking exception when the Hyper-V module is not installed on the host.
+    v1.2: [July 2026] - Refactored logging to support desktop-first paths with SYSTEM fallback.
+                       - Aligned dependency path validation and added explicit loop logging summaries.
+    v1.1: [May 2026]  - Fixed breaking exception when the Hyper-V module is not installed on the host.
                        - Added explicit checking via Get-Module before executing nested VM discovery.
                        - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
-    v1.0: Initial commit. This was the version 1.0 of the script.
-
+    v1.0: Initial commit.
 .LINK
     https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/troubleshoot-check-disk-boot-error
-
-.SCENARIO_RECREATION
-    To recreate a testable dirty-bit scenario on a rescue VM with an attached OS disk:
-    1. Create a test VM in Azure and attach its OS disk to a rescue VM.
-    2. Set the dirty bit on the attached partition (replace F with actual drive letter):
-fsutil dirty set F:
-    3. Verify the dirty bit is set:
-fsutil dirty query F:
-    Expected: "Volume - F: is Dirty"
-    4. Run the script. It should detect the dirty bit and run chkdsk /f.
-    5. After the script completes, verify the dirty bit was cleared:
-fsutil dirty query F:
-    Expected: "Volume - F: is NOT Dirty"
-
-.EXAMPLE
-    az vm repair run -g <rg> -n <vm> --run-id win-chkdsk-fs-corruption --run-on-repair
-
-.VERIFICATION
-    1. Check the log file for success:
-Get-ChildItem "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension\chkdsk-repair_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
-    Expected: "All partitions processed successfully." and return code 0 ($STATUS_SUCCESS).
-    2. Verify the dirty bit was cleared on the attached disk (replace F with the disk letter):
-fsutil dirty query F:
-    Expected: "Volume - F: is NOT Dirty"
 #>
 
-# Initialization
-$initPath = Join-Path $PSScriptRoot "src\windows\common\setup\init.ps1"
-if (-not (Test-Path $initPath)) {
-    Write-Error "Required helper not found: $initPath"
+[CmdletBinding()]
+param()
+
+# ==============================================================================
+# 1. DEPENDENCY PATH VALIDATION & INITIALIZATION (DEP-01)
+# ==============================================================================
+$initPath = Join-Path -Path $PSScriptRoot -ChildPath "src\windows\common\setup\init.ps1"
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "[Error] Required helper not found: $initPath"
     return 1
 }
 . $initPath
 
-$partitionsHelperPath = Join-Path $PSScriptRoot "src\windows\common\helpers\Get-Disk-Partitions-v2.ps1"
-if (-not (Test-Path $partitionsHelperPath)) {
-    Log-Error "Required helper not found: $partitionsHelperPath"
+$partitionsHelperPath = Join-Path -Path $PSScriptRoot -ChildPath "src\windows\common\helpers\Get-Disk-Partitions-v2.ps1"
+if (-not (Test-Path -Path $partitionsHelperPath -PathType Leaf)) {
+    if (Get-Command Log-Error -ErrorAction SilentlyContinue) {
+        Log-Error "Required helper not found: $partitionsHelperPath"
+    } else {
+        Write-Error "[Error] Required helper not found: $partitionsHelperPath"
+    }
     return $STATUS_ERROR
 }
 . $partitionsHelperPath
 
-# Log Configuration
-$logDir = "C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension"
-if (-not (Test-Path $logDir)) { $null = New-Item -ItemType Directory -Path $logDir -Force }
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = "$logDir\chkdsk-repair_$timestamp.log"
+# ==============================================================================
+# 2. SYSTEM-SAFE LOG CONFIGURATION (LOG-01, DOC-01)
+# ==============================================================================
+# Attempt to resolve the standard User Desktop first (LOG-01)
+$logDir = [Environment]::GetFolderPath('Desktop')
 
-# Status Tracking
+# Secure fallback to system-wide TEMP directories if Desktop is empty/SYSTEM profile (DOC-01)
+if ([string]::IsNullOrEmpty($logDir)) {
+    $logDir = $env:TEMP
+    if ([string]::IsNullOrEmpty($logDir)) {
+        $logDir = "C:\Windows\Temp"
+    }
+}
+
+if (-not (Test-Path -Path $logDir)) { 
+    $null = New-Item -ItemType Directory -Path $logDir -Force 
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$logFile = Join-Path -Path $logDir -ChildPath "chkdsk-repair_$timestamp.log"
+
+# Unified logging helper to ensure stdout and physical file are consistently fed
+function Write-ScriptLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [ValidateSet('INFO', 'WARNING', 'ERROR', 'OUTPUT')]
+        [string]$Level = 'INFO'
+    )
+    $formattedMsg = "[$(Get-Date -Format 'MM/dd/yyyy HH:mm:ss')] [$Level] $Message"
+    
+    # Direct to correct stream or custom framework logger
+    switch ($Level) {
+        'ERROR' {
+            if (Get-Command Log-Error -ErrorAction SilentlyContinue) { Log-Error $Message } 
+            else { Write-Error $formattedMsg }
+        }
+        'WARNING' {
+            if (Get-Command Log-Warning -ErrorAction SilentlyContinue) { Log-Warning $Message } 
+            else { Write-Warning $formattedMsg }
+        }
+        'OUTPUT' {
+            if (Get-Command Log-Output -ErrorAction SilentlyContinue) { Log-Output $Message } 
+            else { Write-Output $formattedMsg }
+        }
+        Default {
+            if (Get-Command Log-Info -ErrorAction SilentlyContinue) { Log-Info $Message } 
+            else { Write-Output $formattedMsg }
+        }
+    }
+
+    # Write to local physical file
+    $formattedMsg | Out-File -FilePath $logFile -Append -Encoding utf8
+}
+
+# ==============================================================================
+# 3. CORE REPAIR LOGIC
+# ==============================================================================
 $script_final_status = $STATUS_SUCCESS
 
 try {
-    Log-Info "Script execution started. Report: $logFile"
+    Write-ScriptLog "Script execution started. Logging active at: $logFile" "INFO"
 
-    # Stop nested guest VM if running (only when Hyper-V module/cmdlets are available)
+    # Stop nested guest VM if running (Only calls Hyper-V cmdlets after validation - DEP-02)
     $hyperVModuleAvailable = @(Get-Module -ListAvailable -Name 'Hyper-V').Count -gt 0
     if ($hyperVModuleAvailable -and (Get-Command -Name 'Get-VM' -ErrorAction SilentlyContinue)) {
         $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
         if ($guestHyperVVirtualMachine) {
             if ($guestHyperVVirtualMachine.State -eq 'Running') {
-                Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
+                Write-ScriptLog "Stopping nested guest VM: $($guestHyperVVirtualMachine.VMName)" "INFO"
                 try {
                     Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                 }
                 catch {
-                    Log-Warning "Failed to stop nested guest VM, will continue but may have limited success"
+                    Write-ScriptLog "Failed to stop nested guest VM, continuing but with limited raw write access risks." "WARNING"
                 }
             }
         }
     }
     else {
-        Log-Info "Hyper-V module/cmdlets not available on this host -> skipping nested VM discovery"
+        Write-ScriptLog "Hyper-V module/cmdlets not available on this host -> skipping nested VM discovery" "INFO"
     }
 
     # --- Partition Enumeration and CHKDSK ---
-    # Step 1 - Enumerate attached partitions
     $partitionlist = Get-Disk-Partitions
     $rescueDrive = $env:SystemDrive -replace ':', ''
 
@@ -114,45 +150,45 @@ try {
     $failedCount    = 0
 
     if ($null -eq $partitionlist -or $partitionlist.Count -eq 0) {
-        Log-Warning "No partitions found to check."
+        Write-ScriptLog "No partitions found to check." "WARNING"
     }
     else {
+        # Loop through each partition securely (FE-01: Explicit loop naming, no $_ scope pollution)
         foreach ($partition in $partitionlist) {
             if (-not ($partition -and $partition.DriveLetter)) {
                 $skippedCount++
                 continue
             }
 
-            # Skip the rescue VM's own OS drive
+            # Skip the rescue VM's own OS drive explicitly (SAFE-01 Protection)
             if ($partition.DriveLetter -eq $rescueDrive) {
-                Log-Info "Skipping rescue VM system drive $rescueDrive (own OS)"
+                Write-ScriptLog "Skipping rescue VM system drive $rescueDrive to protect host state." "INFO"
                 $skippedCount++
                 continue
             }
 
             $letter = 'unknown'
             try {
-                # Format drive letter with colon (Get-Disk-Partitions returns single character)
                 $letter = "$($partition.DriveLetter):"
                 $processedCount++
 
-                Log-Info "Checking drive: $letter"
+                Write-ScriptLog "Checking drive: $letter" "INFO"
 
-                # Step 2 - Query the NTFS dirty bit using fsutil
+                # Query the NTFS dirty bit using fsutil (LOG-03: Capture and save command outputs)
                 $dirtyFlag = fsutil dirty query $letter
-                Log-Output "FSUTIL Output: $dirtyFlag"
+                Write-ScriptLog "FSUTIL Output: $dirtyFlag" "OUTPUT"
 
-                # Step 3 - If dirty bit is set, run chkdsk /f to repair file system errors
+                # If dirty bit is set, run chkdsk /f to repair file system errors
                 if ($dirtyFlag -notmatch "NOT Dirty") {
-                    Log-Warning "$letter dirty bit set -> running chkdsk /f"
+                    Write-ScriptLog "$letter dirty bit set -> executing chkdsk /f" "WARNING"
 
-                    # Capture all chkdsk output
+                    # Capture raw stdout & stderr from the system command (LOG-02/LOG-03: No Out-Null suppression)
                     $chkdskResults = chkdsk $letter /f 2>&1
                     $chkdskExitCode = $LASTEXITCODE
 
                     # Check for unfixable corruption (exit code 3)
                     if ($chkdskExitCode -eq 3) {
-                        Log-Error "CHKDSK reported unfixable corruption on $letter (exit code 3) - disk may require replacement"
+                        Write-ScriptLog "CHKDSK reported unfixable corruption on $letter (Exit Code: 3). Disk may need hardware level diagnostics." "ERROR"
                         $script_final_status = $STATUS_ERROR
                         $failedCount++
                     }
@@ -160,58 +196,57 @@ try {
                         $fixedCount++
                     }
 
-                    # Write full output to log file only (not stdout) for detailed review
-                    # Using Add-Content instead of Tee-Object to keep detailed logs separate from stdout summary
+                    # Write full raw chkdsk trace straight into the log file (LOG-01 / LOG-03)
                     foreach ($line in $chkdskResults) {
                         $str = $line.ToString()
                         if ($str.Trim()) {
-                            Add-Content -Path $logFile -Value $str
+                            $str | Out-File -FilePath $logFile -Append -Encoding utf8
                         }
                     }
 
-                    # Extract only the key summary lines for stdout
-                    # Keep: result lines, error/fix lines, and the final disk space summary block
+                    # Extract crucial structural logs for immediate stdout summary
                     $summaryLines = @()
                     $inSummary = $false
                     foreach ($line in $chkdskResults) {
                         $str = $line.ToString().Trim()
                         if (-not $str) { continue }
-                        # Start capturing disk space summary at "total disk space"
                         if ($str -match 'total disk space') { $inSummary = $true }
                         if ($inSummary) {
                             $summaryLines += $str
                             continue
                         }
-                        # Keep important result/action lines, skip verbose progress
                         if ($str -match '(no problems|correcting|replacing|deleting|recovering|inserting|truncating|adjusting|resetting|Windows has|No further action|Cleaning up|could not fix|Errors detected|corrupt|found no)') {
                             $summaryLines += $str
                         }
                     }
 
                     foreach ($sl in $summaryLines) {
-                        Log-Output $sl
+                        Write-ScriptLog $sl "OUTPUT"
                     }
                 }
                 else {
-                    Log-Info "$letter dirty bit not set -> skipping"
+                    Write-ScriptLog "$letter dirty bit not set -> skipping check" "INFO"
                 }
             }
             catch {
-                Log-Error "Failed processing partition $letter : $($_.Exception.Message)"
+                # Ensure loop handles individual processing errors without halting execution (ERR-03)
+                Write-ScriptLog "Failed processing partition $letter : $($_.Exception.Message)" "ERROR"
                 $script_final_status = $STATUS_ERROR
                 $failedCount++
             }
         }
     }
-    Log-Info "Partition summary: Processed=$processedCount Skipped=$skippedCount Fixed=$fixedCount Failed=$failedCount"
+    
+    # Loop summary logging (FE-02)
+    Write-ScriptLog "Partition Summary: Total Processed=$processedCount | Skipped=$skippedCount | Fixed=$fixedCount | Failed=$failedCount" "INFO"
 }
 catch {
-    Log-Error "An error occurred: $($_.Exception.Message)"
+    Write-ScriptLog "An unhandled execution crash occurred: $($_.Exception.Message)" "ERROR"
     $script_final_status = $STATUS_ERROR
 }
 finally {
-    Log-Info "Script ended at $(Get-Date)"
+    Write-ScriptLog "Script finalized. Destination log package details: $logFile" "INFO"
 }
 
-# THE FIX: Return must be outside the try/catch/finally blocks
+# Ensure the status gets exited safely (ERR-01)
 return $script_final_status
