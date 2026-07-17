@@ -45,8 +45,11 @@
     Author:  Tony Mocanu / Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.1: [May 2026] - Updated the script (current)
-                       - Fixed Get-VM failure when Hyper-V module is not available on host.
+    v1.2: [Jul 2026] - Updated the script (current)
+                       - Fixed DEP-01: Added Get-PSCallStack fallback when PSScriptRoot is empty
+                         (e.g. when az vm repair run delivers the script as a ScriptBlock).
+                         Emits a clear diagnostic and returns before constructing any helper paths.
+    v1.1: [May 2026] - Fixed Get-VM failure when Hyper-V module is not available on host.
                        - Added guarded nested VM validation with safe fallback logging.
                        - Added explicit runtime parameter validation for rootKey, propertyType, controlSet, and required inputs.
                        - Updated helper import to Get-Disk-Partitions-v2 and aligned partition processing flow.
@@ -89,21 +92,37 @@ reg unload HKLM\VERIFY
 #>
 
 # Initialization (no Param() block to avoid ParserErrors and argument transformation failures)
-$initPath = Join-Path $PSScriptRoot 'src\windows\common\setup\init.ps1'
-$diskPartitionsHelperPath = Join-Path $PSScriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
 
-if (-not (Test-Path -LiteralPath $initPath)) {
-    Write-Error "Missing required helper: $initPath"
+# ==============================================================================
+# 1. DEPENDENCY PATH VALIDATION & INITIALIZATION (DEP-01)
+# ==============================================================================
+# $PSScriptRoot can be empty when invoked through ScriptBlock execution.
+# Fall back to call stack script attribution to resolve the originating file directory.
+$resolvedScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    $resolvedScriptRoot = Split-Path -Parent (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
+}
+if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
+    Write-Error "Cannot determine script directory: PSScriptRoot is empty and call stack provides no path."
     return 1
 }
 
-if (-not (Test-Path -LiteralPath $diskPartitionsHelperPath)) {
-    Write-Error "Missing required helper: $diskPartitionsHelperPath"
+$initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
+$partitionsHelperPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
+
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initPath"
     return 1
 }
 
 . $initPath
-. $diskPartitionsHelperPath
+
+if (-not (Test-Path -Path $partitionsHelperPath -PathType Leaf)) {
+    Log-Error "Missing required dependency: $partitionsHelperPath"
+    return $STATUS_ERROR
+}
+
+. $partitionsHelperPath
 
 # DEBUG: Uncomment below to test locally without --parameters
 # $rootKey = 'HKLM'
