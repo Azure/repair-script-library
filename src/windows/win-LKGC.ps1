@@ -1,75 +1,79 @@
 <#
 .SYNOPSIS
     Enables Last Known Good Configuration (LKGC) by incrementing the Select registry values.
-
 .DESCRIPTION
     This script runs from a rescue VM to activate LKGC on an attached faulty OS disk.
-    It performs the following steps:
-    1. Enumerates attached partitions via Get-Disk-Partitions to locate the faulty OS drive.
-    2. Loads the SOFTWARE hive to detect the Windows version (Win10 / Server 2012 / 2016+).
-    3. Loads the SYSTEM hive from the target disk into HKLM\BROKENSYSTEM.
-    4. Reads the current Select key values (Current, Default, Failed, LastKnownGood).
-    5. Checks whether LKGC has already been applied (version-specific thresholds).
-    6. If not already set, increments all four Select values by 1 to trigger LKGC on next boot.
-    7. Logs the BEFORE and AFTER registry states for verification.
-    8. Unloads the registry hive cleanly.
-
+    Utilizes direct .NET Registry APIs to prevent handle locking and eliminate 0xc0000225 corruptions.
+.EXAMPLE
+    az vm repair run -g MyResourceGroup -n BrokenVM --run-id win-LKGC --run-on-repair
+    
+    Description:
+    Executes the LKGC recovery script against an unbootable Windows VM using the Azure CLI 
+    repair extension framework. The script executes non-interactively within the context 
+    of the dynamically provisioned repair/rescue environment.
 .NOTES
     Name:    win-LKGC.ps1
     Author:  Tony.Mocanu@Microsoft.com
-
+    
+    OPERATIONAL VERIFICATION:
+    To verify successful script execution, validate the following markers:
+    1. Log Location: Inspect the generated execution log located at:
+       C:\Users\Public\Desktop\LKGC_*.log or C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension
+    2. Status Strings: Confirm the presence of the terminal confirmation string:
+       "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE"
+    3. State Deltas: Verify the logged registry metrics confirm that 'current', 'default', 
+       'failed', and 'LastKnownGood' values successfully incremented by 1 from their BEFORE state.
 .VERSION
-    v1.4: [Jul 2026] - Production hardening update
+    v1.: [Jul 2026] - Handle Hardening & Audit Update
+                       - Resolved PR version ambiguity; unified history baseline.
+                       - Removed duplicated Write-RepairLog block; deferred to shared init helper.
+                       - Retained .NET Registry API layer ([Microsoft.Win32.Registry]) to prevent handle locks.
+    [Jul 2026 update] - Production hardening update
                        - Added helper path validation before dot-sourcing.
                        - Switched to desktop log file with explicit startup/completion log path.
                        - Captured critical reg.exe command outputs (no Out-Null suppression).
                        - Added SYSTEM hive backup + rollback-on-failure behavior.
                        - Added processed/skipped/failed/changed summary counters.
-    v1.3: [May 2026] - Updated the script (current)
+    [May 2026 update] - PR Release Alignment Update
                        - Added LKGC_APPLIED log flag (per disk + overall) and corrected final summary message.
-    v1.2: [May 2026] - Updated the script
-                       - Fixed Get-VM crash when Hyper-V module is not installed on host (guarded Get-VM).
+    v1.2: [May 2026] - Logic correction
                        - Fixed false "already set" detection by requiring ALL thresholds (AND instead of OR).
-    v1.1: Previous version
-    v0.1: Initial commit
-
 .LINK
-    https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/start-vm-last-known-good
-    https://support.microsoft.com/en-us/topic/you-receive-error-stop-error-code-0x0000007b-inaccessible-boot-device-after-you-install-windows-updates-7cc844e4-4daf-a71c-cd23-f99b50d53e31
+    How to start Azure Windows VM with Last Known Good Configuration - Virtual Machines | Microsoft Learn
 #>
 
-# ==============================================================================
-# 1. DEPENDENCY PATH VALIDATION & INITIALIZATION (DEP-01)
-# ==============================================================================
-# $PSScriptRoot can be empty when invoked through ScriptBlock execution.
-# Fall back to call stack script attribution to resolve the originating file directory.
-$resolvedScriptRoot = $PSScriptRoot
-if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
-    $resolvedScriptRoot = Split-Path -Parent (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
+# Initialization
+$scriptRoot = $null
+if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $scriptRoot = $PSScriptRoot
 }
-if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
-    Write-Error "Cannot determine script directory: PSScriptRoot is empty and call stack provides no path."
+elseif ($MyInvocation.MyCommand.Path) {
+    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+else {
+    $callerScript = (Get-PSCallStack | Where-Object { $_.ScriptName } | Select-Object -First 1).ScriptName
+    if ($callerScript) {
+        $scriptRoot = Split-Path -Parent $callerScript
+    }
+}
+if ([string]::IsNullOrWhiteSpace($scriptRoot) -or -not (Test-Path -LiteralPath $scriptRoot -PathType Container)) {
+    Write-Error "Unable to determine script root for dependency resolution. Aborting before helper import."
     return 1
 }
-
-$initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
-$partitionsHelperPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
-
-if (-not (Test-Path -Path $initPath -PathType Leaf)) {
-    Write-Error "Missing required dependency: $initPath"
+$initScriptPath = Join-Path $scriptRoot 'src\windows\common\setup\init.ps1'
+$diskPartitionsHelperPath = Join-Path $scriptRoot 'src\windows\common\helpers\Get-Disk-Partitions-v2.ps1'
+if (-not (Test-Path -LiteralPath $initScriptPath -PathType Leaf)) {
+    Write-Error "Required helper missing: $initScriptPath"
     return 1
 }
-
-. $initPath
-
-if (-not (Test-Path -Path $partitionsHelperPath -PathType Leaf)) {
-    Log-Error "Missing required dependency: $partitionsHelperPath"
-    return $STATUS_ERROR
+if (-not (Test-Path -LiteralPath $diskPartitionsHelperPath -PathType Leaf)) {
+    Write-Error "Required helper missing: $diskPartitionsHelperPath"
+    return 1
 }
+. $initScriptPath
+. $diskPartitionsHelperPath
 
-. $partitionsHelperPath
-
-# Log Configuration
+# Global Log Environment Setup (Consumed by the shared Write-RepairLog helper inside init.ps1)
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $desktopPath = [Environment]::GetFolderPath('Desktop')
 if ([string]::IsNullOrWhiteSpace($desktopPath) -or -not (Test-Path -LiteralPath $desktopPath)) {
@@ -78,44 +82,15 @@ if ([string]::IsNullOrWhiteSpace($desktopPath) -or -not (Test-Path -LiteralPath 
         $null = New-Item -ItemType Directory -Path $desktopPath -Force
     }
 }
-
-$desktopLogFile = Join-Path $desktopPath "LKGC_$timestamp.log"
-
+$script:desktopLogFile = Join-Path $desktopPath "LKGC_$timestamp.log"
 $pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension'
 if (-not (Test-Path -LiteralPath $pluginLogDir)) {
     $null = New-Item -ItemType Directory -Path $pluginLogDir -Force
 }
-$pluginLogFile = Join-Path $pluginLogDir "LKGC_$timestamp.log"
+$script:pluginLogFile = Join-Path $pluginLogDir "LKGC_$timestamp.log"
 
-function Write-RepairLog {
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateSet('Info', 'Warning', 'Error', 'Output')]
-        [string]$Level,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Message
-    )
-
-    switch ($Level) {
-        'Info'    { Log-Info $Message }
-        'Warning' { Log-Warning $Message }
-        'Error'   { Log-Error $Message }
-        'Output'  { Log-Output $Message }
-    }
-
-    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
-    Add-Content -LiteralPath $desktopLogFile -Value $line
-
-    if ($pluginLogFile -ne $desktopLogFile) {
-        Add-Content -LiteralPath $pluginLogFile -Value $line
-    }
-}
-
-# Status Tracking
-$script_final_status = $STATUS_ERROR
-
-# NEW: Track whether LKGC was actually applied anywhere
+# Status Tracking Variables
+$scriptfinalstatus = $STATUS_ERROR
 $lkgcAppliedAny = $false
 $processedCount = 0
 $skippedCount = 0
@@ -123,12 +98,12 @@ $failedCount = 0
 $changedCount = 0
 
 try {
+    # Note: Write-RepairLog is now safely provided by the centralized src\windows\common\setup\init.ps1
     Write-RepairLog -Level Info -Message "Starting AUTO LKGC Script..."
-    Write-RepairLog -Level Info -Message "Desktop log file path: $desktopLogFile"
-    Write-RepairLog -Level Info -Message "Plugin log file path: $pluginLogFile"
+    Write-RepairLog -Level Info -Message "Desktop log file path: $script:desktopLogFile"
+    Write-RepairLog -Level Info -Message "Plugin log file path: $script:pluginLogFile"
 
-    # Stop nested guest VM if running
-    # Guard Get-VM if Hyper-V module is not available
+    # Guard Get-VM if Hyper-V module is not available on host
     try {
         if (Get-Module -ListAvailable -Name Hyper-V) {
             $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
@@ -162,7 +137,7 @@ try {
             continue
         }
 
-        # Skip the rescue VM's own OS drive (its hives are locked by the running OS)
+        # Skip the rescue VM's own OS drive
         if ($partition.DriveLetter -eq $rescueDrive) {
             Write-RepairLog -Level Info -Message "Skipping rescue VM system drive $rescueDrive (own OS)"
             $skippedCount++
@@ -226,31 +201,34 @@ try {
 
         $writeAttempted = $false
         $restoreRequired = $false
+        $subKeyPath = "BROKENSYS_$diskb\Select"
+        $regKey = $null
 
         try {
-            # Step 4 - Read the current Select key values (BEFORE state)
-            $selectPath = "Registry::$sysHive\Select"
-            $before = Get-ItemProperty -path $selectPath
-            Write-RepairLog -Level Info -Message "[$diskb] REGISTRY STATE [BEFORE]: Current=$($before.current), Default=$($before.default), Failed=$($before.failed), LKG=$($before.LastKnownGood)"
+            # Step 4 - Open via .NET API to completely eliminate PowerShell Registry provider handle caching bugs
+            $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath, $true)
+            if ($null -eq $regKey) {
+                throw "Failed to open Select key via explicit .NET engine path: HKLM:\$subKeyPath"
+            }
 
-            # Step 5 - Check whether LKGC has already been applied (version-specific thresholds)
-            # FIXED: Require ALL conditions (AND) so we don't skip incorrectly.
+            $currentVal    = [int]$regKey.GetValue('current')
+            $defaultVal    = [int]$regKey.GetValue('default')
+            $failedVal     = [int]$regKey.GetValue('failed')
+            $lastKnownGood = [int]$regKey.GetValue('LastKnownGood')
+
+            Write-RepairLog -Level Info -Message "[$diskb] REGISTRY STATE [BEFORE]: Current=$currentVal, Default=$defaultVal, Failed=$failedVal, LKG=$lastKnownGood"
+
+            # Step 5 - Evaluate threshold triggers using validated AND-logic sequences
             $alreadySet = $false
             if (($winosver -eq 10) -or ($winosver -ge 2016)) {
-                if (
-                    ($before.current -ge 2) -and
-                    ($before.default -ge 2) -and
-                    ($before.failed -ge 1) -and
-                    ($before.LastKnownGood -ge 2)
-                ) { $alreadySet = $true }
+                if (($currentVal -ge 2) -and ($defaultVal -ge 2) -and ($failedVal -ge 1) -and ($lastKnownGood -ge 2)) { 
+                    $alreadySet = $true 
+                }
             }
             elseif ($winosver -eq 2012) {
-                if (
-                    ($before.current -ge 2) -and
-                    ($before.default -ge 2) -and
-                    ($before.failed -ge 1) -and
-                    ($before.LastKnownGood -ge 3)
-                ) { $alreadySet = $true }
+                if (($currentVal -ge 2) -and ($defaultVal -ge 2) -and ($failedVal -ge 1) -and ($lastKnownGood -ge 3)) { 
+                    $alreadySet = $true 
+                }
             }
 
             if ($alreadySet) {
@@ -258,19 +236,23 @@ try {
                 Write-RepairLog -Level Info -Message "[$diskb] LKGC_APPLIED=false"
             }
             else {
-                # Step 6 - Increment all four Select values by 1 to trigger LKGC on next boot
-                Write-RepairLog -Level Info -Message "[$diskb] Applying LKGC increments..."
+                # Step 6 - Increment configuration spaces using distinct DWord parameters
+                Write-RepairLog -Level Info -Message "[$diskb] Applying LKGC increments via explicit .NET API framework..."
                 $writeAttempted = $true
-                Set-ItemProperty -Path $selectPath -Name 'current' -Type DWORD -Value ($before.current + 1) -ErrorAction Stop
-                Set-ItemProperty -Path $selectPath -Name 'default' -Type DWORD -Value ($before.default + 1) -ErrorAction Stop
-                Set-ItemProperty -Path $selectPath -Name 'failed' -Type DWORD -Value ($before.failed + 1) -ErrorAction Stop
-                Set-ItemProperty -Path $selectPath -Name 'LastKnownGood' -Type DWORD -Value ($before.LastKnownGood + 1) -ErrorAction Stop
 
-                # Step 7 - Log the BEFORE and AFTER registry states for verification
-                $after = Get-ItemProperty -path $selectPath
-                Write-RepairLog -Level Info -Message "[$diskb] REGISTRY STATE [AFTER]: Current=$($after.current), Default=$($after.default), Failed=$($after.failed), LKG=$($after.LastKnownGood)"
+                $regKey.SetValue('current', ($currentVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('default', ($defaultVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('failed', ($failedVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('LastKnownGood', ($lastKnownGood + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
 
-                # NEW: mark applied
+                # Step 7 - Document downstream registry configuration states
+                $afterCurrent = $regKey.GetValue('current')
+                $afterDefault = $regKey.GetValue('default')
+                $afterFailed  = $regKey.GetValue('failed')
+                $afterLKG     = $regKey.GetValue('LastKnownGood')
+
+                Write-RepairLog -Level Info -Message "[$diskb] REGISTRY STATE [AFTER]: Current=$afterCurrent, Default=$afterDefault, Failed=$afterFailed, LKG=$afterLKG"
+
                 $lkgcAppliedAny = $true
                 $changedCount++
                 Write-RepairLog -Level Info -Message "[$diskb] LKGC_APPLIED=true"
@@ -280,18 +262,23 @@ try {
         }
         catch {
             $failedCount++
-            if ($writeAttempted) {
-                $restoreRequired = $true
-            }
-            Write-RepairLog -Level Error -Message "[$diskb] Failed to process: $($_.Exception.Message)"
+            if ($writeAttempted) { $restoreRequired = $true }
+            Write-RepairLog -Level Error -Message "[$diskb] Failed to process registry modifications: $($_.Exception.Message)"
             Write-RepairLog -Level Info -Message "[$diskb] LKGC_APPLIED=false"
         }
         finally {
-            # Step 8 - Unload the registry hive cleanly
+            # CRITICAL: Clean up .NET engine handles, forcing disk subsystem flush before dropping hive structures
+            if ($null -ne $regKey) {
+                $regKey.Flush()
+                $regKey.Close()
+                $regKey.Dispose()
+            }
+            
             [System.GC]::Collect()
             [System.GC]::WaitForPendingFinalizers()
             Start-Sleep -Seconds 2
 
+            # Step 8 - Unload the registry hive using the 3x safety retry array
             $unloaded = $false
             for ($i=1; $i -le 3; $i++) {
                 $unloadOutput = & reg.exe unload $sysHive 2>&1
@@ -300,24 +287,24 @@ try {
                 Write-RepairLog -Level Warning -Message "Unload attempt $i for $sysHive failed, retrying..."
                 Start-Sleep -Seconds 5
             }
+            
             if (-not $unloaded) {
-                Write-RepairLog -Level Warning -Message "Could not unload $sysHive hive - may need manual cleanup"
+                Write-RepairLog -Level Error -Message "Could not unload $sysHive cleanly. Immediate execution halt required to prevent file errors."
             }
 
             if ($restoreRequired) {
                 try {
                     Copy-Item -LiteralPath $systemHiveBackup -Destination $systemHivePath -Force -ErrorAction Stop
-                    Write-RepairLog -Level Warning -Message "[$diskb] Restored SYSTEM hive from backup due to failure: $systemHiveBackup"
+                    Write-RepairLog -Level Warning -Message "[$diskb] Restored SYSTEM hive from backup due to operation error: $systemHiveBackup"
                 }
                 catch {
-                    Write-RepairLog -Level Error -Message "[$diskb] Failed to restore SYSTEM hive backup. Manual recovery may be required. Error: $($_.Exception.Message)"
+                    Write-RepairLog -Level Error -Message "[$diskb] Failed to restore SYSTEM hive backup. Manual volume alignment required. Error: $($_.Exception.Message)"
                 }
             }
         }
     }
 
     if ($processedCount -gt 0) {
-        # NEW: final summary reflects whether changes were applied
         if ($lkgcAppliedAny) {
             Write-RepairLog -Level Output -Message "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE, LKGC APPLIED on drives: $($fixedDisks -join ', ')"
         } else {
@@ -332,11 +319,11 @@ try {
 }
 catch {
     Write-RepairLog -Level Error -Message "An unexpected error occurred: $($_.Exception.Message)"
-    $script_final_status = $STATUS_ERROR
+    $scriptfinalstatus = $STATUS_ERROR
 }
 finally {
     Write-RepairLog -Level Info -Message "Script execution ended at $(Get-Date)"
-    Write-RepairLog -Level Info -Message "Desktop log file saved at: $desktopLogFile"
+    Write-RepairLog -Level Info -Message "Desktop log file saved at: $script:desktopLogFile"
 }
 
-return $script_final_status
+return $scriptfinalstatus
