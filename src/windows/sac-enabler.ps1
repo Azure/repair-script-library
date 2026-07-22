@@ -349,9 +349,25 @@ try {
             $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
             if ($diskNum -ne $rescueDiskNum)
             {
+                $diskState = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
+                if ($diskState)
+                {
+                    Log-Info "Disk ${diskNum} state: Number=$($diskState.Number) IsOffline=$($diskState.IsOffline) IsReadOnly=$($diskState.IsReadOnly) PartitionStyle=$($diskState.PartitionStyle) OperationalStatus=$($diskState.OperationalStatus -join ',')"
+                }
                 Log-Info "Disk ${diskNum}: probing unlettered partitions for Windows loader and BCD store..."
                 $msrGptType = '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
-                $unletteredParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
+                $allParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue
+                if ($allParts)
+                {
+                    foreach ($p in $allParts)
+                    {
+                        $dl = if ($p.DriveLetter) { $p.DriveLetter } else { '<none>' }
+                        $gpt = if ($p.GptType) { $p.GptType } else { '<n/a>' }
+                        Log-Info "Disk ${diskNum} partition: Number=$($p.PartitionNumber) DriveLetter=$dl Type=$($p.Type) GptType=$gpt SizeBytes=$($p.Size)"
+                    }
+                }
+
+                $unletteredParts = $allParts | Where-Object {
                     (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and $_.GptType -ne $msrGptType
                 }
                 if ($unletteredParts)
@@ -427,6 +443,10 @@ try {
                             foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
                         }
                     }
+                }
+                else
+                {
+                    Log-Info "Disk ${diskNum}: no unlettered candidate partitions were found for temporary mount probing."
                 }
             }
         }
