@@ -35,7 +35,8 @@
 .PARAMETER MovePagefile
     Switch to relocate pagefile from temporary D: drive to persistent storage (C: or F: drive).
     WARNING: This change requires restoration after troubleshooting. The script will log
-    detailed restoration instructions including the original pagefile location.
+    detailed restoration instructions including the original pagefile location and
+    explicit CIM commands to restore it.
 
 .PARAMETER ConfigureAutomaticReboot
     Switch to configure automatic reboot after system crash (BootStatusPolicy=1).
@@ -72,6 +73,8 @@
                        - IMPROVED: Added comprehensive warnings about pagefile relocation destructiveness
                        - IMPROVED: Added C: drive free space validation before relocation (20% minimum required)
                        - IMPROVED: Added local test defaults documentation for local testing without CLI parameters
+                       - IMPROVED: Added explicit CIM restore commands for pagefile rollback guidance
+                       - IMPROVED: Dual-wrote plain text logs to desktop and script-local collected folder
     v1.2: [May 2026] - Updated script
                        - Added Michael.Smith@microsoft.com as co-author (v1.0 creator)
                        - Changed log file location to $env:PUBLIC\Desktop for uniformity with other scripts
@@ -118,18 +121,26 @@ if (-not (Test-Path -Path $initScriptPath -PathType Leaf)) {
 
 . $initScriptPath
 
-# Script-level logging: create a plain text desktop log that mirrors Log-* output.
+# Script-level logging: create desktop and collected plain text logs that mirror Log-* output.
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
-$logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+$desktopRunOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$collectedRunOutputDir = Join-Path -Path $PSScriptRoot -ChildPath ("logs\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$runOutputDir = $collectedRunOutputDir
+$desktopLogFilePath = Join-Path -Path $desktopRunOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+$collectedLogFilePath = Join-Path -Path $collectedRunOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+$script:LogFilePaths = @($desktopLogFilePath, $collectedLogFilePath)
 
-if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
-    New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
+foreach ($outputDir in @($desktopRunOutputDir, $collectedRunOutputDir)) {
+    if (-not (Test-Path -Path $outputDir -PathType Container)) {
+        New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
+    }
 }
 
-if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
-    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
+foreach ($path in $script:LogFilePaths) {
+    if (-not (Test-Path -Path $path -PathType Leaf)) {
+        New-Item -Path $path -ItemType File -Force | Out-Null
+    }
 }
 
 $script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
@@ -138,7 +149,7 @@ $script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).Scr
 $script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
 $script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
 
-function Write-DesktopLogLine {
+function Write-RunLogLine {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Level,
@@ -150,44 +161,52 @@ function Write-DesktopLogLine {
     try {
         $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
         $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
-        Add-Content -Path $logFilePath -Value $line -Encoding UTF8 -ErrorAction Stop
+        foreach ($path in $script:LogFilePaths) {
+            try {
+                Add-Content -Path $path -Value $line -Encoding UTF8 -ErrorAction Stop
+            }
+            catch {
+                Write-Output "[Warning $(Get-Date)]Failed to append to plain text log '$path': $($_.Exception.Message)"
+            }
+        }
     }
     catch {
-        Write-Output "[Warning $(Get-Date)]Failed to append to desktop log '$logFilePath': $($_.Exception.Message)"
+        Write-Output "[Warning $(Get-Date)]Failed to render log line: $($_.Exception.Message)"
     }
 }
 
 function Log-Output {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogOutput -message $message
-    Write-DesktopLogLine -Level 'Output' -Message $message
+    Write-RunLogLine -Level 'Output' -Message $message
 }
 
 function Log-Info {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogInfo -message $message
-    Write-DesktopLogLine -Level 'Info' -Message $message
+    Write-RunLogLine -Level 'Info' -Message $message
 }
 
 function Log-Warning {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogWarning -message $message
-    Write-DesktopLogLine -Level 'Warning' -Message $message
+    Write-RunLogLine -Level 'Warning' -Message $message
 }
 
 function Log-Error {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogError -message $message
-    Write-DesktopLogLine -Level 'Error' -Message $message
+    Write-RunLogLine -Level 'Error' -Message $message
 }
 
 function Log-Debug {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogDebug -message $message
-    Write-DesktopLogLine -Level 'Debug' -Message $message
+    Write-RunLogLine -Level 'Debug' -Message $message
 }
 
-Log-Info "Desktop plain text log initialized: $logFilePath"
+Log-Info "Plain text log initialized (desktop copy): $desktopLogFilePath"
+Log-Info "Plain text log initialized (collected copy): $collectedLogFilePath"
 
 # LOCAL TEST DEFAULTS: Uncomment the variables below to test locally without --parameters
 # You can either:
@@ -344,6 +363,43 @@ function Get-AuditSnapshot {
     }
 }
 
+function Get-PagefileRestoreCommands {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$OriginalPagefileLocations
+    )
+
+    $commands = @(
+        "Get-CimInstance -ClassName Win32_PageFileSetting | Where-Object { `$_.Name -eq 'C:\pagefile.sys' } | Remove-CimInstance"
+    )
+
+    foreach ($location in $OriginalPagefileLocations) {
+        if (-not [string]::IsNullOrWhiteSpace($location)) {
+            $commands += "New-CimInstance -ClassName Win32_PageFileSetting -Property @{ Name='$location'; InitialSize=0; MaximumSize=0 }"
+        }
+    }
+
+    return $commands
+}
+
+function Write-PagefileRestoreGuidance {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$OriginalPagefileLocations
+    )
+
+    if (-not $OriginalPagefileLocations -or $OriginalPagefileLocations.Count -eq 0) {
+        return
+    }
+
+    Log-Warning "RESTORATION REQUIRED: original pagefile settings were $($OriginalPagefileLocations -join ', ')"
+    Log-Warning "To restore the original pagefile configuration after debugging, run:"
+
+    foreach ($command in (Get-PagefileRestoreCommands -OriginalPagefileLocations $OriginalPagefileLocations)) {
+        Log-Warning "  $command"
+    }
+}
+
 try {
     # Step 1 - Audit BEFORE
     Get-AuditSnapshot "AUDITING SETTINGS (BEFORE)"
@@ -427,6 +483,7 @@ try {
         Log-Warning "    2. To restore pagefile to D: after troubleshooting, manual intervention or script re-run is required"
         Log-Warning "    3. Ensure C: drive has sufficient free space (recommend minimum 50% free) before proceeding"
         Log-Warning "    4. For production VMs, consider scheduling this change during maintenance window"
+        Write-PagefileRestoreGuidance -OriginalPagefileLocations $originalPagefileLocations
         
         try {
             # FIX: Explicitly target C: if logic loop fails, bypass the CIM free space comparison bug
@@ -509,8 +566,8 @@ try {
 
     # Step 7 - Guard for empty DumpFile (ensure valid path before kdbgctrl)
     if ([string]::IsNullOrEmpty($DumpFile)) {
-        Log-Warning "DumpFile is empty. Using Windows default: %SystemRoot%\MEMORY.DMP"
-        $DumpFile = "%SystemRoot%\MEMORY.DMP"
+        Log-Warning "DumpFile is empty. Using Windows default: %SystemRoot%\\MEMORY.DMP"
+        $DumpFile = "%SystemRoot%\\MEMORY.DMP"
         Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
     }
 
@@ -585,7 +642,7 @@ try {
     
     if ($pagefileWasMoved) {
         Log-Output "PAGEFILE RELOCATION COMPLETED: Pagefile moved from temporary D: drive."
-        Log-Warning "RESTORATION REQUIRED: Restore to $($originalPagefileLocations -join ', ') after debugging."
+        Write-PagefileRestoreGuidance -OriginalPagefileLocations $originalPagefileLocations
     }
     
     if ($verificationFailed) {
@@ -594,7 +651,8 @@ try {
     }
     else {
         Log-Output "SUCCESS: Configuration applied immediately - NO REBOOT REQUIRED"
-        Log-Info "Desktop log file: $logFilePath"
+        Log-Info "Desktop log file: $desktopLogFilePath"
+        Log-Info "Collected log file: $collectedLogFilePath"
         $script_final_status = $STATUS_SUCCESS
     }
 }
