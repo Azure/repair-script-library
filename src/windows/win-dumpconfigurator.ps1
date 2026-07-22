@@ -125,33 +125,39 @@ if (-not (Test-Path -Path $initScriptPath -PathType Leaf)) {
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $desktopRunOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
-$collectedRunOutputDir = Join-Path -Path $PSScriptRoot -ChildPath ("logs\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$collectedLogsBaseDir = Join-Path -Path $PSScriptRoot -ChildPath 'logs'
+
+# In RunCommand scenarios, prefer a shorter collection path under the repair-files root
+# to avoid deep nested paths that can fail directory/file creation.
+if ($PSScriptRoot -match '^(.*?\\repair-files-\d{14})(\\|$)') {
+    $collectedLogsBaseDir = Join-Path -Path $Matches[1] -ChildPath 'plugin-logs'
+}
+
+$collectedRunOutputDir = Join-Path -Path $collectedLogsBaseDir -ChildPath ("{0}-run-{1}" -f $scriptName, $runTimestamp)
 $runOutputDir = $collectedRunOutputDir
 $desktopLogFilePath = Join-Path -Path $desktopRunOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
 $collectedLogFilePath = Join-Path -Path $collectedRunOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
-$script:LogFilePaths = @($desktopLogFilePath, $collectedLogFilePath)
+$script:LogFilePaths = @()
 
 foreach ($outputDir in @($desktopRunOutputDir, $collectedRunOutputDir)) {
     try {
-        if (-not (Test-Path -Path $outputDir -PathType Container)) {
-            New-Item -Path $outputDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
+        [System.IO.Directory]::CreateDirectory($outputDir) | Out-Null
     }
     catch {
         Write-Output "[Warning $(Get-Date)]Failed to create log directory '$outputDir': $($_.Exception.Message)"
     }
 }
 
-foreach ($path in $script:LogFilePaths) {
+foreach ($path in @($desktopLogFilePath, $collectedLogFilePath)) {
     $parentDir = Split-Path -Path $path -Parent
     try {
-        if (-not (Test-Path -Path $parentDir -PathType Container)) {
-            New-Item -Path $parentDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
+        [System.IO.Directory]::CreateDirectory($parentDir) | Out-Null
 
         if (-not (Test-Path -Path $path -PathType Leaf)) {
             New-Item -Path $path -ItemType File -Force -ErrorAction Stop | Out-Null
         }
+
+        $script:LogFilePaths += $path
     }
     catch {
         Write-Output "[Warning $(Get-Date)]Failed to initialize log file '$path': $($_.Exception.Message)"
