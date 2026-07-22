@@ -248,6 +248,22 @@ function Remove-StaleEfiTempLetters {
     }
 }
 
+function Get-AvailableTempDriveLetter {
+    $preferredLetters = @('Z','Y','X','W','V','U','T','S','R','Q')
+    $usedLetters = @()
+    Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | ForEach-Object {
+        $usedLetters += $_.DriveLetter.ToString().ToUpperInvariant()
+    }
+
+    foreach ($letter in $preferredLetters) {
+        if ($letter -notin $usedLetters) {
+            return $letter
+        }
+    }
+
+    return $null
+}
+
 $logFile = $logFilePath
 Log-Info "Desktop plain text log initialized: $logFilePath"
 Log-Info "Plugin log initialized: $pluginLogPath"
@@ -297,9 +313,7 @@ try {
         $isBcdPath = $false
         $bcdPath = ''
         $isOsPath = $false
-        $tempEfiLetter = $null
-        $tempEfiDiskNum = $null
-        $tempEfiPartNum = $null
+        $tempMountedPartitions = @()
         Log-Info "Processing Disk $diskNumber"
 
         try {
@@ -328,62 +342,98 @@ try {
             }
         }
 
-        # Gen2 EFI fallback: if OS found but no BCD, discover unlettered EFI partition
-        if (-not $isBcdPath -and $isOsPath)
+        # Fallback: temporarily mount unlettered partitions to find missing OS/BCD paths.
+        if (-not $isBcdPath -or -not $isOsPath)
         {
             $diskNum = [int]$partitionGroup.Name
             $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
             if ($diskNum -ne $rescueDiskNum)
             {
-                Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..."
-                $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
-                $efiParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
-                    $_.GptType -eq $efiGptType -and (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0)
+                Log-Info "Disk ${diskNum}: probing unlettered partitions for Windows loader and BCD store..."
+                $msrGptType = '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
+                $unletteredParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
+                    (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and $_.GptType -ne $msrGptType
                 }
-                if ($efiParts)
+                if ($unletteredParts)
                 {
-                    # Find an available drive letter (Z downward to avoid conflicts)
-                    $usedLetters = @()
-                    Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | ForEach-Object { $usedLetters += $_.DriveLetter }
-                    $tempLetter = $null
-                    foreach ($l in @('Z','Y','X','W','V','U','T','S','R','Q')) {
-                        if ($l -notin $usedLetters) { $tempLetter = $l; break }
-                    }
-                    if ($tempLetter)
+                    foreach ($part in $unletteredParts)
                     {
-                        foreach ($ep in $efiParts)
+                        if ($isBcdPath -and $isOsPath) { break }
+
+                        $tempLetter = Get-AvailableTempDriveLetter
+                        if (-not $tempLetter)
                         {
-                            $pn = $ep.PartitionNumber
-                            Log-Info "Assigning temp letter ${tempLetter}: to Disk $diskNum Partition $pn (EFI)..."
-                            $dpLines = @("select disk $diskNum", "select partition $pn", "assign letter=$tempLetter")
-                            $dpAssignOut = $dpLines | diskpart 2>&1
-                            foreach ($line in @($dpAssignOut)) { if ($line) { Log-Output "[diskpart][assign] $line" } }
-                            Start-Sleep -Seconds 2
-                            $bcdPath = "${tempLetter}:\efi\microsoft\boot\bcd"
-                            $isBcdPath = Test-Path $bcdPath
-                            if ($isBcdPath)
+                            Log-Warning "No available temporary drive letter to probe Disk $diskNum"
+                            break
+                        }
+
+                        $pn = $part.PartitionNumber
+                        Log-Info "Assigning temp letter ${tempLetter}: to Disk $diskNum Partition $pn for probe..."
+                        $dpLines = @("select disk $diskNum", "select partition $pn", "assign letter=$tempLetter")
+                        $dpAssignOut = $dpLines | diskpart 2>&1
+                        foreach ($line in @($dpAssignOut)) { if ($line) { Log-Output "[diskpart][assign] $line" } }
+                        Start-Sleep -Seconds 2
+
+                        $foundSomething = $false
+
+                        if (-not $isBcdPath)
+                        {
+                            $candidateBcdPath = "${tempLetter}:\boot\bcd"
+                            if (Test-Path $candidateBcdPath)
                             {
-                                Log-Info "Found Gen2 BCD store at $bcdPath"
-                                $tempEfiLetter = $tempLetter
-                                $tempEfiDiskNum = $diskNum
-                                $tempEfiPartNum = $pn
-                                break
+                                $bcdPath = $candidateBcdPath
+                                $isBcdPath = $true
+                                $foundSomething = $true
+                                Log-Info "Found BCD store at $bcdPath"
                             }
                             else
                             {
-                                Log-Info "No BCD at $bcdPath, removing letter..."
-                                $dpRemove = @("select disk $diskNum", "select partition $pn", "remove letter=$tempLetter")
-                                $dpRemoveOut = $dpRemove | diskpart 2>&1
-                                foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
+                                $candidateBcdPath = "${tempLetter}:\efi\microsoft\boot\bcd"
+                                if (Test-Path $candidateBcdPath)
+                                {
+                                    $bcdPath = $candidateBcdPath
+                                    $isBcdPath = $true
+                                    $foundSomething = $true
+                                    Log-Info "Found EFI BCD store at $bcdPath"
+                                }
                             }
                         }
-                    }
-                    else
-                    {
-                        Log-Warning "No available drive letter for EFI partition on Disk $diskNum"
+
+                        if (-not $isOsPath)
+                        {
+                            $winloadExePath = "${tempLetter}:\windows\system32\winload.exe"
+                            $winloadEfiPath = "${tempLetter}:\windows\system32\winload.efi"
+                            if ((Test-Path $winloadExePath) -or (Test-Path $winloadEfiPath))
+                            {
+                                $isOsPath = $true
+                                $foundSomething = $true
+                                Log-Info "Found Windows loader on ${tempLetter}:"
+                            }
+                        }
+
+                        if ($foundSomething)
+                        {
+                            $tempMountedPartitions += @{
+                                Letter = $tempLetter
+                                DiskNumber = $diskNum
+                                PartitionNumber = $pn
+                            }
+                        }
+                        else
+                        {
+                            Log-Info "No OS/BCD artifacts on ${tempLetter}:, removing temporary letter..."
+                            $dpRemove = @("select disk $diskNum", "select partition $pn", "remove letter=$tempLetter")
+                            $dpRemoveOut = $dpRemove | diskpart 2>&1
+                            foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
+                        }
                     }
                 }
             }
+        }
+
+        if (-not $isBcdPath -or -not $isOsPath)
+        {
+            Log-Info "Disk $diskNumber probe result: isOsPath=$isOsPath isBcdPath=$isBcdPath"
         }
 
         # Apply SAC changes if both BCD and OS loader were found
@@ -453,11 +503,14 @@ try {
         }
         finally {
 
-        # Clean up temporary EFI drive letter if one was assigned
-        if ($tempEfiLetter)
+        # Clean up temporary drive letters that were kept for BCD/OS access.
+        foreach ($mount in $tempMountedPartitions)
         {
-            Log-Info "Removing temp letter ${tempEfiLetter}: from Disk $tempEfiDiskNum Partition $tempEfiPartNum"
-            $dpClean = @("select disk $tempEfiDiskNum", "select partition $tempEfiPartNum", "remove letter=$tempEfiLetter")
+            $cleanupLetter = $mount.Letter
+            $cleanupDisk = $mount.DiskNumber
+            $cleanupPart = $mount.PartitionNumber
+            Log-Info "Removing temp letter ${cleanupLetter}: from Disk $cleanupDisk Partition $cleanupPart"
+            $dpClean = @("select disk $cleanupDisk", "select partition $cleanupPart", "remove letter=$cleanupLetter")
             $dpCleanOut = $dpClean | diskpart 2>&1
             foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][cleanup] $line" } }
         }
