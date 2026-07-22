@@ -132,14 +132,29 @@ $collectedLogFilePath = Join-Path -Path $collectedRunOutputDir -ChildPath ("{0}-
 $script:LogFilePaths = @($desktopLogFilePath, $collectedLogFilePath)
 
 foreach ($outputDir in @($desktopRunOutputDir, $collectedRunOutputDir)) {
-    if (-not (Test-Path -Path $outputDir -PathType Container)) {
-        New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
+    try {
+        if (-not (Test-Path -Path $outputDir -PathType Container)) {
+            New-Item -Path $outputDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    catch {
+        Write-Output "[Warning $(Get-Date)]Failed to create log directory '$outputDir': $($_.Exception.Message)"
     }
 }
 
 foreach ($path in $script:LogFilePaths) {
-    if (-not (Test-Path -Path $path -PathType Leaf)) {
-        New-Item -Path $path -ItemType File -Force | Out-Null
+    $parentDir = Split-Path -Path $path -Parent
+    try {
+        if (-not (Test-Path -Path $parentDir -PathType Container)) {
+            New-Item -Path $parentDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+
+        if (-not (Test-Path -Path $path -PathType Leaf)) {
+            New-Item -Path $path -ItemType File -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    catch {
+        Write-Output "[Warning $(Get-Date)]Failed to initialize log file '$path': $($_.Exception.Message)"
     }
 }
 
