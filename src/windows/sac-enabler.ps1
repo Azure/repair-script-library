@@ -264,6 +264,38 @@ function Get-AvailableTempDriveLetter {
     return $null
 }
 
+function Test-WindowsOsVolume {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DriveLetter
+    )
+
+    $candidateChecks = @(
+        @{ Path = "$DriveLetter`:\windows\system32\winload.exe"; Reason = 'winload.exe' },
+        @{ Path = "$DriveLetter`:\windows\system32\winload.efi"; Reason = 'winload.efi' },
+        @{ Path = "$DriveLetter`:\windows\system32\config\SYSTEM"; Reason = 'SYSTEM hive' },
+        @{ Path = "$DriveLetter`:\windows\explorer.exe"; Reason = 'explorer.exe' }
+    )
+
+    foreach ($check in $candidateChecks)
+    {
+        if (Test-Path -Path $check.Path)
+        {
+            return @{
+                IsMatch = $true
+                Reason = $check.Reason
+                Path = $check.Path
+            }
+        }
+    }
+
+    return @{
+        IsMatch = $false
+        Reason = $null
+        Path = $null
+    }
+}
+
 $logFile = $logFilePath
 Log-Info "Desktop plain text log initialized: $logFilePath"
 Log-Info "Plugin log initialized: $pluginLogPath"
@@ -336,9 +368,12 @@ try {
             }        
             if (-not $isOsPath)
             {
-                $winloadExePath = $drive + ':\windows\system32\winload.exe'
-                $winloadEfiPath = $drive + ':\windows\system32\winload.efi'
-                $isOsPath = (Test-Path $winloadExePath) -or (Test-Path $winloadEfiPath)
+                $osProbe = Test-WindowsOsVolume -DriveLetter $drive
+                $isOsPath = $osProbe.IsMatch
+                if ($isOsPath)
+                {
+                    Log-Info "Disk $diskNumber OS partition detected on ${drive}: via $($osProbe.Reason) at $($osProbe.Path)"
+                }
             }
         }
 
@@ -417,13 +452,12 @@ try {
 
                         if (-not $isOsPath)
                         {
-                            $winloadExePath = "${tempLetter}:\windows\system32\winload.exe"
-                            $winloadEfiPath = "${tempLetter}:\windows\system32\winload.efi"
-                            if ((Test-Path $winloadExePath) -or (Test-Path $winloadEfiPath))
+                            $osProbe = Test-WindowsOsVolume -DriveLetter $tempLetter
+                            if ($osProbe.IsMatch)
                             {
                                 $isOsPath = $true
                                 $foundSomething = $true
-                                Log-Info "Found Windows loader on ${tempLetter}:"
+                                Log-Info "Found Windows OS markers on ${tempLetter}: via $($osProbe.Reason) at $($osProbe.Path)"
                             }
                         }
 
