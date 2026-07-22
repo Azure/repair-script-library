@@ -121,18 +121,30 @@ if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
 
 . $diskPartitionsPath
 
-# Script-level logging: create a plain text desktop log that mirrors Log-* output.
+# Script-level logging: mirror Log-* output to desktop and plugin log files.
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
 $logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+$pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension'
+$pluginLogPath = Join-Path -Path $pluginLogDir -ChildPath ("{0}_{1}.log" -f $scriptName, $runTimestamp)
+$script:RunLogTargets = @()
 
 if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
     New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
 }
 
-if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
-    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
+if (-not (Test-Path -Path $pluginLogDir -PathType Container)) {
+    New-Item -Path $pluginLogDir -ItemType Directory -Force | Out-Null
+}
+
+$script:RunLogTargets += $logFilePath
+$script:RunLogTargets += $pluginLogPath
+
+foreach ($targetLogPath in $script:RunLogTargets) {
+    if (-not (Test-Path -Path $targetLogPath -PathType Leaf)) {
+        New-Item -Path $targetLogPath -ItemType File -Force | Out-Null
+    }
 }
 
 $script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
@@ -141,7 +153,7 @@ $script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).Scr
 $script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
 $script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
 
-function Write-DesktopLogLine {
+function Write-RunLogLine {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Level,
@@ -153,14 +165,16 @@ function Write-DesktopLogLine {
     try {
         $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
         $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
-        Add-Content -Path $logFilePath -Value $line -Encoding UTF8 -ErrorAction Stop
+        foreach ($targetLogPath in $script:RunLogTargets) {
+            Add-Content -Path $targetLogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+        }
     }
     catch {
         if ($script:OriginalLogWarning) {
-            & $script:OriginalLogWarning -message "Failed to append to desktop log '$logFilePath': $($_.Exception.Message)"
+            & $script:OriginalLogWarning -message "Failed to append to one or more run logs: $($_.Exception.Message)"
         }
         else {
-            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to desktop log '$logFilePath': $($_.Exception.Message)")
+            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to one or more run logs: $($_.Exception.Message)")
         }
     }
 }
@@ -168,35 +182,75 @@ function Write-DesktopLogLine {
 function Log-Output {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogOutput -message $message
-    Write-DesktopLogLine -Level 'Output' -Message $message
+    Write-RunLogLine -Level 'Output' -Message $message
 }
 
 function Log-Info {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogInfo -message $message
-    Write-DesktopLogLine -Level 'Info' -Message $message
+    Write-RunLogLine -Level 'Info' -Message $message
 }
 
 function Log-Warning {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogWarning -message $message
-    Write-DesktopLogLine -Level 'Warning' -Message $message
+    Write-RunLogLine -Level 'Warning' -Message $message
 }
 
 function Log-Error {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogError -message $message
-    Write-DesktopLogLine -Level 'Error' -Message $message
+    Write-RunLogLine -Level 'Error' -Message $message
 }
 
 function Log-Debug {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogDebug -message $message
-    Write-DesktopLogLine -Level 'Debug' -Message $message
+    Write-RunLogLine -Level 'Debug' -Message $message
+}
+
+function Remove-StaleEfiTempLetters {
+    $candidateLetters = @('Z','Y','X','W','V','U','T','S','R','Q')
+    $rescueDrive = ($env:SystemDrive -replace ':', '').ToUpperInvariant()
+    $rescueDisk = Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1
+    $rescueDiskNum = $null
+    if ($rescueDisk) {
+        $rescueDiskNum = $rescueDisk.DiskNumber
+    }
+
+    $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+    $staleParts = Get-Partition -ErrorAction SilentlyContinue | Where-Object {
+        $_.GptType -eq $efiGptType -and
+        $_.DriveLetter -and
+        ($_.DriveLetter.ToString().ToUpperInvariant() -in $candidateLetters) -and
+        ($null -eq $rescueDiskNum -or $_.DiskNumber -ne $rescueDiskNum)
+    }
+
+    foreach ($part in $staleParts) {
+        $letter = $part.DriveLetter.ToString().ToUpperInvariant()
+        $probePath = "${letter}:\efi\microsoft\boot\bcd"
+        if (-not (Test-Path -Path $probePath)) {
+            continue
+        }
+
+        Log-Warning "Found possible stale EFI temp letter ${letter}: on Disk $($part.DiskNumber) Partition $($part.PartitionNumber). Removing..."
+        $dpRemove = @(
+            "select disk $($part.DiskNumber)",
+            "select partition $($part.PartitionNumber)",
+            "remove letter=$letter"
+        )
+        $dpOut = $dpRemove | diskpart 2>&1
+        foreach ($line in @($dpOut)) {
+            if ($line) {
+                Log-Output "[diskpart][stale-cleanup] $line"
+            }
+        }
+    }
 }
 
 $logFile = $logFilePath
 Log-Info "Desktop plain text log initialized: $logFilePath"
+Log-Info "Plugin log initialized: $pluginLogPath"
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
@@ -207,6 +261,8 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting SAC enabler. Desktop log: $logFile"
+Log-Info "Run logs: $($script:RunLogTargets -join ', ')"
+Remove-StaleEfiTempLetters
 
 try {
     # Check if the Hyper-V module is available before performing nested VM checks
