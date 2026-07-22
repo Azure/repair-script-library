@@ -121,30 +121,36 @@ if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
 
 . $diskPartitionsPath
 
-# Script-level logging: mirror Log-* output to desktop and plugin log files.
+# Script-level logging: create a plain text desktop log that mirrors Log-* output.
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
 $logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
 $pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension'
-$pluginLogPath = Join-Path -Path $pluginLogDir -ChildPath ("{0}_{1}.log" -f $scriptName, $runTimestamp)
-$script:RunLogTargets = @()
+$pluginLogFilePath = Join-Path -Path $pluginLogDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+$scriptLogTargets = @()
 
 if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
     New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
 }
 
-if (-not (Test-Path -Path $pluginLogDir -PathType Container)) {
-    New-Item -Path $pluginLogDir -ItemType Directory -Force | Out-Null
+if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
+    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
 }
 
-$script:RunLogTargets += $logFilePath
-$script:RunLogTargets += $pluginLogPath
+$scriptLogTargets += $logFilePath
 
-foreach ($targetLogPath in $script:RunLogTargets) {
-    if (-not (Test-Path -Path $targetLogPath -PathType Leaf)) {
-        New-Item -Path $targetLogPath -ItemType File -Force | Out-Null
+try {
+    if (-not (Test-Path -Path $pluginLogDir -PathType Container)) {
+        New-Item -Path $pluginLogDir -ItemType Directory -Force | Out-Null
     }
+    if (-not (Test-Path -Path $pluginLogFilePath -PathType Leaf)) {
+        New-Item -Path $pluginLogFilePath -ItemType File -Force | Out-Null
+    }
+    $scriptLogTargets += $pluginLogFilePath
+}
+catch {
+    [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to initialize plugin log path '$pluginLogFilePath': $($_.Exception.Message)")
 }
 
 $script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
@@ -153,7 +159,7 @@ $script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).Scr
 $script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
 $script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
 
-function Write-RunLogLine {
+function Write-DesktopLogLine {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Level,
@@ -165,140 +171,107 @@ function Write-RunLogLine {
     try {
         $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
         $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
-        foreach ($targetLogPath in $script:RunLogTargets) {
-            Add-Content -Path $targetLogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+        foreach ($target in $scriptLogTargets) {
+            Add-Content -Path $target -Value $line -Encoding UTF8 -ErrorAction Stop
         }
     }
     catch {
         if ($script:OriginalLogWarning) {
-            & $script:OriginalLogWarning -message "Failed to append to one or more run logs: $($_.Exception.Message)"
+            & $script:OriginalLogWarning -message "Failed to append to one or more log targets '$($scriptLogTargets -join ', ')': $($_.Exception.Message)"
         }
         else {
-            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to one or more run logs: $($_.Exception.Message)")
+            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to one or more log targets '$($scriptLogTargets -join ', ')': $($_.Exception.Message)")
         }
     }
+}
+
+function Invoke-LogWithMirrors {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ScriptBlock]$OriginalLogger,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Level,
+
+        [Parameter(Mandatory = $true)]
+        [PSObject[]]$Message
+    )
+
+    & $OriginalLogger -message $Message
+    Write-DesktopLogLine -Level $Level -Message $Message
 }
 
 function Log-Output {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    & $script:OriginalLogOutput -message $message
-    Write-RunLogLine -Level 'Output' -Message $message
+    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogOutput -Level 'Output' -Message $message
 }
 
 function Log-Info {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    & $script:OriginalLogInfo -message $message
-    Write-RunLogLine -Level 'Info' -Message $message
+    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogInfo -Level 'Info' -Message $message
 }
 
 function Log-Warning {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    & $script:OriginalLogWarning -message $message
-    Write-RunLogLine -Level 'Warning' -Message $message
+    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogWarning -Level 'Warning' -Message $message
 }
 
 function Log-Error {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    & $script:OriginalLogError -message $message
-    Write-RunLogLine -Level 'Error' -Message $message
+    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogError -Level 'Error' -Message $message
 }
 
 function Log-Debug {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    & $script:OriginalLogDebug -message $message
-    Write-RunLogLine -Level 'Debug' -Message $message
+    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogDebug -Level 'Debug' -Message $message
 }
 
-function Remove-StaleEfiTempLetters {
-    $candidateLetters = @('Z','Y','X','W','V','U','T','S','R','Q')
-    $rescueDrive = ($env:SystemDrive -replace ':', '').ToUpperInvariant()
-    $rescueDisk = Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1
-    $rescueDiskNum = $null
-    if ($rescueDisk) {
-        $rescueDiskNum = $rescueDisk.DiskNumber
-    }
+function Invoke-StaleEfiTempLetterSweep {
+    param(
+        [bool]$Cleanup = $false
+    )
 
     $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
-    $staleParts = Get-Partition -ErrorAction SilentlyContinue | Where-Object {
-        $_.GptType -eq $efiGptType -and
-        $_.DriveLetter -and
-        ($_.DriveLetter.ToString().ToUpperInvariant() -in $candidateLetters) -and
-        ($null -eq $rescueDiskNum -or $_.DiskNumber -ne $rescueDiskNum)
-    }
+    $candidateLetters = @('Q','R','S','T','U','V','W','X','Y','Z')
 
-    foreach ($part in $staleParts) {
-        $letter = $part.DriveLetter.ToString().ToUpperInvariant()
-        $probePath = "${letter}:\efi\microsoft\boot\bcd"
-        if (-not (Test-Path -Path $probePath)) {
-            continue
-        }
+    foreach ($letter in $candidateLetters) {
+        $vol = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
+        if (-not $vol) { continue }
 
-        Log-Warning "Found possible stale EFI temp letter ${letter}: on Disk $($part.DiskNumber) Partition $($part.PartitionNumber). Removing..."
-        $dpRemove = @(
-            "select disk $($part.DiskNumber)",
-            "select partition $($part.PartitionNumber)",
-            "remove letter=$letter"
-        )
-        $dpOut = $dpRemove | diskpart 2>&1
-        foreach ($line in @($dpOut)) {
-            if ($line) {
-                Log-Output "[diskpart][stale-cleanup] $line"
+        $part = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue
+        if (-not $part) { continue }
+
+        if ($part.GptType -ne $efiGptType) { continue }
+
+        $bcdCandidate = "${letter}:\efi\microsoft\boot\bcd"
+        if (-not (Test-Path -Path $bcdCandidate)) { continue }
+
+        Log-Warning "Detected mounted EFI partition at ${letter}: that may be from a prior interrupted run (Disk $($part.DiskNumber), Partition $($part.PartitionNumber))."
+
+        if ($Cleanup) {
+            try {
+                Log-Info "Removing stale EFI temp letter ${letter}: from Disk $($part.DiskNumber) Partition $($part.PartitionNumber)"
+                $dpClean = @("select disk $($part.DiskNumber)", "select partition $($part.PartitionNumber)", "remove letter=$letter")
+                $dpCleanOut = $dpClean | diskpart 2>&1
+                foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][startup-cleanup] $line" } }
+            }
+            catch {
+                Log-Warning "Failed removing stale EFI temp letter ${letter}: $($_.Exception.Message)"
             }
         }
-    }
-}
-
-function Get-AvailableTempDriveLetter {
-    $preferredLetters = @('Z','Y','X','W','V','U','T','S','R','Q')
-    $usedLetters = @()
-    Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | ForEach-Object {
-        $usedLetters += $_.DriveLetter.ToString().ToUpperInvariant()
-    }
-
-    foreach ($letter in $preferredLetters) {
-        if ($letter -notin $usedLetters) {
-            return $letter
-        }
-    }
-
-    return $null
-}
-
-function Test-WindowsOsVolume {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DriveLetter
-    )
-
-    $candidateChecks = @(
-        @{ Path = "$DriveLetter`:\windows\system32\winload.exe"; Reason = 'winload.exe' },
-        @{ Path = "$DriveLetter`:\windows\system32\winload.efi"; Reason = 'winload.efi' },
-        @{ Path = "$DriveLetter`:\windows\system32\config\SYSTEM"; Reason = 'SYSTEM hive' },
-        @{ Path = "$DriveLetter`:\windows\explorer.exe"; Reason = 'explorer.exe' }
-    )
-
-    foreach ($check in $candidateChecks)
-    {
-        if (Test-Path -Path $check.Path)
-        {
-            return @{
-                IsMatch = $true
-                Reason = $check.Reason
-                Path = $check.Path
-            }
-        }
-    }
-
-    return @{
-        IsMatch = $false
-        Reason = $null
-        Path = $null
     }
 }
 
 $logFile = $logFilePath
 Log-Info "Desktop plain text log initialized: $logFilePath"
-Log-Info "Plugin log initialized: $pluginLogPath"
+if ($scriptLogTargets -contains $pluginLogFilePath) {
+    Log-Info "Plugin plain text log initialized: $pluginLogFilePath"
+}
+
+# Optional startup cleanup for stale EFI temp letters from interrupted runs.
+# Disabled by default to avoid removing intentionally mounted EFI volumes.
+$enableStaleEfiSweepCleanup = $false
+Invoke-StaleEfiTempLetterSweep -Cleanup $enableStaleEfiSweepCleanup
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
@@ -309,8 +282,6 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting SAC enabler. Desktop log: $logFile"
-Log-Info "Run logs: $($script:RunLogTargets -join ', ')"
-Remove-StaleEfiTempLetters
 
 try {
     # Check if the Hyper-V module is available before performing nested VM checks
@@ -345,7 +316,9 @@ try {
         $isBcdPath = $false
         $bcdPath = ''
         $isOsPath = $false
-        $tempMountedPartitions = @()
+        $tempEfiLetter = $null
+        $tempEfiDiskNum = $null
+        $tempEfiPartNum = $null
         Log-Info "Processing Disk $diskNumber"
 
         try {
@@ -368,126 +341,68 @@ try {
             }        
             if (-not $isOsPath)
             {
-                $osProbe = Test-WindowsOsVolume -DriveLetter $drive
-                $isOsPath = $osProbe.IsMatch
-                if ($isOsPath)
-                {
-                    Log-Info "Disk $diskNumber OS partition detected on ${drive}: via $($osProbe.Reason) at $($osProbe.Path)"
-                }
+                $winloadExePath = $drive + ':\windows\system32\winload.exe'
+                $winloadEfiPath = $drive + ':\windows\system32\winload.efi'
+                $isOsPath = (Test-Path $winloadExePath) -or (Test-Path $winloadEfiPath)
             }
         }
 
-        # Fallback: temporarily mount unlettered partitions to find missing OS/BCD paths.
-        if (-not $isBcdPath -or -not $isOsPath)
+        # Gen2 EFI fallback: if OS found but no BCD, discover unlettered EFI partition
+        if (-not $isBcdPath -and $isOsPath)
         {
             $diskNum = [int]$partitionGroup.Name
             $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
             if ($diskNum -ne $rescueDiskNum)
             {
-                $diskState = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
-                if ($diskState)
-                {
-                    Log-Info "Disk ${diskNum} state: Number=$($diskState.Number) IsOffline=$($diskState.IsOffline) IsReadOnly=$($diskState.IsReadOnly) PartitionStyle=$($diskState.PartitionStyle) OperationalStatus=$($diskState.OperationalStatus -join ',')"
+                Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..."
+                $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+                $efiParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
+                    $_.GptType -eq $efiGptType -and (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0)
                 }
-                Log-Info "Disk ${diskNum}: probing unlettered partitions for Windows loader and BCD store..."
-                $msrGptType = '{e3c9e316-0b5c-4db8-817d-f92df00215ae}'
-                $allParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue
-                if ($allParts)
+                if ($efiParts)
                 {
-                    foreach ($p in $allParts)
-                    {
-                        $dl = if ($p.DriveLetter) { $p.DriveLetter } else { '<none>' }
-                        $gpt = if ($p.GptType) { $p.GptType } else { '<n/a>' }
-                        Log-Info "Disk ${diskNum} partition: Number=$($p.PartitionNumber) DriveLetter=$dl Type=$($p.Type) GptType=$gpt SizeBytes=$($p.Size)"
+                    # Find an available drive letter (Z downward to avoid conflicts)
+                    $usedLetters = @()
+                    Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | ForEach-Object { $usedLetters += $_.DriveLetter }
+                    $tempLetter = $null
+                    foreach ($l in @('Z','Y','X','W','V','U','T','S','R','Q')) {
+                        if ($l -notin $usedLetters) { $tempLetter = $l; break }
                     }
-                }
-
-                $unletteredParts = $allParts | Where-Object {
-                    (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and $_.GptType -ne $msrGptType
-                }
-                if ($unletteredParts)
-                {
-                    foreach ($part in $unletteredParts)
+                    if ($tempLetter)
                     {
-                        if ($isBcdPath -and $isOsPath) { break }
-
-                        $tempLetter = Get-AvailableTempDriveLetter
-                        if (-not $tempLetter)
+                        foreach ($ep in $efiParts)
                         {
-                            Log-Warning "No available temporary drive letter to probe Disk $diskNum"
-                            break
-                        }
-
-                        $pn = $part.PartitionNumber
-                        Log-Info "Assigning temp letter ${tempLetter}: to Disk $diskNum Partition $pn for probe..."
-                        $dpLines = @("select disk $diskNum", "select partition $pn", "assign letter=$tempLetter")
-                        $dpAssignOut = $dpLines | diskpart 2>&1
-                        foreach ($line in @($dpAssignOut)) { if ($line) { Log-Output "[diskpart][assign] $line" } }
-                        Start-Sleep -Seconds 2
-
-                        $foundSomething = $false
-
-                        if (-not $isBcdPath)
-                        {
-                            $candidateBcdPath = "${tempLetter}:\boot\bcd"
-                            if (Test-Path $candidateBcdPath)
+                            $pn = $ep.PartitionNumber
+                            Log-Info "Assigning temp letter ${tempLetter}: to Disk $diskNum Partition $pn (EFI)..."
+                            $dpLines = @("select disk $diskNum", "select partition $pn", "assign letter=$tempLetter")
+                            $dpAssignOut = $dpLines | diskpart 2>&1
+                            foreach ($line in @($dpAssignOut)) { if ($line) { Log-Output "[diskpart][assign] $line" } }
+                            Start-Sleep -Seconds 2
+                            $bcdPath = "${tempLetter}:\efi\microsoft\boot\bcd"
+                            $isBcdPath = Test-Path $bcdPath
+                            if ($isBcdPath)
                             {
-                                $bcdPath = $candidateBcdPath
-                                $isBcdPath = $true
-                                $foundSomething = $true
-                                Log-Info "Found BCD store at $bcdPath"
+                                Log-Info "Found Gen2 BCD store at $bcdPath"
+                                $tempEfiLetter = $tempLetter
+                                $tempEfiDiskNum = $diskNum
+                                $tempEfiPartNum = $pn
+                                break
                             }
                             else
                             {
-                                $candidateBcdPath = "${tempLetter}:\efi\microsoft\boot\bcd"
-                                if (Test-Path $candidateBcdPath)
-                                {
-                                    $bcdPath = $candidateBcdPath
-                                    $isBcdPath = $true
-                                    $foundSomething = $true
-                                    Log-Info "Found EFI BCD store at $bcdPath"
-                                }
+                                Log-Info "No BCD at $bcdPath, removing letter..."
+                                $dpRemove = @("select disk $diskNum", "select partition $pn", "remove letter=$tempLetter")
+                                $dpRemoveOut = $dpRemove | diskpart 2>&1
+                                foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
                             }
-                        }
-
-                        if (-not $isOsPath)
-                        {
-                            $osProbe = Test-WindowsOsVolume -DriveLetter $tempLetter
-                            if ($osProbe.IsMatch)
-                            {
-                                $isOsPath = $true
-                                $foundSomething = $true
-                                Log-Info "Found Windows OS markers on ${tempLetter}: via $($osProbe.Reason) at $($osProbe.Path)"
-                            }
-                        }
-
-                        if ($foundSomething)
-                        {
-                            $tempMountedPartitions += @{
-                                Letter = $tempLetter
-                                DiskNumber = $diskNum
-                                PartitionNumber = $pn
-                            }
-                        }
-                        else
-                        {
-                            Log-Info "No OS/BCD artifacts on ${tempLetter}:, removing temporary letter..."
-                            $dpRemove = @("select disk $diskNum", "select partition $pn", "remove letter=$tempLetter")
-                            $dpRemoveOut = $dpRemove | diskpart 2>&1
-                            foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
                         }
                     }
-                }
-                else
-                {
-                    Log-Info "Disk ${diskNum}: no unlettered candidate partitions were found for temporary mount probing."
+                    else
+                    {
+                        Log-Warning "No available drive letter for EFI partition on Disk $diskNum"
+                    }
                 }
             }
-        }
-
-        if (-not $isBcdPath -or -not $isOsPath)
-        {
-            Log-Info "Disk $diskNumber probe result: isOsPath=$isOsPath isBcdPath=$isBcdPath"
         }
 
         # Apply SAC changes if both BCD and OS loader were found
@@ -557,14 +472,11 @@ try {
         }
         finally {
 
-        # Clean up temporary drive letters that were kept for BCD/OS access.
-        foreach ($mount in $tempMountedPartitions)
+        # Clean up temporary EFI drive letter if one was assigned
+        if ($tempEfiLetter)
         {
-            $cleanupLetter = $mount.Letter
-            $cleanupDisk = $mount.DiskNumber
-            $cleanupPart = $mount.PartitionNumber
-            Log-Info "Removing temp letter ${cleanupLetter}: from Disk $cleanupDisk Partition $cleanupPart"
-            $dpClean = @("select disk $cleanupDisk", "select partition $cleanupPart", "remove letter=$cleanupLetter")
+            Log-Info "Removing temp letter ${tempEfiLetter}: from Disk $tempEfiDiskNum Partition $tempEfiPartNum"
+            $dpClean = @("select disk $tempEfiDiskNum", "select partition $tempEfiPartNum", "remove letter=$tempEfiLetter")
             $dpCleanOut = $dpClean | diskpart 2>&1
             foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][cleanup] $line" } }
         }
@@ -589,6 +501,9 @@ catch {
 finally {
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
     Log-Info "Desktop log file: $logFile"
+    if ($scriptLogTargets -contains $pluginLogFilePath) {
+        Log-Info "Plugin log file: $pluginLogFilePath"
+    }
     Log-Info "Script ended at $(Get-Date)"
 }
 
