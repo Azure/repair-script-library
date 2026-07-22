@@ -566,8 +566,8 @@ try {
 
     # Step 7 - Guard for empty DumpFile (ensure valid path before kdbgctrl)
     if ([string]::IsNullOrEmpty($DumpFile)) {
-        Log-Warning "DumpFile is empty. Using Windows default: %SystemRoot%\\MEMORY.DMP"
-        $DumpFile = "%SystemRoot%\\MEMORY.DMP"
+        Log-Warning "DumpFile is empty. Using Windows default: %SystemRoot%\MEMORY.DMP"
+        $DumpFile = "%SystemRoot%\MEMORY.DMP"
         Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
     }
 
