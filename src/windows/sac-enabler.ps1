@@ -610,7 +610,6 @@ try {
         elseif ($diskFailed) { $failedCount++ }
         else { $skippedCount++ }
         }
-    }
     }  # Close else block from target disk check
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
