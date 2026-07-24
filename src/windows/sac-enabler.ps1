@@ -586,16 +586,14 @@ try {
         else {
             Log-Info "Disk $diskNumber skipped: no valid BCD + OS loader combination was found."
         }
-
-        catch {
+        } catch {
             $diskFailed = $true
             $failureReason = "Disk $diskNumber failed with exception: $($_.Exception.Message)"
             Log-Error $failureReason
             if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
                 Log-Error "Disk $diskNumber failure context: $($_.InvocationInfo.PositionMessage)"
             }
-        }
-        finally {
+        } finally {
 
         # Clean up temporary EFI drive letter if one was assigned
         if ($tempEfiLetter)
@@ -609,9 +607,9 @@ try {
         if ($diskChanged) { $changedCount++ }
         elseif ($diskFailed) { $failedCount++ }
         else { $skippedCount++ }
-        }  # Close finally
-    }  # Close foreach
-    }  # Close else block from target disk check
+        }
+    }
+    }
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
         if ($executionContext -eq 'STANDARD_VM') {
