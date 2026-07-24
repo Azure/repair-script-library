@@ -126,9 +126,6 @@ $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyComm
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
 $logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
-$pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension'
-$pluginLogFilePath = Join-Path -Path $pluginLogDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
-$scriptLogTargets = @()
 
 if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
     New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
@@ -136,21 +133,6 @@ if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
 
 if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
     New-Item -Path $logFilePath -ItemType File -Force | Out-Null
-}
-
-$scriptLogTargets += $logFilePath
-
-try {
-    if (-not (Test-Path -Path $pluginLogDir -PathType Container)) {
-        New-Item -Path $pluginLogDir -ItemType Directory -Force | Out-Null
-    }
-    if (-not (Test-Path -Path $pluginLogFilePath -PathType Leaf)) {
-        New-Item -Path $pluginLogFilePath -ItemType File -Force | Out-Null
-    }
-    $scriptLogTargets += $pluginLogFilePath
-}
-catch {
-    [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to initialize plugin log path '$pluginLogFilePath': $($_.Exception.Message)")
 }
 
 $script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
@@ -171,59 +153,46 @@ function Write-DesktopLogLine {
     try {
         $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
         $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
-        foreach ($target in $scriptLogTargets) {
-            Add-Content -Path $target -Value $line -Encoding UTF8 -ErrorAction Stop
-        }
+        Add-Content -Path $logFilePath -Value $line -Encoding UTF8 -ErrorAction Stop
     }
     catch {
         if ($script:OriginalLogWarning) {
-            & $script:OriginalLogWarning -message "Failed to append to one or more log targets '$($scriptLogTargets -join ', ')': $($_.Exception.Message)"
+            & $script:OriginalLogWarning -message "Failed to append to desktop log '$logFilePath': $($_.Exception.Message)"
         }
         else {
-            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to one or more log targets '$($scriptLogTargets -join ', ')': $($_.Exception.Message)")
+            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to desktop log '$logFilePath': $($_.Exception.Message)")
         }
     }
-}
-
-function Invoke-LogWithMirrors {
-    param(
-        [Parameter(Mandatory = $true)]
-        [ScriptBlock]$OriginalLogger,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Level,
-
-        [Parameter(Mandatory = $true)]
-        [PSObject[]]$Message
-    )
-
-    & $OriginalLogger -message $Message
-    Write-DesktopLogLine -Level $Level -Message $Message
 }
 
 function Log-Output {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogOutput -Level 'Output' -Message $message
+    & $script:OriginalLogOutput -message $message
+    Write-DesktopLogLine -Level 'Output' -Message $message
 }
 
 function Log-Info {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogInfo -Level 'Info' -Message $message
+    & $script:OriginalLogInfo -message $message
+    Write-DesktopLogLine -Level 'Info' -Message $message
 }
 
 function Log-Warning {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogWarning -Level 'Warning' -Message $message
+    & $script:OriginalLogWarning -message $message
+    Write-DesktopLogLine -Level 'Warning' -Message $message
 }
 
 function Log-Error {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogError -Level 'Error' -Message $message
+    & $script:OriginalLogError -message $message
+    Write-DesktopLogLine -Level 'Error' -Message $message
 }
 
 function Log-Debug {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
-    Invoke-LogWithMirrors -OriginalLogger $script:OriginalLogDebug -Level 'Debug' -Message $message
+    & $script:OriginalLogDebug -message $message
+    Write-DesktopLogLine -Level 'Debug' -Message $message
 }
 
 function Invoke-StaleEfiTempLetterSweep {
@@ -264,12 +233,9 @@ function Invoke-StaleEfiTempLetterSweep {
 
 $logFile = $logFilePath
 Log-Info "Desktop plain text log initialized: $logFilePath"
-if ($scriptLogTargets -contains $pluginLogFilePath) {
-    Log-Info "Plugin plain text log initialized: $pluginLogFilePath"
-}
 
 # Optional startup cleanup for stale EFI temp letters from interrupted runs.
-# Disabled by default to avoid removing intentionally mounted EFI volumes.
+# Disabled by default to preserve existing behavior.
 $enableStaleEfiSweepCleanup = $false
 Invoke-StaleEfiTempLetterSweep -Cleanup $enableStaleEfiSweepCleanup
 
@@ -501,9 +467,6 @@ catch {
 finally {
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
     Log-Info "Desktop log file: $logFile"
-    if ($scriptLogTargets -contains $pluginLogFilePath) {
-        Log-Info "Plugin log file: $pluginLogFilePath"
-    }
     Log-Info "Script ended at $(Get-Date)"
 }
 
