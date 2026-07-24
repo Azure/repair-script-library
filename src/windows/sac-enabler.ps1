@@ -30,6 +30,8 @@
                          - Detects repair vs. standard context from secondary disks returned by the helper.
                          - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
                          - Probes unlettered partitions directly instead of assuming GPT metadata or size.
+                         - Journals temporary mounts and removes only identity-matched stale mounts.
+                         - Keeps dual logs on the repair host; does not write to the attached OS disk.
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
@@ -40,7 +42,7 @@
                          - **NEW SAFETY: Validates GUID format before making BCD edits.
                          - **NEW SAFETY: Verifies EMS was actually enabled after bcdedit commands.
                          - Added .ROLLBACK_RECOVERY section with disaster recovery instructions.
-                         - Annotated Log-* wrapper pattern with consolidation note.
+                         - Identified the Log-* wrapper pattern for shared-helper consolidation.
     v1.2: [May 2026]   - Fixed breaking exception when the Hyper-V module is not installed on the host.
                          - Added explicit checking via Get-Module before executing nested VM discovery.
     v1.1: [May 2026]   - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
@@ -122,7 +124,8 @@ bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
 
     NOTE: For Gen2 disks, the script automatically assigns a temporary drive letter
     to the EFI System Partition via diskpart if Get-Disk-Partitions did not assign one.
-    The temporary letter is removed after processing.
+    The temporary letter is removed after processing. Before each assignment, ownership
+    is journaled under ProgramData so an exact stale mount can be removed on the next run.
 
 .ROLLBACK_RECOVERY
     IF THE VM FAILS TO BOOT AFTER az vm repair restore:
@@ -212,6 +215,121 @@ function Test-SacGptType {
     return $actual -eq $expected
 }
 
+$script:SacTempMountStateDirectory = Join-Path -Path $env:ProgramData -ChildPath 'AzureVmRepair\SacEnabler\TempMounts'
+
+function Get-SacDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$DiskNumber
+    )
+
+    $disk = Get-Disk -Number $DiskNumber -ErrorAction SilentlyContinue
+    if (-not $disk) { return $null }
+
+    $identityParts = @($disk.UniqueId, $disk.SerialNumber, $disk.Location) | Where-Object {
+        -not [string]::IsNullOrWhiteSpace("$_")
+    }
+    if ($identityParts.Count -eq 0) { return $null }
+
+    return ($identityParts -join '|')
+}
+
+function Register-SacTemporaryMount {
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber,
+        [Parameter(Mandatory = $true)][char]$DriveLetter,
+        [Parameter(Mandatory = $true)][ValidateSet('Windows', 'EFI')][string]$Kind
+    )
+
+    $diskIdentity = Get-SacDiskIdentity -DiskNumber $DiskNumber
+    if (-not $diskIdentity) {
+        Log-Warning "Disk ${DiskNumber}: temporary $Kind mount ownership cannot be persisted because the disk has no stable identity. Runtime finally cleanup will still be attempted."
+        return $null
+    }
+
+    New-Item -Path $script:SacTempMountStateDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    $statePath = Join-Path -Path $script:SacTempMountStateDirectory -ChildPath (([guid]::NewGuid().ToString('N')) + '.json')
+    $state = [ordered]@{
+        DiskIdentity   = $diskIdentity
+        DiskNumber     = $DiskNumber
+        PartitionNumber = $PartitionNumber
+        DriveLetter    = "$DriveLetter"
+        Kind           = $Kind
+        CreatedUtc     = [DateTime]::UtcNow.ToString('o')
+    }
+    $state | ConvertTo-Json | Set-Content -Path $statePath -Encoding UTF8 -ErrorAction Stop
+    return $statePath
+}
+
+function Complete-SacTemporaryMountCleanup {
+    param(
+        [AllowNull()][string]$StatePath,
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber,
+        [Parameter(Mandatory = $true)][char]$DriveLetter
+    )
+
+    if (-not $StatePath) { return }
+
+    $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
+    if (-not $partition -or "$($partition.DriveLetter)" -ne "$DriveLetter") {
+        Remove-Item -Path $StatePath -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        Log-Warning "Temporary letter ${DriveLetter}: remains on Disk $DiskNumber Partition $PartitionNumber. Ownership state retained for the next run."
+    }
+}
+
+function Clear-SacStaleTemporaryMounts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int[]]$TargetDiskNumbers
+    )
+
+    if (-not (Test-Path -Path $script:SacTempMountStateDirectory -PathType Container)) { return }
+
+    $targetIdentities = @{}
+    foreach ($targetDiskNumber in $TargetDiskNumbers) {
+        $identity = Get-SacDiskIdentity -DiskNumber $targetDiskNumber
+        if ($identity) { $targetIdentities[$identity] = $targetDiskNumber }
+    }
+
+    foreach ($stateFile in @(Get-ChildItem -Path $script:SacTempMountStateDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        try {
+            $state = Get-Content -Path $stateFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $requiredValues = @($state.DiskIdentity, $state.PartitionNumber, $state.DriveLetter, $state.Kind)
+            if (@($requiredValues | Where-Object { [string]::IsNullOrWhiteSpace("$_") }).Count -gt 0) {
+                throw 'The ownership record is incomplete.'
+            }
+
+            if (-not $targetIdentities.ContainsKey("$($state.DiskIdentity)")) {
+                Log-Warning "Discarding stale temporary-mount state '$($stateFile.Name)': its disk is not an attached repair target. No drive letter was removed."
+                Remove-Item -Path $stateFile.FullName -Force -ErrorAction SilentlyContinue
+                continue
+            }
+
+            $currentDiskNumber = [int]$targetIdentities["$($state.DiskIdentity)"]
+            $partitionNumber = [int]$state.PartitionNumber
+            $driveLetter = [char]("$($state.DriveLetter)")
+            $partition = Get-Partition -DiskNumber $currentDiskNumber -PartitionNumber $partitionNumber -ErrorAction SilentlyContinue
+            if (-not $partition -or "$($partition.DriveLetter)" -ne "$driveLetter") {
+                Log-Info "Removing resolved temporary-mount state '$($stateFile.Name)'; the recorded letter is no longer assigned."
+                Remove-Item -Path $stateFile.FullName -Force -ErrorAction SilentlyContinue
+                continue
+            }
+
+            Log-Warning "Recovering stale $($state.Kind) letter ${driveLetter}: from Disk $currentDiskNumber Partition $partitionNumber."
+            $removeOutput = @("select disk $currentDiskNumber", "select partition $partitionNumber", "remove letter=$driveLetter") | diskpart 2>&1
+            foreach ($line in @($removeOutput)) { if ($line) { Log-Output "[diskpart][stale-cleanup] $line" } }
+            Complete-SacTemporaryMountCleanup -StatePath $stateFile.FullName -DiskNumber $currentDiskNumber -PartitionNumber $partitionNumber -DriveLetter $driveLetter
+        }
+        catch {
+            Log-Warning "Could not process temporary-mount state '$($stateFile.FullName)': $($_.Exception.Message). No drive letter was removed from this record."
+        }
+    }
+}
+
 # ===========================================
 # Logging Setup (Dual-Write: Desktop + Plugin Directory)
 # ===========================================
@@ -260,9 +378,8 @@ $logFilePath = $desktopLogFile
 # ===========================================
 # Log Wrapper Functions (Consolidation Note)
 # ===========================================
-# NOTE: This Log-* wrapper pattern (duplicated across sac-enabler.ps1 and other scripts)
-# should be consolidated into a shared helper module (e.g., common\helpers\Logging-Helper.ps1)
-# to avoid duplication. All scripts should source a single centralized logging provider.
+# These wrappers remain local so the repair script stays self-contained while dual-writing
+# to repair-host locations. Logs are not written to the attached customer OS disk.
 
 $script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
 $script:OriginalLogInfo = (Get-Command Log-Info -CommandType Function).ScriptBlock
@@ -345,26 +462,6 @@ $changedCount = 0
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
 
 try {
-    # Optional: Clean up orphaned temp drive letters from previous failed runs
-    # This helps prevent lingering mount points from blocking EFI partition access
-    $orphanedLetters = @()
-    try {
-        Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and -not $_.DriveType -eq 'Unknown' } | ForEach-Object {
-            $letter = $_.DriveLetter
-            $volumePath = "${letter}:\"
-            if (-not (Test-Path -Path $volumePath)) {
-                $orphanedLetters += $letter
-            }
-        }
-        if ($orphanedLetters.Count -gt 0) {
-            Log-Info "Found potentially orphaned drive letters (may be harmless): $($orphanedLetters -join ', '). Continuing..."
-        }
-    }
-    catch {
-        # Orphan detection is optional; don't block on failure
-        Log-Debug "Orphan detection encountered an error (non-critical): $($_.Exception.Message)"
-    }
-    
     # Check if the Hyper-V module is available before performing nested VM checks
     if (Get-Module -ListAvailable -Name Hyper-V) {
         $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
@@ -415,6 +512,9 @@ try {
     }
     else
     {
+    $targetDiskNumbers = @($targetDiskGroups | ForEach-Object { [int]$_.Name })
+    Clear-SacStaleTemporaryMounts -TargetDiskNumbers $targetDiskNumbers
+
     foreach ( $partitionGroup in $targetDiskGroups )
     {
         $processedCount++
@@ -430,6 +530,8 @@ try {
         $tempOsLetter = $null
         $tempOsDiskNum = $null
         $tempOsPartNum = $null
+        $tempOsStatePath = $null
+        $tempEfiStatePath = $null
         $bcdBackup = $null
         
         Log-Info "Processing Disk $diskNumber"
@@ -486,6 +588,7 @@ try {
 
                 $candidatePartNum = $osCandidate.PartitionNumber
                 Log-Info "Assigning temp letter ${candidateLetter}: to Disk $diskNum Partition $candidatePartNum (Windows candidate)..."
+                $tempOsStatePath = Register-SacTemporaryMount -DiskNumber $diskNum -PartitionNumber $candidatePartNum -DriveLetter $candidateLetter -Kind Windows
                 $dpOsAssign = @("select disk $diskNum", "select partition $candidatePartNum", "assign letter=$candidateLetter")
                 $dpOsAssignOut = $dpOsAssign | diskpart 2>&1
                 foreach ($line in @($dpOsAssignOut)) { if ($line) { Log-Output "[diskpart][os-assign] $line" } }
@@ -506,9 +609,11 @@ try {
                 $dpOsRemove = @("select disk $diskNum", "select partition $candidatePartNum", "remove letter=$candidateLetter")
                 $dpOsRemoveOut = $dpOsRemove | diskpart 2>&1
                 foreach ($line in @($dpOsRemoveOut)) { if ($line) { Log-Output "[diskpart][os-remove] $line" } }
+                Complete-SacTemporaryMountCleanup -StatePath $tempOsStatePath -DiskNumber $diskNum -PartitionNumber $candidatePartNum -DriveLetter $candidateLetter
                 $tempOsLetter = $null
                 $tempOsDiskNum = $null
                 $tempOsPartNum = $null
+                $tempOsStatePath = $null
             }
         }
 
@@ -533,6 +638,7 @@ try {
                         {
                             $pn = $ep.PartitionNumber
                             Log-Info "Assigning temp letter ${tempLetter}: to Disk $diskNum Partition $pn (EFI)..."
+                            $tempEfiStatePath = Register-SacTemporaryMount -DiskNumber $diskNum -PartitionNumber $pn -DriveLetter $tempLetter -Kind EFI
                             $dpLines = @("select disk $diskNum", "select partition $pn", "assign letter=$tempLetter")
                             $dpAssignOut = $dpLines | diskpart 2>&1
                             foreach ($line in @($dpAssignOut)) { if ($line) { Log-Output "[diskpart][assign] $line" } }
@@ -553,9 +659,11 @@ try {
                                 $dpRemove = @("select disk $diskNum", "select partition $pn", "remove letter=$tempLetter")
                                 $dpRemoveOut = $dpRemove | diskpart 2>&1
                                 foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
+                                Complete-SacTemporaryMountCleanup -StatePath $tempEfiStatePath -DiskNumber $diskNum -PartitionNumber $pn -DriveLetter $tempLetter
                                 $tempEfiLetter = $null
                                 $tempEfiDiskNum = $null
                                 $tempEfiPartNum = $null
+                                $tempEfiStatePath = $null
                             }
                         }
                     }
@@ -667,6 +775,7 @@ try {
             $dpClean = @("select disk $tempEfiDiskNum", "select partition $tempEfiPartNum", "remove letter=$tempEfiLetter")
             $dpCleanOut = $dpClean | diskpart 2>&1
             foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][cleanup] $line" } }
+            Complete-SacTemporaryMountCleanup -StatePath $tempEfiStatePath -DiskNumber $tempEfiDiskNum -PartitionNumber $tempEfiPartNum -DriveLetter $tempEfiLetter
         }
 
         if ($tempOsLetter)
@@ -675,6 +784,7 @@ try {
             $dpOsClean = @("select disk $tempOsDiskNum", "select partition $tempOsPartNum", "remove letter=$tempOsLetter")
             $dpOsCleanOut = $dpOsClean | diskpart 2>&1
             foreach ($line in @($dpOsCleanOut)) { if ($line) { Log-Output "[diskpart][os-cleanup] $line" } }
+            Complete-SacTemporaryMountCleanup -StatePath $tempOsStatePath -DiskNumber $tempOsDiskNum -PartitionNumber $tempOsPartNum -DriveLetter $tempOsLetter
         }
 
         if ($diskChanged) { $changedCount++ }
