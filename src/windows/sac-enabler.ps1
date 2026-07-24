@@ -27,7 +27,8 @@
     .VERSION
     v1.4: [July 2026]  - Restricted execution to repair VM mode (current).
                          - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
-                         - Detects repair vs. standard context from a Windows loader on a secondary disk.
+                         - Detects repair vs. standard context from secondary disks returned by the helper.
+                         - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
@@ -45,8 +46,8 @@
     v0.1: [Initial]    - Initial commit. Version 1.0 of the script.
     
     .EXECUTION_CONTEXT
-    This script is classified as repair-VM-only. It detects whether a Windows OS loader exists
-    on a secondary disk and refuses to modify BCD when it detects standard VM execution.
+    This script is classified as repair-VM-only. It detects repair context when the helper returns
+    at least one disk other than the repair VM OS disk and refuses BCD changes when none exists.
     Use: az vm repair run -g <rg> -n <vm> --run-id win-sac-on --run-on-repair
     The repair VM OS disk is identified from $env:SystemDrive and excluded from all BCD operations.
 
@@ -175,27 +176,25 @@ function Get-SacExecutionContext {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
-        [object[]]$TargetDiskGroups,
-
-        [Parameter(Mandatory = $true)]
-        [string]$RepairDrive
+        [object[]]$TargetDiskGroups
     )
 
-    foreach ($partitionGroup in $TargetDiskGroups) {
-        foreach ($drive in @($partitionGroup.Group | Select-Object -ExpandProperty DriveLetter)) {
-            if (-not $drive -or $drive -eq $RepairDrive) {
-                continue
-            }
-
-            $winloadExePath = $drive + ':\windows\system32\winload.exe'
-            $winloadEfiPath = $drive + ':\windows\system32\winload.efi'
-            if ((Test-Path -Path $winloadExePath) -or (Test-Path -Path $winloadEfiPath)) {
-                return 'REPAIR_VM'
-            }
-        }
+    if ($TargetDiskGroups.Count -gt 0) {
+        return 'REPAIR_VM'
     }
 
     return 'STANDARD_VM'
+}
+
+function Get-AvailableTempDriveLetter {
+    $usedLetters = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter)
+    foreach ($letter in @('Z','Y','X','W','V','U','T','S','R','Q')) {
+        if ($letter -notin $usedLetters -and -not (Test-Path -Path "${letter}:\")) {
+            return $letter
+        }
+    }
+
+    return $null
 }
 
 # ===========================================
@@ -317,7 +316,7 @@ function Log-Debug {
 
 $logFile = $logFilePath
 Log-Info "Dual logging initialized - Desktop: $desktopLogFile | Plugin: $pluginLogFile"
-Log-Info "Execution mode: REPAIR_VM"
+Log-Info "Script classification: REPAIR_VM_ONLY"
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
@@ -328,7 +327,7 @@ $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
 
-Log-Info "Starting SAC enabler in REPAIR_VM mode. Logs: $logFile"
+Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
 
 try {
     # Optional: Clean up orphaned temp drive letters from previous failed runs
@@ -390,11 +389,11 @@ try {
     Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber"
 
     $targetDiskGroups = @($partitionlist | Group-Object DiskNumber | Where-Object { [int]$_.Name -ne $repairDiskNumber })
-    $detectedExecutionContext = Get-SacExecutionContext -TargetDiskGroups $targetDiskGroups -RepairDrive $repairDrive
+    $detectedExecutionContext = Get-SacExecutionContext -TargetDiskGroups $targetDiskGroups
     Log-Info "Detected execution context: $detectedExecutionContext"
 
     if ($detectedExecutionContext -ne 'REPAIR_VM') {
-        Log-Error "[STANDARD_VM] REPAIR-ONLY SCRIPT: No attached Windows OS disk was detected on a secondary disk."
+        Log-Error "[STANDARD_VM] REPAIR-ONLY SCRIPT: The helper returned no secondary disk."
         Log-Error "[STANDARD_VM] Run this script with az vm repair run and --run-on-repair. No BCD changes were attempted."
         $script_final_status = $STATUS_ERROR
         $failureReason = 'Standard VM context detected, or the repair VM has no accessible attached Windows OS disk.'
@@ -413,6 +412,9 @@ try {
         $tempEfiLetter = $null
         $tempEfiDiskNum = $null
         $tempEfiPartNum = $null
+        $tempOsLetter = $null
+        $tempOsDiskNum = $null
+        $tempOsPartNum = $null
         $bcdBackup = $null
         
         Log-Info "Processing Disk $diskNumber"
@@ -443,6 +445,53 @@ try {
             }
         }
 
+        # Gen2 OS fallback: temporarily mount an unlettered GPT Basic Data partition.
+        if (-not $isOsPath)
+        {
+            $diskNum = [int]$partitionGroup.Name
+            $basicDataGptType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+            $unletteredOsCandidates = @(Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
+                $_.GptType -eq $basicDataGptType -and
+                (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and
+                $_.Size -gt 10GB
+            })
+
+            foreach ($osCandidate in $unletteredOsCandidates)
+            {
+                $candidateLetter = Get-AvailableTempDriveLetter
+                if (-not $candidateLetter) {
+                    Log-Warning "No available drive letter for an unlettered Windows partition on Disk $diskNum"
+                    break
+                }
+
+                $candidatePartNum = $osCandidate.PartitionNumber
+                Log-Info "Assigning temp letter ${candidateLetter}: to Disk $diskNum Partition $candidatePartNum (Windows candidate)..."
+                $dpOsAssign = @("select disk $diskNum", "select partition $candidatePartNum", "assign letter=$candidateLetter")
+                $dpOsAssignOut = $dpOsAssign | diskpart 2>&1
+                foreach ($line in @($dpOsAssignOut)) { if ($line) { Log-Output "[diskpart][os-assign] $line" } }
+                $tempOsLetter = $candidateLetter
+                $tempOsDiskNum = $diskNum
+                $tempOsPartNum = $candidatePartNum
+                Start-Sleep -Seconds 2
+
+                $winloadExePath = "${candidateLetter}:\windows\system32\winload.exe"
+                $winloadEfiPath = "${candidateLetter}:\windows\system32\winload.efi"
+                $isOsPath = (Test-Path -Path $winloadExePath) -or (Test-Path -Path $winloadEfiPath)
+                if ($isOsPath) {
+                    Log-Info "Found Windows OS partition at ${candidateLetter}: on Disk $diskNum"
+                    break
+                }
+
+                Log-Info "No Windows loader found at ${candidateLetter}:, removing letter..."
+                $dpOsRemove = @("select disk $diskNum", "select partition $candidatePartNum", "remove letter=$candidateLetter")
+                $dpOsRemoveOut = $dpOsRemove | diskpart 2>&1
+                foreach ($line in @($dpOsRemoveOut)) { if ($line) { Log-Output "[diskpart][os-remove] $line" } }
+                $tempOsLetter = $null
+                $tempOsDiskNum = $null
+                $tempOsPartNum = $null
+            }
+        }
+
         # Gen2 EFI fallback: if OS found but no BCD, discover unlettered EFI partition
         if (-not $isBcdPath -and $isOsPath)
         {
@@ -456,13 +505,7 @@ try {
                 }
                 if ($efiParts)
                 {
-                    # Find an available drive letter (Z downward to avoid conflicts)
-                    $usedLetters = @()
-                    Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | ForEach-Object { $usedLetters += $_.DriveLetter }
-                    $tempLetter = $null
-                    foreach ($l in @('Z','Y','X','W','V','U','T','S','R','Q')) {
-                        if ($l -notin $usedLetters) { $tempLetter = $l; break }
-                    }
+                    $tempLetter = Get-AvailableTempDriveLetter
                     if ($tempLetter)
                     {
                         foreach ($ep in $efiParts)
@@ -472,15 +515,15 @@ try {
                             $dpLines = @("select disk $diskNum", "select partition $pn", "assign letter=$tempLetter")
                             $dpAssignOut = $dpLines | diskpart 2>&1
                             foreach ($line in @($dpAssignOut)) { if ($line) { Log-Output "[diskpart][assign] $line" } }
+                            $tempEfiLetter = $tempLetter
+                            $tempEfiDiskNum = $diskNum
+                            $tempEfiPartNum = $pn
                             Start-Sleep -Seconds 2
                             $bcdPath = "${tempLetter}:\efi\microsoft\boot\bcd"
                             $isBcdPath = Test-Path $bcdPath
                             if ($isBcdPath)
                             {
                                 Log-Info "Found Gen2 BCD store at $bcdPath"
-                                $tempEfiLetter = $tempLetter
-                                $tempEfiDiskNum = $diskNum
-                                $tempEfiPartNum = $pn
                                 break
                             }
                             else
@@ -489,6 +532,9 @@ try {
                                 $dpRemove = @("select disk $diskNum", "select partition $pn", "remove letter=$tempLetter")
                                 $dpRemoveOut = $dpRemove | diskpart 2>&1
                                 foreach ($line in @($dpRemoveOut)) { if ($line) { Log-Output "[diskpart][remove] $line" } }
+                                $tempEfiLetter = $null
+                                $tempEfiDiskNum = $null
+                                $tempEfiPartNum = $null
                             }
                         }
                     }
@@ -600,6 +646,14 @@ try {
             $dpClean = @("select disk $tempEfiDiskNum", "select partition $tempEfiPartNum", "remove letter=$tempEfiLetter")
             $dpCleanOut = $dpClean | diskpart 2>&1
             foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][cleanup] $line" } }
+        }
+
+        if ($tempOsLetter)
+        {
+            Log-Info "Removing temp letter ${tempOsLetter}: from Disk $tempOsDiskNum Partition $tempOsPartNum"
+            $dpOsClean = @("select disk $tempOsDiskNum", "select partition $tempOsPartNum", "remove letter=$tempOsLetter")
+            $dpOsCleanOut = $dpOsClean | diskpart 2>&1
+            foreach ($line in @($dpOsCleanOut)) { if ($line) { Log-Output "[diskpart][os-cleanup] $line" } }
         }
 
         if ($diskChanged) { $changedCount++ }
