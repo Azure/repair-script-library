@@ -271,14 +271,37 @@ try {
     # Step 1 - Enumerate partitions to locate the BCD store and OS loader
     $partitionlist = Get-Disk-Partitions
     $rescueDrive = $env:SystemDrive -replace ':', ''
+    $partitionGroups = @($partitionlist | Group-Object DiskNumber)
+    $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
+
+    $hasNonRescueDisk = $false
+    foreach ($group in $partitionGroups) {
+        if ($null -ne $rescueDiskNum -and ([int]$group.Name -ne [int]$rescueDiskNum)) {
+            $hasNonRescueDisk = $true
+            break
+        }
+    }
+
+    $processRescueDisk = -not $hasNonRescueDisk
+
+    if ($processRescueDisk) {
+        Log-Warning "No attached non-rescue disk detected. Falling back to in-place mode on current VM disk."
+    }
+
     Log-Info 'Enumerating partitions to enable SAC...'
 
-    foreach ( $partitionGroup in $partitionlist | Group-Object DiskNumber )
+    foreach ( $partitionGroup in $partitionGroups )
     {
+        $diskNumber = [int]$partitionGroup.Name
+
+        if (($null -ne $rescueDiskNum) -and (-not $processRescueDisk) -and ($diskNumber -eq [int]$rescueDiskNum)) {
+            Log-Info "Skipping rescue host disk $diskNumber because attached disk(s) were detected."
+            continue
+        }
+
         $processedCount++
         $diskChanged = $false
         $diskFailed = $false
-        $diskNumber = $partitionGroup.Name
         $isBcdPath = $false
         $bcdPath = ''
         $isOsPath = $false
@@ -293,7 +316,7 @@ try {
         ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter )
         {
             # Skip the rescue VM's own OS drive
-            if ($drive -eq $rescueDrive) { continue }
+            if (($drive -eq $rescueDrive) -and (-not $processRescueDisk)) { continue }
 
             if ( -not $isBcdPath )
             {
@@ -317,8 +340,7 @@ try {
         if (-not $isBcdPath -and $isOsPath)
         {
             $diskNum = [int]$partitionGroup.Name
-            $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
-            if ($diskNum -ne $rescueDiskNum)
+            if (($null -eq $rescueDiskNum) -or ($diskNum -ne [int]$rescueDiskNum) -or $processRescueDisk)
             {
                 Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..."
                 $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
@@ -454,6 +476,14 @@ try {
     }
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
+        if (($failedCount -eq 0) -and ($changedCount -eq 0)) {
+            if ($processRescueDisk) {
+                $failureReason = 'In-place mode did not find a valid BCD + OS loader combination on the current VM disk.'
+            }
+            else {
+                $failureReason = 'No attached OS disk was detected with a valid BCD + OS loader combination.'
+            }
+        }
         Log-Error "FAILED: $failureReason"
     }
 }
