@@ -3,7 +3,7 @@
     Enables SAC and Serial Console boot settings on attached Windows disks, including BIOS and UEFI layouts.
 
 .DESCRIPTION
-    This script runs from a rescue VM to enable SAC/EMS on an attached OS disk's BCD store.
+    This script runs only from a repair VM to enable SAC/EMS on an attached OS disk's BCD store.
     It performs the following steps:
     1. Enumerates attached partitions via Get-Disk-Partitions to locate the BCD store and OS loader.
        OS detection accepts either winload.exe or winload.efi.
@@ -21,12 +21,18 @@
 .NOTES
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
-    Requirement: Azure rescue VM with attached Windows OS disk OR standard VM with local modifications
+    Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.3: [July 2026]  - Added execution context detection and dual-logging (current)
-                         - Detects rescue VM mode vs standard mode for context-aware error messages.
+    v1.4: [July 2026]  - Restricted execution to repair VM mode (current).
+                         - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
+                         - Detects repair vs. standard context from a Windows loader on a secondary disk.
+                         - Refuses BCD changes when a repair VM context is not detected.
+                         - Fails closed if the repair VM OS disk cannot be identified.
+                         - Filters out the repair VM OS disk before processing attached disks.
+    v1.3: [July 2026]  - Added execution context detection and dual-logging.
+                         - Detected rescue VM mode vs standard mode for context-aware error messages.
                          - Dual-logs to desktop and plugin directory for az vm repair auto-collection.
                          - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
                          - **NEW SAFETY: Validates GUID format before making BCD edits.
@@ -38,16 +44,15 @@
     v1.1: [May 2026]   - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
     v0.1: [Initial]    - Initial commit. Version 1.0 of the script.
     
-    .MODE_DETECTION
-    This script can run in two modes:
-    - RESCUE_VM: Running from a rescue VM with the target OS disk attached as a secondary disk.
-                 Use: az vm repair run -g <rg> -n <vm> --run-id win-sac-enabler --run-on-repair
-    - STANDARD_VM: Running directly on the target VM (not recommended; use rescue mode for safety).
-                   Useful for testing or direct remediation if rescue VM access is unavailable.
+    .EXECUTION_CONTEXT
+    This script is classified as repair-VM-only. It detects whether a Windows OS loader exists
+    on a secondary disk and refuses to modify BCD when it detects standard VM execution.
+    Use: az vm repair run -g <rg> -n <vm> --run-id win-sac-on --run-on-repair
+    The repair VM OS disk is identified from $env:SystemDrive and excluded from all BCD operations.
 
 .SCENARIO_RECREATION
-    To recreate a testable scenario on a rescue VM with an attached OS disk:
-    1. Create a test VM in Azure and attach its OS disk to a rescue VM.
+    To recreate a testable scenario on a repair VM with an attached OS disk:
+    1. Create a test VM in Azure and attach its OS disk to a repair VM.
     2. The BCD store is on the System Reserved (Gen1) or EFI (Gen2) partition, which
        may not have a drive letter. Find it by scanning all volumes (run as Admin):
 Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { $d = $_.DriveLetter; @("$d`:\boot\bcd","$d`:\efi\microsoft\boot\bcd") | Where-Object { Test-Path $_ } | ForEach-Object { Write-Output "FOUND: $_" } }
@@ -94,7 +99,7 @@ bcdedit /store S:\efi\microsoft\boot\bcd /enum "{default}"
     6. Verify all SAC settings are now enabled (see .VERIFICATION section).
 
 .EXAMPLE
-    az vm repair run -g <rg> -n <vm> --run-id win-sac-enabler --run-on-repair
+    az vm repair run -g <rg> -n <vm> --run-id win-sac-on --run-on-repair
 
 .VERIFICATION
     1. Check the log file for success:
@@ -120,9 +125,9 @@ bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
 .ROLLBACK_RECOVERY
     IF THE VM FAILS TO BOOT AFTER az vm repair restore:
     
-    1. Boot the VM from the Windows installation media or attach to a rescue VM.
+    1. Boot the VM from the Windows installation media or attach to a repair VM.
     2. Locate the BCD backup file created by the script:
-       - From rescue VM: Look in the mounted disk for *.backup-* files
+    - From repair VM: Look in the mounted disk for *.backup-* files
        - Example path: F:\boot\bcd.backup-20260724-153022 (or S:\efi\microsoft\boot\bcd.backup-...)
     3. Restore the BCD from backup:
        Gen1 (System Reserved):
@@ -161,41 +166,37 @@ if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
 
 . $diskPartitionsPath
 
-# ===========================================
-# Execution Context Detection
-# ===========================================
-function Test-RescueVmMode {
-    <#
-    .SYNOPSIS
-        Detects if the script is running in rescue VM mode (attached OS disk) or standard mode (local VM).
-    .DESCRIPTION
-        Rescue VM mode: The target OS disk is attached as a secondary disk to a rescue VM.
-                        Get-Disk will show multiple disks, rescue disk is at index 0.
-        Standard mode:  The script runs on the actual target VM.
-                        Only one disk (or all disks are the OS disk).
-    #>
-    try {
-        $disks = @(Get-Disk -ErrorAction Stop | Where-Object { $_.OperationalStatus -eq 'Online' })
-        
-        if ($disks.Count -lt 2) {
-            return $false  # Standard mode: only one disk (or one online disk)
-        }
-        
-        # Check if multiple OS drives are detected (unlikely on rescue, likely on standard)
-        $osDriveLetters = @(Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter | Where-Object { $_ -eq $env:SystemDrive[0] })
-        
-        # Rescue mode: typically has multiple disks but only one local OS drive (the rescue VM's own)
-        # Standard mode: has the target disk with its own OS boot structures
-        return ($disks.Count -ge 2)
-    }
-    catch {
-        # If we can't determine, assume we might be in rescue mode (safer assumption)
-        return $true
-    }
+if (-not (Get-Command -Name Get-Disk-Partitions -CommandType Function -ErrorAction SilentlyContinue)) {
+    Log-Error "Dependency did not define the required Get-Disk-Partitions function: $diskPartitionsPath"
+    return $STATUS_ERROR
 }
 
-$isRescueVmMode = Test-RescueVmMode
-$executionContext = if ($isRescueVmMode) { 'RESCUE_VM' } else { 'STANDARD_VM' }
+function Get-SacExecutionContext {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$TargetDiskGroups,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RepairDrive
+    )
+
+    foreach ($partitionGroup in $TargetDiskGroups) {
+        foreach ($drive in @($partitionGroup.Group | Select-Object -ExpandProperty DriveLetter)) {
+            if (-not $drive -or $drive -eq $RepairDrive) {
+                continue
+            }
+
+            $winloadExePath = $drive + ':\windows\system32\winload.exe'
+            $winloadEfiPath = $drive + ':\windows\system32\winload.efi'
+            if ((Test-Path -Path $winloadExePath) -or (Test-Path -Path $winloadEfiPath)) {
+                return 'REPAIR_VM'
+            }
+        }
+    }
+
+    return 'STANDARD_VM'
+}
 
 # ===========================================
 # Logging Setup (Dual-Write: Desktop + Plugin Directory)
@@ -316,21 +317,18 @@ function Log-Debug {
 
 $logFile = $logFilePath
 Log-Info "Dual logging initialized - Desktop: $desktopLogFile | Plugin: $pluginLogFile"
-Log-Info "Execution mode: $executionContext"
+Log-Info "Execution mode: REPAIR_VM"
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
-$contextAwareFailureReason = @{
-    RESCUE_VM = 'Script could not find a valid attached OS disk to enable SAC. Verify the disk is properly attached to the rescue VM.'
-    STANDARD_VM = 'Script could not find a valid OS disk. Running on the local VM instead of rescue mode may limit disk detection.'
-}
-$failureReason = $contextAwareFailureReason[$executionContext]
+$failureReason = 'Script could not find a valid attached OS disk to enable SAC. Verify the disk is attached to the repair VM.'
+$detectedExecutionContext = 'UNDETERMINED'
 $processedCount = 0
 $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
 
-Log-Info "Starting SAC enabler in $executionContext mode. Logs: $logFile"
+Log-Info "Starting SAC enabler in REPAIR_VM mode. Logs: $logFile"
 
 try {
     # Optional: Clean up orphaned temp drive letters from previous failed runs
@@ -372,30 +370,38 @@ try {
     }
 
     # Step 1 - Enumerate partitions to locate the BCD store and OS loader
-    $partitionlist = Get-Disk-Partitions
-    $rescueDrive = $env:SystemDrive -replace ':', ''
+    $partitionlist = @(Get-Disk-Partitions)
+    if ($partitionlist.Count -eq 0) {
+        throw 'Get-Disk-Partitions returned no partitions from Azure virtual disks.'
+    }
+
+    $discoveredDiskNumbers = @($partitionlist | Select-Object -ExpandProperty DiskNumber -Unique)
+    Log-Info "Get-Disk-Partitions discovered disk numbers: $($discoveredDiskNumbers -join ', ')"
+    $repairDrive = $env:SystemDrive -replace ':', ''
     Log-Info 'Enumerating partitions to enable SAC...'
     
-    # SAFETY CHECK: Ensure we're not operating on the rescue VM's own disk
-    $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
-    Log-Info "Rescue VM OS disk identified as Disk $rescueDiskNum"
-    
-    $targetDisksFound = @($partitionlist | Group-Object DiskNumber | Where-Object { [int]$_.Name -ne $rescueDiskNum })
-    if ($targetDisksFound.Count -eq 0 -and $executionContext -eq 'RESCUE_VM') {
-        Log-Error "CRITICAL SAFETY CHECK FAILED: No secondary disks found in rescue VM mode."
-        Log-Error "This script requires an attached OS disk (different from the rescue VM's own disk)."
+    # SAFETY CHECK: Ensure we're not operating on the repair VM's own disk
+    $repairOsPartition = Get-Partition -DriveLetter $repairDrive -ErrorAction Stop | Select-Object -First 1
+    if ($null -eq $repairOsPartition -or $null -eq $repairOsPartition.DiskNumber) {
+        throw "CRITICAL SAFETY CHECK FAILED: Could not identify the repair VM OS disk from $($env:SystemDrive)."
+    }
+
+    $repairDiskNumber = [int]$repairOsPartition.DiskNumber
+    Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber"
+
+    $targetDiskGroups = @($partitionlist | Group-Object DiskNumber | Where-Object { [int]$_.Name -ne $repairDiskNumber })
+    $detectedExecutionContext = Get-SacExecutionContext -TargetDiskGroups $targetDiskGroups -RepairDrive $repairDrive
+    Log-Info "Detected execution context: $detectedExecutionContext"
+
+    if ($detectedExecutionContext -ne 'REPAIR_VM') {
+        Log-Error "[STANDARD_VM] REPAIR-ONLY SCRIPT: No attached Windows OS disk was detected on a secondary disk."
+        Log-Error "[STANDARD_VM] Run this script with az vm repair run and --run-on-repair. No BCD changes were attempted."
         $script_final_status = $STATUS_ERROR
-        $failureReason = "No secondary disks found. Rescue VM must have an attached target OS disk."
+        $failureReason = 'Standard VM context detected, or the repair VM has no accessible attached Windows OS disk.'
     }
     else
     {
-        if ($executionContext -eq 'STANDARD_VM') {
-            Log-Warning "Running in STANDARD_VM mode. Changes will be applied to the local VM's boot configuration."
-            Log-Warning "SAFETY RISK: If changes corrupt BCD, the VM may not boot after restart."
-            Log-Warning "Ensure you have recovery/rollback capability before proceeding."
-        }
-
-    foreach ( $partitionGroup in $partitionlist | Group-Object DiskNumber )
+    foreach ( $partitionGroup in $targetDiskGroups )
     {
         $processedCount++
         $diskChanged = $false
@@ -411,20 +417,13 @@ try {
         
         Log-Info "Processing Disk $diskNumber"
         
-        # SAFETY: Skip if this is the rescue VM's own disk in rescue mode
-        if ($executionContext -eq 'RESCUE_VM' -and [int]$diskNumber -eq $rescueDiskNum) {
-            Log-Warning "Disk $diskNumber is the rescue VM's own disk. Skipping for safety."
-            $skippedCount++
-            continue
-        }
-
         try {
 
         # Scan each drive for BCD store and Windows OS loader
         ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter )
         {
-            # Skip the rescue VM's own OS drive
-            if ($drive -eq $rescueDrive) { continue }
+            # The repair disk was filtered out above; retain this drive-level safety check.
+            if ($drive -eq $repairDrive) { continue }
 
             if ( -not $isBcdPath )
             {
@@ -448,8 +447,7 @@ try {
         if (-not $isBcdPath -and $isOsPath)
         {
             $diskNum = [int]$partitionGroup.Name
-            $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
-            if ($diskNum -ne $rescueDiskNum)
+            if ($diskNum -ne $repairDiskNumber)
             {
                 Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..."
                 $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
@@ -612,16 +610,11 @@ try {
     }
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
-        if ($executionContext -eq 'STANDARD_VM') {
-            Log-Error "[$executionContext] FAILED: $failureReason"
-            Log-Error "[$executionContext] Note: This script is optimized for RESCUE_VM mode. Consider running from a rescue VM for better disk detection."
-        } else {
-            Log-Error "[$executionContext] FAILED: $failureReason"
-        }
+        Log-Error "[$detectedExecutionContext] FAILED: $failureReason"
     }
 }
 catch {
-    Log-Error "An error occurred: $($_.Exception.Message)"
+    Log-Error "[$detectedExecutionContext] An error occurred: $($_.Exception.Message)"
     if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
         Log-Error "Failure context: $($_.InvocationInfo.PositionMessage)"
     }
@@ -629,7 +622,7 @@ catch {
 }
 finally {
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
-    Log-Info "Execution mode: $executionContext"
+    Log-Info "Detected execution context: $detectedExecutionContext"
     Log-Info "Desktop log: $desktopLogFile"
     if (Test-Path -Path $pluginLogFile -PathType Leaf) {
         Log-Info "Plugin log (auto-collected): $pluginLogFile"
