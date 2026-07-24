@@ -274,18 +274,35 @@ try {
     $partitionGroups = @($partitionlist | Group-Object DiskNumber)
     $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
 
-    $hasNonRescueDisk = $false
+    $hasAttachedOsCandidate = $false
     foreach ($group in $partitionGroups) {
-        if ($null -ne $rescueDiskNum -and ([int]$group.Name -ne [int]$rescueDiskNum)) {
-            $hasNonRescueDisk = $true
+        if ($null -ne $rescueDiskNum -and ([int]$group.Name -eq [int]$rescueDiskNum)) {
+            continue
+        }
+
+        foreach ($drive in $group.Group | Select-Object -ExpandProperty DriveLetter) {
+            if ([string]::IsNullOrWhiteSpace("$drive")) { continue }
+
+            $winloadExePath = $drive + ':\windows\system32\winload.exe'
+            $winloadEfiPath = $drive + ':\windows\system32\winload.efi'
+            if ((Test-Path $winloadExePath) -or (Test-Path $winloadEfiPath)) {
+                $hasAttachedOsCandidate = $true
+                break
+            }
+        }
+
+        if ($hasAttachedOsCandidate) {
             break
         }
     }
 
-    $processRescueDisk = -not $hasNonRescueDisk
+    $processRescueDisk = -not $hasAttachedOsCandidate
 
     if ($processRescueDisk) {
         Log-Warning "No attached non-rescue disk detected. Falling back to in-place mode on current VM disk."
+    }
+    else {
+        Log-Info "Detected attached OS candidate disk(s). Running in rescue mode."
     }
 
     Log-Info 'Enumerating partitions to enable SAC...'
