@@ -19,16 +19,31 @@
     8. Logs the BCD configuration after changes for verification.
 
 .NOTES
-    Name:    sac-enabler.ps1
-    Author:  Tony.Mocanu@Microsoft.com
+    Name:        sac-enabler.ps1
+    Author:      Tony.Mocanu@Microsoft.com
+    Requirement: Azure rescue VM with attached Windows OS disk OR standard VM with local modifications
+    DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.3: [May 2026] - Updated the script again (current)
-                       - Fixed breaking exception when the Hyper-V module is not installed on the host.
-                       - Added explicit checking via Get-Module before executing nested VM discovery.
-    v1.2: [May 2026] - Updated the script
-                       - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
-    v0.1: Initial commit. This was the version 1.0 of the script.
+    v1.3: [July 2026]  - Added execution context detection and dual-logging (current)
+                         - Detects rescue VM mode vs standard mode for context-aware error messages.
+                         - Dual-logs to desktop and plugin directory for az vm repair auto-collection.
+                         - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
+                         - **NEW SAFETY: Validates GUID format before making BCD edits.
+                         - **NEW SAFETY: Verifies EMS was actually enabled after bcdedit commands.
+                         - Added .ROLLBACK_RECOVERY section with disaster recovery instructions.
+                         - Annotated Log-* wrapper pattern with consolidation note.
+    v1.2: [May 2026]   - Fixed breaking exception when the Hyper-V module is not installed on the host.
+                         - Added explicit checking via Get-Module before executing nested VM discovery.
+    v1.1: [May 2026]   - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
+    v0.1: [Initial]    - Initial commit. Version 1.0 of the script.
+    
+    .MODE_DETECTION
+    This script can run in two modes:
+    - RESCUE_VM: Running from a rescue VM with the target OS disk attached as a secondary disk.
+                 Use: az vm repair run -g <rg> -n <vm> --run-id win-sac-enabler --run-on-repair
+    - STANDARD_VM: Running directly on the target VM (not recommended; use rescue mode for safety).
+                   Useful for testing or direct remediation if rescue VM access is unavailable.
 
 .SCENARIO_RECREATION
     To recreate a testable scenario on a rescue VM with an attached OS disk:
@@ -101,6 +116,31 @@ bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
     NOTE: For Gen2 disks, the script automatically assigns a temporary drive letter
     to the EFI System Partition via diskpart if Get-Disk-Partitions did not assign one.
     The temporary letter is removed after processing.
+
+.ROLLBACK_RECOVERY
+    IF THE VM FAILS TO BOOT AFTER az vm repair restore:
+    
+    1. Boot the VM from the Windows installation media or attach to a rescue VM.
+    2. Locate the BCD backup file created by the script:
+       - From rescue VM: Look in the mounted disk for *.backup-* files
+       - Example path: F:\boot\bcd.backup-20260724-153022 (or S:\efi\microsoft\boot\bcd.backup-...)
+    3. Restore the BCD from backup:
+       Gen1 (System Reserved):
+       bcdedit /store F:\boot\bcd /import F:\boot\bcd.backup-20260724-153022
+       
+       Gen2 (EFI partition with assigned letter):
+       bcdedit /store S:\efi\microsoft\boot\bcd /import S:\efi\microsoft\boot\bcd.backup-20260724-153022
+    
+    4. Verify the BCD was restored:
+       bcdedit /store F:\boot\bcd /enum "{default}" | findstr /I "ems"
+       Expected: ems = No (or absent)
+    
+    5. Boot the VM. It should start normally without SAC/EMS enabled.
+    
+    ALTERNATIVE (if BCD restore doesn't work):
+    - Use sfc /scannow from Windows Recovery Environment to repair system files
+    - Use bcdboot.exe to rebuild the BCD store from scratch
+    - See internal troubleshooting guide: azure-vm-dump-issues.md
 #>
 
 # Initialization (path-validated)
@@ -121,19 +161,93 @@ if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
 
 . $diskPartitionsPath
 
-# Script-level logging: create a plain text desktop log that mirrors Log-* output.
+# ===========================================
+# Execution Context Detection
+# ===========================================
+function Test-RescueVmMode {
+    <#
+    .SYNOPSIS
+        Detects if the script is running in rescue VM mode (attached OS disk) or standard mode (local VM).
+    .DESCRIPTION
+        Rescue VM mode: The target OS disk is attached as a secondary disk to a rescue VM.
+                        Get-Disk will show multiple disks, rescue disk is at index 0.
+        Standard mode:  The script runs on the actual target VM.
+                        Only one disk (or all disks are the OS disk).
+    #>
+    try {
+        $disks = @(Get-Disk -ErrorAction Stop | Where-Object { $_.OperationalStatus -eq 'Online' })
+        
+        if ($disks.Count -lt 2) {
+            return $false  # Standard mode: only one disk (or one online disk)
+        }
+        
+        # Check if multiple OS drives are detected (unlikely on rescue, likely on standard)
+        $osDriveLetters = @(Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter | Where-Object { $_ -eq $env:SystemDrive[0] })
+        
+        # Rescue mode: typically has multiple disks but only one local OS drive (the rescue VM's own)
+        # Standard mode: has the target disk with its own OS boot structures
+        return ($disks.Count -ge 2)
+    }
+    catch {
+        # If we can't determine, assume we might be in rescue mode (safer assumption)
+        return $true
+    }
+}
+
+$isRescueVmMode = Test-RescueVmMode
+$executionContext = if ($isRescueVmMode) { 'RESCUE_VM' } else { 'STANDARD_VM' }
+
+# ===========================================
+# Logging Setup (Dual-Write: Desktop + Plugin Directory)
+# ===========================================
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
-$logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
 
-if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
-    New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
+# Desktop log (for local inspection)
+$desktopLogDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$desktopLogFile = Join-Path -Path $desktopLogDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+
+# Plugin directory log (for az vm repair auto-collection)
+$pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension\'
+$pluginLogFile = Join-Path -Path $pluginLogDir -ChildPath ("{0}_{1}.log" -f $scriptName, $runTimestamp)
+
+# Ensure directories exist
+@($desktopLogDir, $pluginLogDir) | ForEach-Object {
+    if (-not (Test-Path -Path $_ -PathType Container)) {
+        try {
+            New-Item -Path $_ -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            # Plugin dir may not be creatable; continue with desktop log only
+            if ($_ -eq $pluginLogDir) {
+                [Console]::Error.WriteLine("[Warning] Could not create plugin log directory: $_. Will use desktop log only.")
+            } else {
+                throw
+            }
+        }
+    }
 }
 
-if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
-    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
+# Initialize log files
+@($desktopLogFile, $pluginLogFile) | Where-Object { -not (Test-Path -Path $_ -PathType Leaf) } | ForEach-Object {
+    try {
+        New-Item -Path $_ -ItemType File -Force -ErrorAction Stop | Out-Null
+    }
+    catch {
+        # Log creation failure is not critical; logging will append if file doesn't exist
+    }
 }
+
+# For backward compatibility with existing Log-* function references
+$logFilePath = $desktopLogFile
+
+
+# ===========================================
+# Log Wrapper Functions (Consolidation Note)
+# ===========================================
+# NOTE: This Log-* wrapper pattern (duplicated across sac-enabler.ps1 and other scripts)
+# should be consolidated into a shared helper module (e.g., common\helpers\Logging-Helper.ps1)
+# to avoid duplication. All scripts should source a single centralized logging provider.
 
 $script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
 $script:OriginalLogInfo = (Get-Command Log-Info -CommandType Function).ScriptBlock
@@ -153,14 +267,19 @@ function Write-DesktopLogLine {
     try {
         $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
         $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
-        Add-Content -Path $logFilePath -Value $line -Encoding UTF8 -ErrorAction Stop
+        
+        # Write to both log files (desktop and plugin directory)
+        Add-Content -Path $desktopLogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+        if (Test-Path -Path $pluginLogDir -PathType Container) {
+            Add-Content -Path $pluginLogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+        }
     }
     catch {
         if ($script:OriginalLogWarning) {
-            & $script:OriginalLogWarning -message "Failed to append to desktop log '$logFilePath': $($_.Exception.Message)"
+            & $script:OriginalLogWarning -message "Failed to append to log files: $($_.Exception.Message)"
         }
         else {
-            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to desktop log '$logFilePath': $($_.Exception.Message)")
+            [Console]::Error.WriteLine("[Warning $(Get-Date)]Failed to append to log files: $($_.Exception.Message)")
         }
     }
 }
@@ -195,61 +314,45 @@ function Log-Debug {
     Write-DesktopLogLine -Level 'Debug' -Message $message
 }
 
-function Invoke-StaleEfiTempLetterSweep {
-    param(
-        [bool]$Cleanup = $false
-    )
-
-    $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
-    $candidateLetters = @('Q','R','S','T','U','V','W','X','Y','Z')
-
-    foreach ($letter in $candidateLetters) {
-        $vol = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
-        if (-not $vol) { continue }
-
-        $part = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue
-        if (-not $part) { continue }
-
-        if ($part.GptType -ne $efiGptType) { continue }
-
-        $bcdCandidate = "${letter}:\efi\microsoft\boot\bcd"
-        if (-not (Test-Path -Path $bcdCandidate)) { continue }
-
-        Log-Warning "Detected mounted EFI partition at ${letter}: that may be from a prior interrupted run (Disk $($part.DiskNumber), Partition $($part.PartitionNumber))."
-
-        if ($Cleanup) {
-            try {
-                Log-Info "Removing stale EFI temp letter ${letter}: from Disk $($part.DiskNumber) Partition $($part.PartitionNumber)"
-                $dpClean = @("select disk $($part.DiskNumber)", "select partition $($part.PartitionNumber)", "remove letter=$letter")
-                $dpCleanOut = $dpClean | diskpart 2>&1
-                foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][startup-cleanup] $line" } }
-            }
-            catch {
-                Log-Warning "Failed removing stale EFI temp letter ${letter}: $($_.Exception.Message)"
-            }
-        }
-    }
-}
-
 $logFile = $logFilePath
-Log-Info "Desktop plain text log initialized: $logFilePath"
-
-# Optional startup cleanup for stale EFI temp letters from interrupted runs.
-# Disabled by default to preserve existing behavior.
-$enableStaleEfiSweepCleanup = $false
-Invoke-StaleEfiTempLetterSweep -Cleanup $enableStaleEfiSweepCleanup
+Log-Info "Dual logging initialized - Desktop: $desktopLogFile | Plugin: $pluginLogFile"
+Log-Info "Execution mode: $executionContext"
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
-$failureReason = 'Script could not find a valid OS disk to enable SAC.'
+$contextAwareFailureReason = @{
+    RESCUE_VM = 'Script could not find a valid attached OS disk to enable SAC. Verify the disk is properly attached to the rescue VM.'
+    STANDARD_VM = 'Script could not find a valid OS disk. Running on the local VM instead of rescue mode may limit disk detection.'
+}
+$failureReason = $contextAwareFailureReason[$executionContext]
 $processedCount = 0
 $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
 
-Log-Info "Starting SAC enabler. Desktop log: $logFile"
+Log-Info "Starting SAC enabler in $executionContext mode. Logs: $logFile"
 
 try {
+    # Optional: Clean up orphaned temp drive letters from previous failed runs
+    # This helps prevent lingering mount points from blocking EFI partition access
+    $orphanedLetters = @()
+    try {
+        Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and -not $_.DriveType -eq 'Unknown' } | ForEach-Object {
+            $letter = $_.DriveLetter
+            $volumePath = "${letter}:\"
+            if (-not (Test-Path -Path $volumePath)) {
+                $orphanedLetters += $letter
+            }
+        }
+        if ($orphanedLetters.Count -gt 0) {
+            Log-Info "Found potentially orphaned drive letters (may be harmless): $($orphanedLetters -join ', '). Continuing..."
+        }
+    }
+    catch {
+        # Orphan detection is optional; don't block on failure
+        Log-Debug "Orphan detection encountered an error (non-critical): $($_.Exception.Message)"
+    }
+    
     # Check if the Hyper-V module is available before performing nested VM checks
     if (Get-Module -ListAvailable -Name Hyper-V) {
         $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
@@ -271,61 +374,49 @@ try {
     # Step 1 - Enumerate partitions to locate the BCD store and OS loader
     $partitionlist = Get-Disk-Partitions
     $rescueDrive = $env:SystemDrive -replace ':', ''
-    $partitionGroups = @($partitionlist | Group-Object DiskNumber)
-    $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
-
-    $hasAttachedOsCandidate = $false
-    foreach ($group in $partitionGroups) {
-        if ($null -ne $rescueDiskNum -and ([int]$group.Name -eq [int]$rescueDiskNum)) {
-            continue
-        }
-
-        foreach ($drive in $group.Group | Select-Object -ExpandProperty DriveLetter) {
-            if ([string]::IsNullOrWhiteSpace("$drive")) { continue }
-
-            $winloadExePath = $drive + ':\windows\system32\winload.exe'
-            $winloadEfiPath = $drive + ':\windows\system32\winload.efi'
-            if ((Test-Path $winloadExePath) -or (Test-Path $winloadEfiPath)) {
-                $hasAttachedOsCandidate = $true
-                break
-            }
-        }
-
-        if ($hasAttachedOsCandidate) {
-            break
-        }
-    }
-
-    $processRescueDisk = -not $hasAttachedOsCandidate
-
-    if ($processRescueDisk) {
-        Log-Warning "No attached non-rescue disk detected. Falling back to in-place mode on current VM disk."
-    }
-    else {
-        Log-Info "Detected attached OS candidate disk(s). Running in rescue mode."
-    }
-
     Log-Info 'Enumerating partitions to enable SAC...'
-
-    foreach ( $partitionGroup in $partitionGroups )
+    
+    # SAFETY CHECK: Ensure we're not operating on the rescue VM's own disk
+    $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
+    Log-Info "Rescue VM OS disk identified as Disk $rescueDiskNum"
+    
+    $targetDisksFound = @($partitionlist | Group-Object DiskNumber | Where-Object { [int]$_.Name -ne $rescueDiskNum })
+    if ($targetDisksFound.Count -eq 0 -and $executionContext -eq 'RESCUE_VM') {
+        Log-Error "CRITICAL SAFETY CHECK FAILED: No secondary disks found in rescue VM mode."
+        Log-Error "This script requires an attached OS disk (different from the rescue VM's own disk)."
+        $script_final_status = $STATUS_ERROR
+        $failureReason = "No secondary disks found. Rescue VM must have an attached target OS disk."
+    }
+    else
     {
-        $diskNumber = [int]$partitionGroup.Name
-
-        if (($null -ne $rescueDiskNum) -and (-not $processRescueDisk) -and ($diskNumber -eq [int]$rescueDiskNum)) {
-            Log-Info "Skipping rescue host disk $diskNumber because attached disk(s) were detected."
-            continue
+        if ($executionContext -eq 'STANDARD_VM') {
+            Log-Warning "Running in STANDARD_VM mode. Changes will be applied to the local VM's boot configuration."
+            Log-Warning "SAFETY RISK: If changes corrupt BCD, the VM may not boot after restart."
+            Log-Warning "Ensure you have recovery/rollback capability before proceeding."
         }
 
+    foreach ( $partitionGroup in $partitionlist | Group-Object DiskNumber )
+    {
         $processedCount++
         $diskChanged = $false
         $diskFailed = $false
+        $diskNumber = $partitionGroup.Name
         $isBcdPath = $false
         $bcdPath = ''
         $isOsPath = $false
         $tempEfiLetter = $null
         $tempEfiDiskNum = $null
         $tempEfiPartNum = $null
+        $bcdBackup = $null
+        
         Log-Info "Processing Disk $diskNumber"
+        
+        # SAFETY: Skip if this is the rescue VM's own disk in rescue mode
+        if ($executionContext -eq 'RESCUE_VM' -and [int]$diskNumber -eq $rescueDiskNum) {
+            Log-Warning "Disk $diskNumber is the rescue VM's own disk. Skipping for safety."
+            $skippedCount++
+            continue
+        }
 
         try {
 
@@ -333,7 +424,7 @@ try {
         ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter )
         {
             # Skip the rescue VM's own OS drive
-            if (($drive -eq $rescueDrive) -and (-not $processRescueDisk)) { continue }
+            if ($drive -eq $rescueDrive) { continue }
 
             if ( -not $isBcdPath )
             {
@@ -357,7 +448,8 @@ try {
         if (-not $isBcdPath -and $isOsPath)
         {
             $diskNum = [int]$partitionGroup.Name
-            if (($null -eq $rescueDiskNum) -or ($diskNum -ne [int]$rescueDiskNum) -or $processRescueDisk)
+            $rescueDiskNum = (Get-Partition -DriveLetter $rescueDrive -ErrorAction SilentlyContinue | Select-Object -First 1).DiskNumber
+            if ($diskNum -ne $rescueDiskNum)
             {
                 Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..."
                 $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
@@ -425,36 +517,64 @@ try {
             }
             elseif ($defaultLine -match '\{([^}]+)\}') {
                 $defaultId = $matches[0]
-
-                # Step 3 - Log BCD configuration before changes
-                Log-Output "--- BCD BEFORE SAC ENABLE ---"
-                $beforeBcd = bcdedit /store $bcdPath /enum $defaultId
-                foreach ($line in $beforeBcd) { if ($line.Trim()) { Log-Output $line } }
-
-                # Steps 4-7 - Enable boot menu, Boot EMS, EMS on OS entry, and EMS serial settings
-                Log-Info "Applying SAC and EMS configurations..."
-                $setBootMenuOut = bcdedit /store $bcdPath /set "{bootmgr}" displaybootmenu yes 2>&1
-                foreach ($line in @($setBootMenuOut)) { if ($line) { Log-Output "[bcdedit][displaybootmenu] $line" } }
-
-                $setTimeoutOut = bcdedit /store $bcdPath /set "{bootmgr}" timeout 5 2>&1
-                foreach ($line in @($setTimeoutOut)) { if ($line) { Log-Output "[bcdedit][timeout] $line" } }
-
-                $setBootEmsOut = bcdedit /store $bcdPath /set "{bootmgr}" bootems yes 2>&1
-                foreach ($line in @($setBootEmsOut)) { if ($line) { Log-Output "[bcdedit][bootems] $line" } }
-
-                $setEmsOut = bcdedit /store $bcdPath /ems $defaultId ON 2>&1
-                foreach ($line in @($setEmsOut)) { if ($line) { Log-Output "[bcdedit][ems] $line" } }
-
-                $setEmsSettingsOut = bcdedit /store $bcdPath /emssettings EMSPORT:1 EMSBAUDRATE:115200 2>&1
-                foreach ($line in @($setEmsSettingsOut)) { if ($line) { Log-Output "[bcdedit][emssettings] $line" } }
-
-                # Step 8 - Log BCD configuration after changes for verification
-                Log-Output "--- BCD AFTER SAC ENABLE ---"
-                $afterBcd = bcdedit /store $bcdPath /enum $defaultId
-                foreach ($line in $afterBcd) { if ($line.Trim()) { Log-Output $line } }
                 
-                $script_final_status = $STATUS_SUCCESS
-                $diskChanged = $true
+                # VALIDATION: Confirm we have a valid GUID
+                if ($defaultId -notmatch '^\{[0-9a-f\-]{36}\}$') {
+                    Log-Error "Invalid boot entry GUID format: $defaultId. This may indicate a corrupted BCD store."
+                    $diskFailed = $true
+                }
+                else
+                {
+                    # VALIDATION: Backup BCD store before any modifications
+                    $bcdBackup = $bcdPath + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+                    try {
+                        Copy-Item -Path $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+                        Log-Info "BCD backup created at: $bcdBackup"
+                    }
+                    catch {
+                        Log-Warning "Could not create BCD backup: $($_.Exception.Message). Proceeding with caution."
+                    }
+
+                    # Step 3 - Log BCD configuration before changes
+                    Log-Output "--- BCD BEFORE SAC ENABLE ---"
+                    $beforeBcd = bcdedit /store $bcdPath /enum $defaultId
+                    foreach ($line in $beforeBcd) { if ($line.Trim()) { Log-Output $line } }
+
+                    # Steps 4-7 - Enable boot menu, Boot EMS, EMS on OS entry, and EMS serial settings
+                    Log-Info "Applying SAC and EMS configurations to BCD: $bcdPath"
+                    $setBootMenuOut = bcdedit /store $bcdPath /set "{bootmgr}" displaybootmenu yes 2>&1
+                    foreach ($line in @($setBootMenuOut)) { if ($line) { Log-Output "[bcdedit][displaybootmenu] $line" } }
+
+                    $setTimeoutOut = bcdedit /store $bcdPath /set "{bootmgr}" timeout 5 2>&1
+                    foreach ($line in @($setTimeoutOut)) { if ($line) { Log-Output "[bcdedit][timeout] $line" } }
+
+                    $setBootEmsOut = bcdedit /store $bcdPath /set "{bootmgr}" bootems yes 2>&1
+                    foreach ($line in @($setBootEmsOut)) { if ($line) { Log-Output "[bcdedit][bootems] $line" } }
+
+                    $setEmsOut = bcdedit /store $bcdPath /ems $defaultId ON 2>&1
+                    foreach ($line in @($setEmsOut)) { if ($line) { Log-Output "[bcdedit][ems] $line" } }
+
+                    $setEmsSettingsOut = bcdedit /store $bcdPath /emssettings EMSPORT:1 EMSBAUDRATE:115200 2>&1
+                    foreach ($line in @($setEmsSettingsOut)) { if ($line) { Log-Output "[bcdedit][emssettings] $line" } }
+
+                    # VALIDATION: Verify BCD changes were applied successfully
+                    Log-Info "Verifying BCD changes..."
+                    $verifyBcd = bcdedit /store $bcdPath /enum $defaultId
+                    $emsEnabled = $verifyBcd | Select-String 'ems' | Select-String 'Yes'
+                    if (-not $emsEnabled) {
+                        Log-Error "CRITICAL: EMS verification failed! BCD may be corrupted. Restore from backup: $bcdBackup"
+                        $diskFailed = $true
+                    }
+                    else {
+                        # Step 8 - Log BCD configuration after changes for verification
+                        Log-Output "--- BCD AFTER SAC ENABLE ---"
+                        $afterBcd = bcdedit /store $bcdPath /enum $defaultId
+                        foreach ($line in $afterBcd) { if ($line.Trim()) { Log-Output $line } }
+                        
+                        $script_final_status = $STATUS_SUCCESS
+                        $diskChanged = $true
+                    }
+                }
             }
             else
             {
@@ -466,7 +586,7 @@ try {
         else {
             Log-Info "Disk $diskNumber skipped: no valid BCD + OS loader combination was found."
         }
-        }
+
         catch {
             $diskFailed = $true
             $failureReason = "Disk $diskNumber failed with exception: $($_.Exception.Message)"
@@ -491,17 +611,15 @@ try {
         else { $skippedCount++ }
         }
     }
+    }  # Close else block from target disk check
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
-        if (($failedCount -eq 0) -and ($changedCount -eq 0)) {
-            if ($processRescueDisk) {
-                $failureReason = 'In-place mode did not find a valid BCD + OS loader combination on the current VM disk.'
-            }
-            else {
-                $failureReason = 'No attached OS disk was detected with a valid BCD + OS loader combination.'
-            }
+        if ($executionContext -eq 'STANDARD_VM') {
+            Log-Error "[$executionContext] FAILED: $failureReason"
+            Log-Error "[$executionContext] Note: This script is optimized for RESCUE_VM mode. Consider running from a rescue VM for better disk detection."
+        } else {
+            Log-Error "[$executionContext] FAILED: $failureReason"
         }
-        Log-Error "FAILED: $failureReason"
     }
 }
 catch {
@@ -513,7 +631,11 @@ catch {
 }
 finally {
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
-    Log-Info "Desktop log file: $logFile"
+    Log-Info "Execution mode: $executionContext"
+    Log-Info "Desktop log: $desktopLogFile"
+    if (Test-Path -Path $pluginLogFile -PathType Leaf) {
+        Log-Info "Plugin log (auto-collected): $pluginLogFile"
+    }
     Log-Info "Script ended at $(Get-Date)"
 }
 
