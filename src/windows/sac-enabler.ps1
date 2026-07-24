@@ -29,6 +29,7 @@
                          - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
                          - Detects repair vs. standard context from secondary disks returned by the helper.
                          - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
+                         - Probes unlettered partitions directly instead of assuming GPT metadata or size.
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
@@ -197,6 +198,20 @@ function Get-AvailableTempDriveLetter {
     return $null
 }
 
+function Test-SacGptType {
+    param(
+        [AllowNull()]
+        [object]$ActualType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedType
+    )
+
+    $actual = ([string]$ActualType).Trim().Trim('{', '}')
+    $expected = $ExpectedType.Trim().Trim('{', '}')
+    return $actual -eq $expected
+}
+
 # ===========================================
 # Logging Setup (Dual-Write: Desktop + Plugin Directory)
 # ===========================================
@@ -212,15 +227,15 @@ $pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExte
 $pluginLogFile = Join-Path -Path $pluginLogDir -ChildPath ("{0}_{1}.log" -f $scriptName, $runTimestamp)
 
 # Ensure directories exist
-@($desktopLogDir, $pluginLogDir) | ForEach-Object {
-    if (-not (Test-Path -Path $_ -PathType Container)) {
+foreach ($logDirectory in @($desktopLogDir, $pluginLogDir)) {
+    if (-not (Test-Path -Path $logDirectory -PathType Container)) {
         try {
-            New-Item -Path $_ -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            New-Item -Path $logDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
         catch {
             # Plugin dir may not be creatable; continue with desktop log only
-            if ($_ -eq $pluginLogDir) {
-                [Console]::Error.WriteLine("[Warning] Could not create plugin log directory: $_. Will use desktop log only.")
+            if ($logDirectory -eq $pluginLogDir) {
+                [Console]::Error.WriteLine("[Warning] Could not create plugin log directory '$logDirectory': $($_.Exception.Message). Will use desktop log only.")
             } else {
                 throw
             }
@@ -422,7 +437,7 @@ try {
         try {
 
         # Scan each drive for BCD store and Windows OS loader
-        ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter )
+        ForEach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter | Where-Object { $_ })
         {
             # The repair disk was filtered out above; retain this drive-level safety check.
             if ($drive -eq $repairDrive) { continue }
@@ -445,16 +460,21 @@ try {
             }
         }
 
-        # Gen2 OS fallback: temporarily mount an unlettered GPT Basic Data partition.
+        # Gen2 fallback: probe unlettered partitions directly for a Windows loader.
         if (-not $isOsPath)
         {
             $diskNum = [int]$partitionGroup.Name
-            $basicDataGptType = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
-            $unletteredOsCandidates = @(Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
-                $_.GptType -eq $basicDataGptType -and
-                (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and
-                $_.Size -gt 10GB
-            })
+            $diskPartitions = @(Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue)
+            foreach ($partition in $diskPartitions) {
+                $driveDescription = if ($partition.DriveLetter) { "$($partition.DriveLetter):" } else { '<none>' }
+                $sizeMb = [math]::Round($partition.Size / 1MB)
+                Log-Info "Disk $diskNum partition $($partition.PartitionNumber): drive=$driveDescription sizeMB=$sizeMb type=$($partition.Type) gptType=$($partition.GptType)"
+            }
+
+            $unletteredOsCandidates = @($diskPartitions | Where-Object {
+                -not $_.DriveLetter -or $_.DriveLetter -eq [char]0
+            } | Sort-Object Size -Descending)
+            Log-Info "Disk ${diskNum}: probing $($unletteredOsCandidates.Count) unlettered partition(s) for a Windows loader."
 
             foreach ($osCandidate in $unletteredOsCandidates)
             {
@@ -499,9 +519,10 @@ try {
             if ($diskNum -ne $repairDiskNumber)
             {
                 Log-Info "Disk ${diskNum}: OS found but no BCD - checking for unlettered EFI partition (Gen2)..."
-                $efiGptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+                $efiGptType = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
                 $efiParts = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Where-Object {
-                    $_.GptType -eq $efiGptType -and (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0)
+                    (Test-SacGptType -ActualType $_.GptType -ExpectedType $efiGptType) -and
+                    (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0)
                 }
                 if ($efiParts)
                 {
