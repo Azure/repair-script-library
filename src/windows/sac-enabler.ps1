@@ -25,7 +25,7 @@
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.4: [July 2026]  - Restricted execution to repair VM mode (current).
+    v1.3: [July 2026]  - Restricted execution to repair VM mode (current).
                          - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
                          - Detects repair vs. standard context from secondary disks returned by the helper.
                          - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
@@ -33,7 +33,7 @@
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
-    v1.3: [July 2026]  - Added execution context detection and dual-logging.
+    Update [July 2026]  - Added execution context detection and dual-logging.
                          - Detected rescue VM mode vs standard mode for context-aware error messages.
                          - Dual-logs to desktop and plugin directory for az vm repair auto-collection.
                          - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
@@ -357,10 +357,10 @@ function Write-SacTelemetry {
 
     $json = $payload | ConvertTo-Json -Compress -Depth 8
     if ($Event -eq 'Error') {
-        Log-Error "[Telemetry] $json" | Out-Null
+        Log-Error "[Telemetry] $json"
     }
     else {
-        Log-Info "[Telemetry] $json" | Out-Null
+        Log-Info "[Telemetry] $json"
     }
 }
 
@@ -383,13 +383,13 @@ function Invoke-SacBcdEdit {
         Command = $script:LastCommand
         ExitCode = $exitCode
         Success = ($exitCode -eq 0)
-    } | Out-Null
-
-    foreach ($line in @($output)) {
-        if ($line) { Log-Output "[bcdedit][$Operation] $line" | Out-Null }
     }
 
-    return [pscustomobject]@{
+    foreach ($line in @($output)) {
+        if ($line) { Log-Output "[bcdedit][$Operation] $line" }
+    }
+
+    [pscustomobject]@{
         Output = @($output)
         ExitCode = $exitCode
         Success = ($exitCode -eq 0)
@@ -703,16 +703,8 @@ try {
                         Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') -Operation 'emssettings'
                     )
 
-                    $failedBcdOperations = @($bcdOperations | Where-Object { $_ -isnot [pscustomobject] -or -not $_.Success })
+                    $failedBcdOperations = @($bcdOperations | Where-Object { -not $_.Success })
                     if ($failedBcdOperations.Count -gt 0) {
-                        foreach ($failedOperation in $failedBcdOperations) {
-                            if ($failedOperation -is [pscustomobject]) {
-                                Log-Error "bcdedit operation failed with exit code $($failedOperation.ExitCode)."
-                            }
-                            else {
-                                Log-Error "Unexpected pipeline output was returned by Invoke-SacBcdEdit: $failedOperation"
-                            }
-                        }
                         throw "$($failedBcdOperations.Count) bcdedit operation(s) failed. BCD backup: $bcdBackup"
                     }
 
