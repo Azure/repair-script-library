@@ -25,7 +25,7 @@
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.4: [July 2026]  - Restricted execution to repair VM mode (current).
+    v1.3: [July 2026]  - Restricted execution to repair VM mode (current).
                          - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
                          - Detects repair vs. standard context from secondary disks returned by the helper.
                          - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
@@ -33,7 +33,7 @@
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
-    v1.3: [July 2026]  - Added execution context detection and dual-logging.
+    Update [July 2026]  - Added execution context detection and dual-logging.
                          - Detected rescue VM mode vs standard mode for context-aware error messages.
                          - Dual-logs to desktop and plugin directory for az vm repair auto-collection.
                          - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
@@ -44,7 +44,7 @@
     v1.2: [May 2026]   - Fixed breaking exception when the Hyper-V module is not installed on the host.
                          - Added explicit checking via Get-Module before executing nested VM discovery.
     v1.1: [May 2026]   - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
-    v0.1: [Initial]    - Initial commit. Version 1.0 of the script.
+    v1.0: [Initial]    - Initial commit. Version 1.0 of the script.
     
     .EXECUTION_CONTEXT
     This script is classified as repair-VM-only. It detects repair context when the helper returns
@@ -329,6 +329,73 @@ function Log-Debug {
     Write-DesktopLogLine -Level 'Debug' -Message $message
 }
 
+# Structured telemetry is written through the existing dual-write logging path.
+$script:RepairScriptVersion = '1.4'
+$script:ExecutionStarted = Get-Date
+$script:OperationCount = 0
+$script:LastCommand = $null
+
+function Write-SacTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Start', 'Operation', 'Success', 'Error')]
+        [string]$Event,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [hashtable]$Properties = @{}
+    )
+
+    $payload = [ordered]@{
+        Event = $Event
+        Message = $Message
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+        RepairScriptVersion = $script:RepairScriptVersion
+        Properties = $Properties
+    }
+
+    $json = $payload | ConvertTo-Json -Compress -Depth 8
+    if ($Event -eq 'Error') {
+        Log-Error "[Telemetry] $json"
+    }
+    else {
+        Log-Info "[Telemetry] $json"
+    }
+}
+
+function Invoke-SacBcdEdit {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Operation
+    )
+
+    $script:OperationCount++
+    $script:LastCommand = 'bcdedit.exe ' + ($Arguments -join ' ')
+    $output = & bcdedit.exe @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+
+    Write-SacTelemetry -Event Operation -Message 'Applied bcdedit command' -Properties @{
+        Operation = $Operation
+        Command = $script:LastCommand
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
+    }
+
+    foreach ($line in @($output)) {
+        if ($line) { Log-Output "[bcdedit][$Operation] $line" }
+    }
+
+    [pscustomobject]@{
+        Output = @($output)
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
+    }
+}
+
 $logFile = $logFilePath
 Log-Info "Dual logging initialized - Desktop: $desktopLogFile | Plugin: $pluginLogFile"
 Log-Info "Script classification: REPAIR_VM_ONLY"
@@ -343,6 +410,15 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
+
+$hostOs = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+Write-SacTelemetry -Event Start -Message 'Starting SAC/EMS enablement' -Properties @{
+    OSVersion = if ($hostOs) { $hostOs.Version } else { [Environment]::OSVersion.Version.ToString() }
+    OSCaption = if ($hostOs) { $hostOs.Caption } else { 'Unknown' }
+    ExecutionMode = 'REPAIR_VM_ONLY'
+    DesktopLog = $desktopLogFile
+    PluginLog = $pluginLogFile
+}
 
 try {
     # Optional: Clean up orphaned temp drive letters from previous failed runs
@@ -571,8 +647,16 @@ try {
         if ( $isBcdPath -and $isOsPath )
         {
             # Step 2 - Identify the default boot entry GUID
-            $bcdout = bcdedit /store $bcdPath /enum bootmgr /v
-            $defaultLine = $bcdout | Select-String 'displayorder' | Select-Object -First 1
+            $bootMgrQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', 'bootmgr', '/v') -Operation 'query-bootmgr'
+            if (-not $bootMgrQuery.Success) {
+                $failureReason = "Could not enumerate boot manager from $bcdPath. Exit code: $($bootMgrQuery.ExitCode)."
+                Log-Warning $failureReason
+                $diskFailed = $true
+                continue
+            }
+
+            $bcdout = $bootMgrQuery.Output
+            $defaultLine = $bcdout | Select-String -Pattern '^\s*displayorder\s+' | Select-Object -First 1
 
             if (-not $defaultLine)
             {
@@ -602,41 +686,75 @@ try {
 
                     # Step 3 - Log BCD configuration before changes
                     Log-Output "--- BCD BEFORE SAC ENABLE ---"
-                    $beforeBcd = bcdedit /store $bcdPath /enum $defaultId
-                    foreach ($line in $beforeBcd) { if ($line.Trim()) { Log-Output $line } }
+                    $beforeQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultId, '/v') -Operation 'before-state'
+                    if (-not $beforeQuery.Success) {
+                        throw "Unable to capture the BCD before-state for $defaultId. Exit code: $($beforeQuery.ExitCode)."
+                    }
+                    $beforeBcd = $beforeQuery.Output
+                    foreach ($line in $beforeBcd) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
 
                     # Steps 4-7 - Enable boot menu, Boot EMS, EMS on OS entry, and EMS serial settings
                     Log-Info "Applying SAC and EMS configurations to BCD: $bcdPath"
-                    $setBootMenuOut = bcdedit /store $bcdPath /set "{bootmgr}" displaybootmenu yes 2>&1
-                    foreach ($line in @($setBootMenuOut)) { if ($line) { Log-Output "[bcdedit][displaybootmenu] $line" } }
+                    $bcdOperations = @(
+                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', '{bootmgr}', 'displaybootmenu', 'yes') -Operation 'displaybootmenu'
+                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', '{bootmgr}', 'timeout', '5') -Operation 'timeout'
+                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', '{bootmgr}', 'bootems', 'yes') -Operation 'bootems'
+                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/ems', $defaultId, 'ON') -Operation 'ems'
+                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') -Operation 'emssettings'
+                    )
 
-                    $setTimeoutOut = bcdedit /store $bcdPath /set "{bootmgr}" timeout 5 2>&1
-                    foreach ($line in @($setTimeoutOut)) { if ($line) { Log-Output "[bcdedit][timeout] $line" } }
+                    $failedBcdOperations = @($bcdOperations | Where-Object { -not $_.Success })
+                    if ($failedBcdOperations.Count -gt 0) {
+                        throw "$($failedBcdOperations.Count) bcdedit operation(s) failed. BCD backup: $bcdBackup"
+                    }
 
-                    $setBootEmsOut = bcdedit /store $bcdPath /set "{bootmgr}" bootems yes 2>&1
-                    foreach ($line in @($setBootEmsOut)) { if ($line) { Log-Output "[bcdedit][bootems] $line" } }
+                    # Verify every setting requested by the repair.
+                    Log-Info 'Verifying BCD changes...'
+                    $verifyLoaderQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultId) -Operation 'verify-loader'
+                    $verifyBootMgrQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', '{bootmgr}') -Operation 'verify-bootmgr'
+                    $verifyEmsSettingsQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', '{emssettings}') -Operation 'verify-emssettings'
 
-                    $setEmsOut = bcdedit /store $bcdPath /ems $defaultId ON 2>&1
-                    foreach ($line in @($setEmsOut)) { if ($line) { Log-Output "[bcdedit][ems] $line" } }
+                    $verifyLoaderText = $verifyLoaderQuery.Output -join "`n"
+                    $verifyBootMgrText = $verifyBootMgrQuery.Output -join "`n"
+                    $verifyEmsSettingsText = $verifyEmsSettingsQuery.Output -join "`n"
 
-                    $setEmsSettingsOut = bcdedit /store $bcdPath /emssettings EMSPORT:1 EMSBAUDRATE:115200 2>&1
-                    foreach ($line in @($setEmsSettingsOut)) { if ($line) { Log-Output "[bcdedit][emssettings] $line" } }
+                    $emsEnabled = $verifyLoaderText -match '(?im)^\s*ems\s+Yes\s*$'
+                    $bootEmsEnabled = $verifyBootMgrText -match '(?im)^\s*bootems\s+Yes\s*$'
+                    $bootMenuEnabled = $verifyBootMgrText -match '(?im)^\s*displaybootmenu\s+Yes\s*$'
+                    $timeoutConfigured = $verifyBootMgrText -match '(?im)^\s*timeout\s+5\s*$'
+                    $portConfigured = $verifyEmsSettingsText -match '(?im)^\s*port\s+1\s*$'
+                    $baudConfigured = $verifyEmsSettingsText -match '(?im)^\s*baudrate\s+115200\s*$'
 
-                    # VALIDATION: Verify BCD changes were applied successfully
-                    Log-Info "Verifying BCD changes..."
-                    $verifyBcd = bcdedit /store $bcdPath /enum $defaultId
-                    $emsEnabled = $verifyBcd | Select-String 'ems' | Select-String 'Yes'
-                    if (-not $emsEnabled) {
-                        Log-Error "CRITICAL: EMS verification failed! BCD may be corrupted. Restore from backup: $bcdBackup"
+                    $verificationPassed = $verifyLoaderQuery.Success -and
+                        $verifyBootMgrQuery.Success -and
+                        $verifyEmsSettingsQuery.Success -and
+                        $emsEnabled -and $bootEmsEnabled -and $bootMenuEnabled -and
+                        $timeoutConfigured -and $portConfigured -and $baudConfigured
+
+                    Write-SacTelemetry -Event Operation -Message 'Post-change BCD verification completed' -Properties @{
+                        DiskNumber = $diskNumber
+                        BcdPath = $bcdPath
+                        LoaderGuid = $defaultId
+                        EmsEnabled = $emsEnabled
+                        BootEmsEnabled = $bootEmsEnabled
+                        BootMenuEnabled = $bootMenuEnabled
+                        TimeoutConfigured = $timeoutConfigured
+                        PortConfigured = $portConfigured
+                        BaudConfigured = $baudConfigured
+                        VerificationPassed = $verificationPassed
+                    }
+
+                    if (-not $verificationPassed) {
+                        Log-Error "CRITICAL: SAC/EMS verification failed. Restore from backup if needed: $bcdBackup"
+                        Log-Error "Verification state: ems=$emsEnabled bootems=$bootEmsEnabled displaybootmenu=$bootMenuEnabled timeout=$timeoutConfigured port=$portConfigured baud=$baudConfigured"
+                        $failureReason = "Post-change BCD verification failed for Disk $diskNumber."
                         $diskFailed = $true
                     }
                     else {
-                        # Step 8 - Log BCD configuration after changes for verification
-                        Log-Output "--- BCD AFTER SAC ENABLE ---"
-                        $afterBcd = bcdedit /store $bcdPath /enum $defaultId
-                        foreach ($line in $afterBcd) { if ($line.Trim()) { Log-Output $line } }
-                        
-                        $script_final_status = $STATUS_SUCCESS
+                        Log-Output '--- BCD AFTER SAC ENABLE ---'
+                        foreach ($line in $verifyLoaderQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
+                        foreach ($line in $verifyBootMgrQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
+                        foreach ($line in $verifyEmsSettingsQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
                         $diskChanged = $true
                     }
                 }
@@ -664,7 +782,7 @@ try {
         if ($tempEfiLetter)
         {
             Log-Info "Removing temp letter ${tempEfiLetter}: from Disk $tempEfiDiskNum Partition $tempEfiPartNum"
-            $dpClean = @("select disk $tempEfiDiskNum", "select partition $tempEfiPartNum", "remove letter=$tempEfiLetter")
+            $dpClean = @("select disk $tempEfiDiskNum", "select partition $tempEfiPartNum", "remove letter=$tempEfiLetter noerr")
             $dpCleanOut = $dpClean | diskpart 2>&1
             foreach ($line in @($dpCleanOut)) { if ($line) { Log-Output "[diskpart][cleanup] $line" } }
         }
@@ -672,16 +790,23 @@ try {
         if ($tempOsLetter)
         {
             Log-Info "Removing temp letter ${tempOsLetter}: from Disk $tempOsDiskNum Partition $tempOsPartNum"
-            $dpOsClean = @("select disk $tempOsDiskNum", "select partition $tempOsPartNum", "remove letter=$tempOsLetter")
+            $dpOsClean = @("select disk $tempOsDiskNum", "select partition $tempOsPartNum", "remove letter=$tempOsLetter noerr")
             $dpOsCleanOut = $dpOsClean | diskpart 2>&1
             foreach ($line in @($dpOsCleanOut)) { if ($line) { Log-Output "[diskpart][os-cleanup] $line" } }
         }
 
-        if ($diskChanged) { $changedCount++ }
-        elseif ($diskFailed) { $failedCount++ }
+        if ($diskFailed) { $failedCount++ }
+        elseif ($diskChanged) { $changedCount++ }
         else { $skippedCount++ }
         }
     }
+    }
+
+    if ($failedCount -gt 0 -or $changedCount -eq 0) {
+        $script_final_status = $STATUS_ERROR
+    }
+    else {
+        $script_final_status = $STATUS_SUCCESS
     }
 
     if ($script_final_status -ne $STATUS_SUCCESS) {
@@ -696,6 +821,32 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    $durationSeconds = [math]::Round(((Get-Date) - $script:ExecutionStarted).TotalSeconds, 3)
+    if ($script_final_status -eq $STATUS_SUCCESS) {
+        Write-SacTelemetry -Event Success -Message 'SAC/EMS repair completed successfully' -Properties @{
+            OperationsPerformed = $script:OperationCount
+            DurationSeconds = $durationSeconds
+            DisksProcessed = $processedCount
+            DisksChanged = $changedCount
+            DisksSkipped = $skippedCount
+            DisksFailed = $failedCount
+            BootEmsEnabled = $true
+            EmsEnabled = $true
+        }
+    }
+    else {
+        Write-SacTelemetry -Event Error -Message 'SAC/EMS repair completed with errors' -Properties @{
+            OperationsPerformed = $script:OperationCount
+            DurationSeconds = $durationSeconds
+            DisksProcessed = $processedCount
+            DisksChanged = $changedCount
+            DisksSkipped = $skippedCount
+            DisksFailed = $failedCount
+            FailureReason = $failureReason
+            LastCommand = $script:LastCommand
+        }
+    }
+
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
     Log-Info "Detected execution context: $detectedExecutionContext"
     Log-Info "Desktop log: $desktopLogFile"
