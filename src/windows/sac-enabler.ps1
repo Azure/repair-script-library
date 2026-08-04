@@ -33,7 +33,7 @@
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
-    Update [July 2026]  - Added execution context detection and dual-logging.
+    Update: [July 2026]  - Added execution context detection and dual-logging.
                          - Detected rescue VM mode vs standard mode for context-aware error messages.
                          - Dual-logs to desktop and plugin directory for az vm repair auto-collection.
                          - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
@@ -357,10 +357,10 @@ function Write-SacTelemetry {
 
     $json = $payload | ConvertTo-Json -Compress -Depth 8
     if ($Event -eq 'Error') {
-        Log-Error "[Telemetry] $json"
+        Log-Error "[Telemetry] $json" | Out-Null
     }
     else {
-        Log-Info "[Telemetry] $json"
+        Log-Info "[Telemetry] $json" | Out-Null
     }
 }
 
@@ -383,13 +383,13 @@ function Invoke-SacBcdEdit {
         Command = $script:LastCommand
         ExitCode = $exitCode
         Success = ($exitCode -eq 0)
-    }
+    } | Out-Null
 
     foreach ($line in @($output)) {
-        if ($line) { Log-Output "[bcdedit][$Operation] $line" }
+        if ($line) { Log-Output "[bcdedit][$Operation] $line" | Out-Null }
     }
 
-    [pscustomobject]@{
+    return [pscustomobject]@{
         Output = @($output)
         ExitCode = $exitCode
         Success = ($exitCode -eq 0)
@@ -410,6 +410,7 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
+Log-Info "Build marker: v1.4-pipeline-fix3"
 
 $hostOs = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
 Write-SacTelemetry -Event Start -Message 'Starting SAC/EMS enablement' -Properties @{
@@ -695,17 +696,21 @@ try {
 
                     # Steps 4-7 - Enable boot menu, Boot EMS, EMS on OS entry, and EMS serial settings
                     Log-Info "Applying SAC and EMS configurations to BCD: $bcdPath"
-                    $bcdOperations = @(
-                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', '{bootmgr}', 'displaybootmenu', 'yes') -Operation 'displaybootmenu'
-                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', '{bootmgr}', 'timeout', '5') -Operation 'timeout'
-                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', '{bootmgr}', 'bootems', 'yes') -Operation 'bootems'
-                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/ems', $defaultId, 'ON') -Operation 'ems'
-                        Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') -Operation 'emssettings'
+                    # Execute each command independently. Do not collect command results in a
+                    # shared pipeline because repository Log-* helpers write to the success stream.
+                    $operationDefinitions = @(
+                        @{ Name = 'displaybootmenu'; Arguments = @('/store', $bcdPath, '/set', '{bootmgr}', 'displaybootmenu', 'yes') }
+                        @{ Name = 'timeout'; Arguments = @('/store', $bcdPath, '/set', '{bootmgr}', 'timeout', '5') }
+                        @{ Name = 'bootems'; Arguments = @('/store', $bcdPath, '/set', '{bootmgr}', 'bootems', 'yes') }
+                        @{ Name = 'ems'; Arguments = @('/store', $bcdPath, '/ems', $defaultId, 'ON') }
+                        @{ Name = 'emssettings'; Arguments = @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') }
                     )
 
-                    $failedBcdOperations = @($bcdOperations | Where-Object { -not $_.Success })
-                    if ($failedBcdOperations.Count -gt 0) {
-                        throw "$($failedBcdOperations.Count) bcdedit operation(s) failed. BCD backup: $bcdBackup"
+                    foreach ($operationDefinition in $operationDefinitions) {
+                        $operationResult = Invoke-SacBcdEdit -Arguments $operationDefinition.Arguments -Operation $operationDefinition.Name
+                        if (-not $operationResult.Success) {
+                            throw "bcdedit operation '$($operationDefinition.Name)' failed with exit code $($operationResult.ExitCode). BCD backup: $bcdBackup"
+                        }
                     }
 
                     # Verify every setting requested by the repair.
@@ -722,8 +727,9 @@ try {
                     $bootEmsEnabled = $verifyBootMgrText -match '(?im)^\s*bootems\s+Yes\s*$'
                     $bootMenuEnabled = $verifyBootMgrText -match '(?im)^\s*displaybootmenu\s+Yes\s*$'
                     $timeoutConfigured = $verifyBootMgrText -match '(?im)^\s*timeout\s+5\s*$'
-                    $portConfigured = $verifyEmsSettingsText -match '(?im)^\s*port\s+1\s*$'
-                    $baudConfigured = $verifyEmsSettingsText -match '(?im)^\s*baudrate\s+115200\s*$'
+                    # BCDEdit may label these fields as EMSPORT/EMSBAUDRATE or port/baudrate.
+                    $portConfigured = $verifyEmsSettingsText -match '(?im)^\s*(?:emsport|port)\s+1\s*$'
+                    $baudConfigured = $verifyEmsSettingsText -match '(?im)^\s*(?:emsbaudrate|baudrate)\s+115200\s*$'
 
                     $verificationPassed = $verifyLoaderQuery.Success -and
                         $verifyBootMgrQuery.Success -and
