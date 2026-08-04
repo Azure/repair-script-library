@@ -25,7 +25,7 @@
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.3: [July 2026]  - Restricted execution to repair VM mode (current).
+    v1.4: [July 2026]  - Restricted execution to repair VM mode (current).
                          - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
                          - Detects repair vs. standard context from secondary disks returned by the helper.
                          - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
@@ -33,7 +33,7 @@
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
-    Update [July 2026]  - Added execution context detection and dual-logging.
+    v1.3: [July 2026]  - Added execution context detection and dual-logging.
                          - Detected rescue VM mode vs standard mode for context-aware error messages.
                          - Dual-logs to desktop and plugin directory for az vm repair auto-collection.
                          - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
@@ -44,7 +44,7 @@
     v1.2: [May 2026]   - Fixed breaking exception when the Hyper-V module is not installed on the host.
                          - Added explicit checking via Get-Module before executing nested VM discovery.
     v1.1: [May 2026]   - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
-    v1.0: [Initial]    - Initial commit. Version 1.0 of the script.
+    v0.1: [Initial]    - Initial commit. Version 1.0 of the script.
     
     .EXECUTION_CONTEXT
     This script is classified as repair-VM-only. It detects repair context when the helper returns
@@ -357,10 +357,10 @@ function Write-SacTelemetry {
 
     $json = $payload | ConvertTo-Json -Compress -Depth 8
     if ($Event -eq 'Error') {
-        Log-Error "[Telemetry] $json"
+        Log-Error "[Telemetry] $json" | Out-Null
     }
     else {
-        Log-Info "[Telemetry] $json"
+        Log-Info "[Telemetry] $json" | Out-Null
     }
 }
 
@@ -383,13 +383,13 @@ function Invoke-SacBcdEdit {
         Command = $script:LastCommand
         ExitCode = $exitCode
         Success = ($exitCode -eq 0)
-    }
+    } | Out-Null
 
     foreach ($line in @($output)) {
-        if ($line) { Log-Output "[bcdedit][$Operation] $line" }
+        if ($line) { Log-Output "[bcdedit][$Operation] $line" | Out-Null }
     }
 
-    [pscustomobject]@{
+    return [pscustomobject]@{
         Output = @($output)
         ExitCode = $exitCode
         Success = ($exitCode -eq 0)
@@ -703,8 +703,16 @@ try {
                         Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') -Operation 'emssettings'
                     )
 
-                    $failedBcdOperations = @($bcdOperations | Where-Object { -not $_.Success })
+                    $failedBcdOperations = @($bcdOperations | Where-Object { $_ -isnot [pscustomobject] -or -not $_.Success })
                     if ($failedBcdOperations.Count -gt 0) {
+                        foreach ($failedOperation in $failedBcdOperations) {
+                            if ($failedOperation -is [pscustomobject]) {
+                                Log-Error "bcdedit operation failed with exit code $($failedOperation.ExitCode)."
+                            }
+                            else {
+                                Log-Error "Unexpected pipeline output was returned by Invoke-SacBcdEdit: $failedOperation"
+                            }
+                        }
                         throw "$($failedBcdOperations.Count) bcdedit operation(s) failed. BCD backup: $bcdBackup"
                     }
 
