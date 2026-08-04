@@ -731,7 +731,7 @@ try {
                 $defaultId = $matches[0]
                 
                 # VALIDATION: Confirm we have a valid GUID
-                if ($defaultId -notmatch '^\{[0-9a-f\-]{36}\}$') {
+                if ($defaultId -notmatch '^(?i)\{[0-9a-f\-]{36}\}$') {
                     Log-Error "Invalid boot entry GUID format: $defaultId. This may indicate a corrupted BCD store."
                     $diskFailed = $true
                 }
