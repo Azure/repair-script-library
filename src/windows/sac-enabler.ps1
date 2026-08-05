@@ -3,7 +3,7 @@
     Enables SAC and Serial Console boot settings on attached Windows disks, including BIOS and UEFI layouts.
 
 .DESCRIPTION
-    This script runs only from a repair VM to enable SAC/EMS on an attached OS disk's BCD store.
+    This script must be run from a repair VM only to enable SAC/EMS on an attached OS disk's BCD store.
     It performs the following steps:
     1. Enumerates attached partitions via Get-Disk-Partitions to locate the BCD store and OS loader.
        OS detection accepts either winload.exe or winload.efi.
@@ -13,7 +13,7 @@
        If the default entry cannot be determined, the script logs an explicit warning.
     3. Logs the BCD configuration before any changes are made.
     4. Enables the boot menu with a 5-second timeout (displaybootmenu, timeout).
-    5. Enables Boot EMS on the boot manager (bootems yes).
+    5. Enables Boot EMS on Boot Manager (bootems yes).
     6. Enables EMS on the default OS entry (ems ON).
     7. Configures EMS settings for serial console (EMSPORT:1, EMSBAUDRATE:115200).
     8. Logs the BCD configuration after changes for verification.
@@ -21,11 +21,16 @@
 .NOTES
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
+    Last Modified: 2026-08-05
+    Version:     1.4
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.3: [July 2026]  - Restricted execution to repair VM mode (current).
+    v1.3: [August 2026] - Added VMRepairMint telemetry, structured before-state capture, and Gen1/Gen2 discovery telemetry.
+                          - Added explicit winload.exe and winload.efi detection.
+                          - Added explicit displayorder and boot entry GUID failure diagnostics.
+    Update [July 2026]  - Restricted execution to repair VM mode.
                          - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
                          - Detects repair vs. standard context from secondary disks returned by the helper.
                          - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
@@ -34,8 +39,8 @@
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
     Update: [July 2026]  - Added execution context detection and dual-logging.
-                         - Detected rescue VM mode vs standard mode for context-aware error messages.
-                         - Dual-logs to desktop and plugin directory for az vm repair auto-collection.
+                         - Detected rescue VM mode versus standard mode for context-aware error messages.
+                         - Logs to both the desktop and the plugin directory for automatic collection by az vm repair.
                          - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
                          - **NEW SAFETY: Validates GUID format before making BCD edits.
                          - **NEW SAFETY: Verifies EMS was actually enabled after bcdedit commands.
@@ -125,7 +130,7 @@ bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
     The temporary letter is removed after processing.
 
 .ROLLBACK_RECOVERY
-    IF THE VM FAILS TO BOOT AFTER az vm repair restore:
+    IF THE VM FAILS TO BOOT AFTER RUNNING az vm repair restore:
     
     1. Boot the VM from the Windows installation media or attach to a repair VM.
     2. Locate the BCD backup file created by the script:
@@ -144,10 +149,13 @@ bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
     
     5. Boot the VM. It should start normally without SAC/EMS enabled.
     
-    ALTERNATIVE (if BCD restore doesn't work):
+    ALTERNATIVE (if BCD restore does not work):
     - Use sfc /scannow from Windows Recovery Environment to repair system files
     - Use bcdboot.exe to rebuild the BCD store from scratch
     - See internal troubleshooting guide: azure-vm-dump-issues.md
+
+.LINK
+    https://github.com/Azure/repair-script-library
 #>
 
 # Initialization (path-validated)
@@ -222,7 +230,7 @@ $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $desktopLogDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
 $desktopLogFile = Join-Path -Path $desktopLogDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
 
-# Plugin directory log (for az vm repair auto-collection)
+# Plugin directory log (for automatic collection by az vm repair)
 $pluginLogDir = 'C:\WindowsAzure\Logs\Plugins\Microsoft.Compute.CustomScriptExtension\'
 $pluginLogFile = Join-Path -Path $pluginLogDir -ChildPath ("{0}_{1}.log" -f $scriptName, $runTimestamp)
 
@@ -397,7 +405,7 @@ function Invoke-SacBcdEdit {
 }
 
 $logFile = $logFilePath
-Log-Info "Dual logging initialized - Desktop: $desktopLogFile | Plugin: $pluginLogFile"
+Log-Info "Dual logging initialized: Desktop: $desktopLogFile | Plugin: $pluginLogFile"
 Log-Info "Script classification: REPAIR_VM_ONLY"
 
 # Status Tracking
@@ -412,10 +420,21 @@ $changedCount = 0
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
 Log-Info "Build marker: v1.4-os-and-bcd-discovery-fix"
 
+# VMRepairMint telemetry marker
+Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
+
+Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
+    ScriptName = 'sac-enabler.ps1'
+    ScriptVersion = $script:RepairScriptVersion
+    BuildMarker = 'v1.4-os-and-bcd-discovery-fix'
+    StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
+}
+
 $hostOs = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
 Write-SacTelemetry -Event Start -Message 'Starting SAC/EMS enablement' -Properties @{
     OSVersion = if ($hostOs) { $hostOs.Version } else { [Environment]::OSVersion.Version.ToString() }
     OSCaption = if ($hostOs) { $hostOs.Caption } else { 'Unknown' }
+    VMGeneration = 'PendingTargetDiskDiscovery'
     ExecutionMode = 'REPAIR_VM_ONLY'
     DesktopLog = $desktopLogFile
     PluginLog = $pluginLogFile
@@ -439,7 +458,7 @@ try {
     }
     catch {
         # Orphan detection is optional; don't block on failure
-        Log-Debug "Orphan detection encountered an error (non-critical): $($_.Exception.Message)"
+        Log-Debug "Orphan detection encountered a noncritical error: $($_.Exception.Message)"
     }
     
     # Check if the Hyper-V module is available before performing nested VM checks
@@ -452,7 +471,7 @@ try {
                     Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                 }
                 catch {
-                    Log-Warning "Failed to stop nested guest VM, will continue but may have limited success"
+                    Log-Warning "Failed to stop the nested guest VM; continuing, but the repair may have limited success."
                 }
             }
         }
@@ -524,6 +543,11 @@ try {
         $isGen2Disk = $efiParts.Count -gt 0
 
         Log-Info "Disk ${diskNum}: generation detection result = $(if ($isGen2Disk) { 'Gen2/UEFI' } else { 'Gen1/BIOS' })"
+        Write-SacTelemetry -Event Operation -Message 'Target disk generation detected' -Properties @{
+            DiskNumber = $diskNum
+            VMGeneration = if ($isGen2Disk) { 'V2' } else { 'V1' }
+            EfiPartitionCount = $efiParts.Count
+        }
 
         foreach ($partition in $diskPartitions) {
             $displayLetter = if ($partition.DriveLetter -and $partition.DriveLetter -ne [char]0) {
@@ -741,10 +765,22 @@ try {
                     $bcdBackup = $bcdPath + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
                     try {
                         Copy-Item -Path $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+
                         Log-Info "BCD backup created at: $bcdBackup"
+
+                        Write-SacTelemetry -Event Operation -Message 'BCD backup created' -Properties @{
+                            DiskNumber = $diskNumber
+                            BcdPath = $bcdPath
+                            BackupPath = $bcdBackup
+                        }
                     }
                     catch {
                         Log-Warning "Could not create BCD backup: $($_.Exception.Message). Proceeding with caution."
+                        Write-SacTelemetry -Event Error -Message 'BCD backup creation failed' -Properties @{
+                            DiskNumber = $diskNumber
+                            BcdPath = $bcdPath
+                            Error = $_.Exception.Message
+                        }
                     }
 
                     # Step 3 - Log BCD configuration before changes
@@ -754,6 +790,22 @@ try {
                         throw "Unable to capture the BCD before-state for $defaultId. Exit code: $($beforeQuery.ExitCode)."
                     }
                     $beforeBcd = $beforeQuery.Output
+                    $beforeLoaderText = $beforeBcd -join "`n"
+                    $beforeBootMgrText = $bootMgrQuery.Output -join "`n"
+                    $beforeEmsEnabled = $beforeLoaderText -match '(?im)^\s*ems\s+Yes\s*$'
+                    $beforeBootEmsEnabled = $beforeBootMgrText -match '(?im)^\s*bootems\s+Yes\s*$'
+                    $beforeBootMenuEnabled = $beforeBootMgrText -match '(?im)^\s*displaybootmenu\s+Yes\s*$'
+
+                    Write-SacTelemetry -Event Operation -Message 'Before-state captured' -Properties @{
+                        DiskNumber = $diskNumber
+                        VMGeneration = if ($isGen2Disk) { 'V2' } else { 'V1' }
+                        BcdPath = $bcdPath
+                        LoaderGuid = $defaultId
+                        EMS = if ($beforeEmsEnabled) { 'Yes' } else { 'NoOrAbsent' }
+                        BootEms = if ($beforeBootEmsEnabled) { 'Yes' } else { 'NoOrAbsent' }
+                        DisplayBootMenu = if ($beforeBootMenuEnabled) { 'Yes' } else { 'NoOrAbsent' }
+                    }
+
                     foreach ($line in $beforeBcd) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
 
                     # Steps 4-7 - Enable boot menu, Boot EMS, EMS on OS entry, and EMS serial settings
@@ -813,6 +865,17 @@ try {
                     }
 
                     if (-not $verificationPassed) {
+                        Write-SacTelemetry -Event Error -Message 'BCD verification failed' -Properties @{
+                            DiskNumber = $diskNumber
+                            BcdPath = $bcdPath
+                            BackupPath = $bcdBackup
+                            EmsEnabled = $emsEnabled
+                            BootEmsEnabled = $bootEmsEnabled
+                            BootMenuEnabled = $bootMenuEnabled
+                            TimeoutConfigured = $timeoutConfigured
+                            PortConfigured = $portConfigured
+                            BaudConfigured = $baudConfigured
+                        }
                         Log-Error "CRITICAL: SAC/EMS verification failed. Restore from backup if needed: $bcdBackup"
                         Log-Error "Verification state: ems=$emsEnabled bootems=$bootEmsEnabled displaybootmenu=$bootMenuEnabled timeout=$timeoutConfigured port=$portConfigured baud=$baudConfigured"
                         $failureReason = "Post-change BCD verification failed for Disk $diskNumber."
@@ -835,7 +898,7 @@ try {
             }
         }
         else {
-            Log-Info "Disk $diskNumber skipped: no valid BCD + OS loader combination was found."
+            Log-Info "Disk $diskNumber skipped: no valid combination of BCD store and OS loader was found."
         }
         } catch {
             $diskFailed = $true
@@ -914,6 +977,18 @@ finally {
             LastCommand = $script:LastCommand
         }
     }
+
+# VMRepairMint telemetry marker
+Log-Info "[final_status] Status=$script_final_status"
+
+Write-SacTelemetry -Event Operation -Message 'final_status' -Properties @{
+    FinalStatus = $script_final_status
+    DurationSeconds = $durationSeconds
+    DisksProcessed = $processedCount
+    DisksChanged = $changedCount
+    DisksSkipped = $skippedCount
+    DisksFailed = $failedCount
+}
 
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
     Log-Info "Detected execution context: $detectedExecutionContext"
