@@ -12,21 +12,23 @@
     2. Identifies and validates the Windows Boot Loader entry referenced by the BCD bootmgr default element.
         The script fails closed if the entry's loader path does not resolve on the discovered Windows partition.
     3. Logs the BCD configuration before any changes are made.
-    4. Enables the boot menu with a 5-second timeout (displaybootmenu, timeout).
-    5. Enables Boot EMS on Boot Manager (bootems yes).
-    6. Enables EMS on the default OS entry (ems ON).
-    7. Configures EMS settings for serial console (EMSPORT:1, EMSBAUDRATE:115200).
-    8. Logs the BCD configuration after changes for verification.
+    4. Enables EMS on the default OS entry (ems ON).
+    5. Configures EMS settings for serial console (EMSPORT:1, EMSBAUDRATE:115200).
+    6. Logs the BCD configuration after changes for verification.
 
 .NOTES
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.5.1
+    Version:     1.5.3
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.3: [August 2026] - Uses only the documented offline EMS and EMS settings commands.
+                            - Does not enable the optional Windows boot menu or Boot Manager EMS.
+    v1.5.2: [August 2026] - Restores the verified BCD backup after any post-write failure.
+                            - Preserves device and osdevice mappings without normalization.
     v1.5.1: [August 2026] - Avoids comparing guest BCD drive letters with repair-VM mount letters.
                             - Uses VM generation when selecting the detected loader path for logging.
     v1.5: [August 2026] - Validates loader mapping before BCD writes and verifies mapping invariance afterward.
@@ -107,7 +109,7 @@ bcdedit /store S:\efi\microsoft\boot\bcd /set "{bootmgr}" displaybootmenu no
 bcdedit /store F:\boot\bcd /enum "{default}"
 bcdedit /store S:\efi\microsoft\boot\bcd /enum "{default}"
     Expected: ems = No or absent, bootems = No or absent.
-    5. Run the script. It should enable ems, bootems, displaybootmenu, and emssettings.
+    5. Run the script. It should enable ems and configure emssettings.
     6. Verify all SAC settings are now enabled (see .VERIFICATION section).
 
 .EXAMPLE
@@ -127,8 +129,7 @@ bcdedit /store F:\boot\bcd /enum "{bootmgr}"
 bcdedit /store P:\efi\microsoft\boot\bcd /enum "{default}"
 bcdedit /store P:\efi\microsoft\boot\bcd /enum "{bootmgr}"
 
-    Expected: ems = Yes on the OS entry, bootems = Yes on bootmgr,
-    displaybootmenu = Yes, timeout = 5, EMSPORT = 1, EMSBAUDRATE = 115200.
+    Expected: ems = Yes on the OS entry, EMSPORT = 1, and EMSBAUDRATE = 115200.
 
     NOTE: For Gen2 disks, the script automatically assigns a temporary drive letter
     to the EFI System Partition via diskpart if Get-Disk-Partitions did not assign one.
@@ -343,7 +344,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.1'
+$script:RepairScriptVersion = '1.5.3'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -423,7 +424,7 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.1-offline-drive-mapping-fix"
+Log-Info "Build marker: v1.5.3-minimal-offline-ems"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -431,7 +432,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.1-offline-drive-mapping-fix'
+    BuildMarker = 'v1.5.3-minimal-offline-ems'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -534,6 +535,8 @@ try {
         $tempOsDiskNum = $null
         $tempOsPartNum = $null
         $bcdBackup = $null
+        $bcdWriteStarted = $false
+        $bcdBackupRestored = $false
         
         Log-Info "Processing Disk $diskNumber"
         
@@ -905,19 +908,17 @@ try {
 
                     foreach ($line in $beforeBcd) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
 
-                    # Steps 4-7 - Enable boot menu, Boot EMS, EMS on OS entry, and EMS serial settings
+                    # Enable only the settings required by Microsoft's offline SAC procedure.
                     Log-Info "Applying SAC and EMS configurations to BCD: $bcdPath"
                     # Execute each command independently. Do not collect command results in a
                     # shared pipeline because repository Log-* helpers write to the success stream.
                     $operationDefinitions = @(
-                        @{ Name = 'displaybootmenu'; Arguments = @('/store', $bcdPath, '/set', '{bootmgr}', 'displaybootmenu', 'yes') }
-                        @{ Name = 'timeout'; Arguments = @('/store', $bcdPath, '/set', '{bootmgr}', 'timeout', '5') }
-                        @{ Name = 'bootems'; Arguments = @('/store', $bcdPath, '/set', '{bootmgr}', 'bootems', 'yes') }
                         @{ Name = 'ems'; Arguments = @('/store', $bcdPath, '/ems', $defaultId, 'ON') }
                         @{ Name = 'emssettings'; Arguments = @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') }
                     )
 
                     foreach ($operationDefinition in $operationDefinitions) {
+                        $bcdWriteStarted = $true
                         $operationResult = Invoke-SacBcdEdit -Arguments $operationDefinition.Arguments -Operation $operationDefinition.Name
                         if (-not $operationResult.Success) {
                             throw "bcdedit operation '$($operationDefinition.Name)' failed with exit code $($operationResult.ExitCode). BCD backup: $bcdBackup"
@@ -954,6 +955,7 @@ try {
                         Log-Error "After: path=$afterPath device=$afterDevice osdevice=$afterOsDevice systemroot=$afterSystemRoot"
 
                         Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+                        $bcdBackupRestored = $true
                         Write-SacTelemetry -Event Error -Message 'BCD loader mapping changed and backup restored' -Properties @{
                             DiskNumber = $diskNumber
                             BcdPath = $bcdPath
@@ -982,27 +984,19 @@ try {
                     $verifyEmsSettingsText = $verifyEmsSettingsQuery.Output -join "`n"
 
                     $emsEnabled = $verifyLoaderText -match '(?im)^\s*ems\s+Yes\s*$'
-                    $bootEmsEnabled = $verifyBootMgrText -match '(?im)^\s*bootems\s+Yes\s*$'
-                    $bootMenuEnabled = $verifyBootMgrText -match '(?im)^\s*displaybootmenu\s+Yes\s*$'
-                    $timeoutConfigured = $verifyBootMgrText -match '(?im)^\s*timeout\s+5\s*$'
                     # BCDEdit may label these fields as EMSPORT/EMSBAUDRATE or port/baudrate.
                     $portConfigured = $verifyEmsSettingsText -match '(?im)^\s*(?:emsport|port)\s+1\s*$'
                     $baudConfigured = $verifyEmsSettingsText -match '(?im)^\s*(?:emsbaudrate|baudrate)\s+115200\s*$'
 
                     $verificationPassed = $verifyLoaderQuery.Success -and
-                        $verifyBootMgrQuery.Success -and
                         $verifyEmsSettingsQuery.Success -and
-                        $emsEnabled -and $bootEmsEnabled -and $bootMenuEnabled -and
-                        $timeoutConfigured -and $portConfigured -and $baudConfigured
+                        $emsEnabled -and $portConfigured -and $baudConfigured
 
                     Write-SacTelemetry -Event Operation -Message 'Post-change BCD verification completed' -Properties @{
                         DiskNumber = $diskNumber
                         BcdPath = $bcdPath
                         LoaderGuid = $defaultId
                         EmsEnabled = $emsEnabled
-                        BootEmsEnabled = $bootEmsEnabled
-                        BootMenuEnabled = $bootMenuEnabled
-                        TimeoutConfigured = $timeoutConfigured
                         PortConfigured = $portConfigured
                         BaudConfigured = $baudConfigured
                         VerificationPassed = $verificationPassed
@@ -1014,16 +1008,12 @@ try {
                             BcdPath = $bcdPath
                             BackupPath = $bcdBackup
                             EmsEnabled = $emsEnabled
-                            BootEmsEnabled = $bootEmsEnabled
-                            BootMenuEnabled = $bootMenuEnabled
-                            TimeoutConfigured = $timeoutConfigured
                             PortConfigured = $portConfigured
                             BaudConfigured = $baudConfigured
                         }
                         Log-Error "CRITICAL: SAC/EMS verification failed. Restore from backup if needed: $bcdBackup"
-                        Log-Error "Verification state: ems=$emsEnabled bootems=$bootEmsEnabled displaybootmenu=$bootMenuEnabled timeout=$timeoutConfigured port=$portConfigured baud=$baudConfigured"
-                        $failureReason = "Post-change BCD verification failed for Disk $diskNumber."
-                        $diskFailed = $true
+                        Log-Error "Verification state: ems=$emsEnabled port=$portConfigured baud=$baudConfigured"
+                        throw "Post-change BCD verification failed for Disk $diskNumber."
                     }
                     else {
                         Log-Output '--- BCD AFTER SAC ENABLE ---'
@@ -1050,6 +1040,22 @@ try {
             Log-Error $failureReason
             if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
                 Log-Error "Disk $diskNumber failure context: $($_.InvocationInfo.PositionMessage)"
+            }
+            if ($bcdWriteStarted -and -not $bcdBackupRestored -and $bcdBackup -and (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+                try {
+                    Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+                    $bcdBackupRestored = $true
+                    Log-Warning "Restored BCD backup after failed operation: $bcdBackup"
+                    Write-SacTelemetry -Event Error -Message 'BCD backup restored after failed operation' -Properties @{
+                        DiskNumber = $diskNumber
+                        BcdPath = $bcdPath
+                        BackupPath = $bcdBackup
+                        FailureReason = $failureReason
+                    }
+                }
+                catch {
+                    Log-Error "CRITICAL: Failed to restore BCD backup '$bcdBackup': $($_.Exception.Message)"
+                }
             }
         } finally {
 
@@ -1105,8 +1111,9 @@ finally {
             DisksChanged = $changedCount
             DisksSkipped = $skippedCount
             DisksFailed = $failedCount
-            BootEmsEnabled = $true
             EmsEnabled = $true
+            EmsPort = 1
+            EmsBaudRate = 115200
         }
     }
     else {
