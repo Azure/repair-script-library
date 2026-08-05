@@ -20,11 +20,13 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.5.4
+    Version:     1.5.5
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.5: [August 2026] - Refuses repair when an attached disk is offline due to an identity collision.
+                            - Prevents onlining a colliding source disk and invalidating BCD device references.
     v1.5.4: [August 2026] - Skips EMS writes for settings that are already correct.
                             - Logs the full verbose BCD store before and after changes.
     v1.5.3: [August 2026] - Uses only the documented offline EMS and EMS settings commands.
@@ -342,7 +344,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.4'
+$script:RepairScriptVersion = '1.5.5'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -422,7 +424,7 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.4-idempotent-offline-ems"
+Log-Info "Build marker: v1.5.5-collision-preflight"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -430,7 +432,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.4-idempotent-offline-ems'
+    BuildMarker = 'v1.5.5-collision-preflight'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -481,6 +483,28 @@ try {
         }
     } else {
         Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
+    }
+
+    # A disk identity collision is unsafe for offline BCD repair. Bringing the
+    # source disk online may require changing its MBR signature or GPT identity,
+    # which invalidates the BCD device descriptors used when the VM boots.
+    $collisionDisks = @(Get-Disk -ErrorAction Stop | Where-Object {
+        $_.IsOffline -and ([string]$_.OfflineReason -eq 'Collision')
+    })
+    if ($collisionDisks.Count -gt 0) {
+        foreach ($collisionDisk in $collisionDisks) {
+            Write-SacTelemetry -Event Error -Message 'Attached disk identity collision detected' -Properties @{
+                DiskNumber = $collisionDisk.Number
+                FriendlyName = $collisionDisk.FriendlyName
+                SerialNumber = $collisionDisk.SerialNumber
+                PartitionStyle = [string]$collisionDisk.PartitionStyle
+                OfflineReason = [string]$collisionDisk.OfflineReason
+                UniqueId = $collisionDisk.UniqueId
+            }
+            Log-Error "Disk $($collisionDisk.Number) is offline because of an identity collision. No disk or BCD changes were attempted."
+        }
+
+        throw 'Unsafe repair context: an attached disk is offline with OfflineReason=Collision. Use a repair VM whose OS disk does not collide with the source disk. Do not change the source disk identity merely to bring it online.'
     }
 
     # Step 1 - Enumerate partitions to locate the BCD store and OS loader
