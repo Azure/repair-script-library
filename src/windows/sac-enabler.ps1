@@ -10,7 +10,7 @@
     1a. For Gen2 disks where the EFI partition has no drive letter, uses diskpart to
         temporarily assign one so the BCD store can be accessed.
     2. Identifies and validates the Windows Boot Loader entry referenced by the BCD bootmgr default element.
-         The script fails closed if the entry does not map to the discovered Windows partition.
+        The script fails closed if the entry's loader path does not resolve on the discovered Windows partition.
     3. Logs the BCD configuration before any changes are made.
     4. Enables the boot menu with a 5-second timeout (displaybootmenu, timeout).
     5. Enables Boot EMS on Boot Manager (bootems yes).
@@ -22,11 +22,13 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.5
+    Version:     1.5.1
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.1: [August 2026] - Avoids comparing guest BCD drive letters with repair-VM mount letters.
+                            - Uses VM generation when selecting the detected loader path for logging.
     v1.5: [August 2026] - Validates loader mapping before BCD writes and verifies mapping invariance afterward.
                           - Requires and verifies a BCD backup before applying SAC settings.
                           - Restores the backup if path, device, osdevice, or systemroot changes unexpectedly.
@@ -341,7 +343,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5'
+$script:RepairScriptVersion = '1.5.1'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -421,7 +423,7 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5-loader-mapping-safety"
+Log-Info "Build marker: v1.5.1-offline-drive-mapping-fix"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -429,7 +431,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5-loader-mapping-safety'
+    BuildMarker = 'v1.5.1-offline-drive-mapping-fix'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -582,7 +584,15 @@ try {
             if ($hasWinloadExe -or $hasWinloadEfi) {
                 $isOsPath = $true
                 $windowsDrive = $drive
-                $detectedLoaderPath = if ($hasWinloadEfi) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
+                $detectedLoaderPath = if ($isGen2Disk -and $hasWinloadEfi) {
+                    '\Windows\System32\winload.efi'
+                }
+                elseif ($hasWinloadExe) {
+                    '\Windows\System32\winload.exe'
+                }
+                else {
+                    '\Windows\System32\winload.efi'
+                }
                 Log-Info "Disk ${diskNum}: Windows loader confirmed on ${windowsDrive}: path=$detectedLoaderPath"
                 break
             }
@@ -631,7 +641,15 @@ try {
                     $tempOsPartNum = $candidatePartNum
                     $isOsPath = $true
                     $windowsDrive = $candidateLetter
-                    $detectedLoaderPath = if ($hasWinloadEfi) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
+                    $detectedLoaderPath = if ($isGen2Disk -and $hasWinloadEfi) {
+                        '\Windows\System32\winload.efi'
+                    }
+                    elseif ($hasWinloadExe) {
+                        '\Windows\System32\winload.exe'
+                    }
+                    else {
+                        '\Windows\System32\winload.efi'
+                    }
                     Log-Info "Disk ${diskNum}: Windows loader confirmed on temporary ${windowsDrive}: path=$detectedLoaderPath"
                     break
                 }
@@ -810,14 +828,9 @@ try {
                         throw "Selected loader $defaultId has osdevice=unknown. Separate BCD repair is required; no BCD changes were made."
                     }
 
-                    $expectedPartitionMapping = "partition=${windowsDrive}:"
-                    if ($originalDevice -match '(?i)^partition=([a-z]):$' -and $originalDevice -ine $expectedPartitionMapping) {
-                        throw "Selected loader $defaultId maps device to '$originalDevice', not the discovered Windows partition '$expectedPartitionMapping'. No BCD changes were made."
-                    }
-                    if ($originalOsDevice -match '(?i)^partition=([a-z]):$' -and $originalOsDevice -ine $expectedPartitionMapping) {
-                        throw "Selected loader $defaultId maps osdevice to '$originalOsDevice', not the discovered Windows partition '$expectedPartitionMapping'. No BCD changes were made."
-                    }
-
+                    # Offline BCD output uses the guest's drive-letter namespace (commonly C:),
+                    # while the repair VM mounts that partition under a temporary letter.
+                    # Validate identity by resolving the BCD loader path on the discovered partition.
                     $resolvedLoaderFile = Join-Path -Path "${windowsDrive}:\" -ChildPath $originalLoaderPath.TrimStart('\')
                     if (-not (Test-Path -LiteralPath $resolvedLoaderFile -PathType Leaf)) {
                         throw "Selected BCD entry references '$originalLoaderPath', but '$resolvedLoaderFile' does not exist. No BCD changes were made."
