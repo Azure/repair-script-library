@@ -20,11 +20,13 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.5.5
+    Version:     1.5.6
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.6: [August 2026] - Temporarily assigns a unique identity to collision-offlined attached disks.
+                            - Restores and verifies the exact original disk identity before reporting success.
     v1.5.5: [August 2026] - Refuses repair when an attached disk is offline due to an identity collision.
                             - Prevents onlining a colliding source disk and invalidating BCD device references.
     v1.5.4: [August 2026] - Skips EMS writes for settings that are already correct.
@@ -226,6 +228,89 @@ function Test-SacGptType {
     return $actual -eq $expected
 }
 
+function Get-SacDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$DiskNumber
+    )
+
+    $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
+    if ([string]$disk.PartitionStyle -eq 'MBR') {
+        $signature = [uint32]$disk.Signature
+        return [pscustomobject]@{
+            PartitionStyle = 'MBR'
+            Value = $signature.ToString('X8')
+            DiskPartValue = $signature.ToString('X8')
+        }
+    }
+
+    if ([string]$disk.PartitionStyle -eq 'GPT') {
+        $diskGuid = ([guid]$disk.Guid).ToString('D')
+        return [pscustomobject]@{
+            PartitionStyle = 'GPT'
+            Value = $diskGuid
+            DiskPartValue = $diskGuid
+        }
+    }
+
+    throw "Disk $DiskNumber has unsupported partition style '$($disk.PartitionStyle)'."
+}
+
+function Invoke-SacDiskPart {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Commands,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Operation
+    )
+
+    $output = $Commands | diskpart 2>&1
+    foreach ($line in @($output)) {
+        if ($line) { Log-Output "[diskpart][$Operation] $line" | Out-Null }
+    }
+}
+
+function Set-SacTemporaryDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    Invoke-SacDiskPart -Operation 'collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+        'online disk'
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-SacDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw "Disk $($Record.DiskNumber) could not be brought online with its verified temporary identity."
+    }
+}
+
+function Restore-SacOriginalDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    Invoke-SacDiskPart -Operation 'collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        'offline disk'
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-SacDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if (-not $restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw "Disk $($Record.DiskNumber) did not return to its original offline identity."
+    }
+}
+
 # ===========================================
 # Logging Setup (Dual-Write: Desktop + Plugin Directory)
 # ===========================================
@@ -344,7 +429,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.5'
+$script:RepairScriptVersion = '1.5.6'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -422,9 +507,10 @@ $processedCount = 0
 $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
+$collisionDiskRecords = @()
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.5-collision-preflight"
+Log-Info "Build marker: v1.5.6-transactional-collision-identity"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -432,7 +518,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.5-collision-preflight'
+    BuildMarker = 'v1.5.6-transactional-collision-identity'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -485,26 +571,50 @@ try {
         Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
     }
 
-    # A disk identity collision is unsafe for offline BCD repair. Bringing the
-    # source disk online may require changing its MBR signature or GPT identity,
-    # which invalidates the BCD device descriptors used when the VM boots.
+    # Get-Disk-Partitions onlines every Microsoft Virtual Disk. Prepare any
+    # colliding attached disk with a temporary identity first, then restore the
+    # exact original identity in the outer finally block before repair restore.
+    $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
+        Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
+        ForEach-Object { [int]$_.Index })
     $collisionDisks = @(Get-Disk -ErrorAction Stop | Where-Object {
-        $_.IsOffline -and ([string]$_.OfflineReason -eq 'Collision')
+        $_.Number -in $azureVirtualDiskNumbers -and
+        $_.IsOffline -and
+        ([string]$_.OfflineReason -eq 'Collision')
     })
-    if ($collisionDisks.Count -gt 0) {
-        foreach ($collisionDisk in $collisionDisks) {
-            Write-SacTelemetry -Event Error -Message 'Attached disk identity collision detected' -Properties @{
-                DiskNumber = $collisionDisk.Number
-                FriendlyName = $collisionDisk.FriendlyName
-                SerialNumber = $collisionDisk.SerialNumber
-                PartitionStyle = [string]$collisionDisk.PartitionStyle
-                OfflineReason = [string]$collisionDisk.OfflineReason
-                UniqueId = $collisionDisk.UniqueId
-            }
-            Log-Error "Disk $($collisionDisk.Number) is offline because of an identity collision. No disk or BCD changes were attempted."
+    foreach ($collisionDisk in $collisionDisks) {
+        $originalIdentity = Get-SacDiskIdentity -DiskNumber $collisionDisk.Number
+        if ($originalIdentity.PartitionStyle -eq 'MBR') {
+            do {
+                $temporaryValue = ([Convert]::ToUInt32(([guid]::NewGuid().ToString('N').Substring(0, 8)), 16)).ToString('X8')
+            } while ($temporaryValue -eq '00000000' -or $temporaryValue -ieq $originalIdentity.Value)
+            $temporaryDiskPartValue = $temporaryValue
+        }
+        else {
+            $temporaryValue = ([guid]::NewGuid()).ToString('D')
+            $temporaryDiskPartValue = $temporaryValue
         }
 
-        throw 'Unsafe repair context: an attached disk is offline with OfflineReason=Collision. Use a repair VM whose OS disk does not collide with the source disk. Do not change the source disk identity merely to bring it online.'
+        $record = [pscustomobject]@{
+            DiskNumber = [int]$collisionDisk.Number
+            PartitionStyle = $originalIdentity.PartitionStyle
+            OriginalValue = $originalIdentity.Value
+            OriginalDiskPartValue = $originalIdentity.DiskPartValue
+            TemporaryValue = $temporaryValue
+            TemporaryDiskPartValue = $temporaryDiskPartValue
+        }
+        $collisionDiskRecords += $record
+
+        Write-SacTelemetry -Event Operation -Message 'Preparing collision-offlined attached disk' -Properties @{
+            DiskNumber = $record.DiskNumber
+            PartitionStyle = $record.PartitionStyle
+            OfflineReason = [string]$collisionDisk.OfflineReason
+            OriginalIdentity = $record.OriginalValue
+            TemporaryIdentity = $record.TemporaryValue
+        }
+        Log-Warning "Disk $($record.DiskNumber) is offline due to an identity collision. Applying a temporary $($record.PartitionStyle) identity for this repair run."
+        Set-SacTemporaryDiskIdentity -Record $record
+        Log-Info "Disk $($record.DiskNumber) is online with a verified temporary identity."
     }
 
     # Step 1 - Enumerate partitions to locate the BCD store and OS loader
@@ -1162,6 +1272,34 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    $identityRestorationFailed = $false
+    foreach ($record in @($collisionDiskRecords | Sort-Object DiskNumber -Descending)) {
+        try {
+            Restore-SacOriginalDiskIdentity -Record $record
+            Log-Info "Disk $($record.DiskNumber) is offline with its verified original $($record.PartitionStyle) identity restored."
+            Write-SacTelemetry -Event Operation -Message 'Original attached disk identity restored' -Properties @{
+                DiskNumber = $record.DiskNumber
+                PartitionStyle = $record.PartitionStyle
+                OriginalIdentity = $record.OriginalValue
+                DiskOffline = $true
+            }
+        }
+        catch {
+            $identityRestorationFailed = $true
+            $failureReason = "CRITICAL: Failed to restore the original identity of Disk $($record.DiskNumber): $($_.Exception.Message)"
+            Log-Error $failureReason
+            Write-SacTelemetry -Event Error -Message 'Original attached disk identity restoration failed' -Properties @{
+                DiskNumber = $record.DiskNumber
+                PartitionStyle = $record.PartitionStyle
+                OriginalIdentity = $record.OriginalValue
+                Error = $_.Exception.Message
+            }
+        }
+    }
+    if ($identityRestorationFailed) {
+        $script_final_status = $STATUS_ERROR
+    }
+
     $durationSeconds = [math]::Round(((Get-Date) - $script:ExecutionStarted).TotalSeconds, 3)
     if ($script_final_status -eq $STATUS_SUCCESS) {
         Write-SacTelemetry -Event Success -Message 'SAC/EMS repair completed successfully' -Properties @{
