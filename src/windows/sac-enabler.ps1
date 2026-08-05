@@ -20,11 +20,13 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.5.3
+    Version:     1.5.4
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.4: [August 2026] - Skips EMS writes for settings that are already correct.
+                            - Logs the full verbose BCD store before and after changes.
     v1.5.3: [August 2026] - Uses only the documented offline EMS and EMS settings commands.
                             - Does not enable the optional Windows boot menu or Boot Manager EMS.
     v1.5.2: [August 2026] - Restores the verified BCD backup after any post-write failure.
@@ -97,18 +99,14 @@ Set-Partition -DiskNumber <disk> -PartitionNumber <part> -NewDriveLetter S
 
        Gen1 example (F:\boot\bcd):
 bcdedit /store F:\boot\bcd /ems "{default}" OFF
-bcdedit /store F:\boot\bcd /set "{bootmgr}" bootems no
-bcdedit /store F:\boot\bcd /set "{bootmgr}" displaybootmenu no
 
        Gen2 example (S:\efi\microsoft\boot\bcd):
 bcdedit /store S:\efi\microsoft\boot\bcd /ems "{default}" OFF
-bcdedit /store S:\efi\microsoft\boot\bcd /set "{bootmgr}" bootems no
-bcdedit /store S:\efi\microsoft\boot\bcd /set "{bootmgr}" displaybootmenu no
 
     4. Verify EMS is disabled:
 bcdedit /store F:\boot\bcd /enum "{default}"
 bcdedit /store S:\efi\microsoft\boot\bcd /enum "{default}"
-    Expected: ems = No or absent, bootems = No or absent.
+    Expected: ems = No or absent.
     5. Run the script. It should enable ems and configure emssettings.
     6. Verify all SAC settings are now enabled (see .VERIFICATION section).
 
@@ -344,7 +342,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.3'
+$script:RepairScriptVersion = '1.5.4'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -424,7 +422,7 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.3-minimal-offline-ems"
+Log-Info "Build marker: v1.5.4-idempotent-offline-ems"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -432,7 +430,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.3-minimal-offline-ems'
+    BuildMarker = 'v1.5.4-idempotent-offline-ems'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -889,12 +887,22 @@ try {
                     if (-not $beforeQuery.Success) {
                         throw "Unable to capture the BCD before-state for $defaultId. Exit code: $($beforeQuery.ExitCode)."
                     }
+                    $beforeEmsSettingsQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', '{emssettings}', '/v') -Operation 'before-emssettings'
+                    $beforeFullQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', 'all', '/v') -Operation 'before-full-store'
+                    if (-not $beforeFullQuery.Success) {
+                        throw "Unable to capture the full BCD before-state. Exit code: $($beforeFullQuery.ExitCode)."
+                    }
                     $beforeBcd = $beforeQuery.Output
                     $beforeLoaderText = $beforeBcd -join "`n"
                     $beforeBootMgrText = $bootMgrQuery.Output -join "`n"
+                    $beforeEmsSettingsText = $beforeEmsSettingsQuery.Output -join "`n"
                     $beforeEmsEnabled = $beforeLoaderText -match '(?im)^\s*ems\s+Yes\s*$'
                     $beforeBootEmsEnabled = $beforeBootMgrText -match '(?im)^\s*bootems\s+Yes\s*$'
                     $beforeBootMenuEnabled = $beforeBootMgrText -match '(?im)^\s*displaybootmenu\s+Yes\s*$'
+                    $beforePortConfigured = $beforeEmsSettingsQuery.Success -and
+                        $beforeEmsSettingsText -match '(?im)^\s*(?:emsport|port)\s+1\s*$'
+                    $beforeBaudConfigured = $beforeEmsSettingsQuery.Success -and
+                        $beforeEmsSettingsText -match '(?im)^\s*(?:emsbaudrate|baudrate)\s+115200\s*$'
 
                     Write-SacTelemetry -Event Operation -Message 'Before-state captured' -Properties @{
                         DiskNumber = $diskNumber
@@ -904,18 +912,32 @@ try {
                         EMS = if ($beforeEmsEnabled) { 'Yes' } else { 'NoOrAbsent' }
                         BootEms = if ($beforeBootEmsEnabled) { 'Yes' } else { 'NoOrAbsent' }
                         DisplayBootMenu = if ($beforeBootMenuEnabled) { 'Yes' } else { 'NoOrAbsent' }
+                        PortConfigured = $beforePortConfigured
+                        BaudConfigured = $beforeBaudConfigured
                     }
 
                     foreach ($line in $beforeBcd) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
+                    Log-Output '--- BCD FULL STORE BEFORE SAC ENABLE ---'
+                    foreach ($line in $beforeFullQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
 
                     # Enable only the settings required by Microsoft's offline SAC procedure.
                     Log-Info "Applying SAC and EMS configurations to BCD: $bcdPath"
                     # Execute each command independently. Do not collect command results in a
                     # shared pipeline because repository Log-* helpers write to the success stream.
-                    $operationDefinitions = @(
-                        @{ Name = 'ems'; Arguments = @('/store', $bcdPath, '/ems', $defaultId, 'ON') }
-                        @{ Name = 'emssettings'; Arguments = @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') }
-                    )
+                    $operationDefinitions = @()
+                    if (-not $beforeEmsEnabled) {
+                        $operationDefinitions += @{ Name = 'ems'; Arguments = @('/store', $bcdPath, '/ems', $defaultId, 'ON') }
+                    }
+                    else {
+                        Log-Info "EMS is already enabled on $defaultId; skipping the EMS write."
+                    }
+
+                    if (-not ($beforePortConfigured -and $beforeBaudConfigured)) {
+                        $operationDefinitions += @{ Name = 'emssettings'; Arguments = @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') }
+                    }
+                    else {
+                        Log-Info 'EMS port and baud rate are already configured; skipping the EMS settings write.'
+                    }
 
                     foreach ($operationDefinition in $operationDefinitions) {
                         $bcdWriteStarted = $true
@@ -975,9 +997,10 @@ try {
 
                     # Verify every setting requested by the repair.
                     Log-Info 'Verifying BCD changes...'
-                    $verifyLoaderQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultId) -Operation 'verify-loader'
-                    $verifyBootMgrQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', '{bootmgr}') -Operation 'verify-bootmgr'
-                    $verifyEmsSettingsQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', '{emssettings}') -Operation 'verify-emssettings'
+                    $verifyLoaderQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultId, '/v') -Operation 'verify-loader'
+                    $verifyBootMgrQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', '{bootmgr}', '/v') -Operation 'verify-bootmgr'
+                    $verifyEmsSettingsQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', '{emssettings}', '/v') -Operation 'verify-emssettings'
+                    $afterFullQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', 'all', '/v') -Operation 'after-full-store'
 
                     $verifyLoaderText = $verifyLoaderQuery.Output -join "`n"
                     $verifyBootMgrText = $verifyBootMgrQuery.Output -join "`n"
@@ -990,6 +1013,7 @@ try {
 
                     $verificationPassed = $verifyLoaderQuery.Success -and
                         $verifyEmsSettingsQuery.Success -and
+                        $afterFullQuery.Success -and
                         $emsEnabled -and $portConfigured -and $baudConfigured
 
                     Write-SacTelemetry -Event Operation -Message 'Post-change BCD verification completed' -Properties @{
@@ -1020,6 +1044,18 @@ try {
                         foreach ($line in $verifyLoaderQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
                         foreach ($line in $verifyBootMgrQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
                         foreach ($line in $verifyEmsSettingsQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
+                        Log-Output '--- BCD FULL STORE AFTER SAC ENABLE ---'
+                        foreach ($line in $afterFullQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
+                        Log-Output '--- BCD VERBOSE DELTA ---'
+                        $verboseDelta = @(Compare-Object -ReferenceObject @($beforeFullQuery.Output) -DifferenceObject @($afterFullQuery.Output))
+                        if ($verboseDelta.Count -eq 0) {
+                            Log-Output '<no rendered differences>'
+                        }
+                        else {
+                            foreach ($difference in $verboseDelta) {
+                                Log-Output "[$($difference.SideIndicator)] $($difference.InputObject)"
+                            }
+                        }
                         $diskChanged = $true
                     }
                 }
