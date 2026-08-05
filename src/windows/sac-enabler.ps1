@@ -9,8 +9,8 @@
        OS detection accepts either winload.exe or winload.efi.
     1a. For Gen2 disks where the EFI partition has no drive letter, uses diskpart to
         temporarily assign one so the BCD store can be accessed.
-    2. Identifies the default boot entry GUID from the BCD bootmgr displayorder.
-       If the default entry cannot be determined, the script logs an explicit warning.
+    2. Identifies and validates the Windows Boot Loader entry referenced by the BCD bootmgr default element.
+         The script fails closed if the entry does not map to the discovered Windows partition.
     3. Logs the BCD configuration before any changes are made.
     4. Enables the boot menu with a 5-second timeout (displaybootmenu, timeout).
     5. Enables Boot EMS on Boot Manager (bootems yes).
@@ -22,12 +22,15 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.4
+    Version:     1.5
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.3: [August 2026] - Added VMRepairMint telemetry, structured before-state capture, and Gen1/Gen2 discovery telemetry.
+    v1.5: [August 2026] - Validates loader mapping before BCD writes and verifies mapping invariance afterward.
+                          - Requires and verifies a BCD backup before applying SAC settings.
+                          - Restores the backup if path, device, osdevice, or systemroot changes unexpectedly.
+    v1.4: [August 2026] - Added VMRepairMint telemetry, structured before-state capture, and Gen1/Gen2 discovery telemetry.
                           - Added explicit winload.exe and winload.efi detection.
                           - Added explicit displayorder and boot entry GUID failure diagnostics.
     Update [July 2026]  - Restricted execution to repair VM mode.
@@ -338,7 +341,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.4'
+$script:RepairScriptVersion = '1.5'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -418,7 +421,7 @@ $failedCount = 0
 $changedCount = 0
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.4-os-and-bcd-discovery-fix"
+Log-Info "Build marker: v1.5-loader-mapping-safety"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -426,7 +429,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.4-os-and-bcd-discovery-fix'
+    BuildMarker = 'v1.5-loader-mapping-safety'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -520,6 +523,8 @@ try {
         $isBcdPath = $false
         $bcdPath = ''
         $isOsPath = $false
+        $windowsDrive = $null
+        $detectedLoaderPath = $null
         $tempEfiLetter = $null
         $tempEfiDiskNum = $null
         $tempEfiPartNum = $null
@@ -576,7 +581,9 @@ try {
 
             if ($hasWinloadExe -or $hasWinloadEfi) {
                 $isOsPath = $true
-                Log-Info "Disk ${diskNum}: Windows loader confirmed on ${drive}:"
+                $windowsDrive = $drive
+                $detectedLoaderPath = if ($hasWinloadEfi) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
+                Log-Info "Disk ${diskNum}: Windows loader confirmed on ${windowsDrive}: path=$detectedLoaderPath"
                 break
             }
         }
@@ -623,7 +630,9 @@ try {
                     $tempOsDiskNum = $diskNum
                     $tempOsPartNum = $candidatePartNum
                     $isOsPath = $true
-                    Log-Info "Disk ${diskNum}: Windows loader confirmed on temporary ${candidateLetter}:"
+                    $windowsDrive = $candidateLetter
+                    $detectedLoaderPath = if ($hasWinloadEfi) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
+                    Log-Info "Disk ${diskNum}: Windows loader confirmed on temporary ${windowsDrive}: path=$detectedLoaderPath"
                     break
                 }
 
@@ -743,12 +752,12 @@ try {
             }
 
             $bcdout = $bootMgrQuery.Output
-            $defaultLine = $bcdout | Select-String -Pattern '^\s*displayorder\s+' | Select-Object -First 1
+            $defaultLine = $bcdout | Select-String -Pattern '^\s*default\s+' | Select-Object -First 1
 
             if (-not $defaultLine)
             {
-                $failureReason = "Could not locate a displayorder entry in boot manager output for $bcdPath."
-                Log-Warning "Could not locate a displayorder entry in boot manager output for $bcdPath. Unable to determine the default boot entry."
+                $failureReason = "Could not locate the default Windows Boot Loader entry in boot manager output for $bcdPath."
+                Log-Warning "$failureReason The script will not fall back to the first displayorder entry."
                 $diskFailed = $true
             }
             elseif ($defaultLine -match '\{([^}]+)\}') {
@@ -761,10 +770,84 @@ try {
                 }
                 else
                 {
+                    # Validate the selected Windows Boot Loader before any BCD write.
+                    $selectedLoaderQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultId, '/v') -Operation 'validate-selected-loader'
+                    if (-not $selectedLoaderQuery.Success) {
+                        throw "Unable to enumerate selected loader $defaultId from $bcdPath. No BCD changes were made."
+                    }
+
+                    $selectedLoaderText = $selectedLoaderQuery.Output -join "`n"
+                    $selectedPathMatch = [regex]::Match($selectedLoaderText, '(?im)^\s*path\s+(.+?)\s*$')
+                    $selectedDeviceMatch = [regex]::Match($selectedLoaderText, '(?im)^\s*device\s+(.+?)\s*$')
+                    $selectedOsDeviceMatch = [regex]::Match($selectedLoaderText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+                    $selectedSystemRootMatch = [regex]::Match($selectedLoaderText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+
+                    if (-not $selectedPathMatch.Success) {
+                        throw "Selected loader $defaultId has no path element. No BCD changes were made."
+                    }
+                    if (-not $selectedDeviceMatch.Success) {
+                        throw "Selected loader $defaultId has no device element. No BCD changes were made."
+                    }
+                    if (-not $selectedOsDeviceMatch.Success) {
+                        throw "Selected loader $defaultId has no osdevice element. No BCD changes were made."
+                    }
+                    if (-not $selectedSystemRootMatch.Success) {
+                        throw "Selected loader $defaultId has no systemroot element. No BCD changes were made."
+                    }
+
+                    $originalLoaderPath = $selectedPathMatch.Groups[1].Value.Trim()
+                    $originalDevice = $selectedDeviceMatch.Groups[1].Value.Trim()
+                    $originalOsDevice = $selectedOsDeviceMatch.Groups[1].Value.Trim()
+                    $originalSystemRoot = $selectedSystemRootMatch.Groups[1].Value.Trim()
+
+                    if ($originalLoaderPath -notmatch '(?i)^\\Windows\\System32\\winload\.(exe|efi)$') {
+                        throw "Selected entry $defaultId does not reference winload.exe or winload.efi. Path: $originalLoaderPath. No BCD changes were made."
+                    }
+                    if ($originalDevice -match '(?i)^unknown$') {
+                        throw "Selected loader $defaultId has device=unknown. Separate BCD repair is required; no BCD changes were made."
+                    }
+                    if ($originalOsDevice -match '(?i)^unknown$') {
+                        throw "Selected loader $defaultId has osdevice=unknown. Separate BCD repair is required; no BCD changes were made."
+                    }
+
+                    $expectedPartitionMapping = "partition=${windowsDrive}:"
+                    if ($originalDevice -match '(?i)^partition=([a-z]):$' -and $originalDevice -ine $expectedPartitionMapping) {
+                        throw "Selected loader $defaultId maps device to '$originalDevice', not the discovered Windows partition '$expectedPartitionMapping'. No BCD changes were made."
+                    }
+                    if ($originalOsDevice -match '(?i)^partition=([a-z]):$' -and $originalOsDevice -ine $expectedPartitionMapping) {
+                        throw "Selected loader $defaultId maps osdevice to '$originalOsDevice', not the discovered Windows partition '$expectedPartitionMapping'. No BCD changes were made."
+                    }
+
+                    $resolvedLoaderFile = Join-Path -Path "${windowsDrive}:\" -ChildPath $originalLoaderPath.TrimStart('\')
+                    if (-not (Test-Path -LiteralPath $resolvedLoaderFile -PathType Leaf)) {
+                        throw "Selected BCD entry references '$originalLoaderPath', but '$resolvedLoaderFile' does not exist. No BCD changes were made."
+                    }
+
+                    Write-SacTelemetry -Event Operation -Message 'Selected loader mapping validated' -Properties @{
+                        DiskNumber = $diskNumber
+                        BcdPath = $bcdPath
+                        LoaderGuid = $defaultId
+                        WindowsDrive = $windowsDrive
+                        DetectedLoaderPath = $detectedLoaderPath
+                        BcdLoaderPath = $originalLoaderPath
+                        Device = $originalDevice
+                        OsDevice = $originalOsDevice
+                        SystemRoot = $originalSystemRoot
+                    }
+
                     # VALIDATION: Backup BCD store before any modifications
                     $bcdBackup = $bcdPath + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
                     try {
-                        Copy-Item -Path $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+                        Copy-Item -LiteralPath $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+
+                        if (-not (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+                            throw "Expected backup file was not created: $bcdBackup"
+                        }
+                        $bcdLength = (Get-Item -LiteralPath $bcdPath -ErrorAction Stop).Length
+                        $backupLength = (Get-Item -LiteralPath $bcdBackup -ErrorAction Stop).Length
+                        if ($backupLength -ne $bcdLength) {
+                            throw "Backup size $backupLength does not match BCD store size $bcdLength."
+                        }
 
                         Log-Info "BCD backup created at: $bcdBackup"
 
@@ -775,12 +858,13 @@ try {
                         }
                     }
                     catch {
-                        Log-Warning "Could not create BCD backup: $($_.Exception.Message). Proceeding with caution."
                         Write-SacTelemetry -Event Error -Message 'BCD backup creation failed' -Properties @{
                             DiskNumber = $diskNumber
                             BcdPath = $bcdPath
+                            BackupPath = $bcdBackup
                             Error = $_.Exception.Message
                         }
+                        throw "Could not create and verify BCD backup for '$bcdPath'. No BCD changes were made. Error: $($_.Exception.Message)"
                     }
 
                     # Step 3 - Log BCD configuration before changes
@@ -825,6 +909,53 @@ try {
                         if (-not $operationResult.Success) {
                             throw "bcdedit operation '$($operationDefinition.Name)' failed with exit code $($operationResult.ExitCode). BCD backup: $bcdBackup"
                         }
+                    }
+
+                    # SAC changes must not alter the selected loader's boot mapping.
+                    $mappingVerificationQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultId, '/v') -Operation 'verify-loader-mapping'
+                    if (-not $mappingVerificationQuery.Success) {
+                        throw "Unable to verify loader mapping after SAC changes. BCD backup: $bcdBackup"
+                    }
+
+                    $mappingVerificationText = $mappingVerificationQuery.Output -join "`n"
+                    $afterPathMatch = [regex]::Match($mappingVerificationText, '(?im)^\s*path\s+(.+?)\s*$')
+                    $afterDeviceMatch = [regex]::Match($mappingVerificationText, '(?im)^\s*device\s+(.+?)\s*$')
+                    $afterOsDeviceMatch = [regex]::Match($mappingVerificationText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+                    $afterSystemRootMatch = [regex]::Match($mappingVerificationText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+                    $mappingUnchanged = $afterPathMatch.Success -and
+                        $afterDeviceMatch.Success -and
+                        $afterOsDeviceMatch.Success -and
+                        $afterSystemRootMatch.Success -and
+                        ($afterPathMatch.Groups[1].Value.Trim() -ieq $originalLoaderPath) -and
+                        ($afterDeviceMatch.Groups[1].Value.Trim() -ieq $originalDevice) -and
+                        ($afterOsDeviceMatch.Groups[1].Value.Trim() -ieq $originalOsDevice) -and
+                        ($afterSystemRootMatch.Groups[1].Value.Trim() -ieq $originalSystemRoot)
+
+                    if (-not $mappingUnchanged) {
+                        $afterPath = if ($afterPathMatch.Success) { $afterPathMatch.Groups[1].Value.Trim() } else { '<missing>' }
+                        $afterDevice = if ($afterDeviceMatch.Success) { $afterDeviceMatch.Groups[1].Value.Trim() } else { '<missing>' }
+                        $afterOsDevice = if ($afterOsDeviceMatch.Success) { $afterOsDeviceMatch.Groups[1].Value.Trim() } else { '<missing>' }
+                        $afterSystemRoot = if ($afterSystemRootMatch.Success) { $afterSystemRootMatch.Groups[1].Value.Trim() } else { '<missing>' }
+                        Log-Error 'BCD loader mapping changed unexpectedly.'
+                        Log-Error "Before: path=$originalLoaderPath device=$originalDevice osdevice=$originalOsDevice systemroot=$originalSystemRoot"
+                        Log-Error "After: path=$afterPath device=$afterDevice osdevice=$afterOsDevice systemroot=$afterSystemRoot"
+
+                        Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+                        Write-SacTelemetry -Event Error -Message 'BCD loader mapping changed and backup restored' -Properties @{
+                            DiskNumber = $diskNumber
+                            BcdPath = $bcdPath
+                            BackupPath = $bcdBackup
+                            LoaderGuid = $defaultId
+                            BeforePath = $originalLoaderPath
+                            AfterPath = $afterPath
+                            BeforeDevice = $originalDevice
+                            AfterDevice = $afterDevice
+                            BeforeOsDevice = $originalOsDevice
+                            AfterOsDevice = $afterOsDevice
+                            BeforeSystemRoot = $originalSystemRoot
+                            AfterSystemRoot = $afterSystemRoot
+                        }
+                        throw 'BCD loader mapping changed unexpectedly. The original BCD backup was restored.'
                     }
 
                     # Verify every setting requested by the repair.
@@ -892,8 +1023,8 @@ try {
             }
             else
             {
-                $failureReason = "Displayorder entry was found but no boot entry GUID could be parsed for $bcdPath."
-                Log-Warning "Displayorder entry was found but no boot entry GUID could be parsed for $bcdPath. Raw line: $($defaultLine.Line)"
+                $failureReason = "The default Windows Boot Loader entry was found, but no GUID could be parsed for $bcdPath."
+                Log-Warning "$failureReason Raw line: $($defaultLine.Line)"
                 $diskFailed = $true
             }
         }
