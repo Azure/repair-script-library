@@ -20,11 +20,13 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.5.6
+    Version:     1.5.7
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.7: [August 2026] - Uses typed BCD WMI element setters instead of BCDEdit for writes.
+                            - Prevents unrelated GPT device descriptors from being reserialized under a temporary identity.
     v1.5.6: [August 2026] - Temporarily assigns a unique identity to collision-offlined attached disks.
                             - Restores and verifies the exact original disk identity before reporting success.
     v1.5.5: [August 2026] - Refuses repair when an attached disk is offline due to an identity collision.
@@ -429,7 +431,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.6'
+$script:RepairScriptVersion = '1.5.7'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -495,6 +497,113 @@ function Invoke-SacBcdEdit {
     }
 }
 
+function Invoke-SacBcdWmiMethod {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.ManagementObject]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$MethodName,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Parameters,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Operation
+    )
+
+    $script:OperationCount++
+    $script:LastCommand = "BcdObject.$MethodName ($Operation)"
+    $inputParameters = $InputObject.GetMethodParameters($MethodName)
+    foreach ($name in $Parameters.Keys) {
+        $inputParameters[$name] = $Parameters[$name]
+    }
+
+    $result = $InputObject.InvokeMethod($MethodName, $inputParameters, $null)
+    $success = $result -and [bool]$result.ReturnValue
+    Write-SacTelemetry -Event Operation -Message 'Applied typed BCD WMI element update' -Properties @{
+        Operation = $Operation
+        Method = $MethodName
+        ElementType = ('0x{0:X8}' -f [uint32]$Parameters.Type)
+        Success = $success
+    } | Out-Null
+
+    if (-not $success) {
+        throw "BCD WMI operation '$Operation' failed."
+    }
+}
+
+function Set-SacBcdEmsElements {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BcdPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LoaderId,
+
+        [bool]$SetLoaderEms,
+        [bool]$SetPort,
+        [bool]$SetBaudRate
+    )
+
+    $storeClass = [wmiclass]'\\.\root\WMI:BcdStore'
+    $openStoreResult = $storeClass.OpenStore($BcdPath)
+    if (-not $openStoreResult.ReturnValue -or -not $openStoreResult.Store) {
+        throw "The BCD WMI provider could not open offline store '$BcdPath'."
+    }
+
+    $store = [System.Management.ManagementObject]$openStoreResult.Store
+    try {
+        if ($SetLoaderEms) {
+            $openLoaderResult = $store.OpenObject($LoaderId)
+            if (-not $openLoaderResult.ReturnValue -or -not $openLoaderResult.Object) {
+                throw "The BCD WMI provider could not open loader '$LoaderId'."
+            }
+
+            $loader = [System.Management.ManagementObject]$openLoaderResult.Object
+            try {
+                Invoke-SacBcdWmiMethod -InputObject $loader -MethodName 'SetBooleanElement' -Operation 'ems' -Parameters @{
+                    Boolean = $true
+                    Type = [uint32]0x260000B0
+                }
+            }
+            finally {
+                $loader.Dispose()
+            }
+        }
+
+        if ($SetPort -or $SetBaudRate) {
+            $emsSettingsId = '{0ce4991b-e6b3-4b16-b23c-5e0d9250e5d9}'
+            $openEmsSettingsResult = $store.OpenObject($emsSettingsId)
+            if (-not $openEmsSettingsResult.ReturnValue -or -not $openEmsSettingsResult.Object) {
+                throw "The BCD WMI provider could not open EMS settings object '$emsSettingsId'."
+            }
+
+            $emsSettings = [System.Management.ManagementObject]$openEmsSettingsResult.Object
+            try {
+                if ($SetPort) {
+                    Invoke-SacBcdWmiMethod -InputObject $emsSettings -MethodName 'SetIntegerElement' -Operation 'ems-port' -Parameters @{
+                        Integer = [uint64]1
+                        Type = [uint32]0x15000022
+                    }
+                }
+                if ($SetBaudRate) {
+                    Invoke-SacBcdWmiMethod -InputObject $emsSettings -MethodName 'SetIntegerElement' -Operation 'ems-baud-rate' -Parameters @{
+                        Integer = [uint64]115200
+                        Type = [uint32]0x15000023
+                    }
+                }
+            }
+            finally {
+                $emsSettings.Dispose()
+            }
+        }
+    }
+    finally {
+        $store.Dispose()
+    }
+}
+
 $logFile = $logFilePath
 Log-Info "Dual logging initialized: Desktop: $desktopLogFile | Plugin: $pluginLogFile"
 Log-Info "Script classification: REPAIR_VM_ONLY"
@@ -510,7 +619,7 @@ $changedCount = 0
 $collisionDiskRecords = @()
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.6-transactional-collision-identity"
+Log-Info "Build marker: v1.5.7-typed-bcd-wmi-writes"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -518,7 +627,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.6-transactional-collision-identity'
+    BuildMarker = 'v1.5.7-typed-bcd-wmi-writes'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -533,6 +642,15 @@ Write-SacTelemetry -Event Start -Message 'Starting SAC/EMS enablement' -Properti
 }
 
 try {
+    $bcdStoreClass = Get-WmiObject -Namespace root\wmi -List BcdStore -ErrorAction Stop
+    $bcdObjectClass = Get-WmiObject -Namespace root\wmi -List BcdObject -ErrorAction Stop
+    $requiredBcdMethods = @('OpenStore', 'OpenObject', 'SetBooleanElement', 'SetIntegerElement')
+    $availableBcdMethods = @($bcdStoreClass.Methods.Name) + @($bcdObjectClass.Methods.Name)
+    $missingBcdMethods = @($requiredBcdMethods | Where-Object { $_ -notin $availableBcdMethods })
+    if ($missingBcdMethods.Count -gt 0) {
+        throw "The BCD WMI provider is missing required methods: $($missingBcdMethods -join ', ')."
+    }
+
     # Optional: Clean up orphaned temp drive letters from previous failed runs
     # This helps prevent lingering mount points from blocking EFI partition access
     $orphanedLetters = @()
@@ -1055,30 +1173,23 @@ try {
                     foreach ($line in $beforeFullQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
 
                     # Enable only the settings required by Microsoft's offline SAC procedure.
+                    # Typed WMI setters update the requested elements without asking BCDEdit to
+                    # rewrite the store while the attached GPT disk has a temporary identity.
                     Log-Info "Applying SAC and EMS configurations to BCD: $bcdPath"
-                    # Execute each command independently. Do not collect command results in a
-                    # shared pipeline because repository Log-* helpers write to the success stream.
-                    $operationDefinitions = @()
-                    if (-not $beforeEmsEnabled) {
-                        $operationDefinitions += @{ Name = 'ems'; Arguments = @('/store', $bcdPath, '/ems', $defaultId, 'ON') }
-                    }
-                    else {
+                    $setLoaderEms = -not $beforeEmsEnabled
+                    $setPort = -not $beforePortConfigured
+                    $setBaudRate = -not $beforeBaudConfigured
+                    if (-not $setLoaderEms) {
                         Log-Info "EMS is already enabled on $defaultId; skipping the EMS write."
                     }
-
-                    if (-not ($beforePortConfigured -and $beforeBaudConfigured)) {
-                        $operationDefinitions += @{ Name = 'emssettings'; Arguments = @('/store', $bcdPath, '/emssettings', 'EMSPORT:1', 'EMSBAUDRATE:115200') }
-                    }
-                    else {
+                    if (-not $setPort -and -not $setBaudRate) {
                         Log-Info 'EMS port and baud rate are already configured; skipping the EMS settings write.'
                     }
 
-                    foreach ($operationDefinition in $operationDefinitions) {
+                    if ($setLoaderEms -or $setPort -or $setBaudRate) {
                         $bcdWriteStarted = $true
-                        $operationResult = Invoke-SacBcdEdit -Arguments $operationDefinition.Arguments -Operation $operationDefinition.Name
-                        if (-not $operationResult.Success) {
-                            throw "bcdedit operation '$($operationDefinition.Name)' failed with exit code $($operationResult.ExitCode). BCD backup: $bcdBackup"
-                        }
+                        Set-SacBcdEmsElements -BcdPath $bcdPath -LoaderId $defaultId `
+                            -SetLoaderEms $setLoaderEms -SetPort $setPort -SetBaudRate $setBaudRate
                     }
 
                     # SAC changes must not alter the selected loader's boot mapping.
