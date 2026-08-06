@@ -20,11 +20,14 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-06
-    Version:     1.5.9
+    Version:     1.6.0
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.6.0: [August 2026] - Preserves the Gen2 source disk GPT GUID for the entire repair.
+                            - Resolves a GPT collision by temporarily changing only the disposable repair VM OS disk GUID.
+                            - Offlines the source disk before restoring and verifying the repair OS disk GUID.
     v1.5.9: [August 2026] - Refuses to rewrite a collision-offlined GPT disk identity.
                             - Requires a non-colliding repair OS disk or matching-generation nested repair for Gen2.
     v1.5.8: [August 2026] - Rebinds embedded BCD WMI results through their documented key properties.
@@ -283,6 +286,10 @@ function Set-SacTemporaryDiskIdentity {
         [pscustomobject]$Record
     )
 
+    if ($Record.PartitionStyle -ne 'MBR') {
+        throw 'Temporary source disk identities are permitted only for the boot-tested Gen1 MBR path.'
+    }
+
     Invoke-SacDiskPart -Operation 'collision-prepare' -Commands @(
         "select disk $($Record.DiskNumber)"
         "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
@@ -303,6 +310,10 @@ function Restore-SacOriginalDiskIdentity {
         [pscustomobject]$Record
     )
 
+    if ($Record.PartitionStyle -ne 'MBR') {
+        throw 'Source disk identity restoration is permitted only for the Gen1 MBR path.'
+    }
+
     Invoke-SacDiskPart -Operation 'collision-restore' -Commands @(
         "select disk $($Record.DiskNumber)"
         'offline disk'
@@ -314,6 +325,44 @@ function Restore-SacOriginalDiskIdentity {
     $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
     if (-not $restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
         throw "Disk $($Record.DiskNumber) did not return to its original offline identity."
+    }
+}
+
+function Set-SacTemporaryRepairDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    Invoke-SacDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-SacDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw 'The repair VM OS disk did not retain a verified temporary GPT identity.'
+    }
+}
+
+function Restore-SacRepairDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    Invoke-SacDiskPart -Operation 'repair-host-collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-SacDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw 'The repair VM OS disk did not return to its original GPT identity.'
     }
 }
 
@@ -435,7 +484,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.9'
+$script:RepairScriptVersion = '1.6.0'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -651,9 +700,11 @@ $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
 $collisionDiskRecords = @()
+$gptCollisionDiskNumbers = @()
+$repairDiskIdentityRecord = $null
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.9-gpt-collision-fail-closed"
+Log-Info "Build marker: v1.6.0-preserve-source-gpt-identity"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -661,7 +712,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.9-gpt-collision-fail-closed'
+    BuildMarker = 'v1.6.0-preserve-source-gpt-identity'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -723,9 +774,19 @@ try {
         Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
     }
 
-    # Get-Disk-Partitions onlines every Microsoft Virtual Disk. A temporary MBR
-    # signature is retained for the boot-tested Gen1 path. Never rewrite a GPT
-    # disk GUID: a later restoration does not make that host online cycle boot-safe.
+    $repairDrive = $env:SystemDrive -replace ':', ''
+    $repairOsPartition = Get-Partition -DriveLetter $repairDrive -ErrorAction Stop | Select-Object -First 1
+    if ($null -eq $repairOsPartition -or $null -eq $repairOsPartition.DiskNumber) {
+        throw "CRITICAL SAFETY CHECK FAILED: Could not identify the repair VM OS disk from $($env:SystemDrive)."
+    }
+    $repairDiskNumber = [int]$repairOsPartition.DiskNumber
+    $repairDiskIdentity = Get-SacDiskIdentity -DiskNumber $repairDiskNumber
+    Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber ($($repairDiskIdentity.PartitionStyle))."
+
+    # Get-Disk-Partitions onlines every Microsoft Virtual Disk. For Gen1, retain
+    # the boot-tested temporary source MBR signature. For a GPT collision, change
+    # only the disposable repair VM OS disk identity; the Gen2 source GUID remains
+    # unchanged before, during, and after BCD access.
     $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
         Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
         ForEach-Object { [int]$_.Index })
@@ -737,15 +798,52 @@ try {
     foreach ($collisionDisk in $collisionDisks) {
         $originalIdentity = Get-SacDiskIdentity -DiskNumber $collisionDisk.Number
         if ($originalIdentity.PartitionStyle -eq 'GPT') {
-            $failureReason = "Disk $($collisionDisk.Number) is a collision-offlined GPT disk. Refusing to change its GPT disk GUID because the temporary-identity online cycle is not boot-safe for Gen2. Recreate the repair VM with an OS image whose disk identity does not collide, or keep this disk offline on the repair host and modify it from a matching-generation nested VM."
-            Write-SacTelemetry -Event Error -Message 'Unsafe GPT identity collision detected' -Properties @{
+            if ($repairDiskIdentity.PartitionStyle -ne 'GPT' -or $repairDiskIdentity.Value -ine $originalIdentity.Value) {
+                throw "Disk $($collisionDisk.Number) reports a GPT identity collision, but its GUID does not match the repair VM OS disk. Refusing an unverified identity change."
+            }
+
+            if (-not $repairDiskIdentityRecord) {
+                $temporaryRepairGuid = ([guid]::NewGuid()).ToString('D')
+                $repairDiskIdentityRecord = [pscustomobject]@{
+                    DiskNumber = $repairDiskNumber
+                    PartitionStyle = 'GPT'
+                    OriginalValue = $repairDiskIdentity.Value
+                    OriginalDiskPartValue = $repairDiskIdentity.DiskPartValue
+                    TemporaryValue = $temporaryRepairGuid
+                    TemporaryDiskPartValue = $temporaryRepairGuid
+                }
+
+                Log-Warning 'Temporarily changing only the repair VM OS disk GPT identity to release the attached Gen2 disk collision. The source disk GUID will not be changed.'
+                Set-SacTemporaryRepairDiskIdentity -Record $repairDiskIdentityRecord
+            }
+
+            $gptCollisionDiskNumbers += [int]$collisionDisk.Number
+            Invoke-SacDiskPart -Operation 'source-gpt-online' -Commands @(
+                "select disk $($collisionDisk.Number)"
+                'online disk'
+            )
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+            $releasedDisk = Get-Disk -Number $collisionDisk.Number -ErrorAction Stop
+            if ($releasedDisk.IsOffline -or [string]$releasedDisk.OfflineReason -eq 'Collision') {
+                throw "Disk $($collisionDisk.Number) could not be onlined after the repair VM OS disk identity changed. No source identity or BCD change was attempted."
+            }
+
+            $sourceIdentityAfterRelease = Get-SacDiskIdentity -DiskNumber $collisionDisk.Number
+            if ($sourceIdentityAfterRelease.Value -ine $originalIdentity.Value) {
+                throw "Source Disk $($collisionDisk.Number) identity changed unexpectedly while releasing the collision."
+            }
+
+            Write-SacTelemetry -Event Operation -Message 'GPT collision released without changing source identity' -Properties @{
                 DiskNumber = [int]$collisionDisk.Number
                 PartitionStyle = $originalIdentity.PartitionStyle
                 OfflineReason = [string]$collisionDisk.OfflineReason
-                OriginalIdentity = $originalIdentity.Value
-                IdentityChanged = $false
+                SourceIdentity = $originalIdentity.Value
+                SourceIdentityChanged = $false
+                RepairDiskNumber = $repairDiskNumber
+                RepairDiskTemporaryIdentity = $repairDiskIdentityRecord.TemporaryValue
             }
-            throw $failureReason
+            Log-Info "Disk $($collisionDisk.Number) collision released; source GPT identity remains $($originalIdentity.Value)."
+            continue
         }
 
         do {
@@ -783,16 +881,9 @@ try {
 
     $discoveredDiskNumbers = @($partitionlist | Select-Object -ExpandProperty DiskNumber -Unique)
     Log-Info "Get-Disk-Partitions discovered disk numbers: $($discoveredDiskNumbers -join ', ')"
-    $repairDrive = $env:SystemDrive -replace ':', ''
     Log-Info 'Enumerating partitions to enable SAC...'
     
     # SAFETY CHECK: Ensure we're not operating on the repair VM's own disk
-    $repairOsPartition = Get-Partition -DriveLetter $repairDrive -ErrorAction Stop | Select-Object -First 1
-    if ($null -eq $repairOsPartition -or $null -eq $repairOsPartition.DiskNumber) {
-        throw "CRITICAL SAFETY CHECK FAILED: Could not identify the repair VM OS disk from $($env:SystemDrive)."
-    }
-
-    $repairDiskNumber = [int]$repairOsPartition.DiskNumber
     Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber"
 
     $targetDiskGroups = @($partitionlist | Group-Object DiskNumber | Where-Object { [int]$_.Name -ne $repairDiskNumber })
@@ -1213,8 +1304,8 @@ try {
                     foreach ($line in $beforeFullQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
 
                     # Enable only the settings required by Microsoft's offline SAC procedure.
-                    # Typed WMI setters update the requested elements without asking BCDEdit to
-                    # rewrite the store while the attached GPT disk has a temporary identity.
+                    # Typed WMI setters update only the requested elements. For Gen2, the source
+                    # disk retains its original GPT identity throughout this operation.
                     Log-Info "Applying SAC and EMS configurations to BCD: $bcdPath"
                     $setLoaderEms = -not $beforeEmsEnabled
                     $setPort = -not $beforePortConfigured
@@ -1424,6 +1515,47 @@ catch {
 }
 finally {
     $identityRestorationFailed = $false
+
+    if ($repairDiskIdentityRecord) {
+        foreach ($diskNumber in @($gptCollisionDiskNumbers | Sort-Object -Unique)) {
+            try {
+                Invoke-SacDiskPart -Operation 'source-before-repair-host-restore' -Commands @(
+                    "select disk $diskNumber"
+                    'offline disk'
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                $sourceDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
+                $sourceIdentity = Get-SacDiskIdentity -DiskNumber $diskNumber
+                if (-not $sourceDisk.IsOffline -or $sourceIdentity.Value -ine $repairDiskIdentityRecord.OriginalValue) {
+                    throw "Source Disk $diskNumber was not offline with its unchanged original GPT identity."
+                }
+                Log-Info "Source Disk $diskNumber is offline with its original GPT identity verified before repair host restoration."
+            }
+            catch {
+                $identityRestorationFailed = $true
+                $failureReason = "CRITICAL: Could not safely offline and verify source Disk ${diskNumber}: $($_.Exception.Message)"
+                Log-Error $failureReason
+            }
+        }
+
+        if (-not $identityRestorationFailed) {
+            try {
+                Restore-SacRepairDiskIdentity -Record $repairDiskIdentityRecord
+                Log-Info 'Repair VM OS disk GPT identity restored and verified.'
+                Write-SacTelemetry -Event Operation -Message 'Repair VM OS disk identity restored' -Properties @{
+                    DiskNumber = $repairDiskIdentityRecord.DiskNumber
+                    OriginalIdentity = $repairDiskIdentityRecord.OriginalValue
+                    SourceIdentityChanged = $false
+                }
+            }
+            catch {
+                $identityRestorationFailed = $true
+                $failureReason = "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)"
+                Log-Error $failureReason
+            }
+        }
+    }
+
     foreach ($record in @($collisionDiskRecords | Sort-Object DiskNumber -Descending)) {
         try {
             Restore-SacOriginalDiskIdentity -Record $record
