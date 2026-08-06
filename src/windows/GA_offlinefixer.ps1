@@ -18,16 +18,18 @@
 
 .NOTES
     Name:    GA_offlinefixer.ps1
-    Version: 1.3
+    Version: 1.4
     Original Author: Daniel Munoz L (damunozl@microsoft.com)
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
+    v1.4: [August 2026] - Temporarily resolves attached-disk identity collisions and restores the
+                        - exact original MBR signature or GPT GUID before returning.
     v1.3: [August 2026] - Identifies and excludes the rescue VM OS disk by physical disk number.
                         - Requires an attached Microsoft virtual disk before service or disk disruption.
                         - Groups candidates by physical disk and validates winload plus the SYSTEM hive.
                         - Temporarily mounts unlettered Windows partition candidates and cleans them up.
-                        - Refuses collision-offlined attached disks rather than changing disk identities.
+                        - Detects collision-offlined attached disks before target discovery.
                         - Restores and verifies the original WSearch service state.
                         - No longer stops Windows Defender on the rescue VM.
                         - Makes fallback hive copy-back part of per-disk success accounting.
@@ -60,7 +62,7 @@ Get-ChildItem F:\WindowsAzure\GuestAgent_* | Rename-Item -NewName { $_.Name + '_
     7. Verify via the .VERIFICATION steps below.
 
 .EXAMPLE
-    az vm repair run -g <rg> -n <vm> --run-id win-GA_offlinefixer --run-on-repair
+    az vm repair run -g <rg> -n <vm> --run-id win-GA-fix --run-on-repair
 
 .VERIFICATION
     1. Check the log file for success:
@@ -223,6 +225,8 @@ $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
 $temporaryOsMounts = @()
+$temporaryDiskIdentities = @()
+$successMessage = $null
 
 # Local execution context for diagnostic logging. No data is transmitted off-box.
 $vmMetadata = @{
@@ -334,9 +338,67 @@ try {
     $collisionDisks = @($attachedDisks | Where-Object {
         $_.IsOffline -and [string]$_.OfflineReason -eq 'Collision'
     })
-    if ($collisionDisks.Count -gt 0) {
-        throw "Attached disk identity collision detected on Disk(s) $($collisionDisks.Number -join ', '). Refusing to change disk identities; use a non-colliding rescue VM or matching-generation nested repair."
+    foreach ($collisionDisk in $collisionDisks) {
+        $diskNumber = [int]$collisionDisk.Number
+        $partitionStyle = [string]$collisionDisk.PartitionStyle
+        if ($partitionStyle -notin @('GPT', 'MBR')) {
+            throw "Disk $diskNumber has identity collision with unsupported partition style '$partitionStyle'."
+        }
+
+        $identityRecord = [pscustomobject]@{
+            DiskNumber = $diskNumber
+            PartitionStyle = $partitionStyle
+            OriginalGuid = [string]$collisionDisk.Guid
+            OriginalSignature = $collisionDisk.Signature
+            OriginalIsOffline = [bool]$collisionDisk.IsOffline
+            TemporaryGuid = $null
+            TemporarySignature = $null
+        }
+        $temporaryDiskIdentities += $identityRecord
+
+        if ($partitionStyle -eq 'GPT') {
+            if ([string]::IsNullOrWhiteSpace($identityRecord.OriginalGuid)) {
+                throw "Cannot preserve the original GPT GUID for collision Disk $diskNumber."
+            }
+            do {
+                $identityRecord.TemporaryGuid = ([guid]::NewGuid()).ToString('B')
+            } while (Get-Disk -ErrorAction Stop | Where-Object {
+                [string]$_.Guid -ieq [string]$identityRecord.TemporaryGuid
+            })
+            Log-Warning "Disk $diskNumber has a GPT identity collision. Assigning a temporary GUID for offline repair."
+            Set-Disk -Number $diskNumber -Guid $identityRecord.TemporaryGuid -ErrorAction Stop
+        }
+        else {
+            if ($null -eq $identityRecord.OriginalSignature) {
+                throw "Cannot preserve the original MBR signature for collision Disk $diskNumber."
+            }
+            do {
+                $signatureBytes = New-Object byte[] 4
+                [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($signatureBytes)
+                $identityRecord.TemporarySignature = [BitConverter]::ToUInt32($signatureBytes, 0)
+            } while ($identityRecord.TemporarySignature -eq 0 -or (Get-Disk -ErrorAction Stop | Where-Object {
+                $_.PartitionStyle -eq 'MBR' -and $_.Signature -eq $identityRecord.TemporarySignature
+            }))
+            Log-Warning "Disk $diskNumber has an MBR identity collision. Assigning a temporary signature for offline repair."
+            Set-Disk -Number $diskNumber -Signature $identityRecord.TemporarySignature -ErrorAction Stop
+        }
+
+        Set-Disk -Number $diskNumber -IsOffline $false -ErrorAction Stop
+        Set-Disk -Number $diskNumber -IsReadOnly $false -ErrorAction Stop
+        Update-HostStorageCache -ErrorAction SilentlyContinue
+        $updatedCollisionDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
+        $temporaryIdentityVerified = if ($partitionStyle -eq 'GPT') {
+            [string]$updatedCollisionDisk.Guid -ieq [string]$identityRecord.TemporaryGuid
+        }
+        else {
+            [uint32]$updatedCollisionDisk.Signature -eq [uint32]$identityRecord.TemporarySignature
+        }
+        if (-not $temporaryIdentityVerified -or $updatedCollisionDisk.IsOffline) {
+            throw "Temporary identity activation could not be verified for collision Disk $diskNumber."
+        }
+        Log-Info "Disk $diskNumber temporary identity applied and disk brought online. Original identity will be restored during cleanup."
     }
+    $attachedDisks = @($attachedDisks | ForEach-Object { Get-Disk -Number $_.Number -ErrorAction Stop })
     $attachedDiskNumbers = @($attachedDisks | Select-Object -ExpandProperty Number)
     Log-Info "Attached repair candidate disk numbers: $($attachedDiskNumbers -join ', ')"
 
@@ -719,7 +781,7 @@ try {
 
     Log-Info "Processing summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
     if ($fixedDisks.Count -gt 0) {
-        Log-Output "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Host=$($vmMetadata.HostName)"
+        $successMessage = "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Host=$($vmMetadata.HostName)"
         $script_final_status = $STATUS_SUCCESS
     }
     else {
@@ -754,6 +816,36 @@ finally {
         }
     }
 
+    foreach ($identityRecord in @($temporaryDiskIdentities)) {
+        try {
+            $diskNumber = [int]$identityRecord.DiskNumber
+            Log-Info "Restoring original $($identityRecord.PartitionStyle) identity on Disk $diskNumber."
+            Set-Disk -Number $diskNumber -IsOffline $true -ErrorAction Stop
+            if ($identityRecord.PartitionStyle -eq 'GPT') {
+                Set-Disk -Number $diskNumber -Guid $identityRecord.OriginalGuid -ErrorAction Stop
+            }
+            else {
+                Set-Disk -Number $diskNumber -Signature ([uint32]$identityRecord.OriginalSignature) -ErrorAction Stop
+            }
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+            $restoredDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
+            $identityRestored = if ($identityRecord.PartitionStyle -eq 'GPT') {
+                [string]$restoredDisk.Guid -ieq [string]$identityRecord.OriginalGuid
+            }
+            else {
+                [uint32]$restoredDisk.Signature -eq [uint32]$identityRecord.OriginalSignature
+            }
+            if (-not $identityRestored) {
+                throw "Original disk identity verification failed."
+            }
+            Log-Info "Original $($identityRecord.PartitionStyle) identity restored and verified on Disk $diskNumber; disk left offline for repair restore."
+        }
+        catch {
+            Log-Error "CRITICAL: Failed to restore original identity on Disk $($identityRecord.DiskNumber): $($_.Exception.Message)"
+            $script_final_status = $STATUS_ERROR
+        }
+    }
+
     # Log local execution context only; this script performs no telemetry upload.
     if ($vmMetadata.OSVersion) {
         Log-Info "Execution Context - Host: $($vmMetadata.HostName), OS: $($vmMetadata.OSVersion)"
@@ -783,6 +875,10 @@ finally {
             Log-Error "Failed to restore $svc to state $originalState : $($_.Exception.Message)"
             $script_final_status = $STATUS_ERROR
         }
+    }
+
+    if ($script_final_status -eq $STATUS_SUCCESS -and $successMessage) {
+        Log-Output $successMessage
     }
 
     Log-Info "Execution ended at $(Get-Date)"
