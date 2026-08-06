@@ -5,9 +5,9 @@
 .DESCRIPTION
     This script runs from a rescue VM to repair a broken Azure Guest Agent on an attached OS disk.
     It performs the following steps:
-    1. Enumerates attached partitions via Get-Disk-Partitions to locate the faulty OS drive.
+    1. Enumerates partitions only on validated attached repair disks to locate the faulty OS drive.
     2. Loads the SYSTEM registry hive from the target disk into HKLM\BROKENSYSTEM.
-    3. Creates a full backup of the loaded hive to the disk root (regbackupbeforeGAchanges).
+    3. Creates and verifies a binary backup of the SYSTEM hive before loading it.
     4. Identifies the primary and backup ControlSets (001/002) from the Select key.
     5. Exports healthy service keys (WindowsAzureGuestAgent, WindowsAzureTelemetryService, RdAgent)
        from the rescue VM and injects them into both ControlSets on the target hive.
@@ -27,6 +27,7 @@
                         - Preserves unrelated content in the target WindowsAzure folder.
                         - Bounds file-copy retries to avoid client repair jobs appearing stuck.
                         - Unloads only stale repair hives that actually exist.
+                        - Avoids broad helper disk onlining and full registry text exports.
                         - Temporarily resolves attached-disk identity collisions and restores the
                         - exact original MBR signature or GPT GUID before returning.
                         - Identifies and excludes the rescue VM OS disk by physical disk number.
@@ -96,21 +97,12 @@ if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
 }
 
 $initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
-$diskPartitionsPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
-
 if (-not (Test-Path -Path $initPath -PathType Leaf)) {
     Write-Error "Missing required dependency: $initPath"
     return 1
 }
 
 . $initPath
-
-if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
-    Log-Error "Missing required dependency: $diskPartitionsPath"
-    return $STATUS_ERROR
-}
-
-. $diskPartitionsPath
 
 # Log Configuration (desktop log standard)
 $desktopPath = [Environment]::GetFolderPath('Desktop')
@@ -443,23 +435,15 @@ try {
     Start-Sleep -Seconds 3
 
     # Step 1 - Find one validated Windows volume on each attached physical disk.
-    $partitionlist = @(Get-Disk-Partitions)
-    if ($partitionlist.Count -eq 0) {
-        throw 'Get-Disk-Partitions returned no partitions from Azure virtual disks.'
-    }
-
-    $targetDiskGroups = @($partitionlist |
-        Where-Object { [int]$_.DiskNumber -in $attachedDiskNumbers -and [int]$_.DiskNumber -ne $rescueDiskNum } |
-        Group-Object DiskNumber)
-    if ($targetDiskGroups.Count -eq 0) {
-        throw 'REPAIR-ONLY SCRIPT: The partition helper returned no partitions from an attached repair disk.'
-    }
-
     $targetWindowsVolumes = @()
     $efiGptType = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
-    foreach ($diskGroup in $targetDiskGroups) {
-        $diskNumber = [int]$diskGroup.Name
+    foreach ($diskNumber in $attachedDiskNumbers) {
         $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
+        if ($diskPartitions.Count -eq 0) {
+            Log-Warning "Attached repair Disk $diskNumber has no partitions."
+            $skippedCount++
+            continue
+        }
         $targetVolume = $null
 
         foreach ($candidate in @($diskPartitions | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne [char]0 })) {
@@ -568,6 +552,25 @@ try {
         & reg.exe unload "HKLM\$hiveName" 2>$null
         [System.GC]::Collect()
         Start-Sleep -Seconds 1
+
+        try {
+            $backupFile = "$($diskb):\SYSTEM_before_GA_changes_$diskb.hiv"
+            Log-Info "Creating binary SYSTEM hive backup at $backupFile..."
+            Copy-Item -LiteralPath $hiveSource -Destination $backupFile -Force -ErrorAction Stop
+            $sourceHiveHash = (Get-FileHash -LiteralPath $hiveSource -Algorithm SHA256 -ErrorAction Stop).Hash
+            $backupHiveHash = (Get-FileHash -LiteralPath $backupFile -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($sourceHiveHash -ne $backupHiveHash) {
+                throw "Source and backup SHA256 hashes differ."
+            }
+            Log-Info "Binary SYSTEM hive backup created and verified for $($diskb):."
+        }
+        catch {
+            Log-Error "Failed to create and verify SYSTEM hive backup for $($diskb):: $($_.Exception.Message)"
+            $failedDisks += $diskb
+            $failedCount++
+            continue
+        }
+
         Log-Info "Loading SYSTEM hive from $($diskb): as $hiveName..."
         $loadResult = & reg.exe load "HKLM\$hiveName" $hiveSource 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -606,14 +609,6 @@ try {
         Start-Sleep -Seconds 2
 
         try {
-            # Step 3 - Create a full backup of the loaded hive before making changes
-            $backupFile = "$($diskb):\regbackupbeforeGAchanges_$diskb.reg"
-            Log-Info "Backing up full registry hive to $backupFile..."
-            $backupResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("export", "HKLM\$hiveName", $backupFile, "/y") -Description "reg export backup ($diskb)"
-            if ($backupResult.ExitCode -ne 0) {
-                throw "Registry backup failed for $($diskb): $($backupResult.Output -join '; ')"
-            }
-
             # Step 4 - Identify the primary and backup ControlSets from the Select key
             $selectPath = "Registry::HKLM\$hiveName\Select"
             $defaultSetID = (Get-ItemProperty -path $selectPath).default
@@ -812,7 +807,7 @@ try {
 
     if ($failedDisks.Count -gt 0) {
         Log-Error "Processing failed on disks: $($failedDisks -join ', ')"
-        throw "One or more disks failed final hive unload or copy-back validation: $($failedDisks -join ', '). Please review logs."
+        throw "One or more disks failed backup, hive processing, unload, or copy-back validation: $($failedDisks -join ', '). Please review logs."
     }
 
     Log-Info "Processing summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
