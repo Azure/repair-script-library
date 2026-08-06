@@ -20,42 +20,42 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-06
-    Version:     1.6.1
+    Version:     1.3
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
-    v1.6.1: [August 2026] - Repairs loader device/osdevice when they render as unknown.
-                            - Writes the validated Windows partition while the source retains its original GPT identity.
-                            - Re-queries and verifies the repaired loader mapping before enabling EMS.
-    v1.6.0: [August 2026] - Preserves the Gen2 source disk GPT GUID for the entire repair.
-                            - Resolves a GPT collision by temporarily changing only the disposable repair VM OS disk GUID.
-                            - Offlines the source disk before restoring and verifying the repair OS disk GUID.
-    v1.5.9: [August 2026] - Refuses to rewrite a collision-offlined GPT disk identity.
-                            - Requires a non-colliding repair OS disk or matching-generation nested repair for Gen2.
-    v1.5.8: [August 2026] - Rebinds embedded BCD WMI results through their documented key properties.
-                            - Avoids invalid ManagementBaseObject-to-ManagementObject casts.
-    v1.5.7: [August 2026] - Uses typed BCD WMI element setters instead of BCDEdit for writes.
-                            - Prevents unrelated GPT device descriptors from being reserialized under a temporary identity.
-    v1.5.6: [August 2026] - Temporarily assigns a unique identity to collision-offlined attached disks.
-                            - Restores and verifies the exact original disk identity before reporting success.
-    v1.5.5: [August 2026] - Refuses repair when an attached disk is offline due to an identity collision.
-                            - Prevents onlining a colliding source disk and invalidating BCD device references.
-    v1.5.4: [August 2026] - Skips EMS writes for settings that are already correct.
-                            - Logs the full verbose BCD store before and after changes.
-    v1.5.3: [August 2026] - Uses only the documented offline EMS and EMS settings commands.
-                            - Does not enable the optional Windows boot menu or Boot Manager EMS.
-    v1.5.2: [August 2026] - Restores the verified BCD backup after any post-write failure.
-                            - Preserves device and osdevice mappings without normalization.
-    v1.5.1: [August 2026] - Avoids comparing guest BCD drive letters with repair-VM mount letters.
-                            - Uses VM generation when selecting the detected loader path for logging.
-    v1.5: [August 2026] - Validates loader mapping before BCD writes and verifies mapping invariance afterward.
+    v1.3: [August 2026] - Repairs loader device/osdevice when they render as unknown.
+                          - Writes the validated Windows partition while the source retains its original GPT identity.
+                          - Re-queries and verifies the repaired loader mapping before enabling EMS.
+                          - Preserves the Gen2 source disk GPT GUID for the entire repair.
+                          - Resolves a GPT collision by temporarily changing only the disposable repair VM OS disk GUID.
+                          - Offlines the source disk before restoring and verifying the repair OS disk GUID.
+                          - Refuses to rewrite a collision-offlined GPT disk identity.
+                          - Requires a non-colliding repair OS disk or matching-generation nested repair for Gen2.
+                          - Rebinds embedded BCD WMI results through their documented key properties.
+                          - Avoids invalid ManagementBaseObject-to-ManagementObject casts.
+                          - Uses typed BCD WMI element setters instead of BCDEdit for writes.
+                          - Prevents unrelated GPT device descriptors from being reserialized under a temporary identity.
+                          - Temporarily assigns a unique identity to collision-offlined attached disks.
+                          - Restores and verifies the exact original disk identity before reporting success.
+                          - Refuses repair when an attached disk is offline due to an identity collision.
+                          - Prevents onlining a colliding source disk and invalidating BCD device references.
+                          - Skips EMS writes for settings that are already correct.
+                          - Logs the full verbose BCD store before and after changes.
+                          - Uses only the documented offline EMS and EMS settings commands.
+                          - Does not enable the optional Windows boot menu or Boot Manager EMS.
+                          - Restores the verified BCD backup after any post-write failure.
+                          - Preserves device and osdevice mappings without normalization.
+                          - Avoids comparing guest BCD drive letters with repair-VM mount letters.
+                          - Uses VM generation when selecting the detected loader path for logging.
+                          - Validates loader mapping before BCD writes and verifies mapping invariance afterward.
                           - Requires and verifies a BCD backup before applying SAC settings.
                           - Restores the backup if path, device, osdevice, or systemroot changes unexpectedly.
-    v1.4: [August 2026] - Added VMRepairMint telemetry, structured before-state capture, and Gen1/Gen2 discovery telemetry.
+                          - Added VMRepairMint telemetry, structured before-state capture, and Gen1/Gen2 discovery telemetry.
                           - Added explicit winload.exe and winload.efi detection.
                           - Added explicit displayorder and boot entry GUID failure diagnostics.
-    Update [July 2026]  - Restricted execution to repair VM mode.
+                         - Restricted execution to repair VM mode.
                          - Uses Get-Disk-Partitions to enumerate Azure virtual disks.
                          - Detects repair vs. standard context from secondary disks returned by the helper.
                          - Mounts unlettered Gen2 Windows and EFI partitions temporarily.
@@ -63,7 +63,7 @@
                          - Refuses BCD changes when a repair VM context is not detected.
                          - Fails closed if the repair VM OS disk cannot be identified.
                          - Filters out the repair VM OS disk before processing attached disks.
-    Update: [July 2026]  - Added execution context detection and dual-logging.
+                         - Added execution context detection and dual-logging.
                          - Detected rescue VM mode versus standard mode for context-aware error messages.
                          - Logs to both the desktop and the plugin directory for automatic collection by az vm repair.
                          - **NEW SAFETY: Pre-flight checks, BCD backup, and post-change verification.
@@ -487,7 +487,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.6.1'
+$script:RepairScriptVersion = '1.3'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -707,7 +707,7 @@ $gptCollisionDiskNumbers = @()
 $repairDiskIdentityRecord = $null
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.6.1-repair-unknown-loader-device"
+Log-Info "Build marker: v1.3-repair-unknown-loader-device"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -715,7 +715,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.6.1-repair-unknown-loader-device'
+    BuildMarker = 'v1.3-repair-unknown-loader-device'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
