@@ -20,11 +20,13 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-05
-    Version:     1.5.7
+    Version:     1.5.8
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.8: [August 2026] - Rebinds embedded BCD WMI results through their documented key properties.
+                            - Avoids invalid ManagementBaseObject-to-ManagementObject casts.
     v1.5.7: [August 2026] - Uses typed BCD WMI element setters instead of BCDEdit for writes.
                             - Prevents unrelated GPT device descriptors from being reserialized under a temporary identity.
     v1.5.6: [August 2026] - Temporarily assigns a unique identity to collision-offlined attached disks.
@@ -431,7 +433,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.7'
+$script:RepairScriptVersion = '1.5.8'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -533,6 +535,28 @@ function Invoke-SacBcdWmiMethod {
     }
 }
 
+function New-SacBcdManagementObject {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('BcdStore', 'BcdObject')]
+        [string]$ClassName,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Keys
+    )
+
+    $keyAssignments = @($Keys.GetEnumerator() | Sort-Object Key | ForEach-Object {
+        $escapedValue = ([string]$_.Value).Replace('\', '\\').Replace('"', '\"')
+        '{0}="{1}"' -f $_.Key, $escapedValue
+    })
+    $relativePath = '{0}.{1}' -f $ClassName, ($keyAssignments -join ',')
+    $scope = [System.Management.ManagementScope]::new('\\.\root\WMI')
+    $path = [System.Management.ManagementPath]::new($relativePath)
+    $managementObject = [System.Management.ManagementObject]::new($scope, $path, $null)
+    $managementObject.Get()
+    return $managementObject
+}
+
 function Set-SacBcdEmsElements {
     param(
         [Parameter(Mandatory = $true)]
@@ -552,7 +576,9 @@ function Set-SacBcdEmsElements {
         throw "The BCD WMI provider could not open offline store '$BcdPath'."
     }
 
-    $store = [System.Management.ManagementObject]$openStoreResult.Store
+    $store = New-SacBcdManagementObject -ClassName BcdStore -Keys @{
+        FilePath = [string]$openStoreResult.Store.FilePath
+    }
     try {
         if ($SetLoaderEms) {
             $openLoaderResult = $store.OpenObject($LoaderId)
@@ -560,7 +586,10 @@ function Set-SacBcdEmsElements {
                 throw "The BCD WMI provider could not open loader '$LoaderId'."
             }
 
-            $loader = [System.Management.ManagementObject]$openLoaderResult.Object
+            $loader = New-SacBcdManagementObject -ClassName BcdObject -Keys @{
+                Id = [string]$openLoaderResult.Object.Id
+                StoreFilePath = [string]$openLoaderResult.Object.StoreFilePath
+            }
             try {
                 Invoke-SacBcdWmiMethod -InputObject $loader -MethodName 'SetBooleanElement' -Operation 'ems' -Parameters @{
                     Boolean = $true
@@ -579,7 +608,10 @@ function Set-SacBcdEmsElements {
                 throw "The BCD WMI provider could not open EMS settings object '$emsSettingsId'."
             }
 
-            $emsSettings = [System.Management.ManagementObject]$openEmsSettingsResult.Object
+            $emsSettings = New-SacBcdManagementObject -ClassName BcdObject -Keys @{
+                Id = [string]$openEmsSettingsResult.Object.Id
+                StoreFilePath = [string]$openEmsSettingsResult.Object.StoreFilePath
+            }
             try {
                 if ($SetPort) {
                     Invoke-SacBcdWmiMethod -InputObject $emsSettings -MethodName 'SetIntegerElement' -Operation 'ems-port' -Parameters @{
@@ -619,7 +651,7 @@ $changedCount = 0
 $collisionDiskRecords = @()
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.7-typed-bcd-wmi-writes"
+Log-Info "Build marker: v1.5.8-bcd-wmi-key-rebind"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -627,7 +659,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.7-typed-bcd-wmi-writes'
+    BuildMarker = 'v1.5.8-bcd-wmi-key-rebind'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
