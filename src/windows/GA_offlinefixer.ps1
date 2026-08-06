@@ -18,18 +18,28 @@
 
 .NOTES
     Name:    GA_offlinefixer.ps1
-    Version: 1.4
+    Version: 1.3
     Original Author: Daniel Munoz L (damunozl@microsoft.com)
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.4: [May 2026] - Updated the script (current)
-                       - Aligned nested VM detection with win-LKGC guard pattern.
-                       - Skips Get-VM safely when Hyper-V module is unavailable.
-                       - Fixed relative path evaluation bug for helper files.
-    v1.3: [May 2026] - Updated the script again (current)
-                       - Fixed breaking exception when the Hyper-V module is not installed on the host.
-                       - Added explicit checking via Get-Module before executing nested VM discovery.
+    v1.3: [August 2026] - Identifies and excludes the rescue VM OS disk by physical disk number.
+                        - Requires an attached Microsoft virtual disk before service or disk disruption.
+                        - Groups candidates by physical disk and validates winload plus the SYSTEM hive.
+                        - Temporarily mounts unlettered Windows partition candidates and cleans them up.
+                        - Refuses collision-offlined attached disks rather than changing disk identities.
+                        - Restores and verifies the original WSearch service state.
+                        - No longer stops Windows Defender on the rescue VM.
+                        - Makes fallback hive copy-back part of per-disk success accounting.
+                        - Removes the unnecessary Azure Instance Metadata Service request.
+                        - Validates WindowsAzure xcopy source and destination content.
+                        - Updated the script (current)
+                        - Aligned nested VM detection with win-LKGC guard pattern.
+                        - Skips Get-VM safely when Hyper-V module is unavailable.
+                        - Fixed relative path evaluation bug for helper files.
+                        - Updated the script again (current)
+                        - Fixed breaking exception when the Hyper-V module is not installed on the host.
+                        - Added explicit checking via Get-Module before executing nested VM discovery.
     v1.2: [May 2026] - Updated the script
                        - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
     v0.1: Initial commit. This was the version 1.0 of the script.
@@ -176,6 +186,35 @@ function Invoke-CriticalCommand {
     }
 }
 
+function Get-AvailableTempDriveLetter {
+    $usedLetters = @(Get-Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveLetter } |
+        Select-Object -ExpandProperty DriveLetter)
+
+    foreach ($letter in @('Z','Y','X','W','V','U','T','S','R','Q')) {
+        if ($letter -notin $usedLetters -and -not (Test-Path -LiteralPath "${letter}:\")) {
+            return $letter
+        }
+    }
+
+    return $null
+}
+
+function Invoke-GaDiskPart {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Commands,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Operation
+    )
+
+    $output = $Commands | diskpart.exe 2>&1
+    foreach ($line in @($output)) {
+        if ($line) { Log-Info "diskpart $Operation :: $line" }
+    }
+}
+
 # Status Tracking
 $script_final_status = $STATUS_ERROR
 $serviceStates = @{}  # Track original service states for restoration
@@ -183,12 +222,11 @@ $processedCount = 0
 $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
+$temporaryOsMounts = @()
 
-# VM Metadata Capture for Telemetry
+# Local execution context for diagnostic logging. No data is transmitted off-box.
 $vmMetadata = @{
     OSVersion = $null
-    VMSku = $null
-    Region = $null
     HostName = $env:COMPUTERNAME
 }
 
@@ -204,24 +242,8 @@ try {
         Log-Warning "OS metadata discovery failed: $($_.Exception.Message)"
     }
 
-    # Attempt to capture Azure VM metadata from Instance Metadata Service
-    try {
-        $imdHeaders = @{Metadata = $true }
-        $imdUri = "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
-        $imdResponse = Invoke-RestMethod -Uri $imdUri -Headers $imdHeaders -ErrorAction SilentlyContinue
-        if ($imdResponse) {
-            $vmMetadata.VMSku = $imdResponse.compute.vmSize
-            $vmMetadata.Region = $imdResponse.compute.location
-        }
-    }
-    catch {
-        Log-Warning "Instance metadata discovery failed: $($_.Exception.Message)"
-    }
-
     # Create metadata context string for logging
     $metadataContext = "[Host:$($vmMetadata.HostName)"
-    if ($vmMetadata.Region) { $metadataContext += " Region:$($vmMetadata.Region)" }
-    if ($vmMetadata.VMSku) { $metadataContext += " SKU:$($vmMetadata.VMSku)" }
     if ($vmMetadata.OSVersion) { $metadataContext += " OS:$($vmMetadata.OSVersion)" }
     $metadataContext += "]"
 
@@ -270,62 +292,192 @@ try {
     if ($hklmKeys) { Log-Info "Loaded HKLM hives: $($hklmKeys -join ', ')" }
     if ($hkuKeys) { Log-Info "Loaded HKU hives: $($hkuKeys -join ', ')" }
 
-    # Stop services that scan/index attached disks and lock hive files
-    Log-Info "Stopping services that may lock disk files..."
-    foreach ($svc in @('WSearch', 'WinDefend')) {
+    # Identify the rescue OS disk before stopping services or touching any disk.
+    $rescueDrive = $env:SystemDrive -replace ':', ''
+    $rescueOsPartition = Get-Partition -DriveLetter $rescueDrive -ErrorAction Stop | Select-Object -First 1
+    if ($null -eq $rescueOsPartition -or $null -eq $rescueOsPartition.DiskNumber) {
+        throw "CRITICAL SAFETY CHECK FAILED: Could not identify the rescue VM OS disk from $($env:SystemDrive)."
+    }
+    $rescueDiskNum = [int]$rescueOsPartition.DiskNumber
+    Log-Info "Rescue VM OS disk identified as physical Disk $rescueDiskNum."
+
+    $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
+        Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
+        ForEach-Object { [int]$_.Index })
+    $attachedDisks = @(Get-Disk -ErrorAction Stop | Where-Object {
+        $_.Number -in $azureVirtualDiskNumbers -and $_.Number -ne $rescueDiskNum
+    })
+    if ($attachedDisks.Count -eq 0) {
+        throw 'REPAIR-ONLY SCRIPT: No attached Microsoft virtual disk was found. No service or disk changes were attempted.'
+    }
+
+    $collisionDisks = @($attachedDisks | Where-Object {
+        $_.IsOffline -and [string]$_.OfflineReason -eq 'Collision'
+    })
+    if ($collisionDisks.Count -gt 0) {
+        throw "Attached disk identity collision detected on Disk(s) $($collisionDisks.Number -join ', '). Refusing to change disk identities; use a non-colliding rescue VM or matching-generation nested repair."
+    }
+    $attachedDiskNumbers = @($attachedDisks | Select-Object -ExpandProperty Number)
+    Log-Info "Attached repair candidate disk numbers: $($attachedDiskNumbers -join ', ')"
+
+    # Pause indexing while attached hives are modified. Defender remains running.
+    Log-Info "Stopping Windows Search temporarily to reduce attached-disk file locks..."
+    foreach ($svc in @('WSearch')) {
         try {
-            $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            $svcObj = Get-Service -Name $svc -ErrorAction Stop
             if ($svcObj) {
-                $serviceStates[$svc] = $svcObj.Status
+                $serviceStates[$svc] = [string]$svcObj.Status
                 Log-Info "Captured original state of $svc : $($svcObj.Status)"
-                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                if ($svcObj.Status -ne 'Stopped') {
+                    Stop-Service -Name $svc -ErrorAction Stop
+                    $svcObj.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+                    Log-Info "$svc stopped temporarily."
+                }
             }
         }
         catch {
-            Log-Warning "Failed to capture state of $svc : $($_.Exception.Message)"
+            throw "Could not safely capture or stop $svc before disk repair: $($_.Exception.Message)"
         }
     }
 
     [System.GC]::Collect()
     [System.GC]::WaitForPendingFinalizers()
 
-    # Cycle non-system disks offline/online to release ALL file handles
+    # Cycle only verified attached Microsoft virtual disks to release file handles.
     Log-Info "Cycling attached disks offline/online to release file locks..."
-    $rescueDiskNum = (Get-Partition -DriveLetter ($env:SystemDrive -replace ':', '') -ErrorAction SilentlyContinue).DiskNumber
-    Get-Disk | Where-Object { $_.Number -ne $rescueDiskNum -and $_.OperationalStatus -eq 'Online' } | ForEach-Object {
+    $attachedDisks | Where-Object { -not $_.IsOffline } | ForEach-Object {
         $dnum = $_.Number
         Log-Info "Cycling disk $dnum offline/online..."
-        Set-Disk -Number $dnum -IsOffline $true -ErrorAction SilentlyContinue
+        Set-Disk -Number $dnum -IsOffline $true -ErrorAction Stop
         Start-Sleep -Seconds 2
-        Set-Disk -Number $dnum -IsOffline $false -ErrorAction SilentlyContinue
-        Set-Disk -Number $dnum -IsReadOnly $false -ErrorAction SilentlyContinue
+        Set-Disk -Number $dnum -IsOffline $false -ErrorAction Stop
+        Set-Disk -Number $dnum -IsReadOnly $false -ErrorAction Stop
     }
     Start-Sleep -Seconds 3
 
-    # Step 1 - Enumerate partitions to locate the faulty OS drive(s)
-    $partitionlist = Get-Disk-Partitions
-    $rescueDrive = $env:SystemDrive -replace ':', ''
-    $fixedDisks = @()
-    $failedDisks = @()  # Track disks that failed copy-back
+    # Step 1 - Find one validated Windows volume on each attached physical disk.
+    $partitionlist = @(Get-Disk-Partitions)
+    if ($partitionlist.Count -eq 0) {
+        throw 'Get-Disk-Partitions returned no partitions from Azure virtual disks.'
+    }
 
-    foreach ($partition in $partitionlist) {
-        $processedCount++
-        if (-not $partition.DriveLetter) { $skippedCount++; continue }
-        # Skip the rescue VM's own OS drive (its hives are locked by the running OS)
-        if ($partition.DriveLetter -eq $rescueDrive) {
-            Log-Info "Skipping rescue VM system drive $rescueDrive (own OS)"
-            $skippedCount++
-            continue
+    $targetDiskGroups = @($partitionlist |
+        Where-Object { [int]$_.DiskNumber -in $attachedDiskNumbers -and [int]$_.DiskNumber -ne $rescueDiskNum } |
+        Group-Object DiskNumber)
+    if ($targetDiskGroups.Count -eq 0) {
+        throw 'REPAIR-ONLY SCRIPT: The partition helper returned no partitions from an attached repair disk.'
+    }
+
+    $targetWindowsVolumes = @()
+    $efiGptType = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
+    foreach ($diskGroup in $targetDiskGroups) {
+        $diskNumber = [int]$diskGroup.Name
+        $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
+        $targetVolume = $null
+
+        foreach ($candidate in @($diskPartitions | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne [char]0 })) {
+            $candidateLetter = [string]$candidate.DriveLetter
+            $winloadExe = "${candidateLetter}:\Windows\System32\winload.exe"
+            $winloadEfi = "${candidateLetter}:\Windows\System32\winload.efi"
+            $systemHive = "${candidateLetter}:\Windows\System32\config\SYSTEM"
+            if (((Test-Path -LiteralPath $winloadExe -PathType Leaf) -or
+                    (Test-Path -LiteralPath $winloadEfi -PathType Leaf)) -and
+                (Test-Path -LiteralPath $systemHive -PathType Leaf)) {
+                $targetVolume = [pscustomobject]@{
+                    DiskNumber = $diskNumber
+                    PartitionNumber = [int]$candidate.PartitionNumber
+                    DriveLetter = $candidateLetter
+                    TemporaryMount = $false
+                }
+                break
+            }
         }
-        if (-not (Test-Path -Path "$($partition.DriveLetter):\Windows")) { $skippedCount++; continue }
 
-        $diskb = $partition.DriveLetter
-        Log-Info "Target OS disk found on letter: $($diskb):"
+        if (-not $targetVolume) {
+            $unletteredCandidates = @($diskPartitions | Where-Object {
+                (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and
+                (([string]$_.GptType).Trim().Trim('{', '}') -ine $efiGptType)
+            } | Sort-Object Size -Descending)
+
+            foreach ($candidate in $unletteredCandidates) {
+                $candidateLetter = Get-AvailableTempDriveLetter
+                if (-not $candidateLetter) {
+                    throw "No temporary drive letter is available to inspect unlettered partitions on Disk $diskNumber."
+                }
+
+                Invoke-GaDiskPart -Operation 'os-assign' -Commands @(
+                    "select disk $diskNumber"
+                    "select partition $($candidate.PartitionNumber)"
+                    "assign letter=$candidateLetter"
+                )
+                Start-Sleep -Seconds 2
+
+                $mounted = Test-Path -LiteralPath "${candidateLetter}:\" -PathType Container
+                $probeMount = [pscustomobject]@{
+                    DiskNumber = $diskNumber
+                    PartitionNumber = [int]$candidate.PartitionNumber
+                    DriveLetter = $candidateLetter
+                    TemporaryMount = $true
+                }
+                if ($mounted) {
+                    $temporaryOsMounts += $probeMount
+                }
+                $winloadExe = "${candidateLetter}:\Windows\System32\winload.exe"
+                $winloadEfi = "${candidateLetter}:\Windows\System32\winload.efi"
+                $systemHive = "${candidateLetter}:\Windows\System32\config\SYSTEM"
+                if ($mounted -and
+                    ((Test-Path -LiteralPath $winloadExe -PathType Leaf) -or
+                        (Test-Path -LiteralPath $winloadEfi -PathType Leaf)) -and
+                    (Test-Path -LiteralPath $systemHive -PathType Leaf)) {
+                    $targetVolume = $probeMount
+                    break
+                }
+
+                Invoke-GaDiskPart -Operation 'os-probe-remove' -Commands @(
+                    "select disk $diskNumber"
+                    "select partition $($candidate.PartitionNumber)"
+                    "remove letter=$candidateLetter noerr"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                $probePartition = Get-Partition -DiskNumber $diskNumber -PartitionNumber $candidate.PartitionNumber -ErrorAction Stop
+                if ([string]$probePartition.DriveLetter -ieq $candidateLetter) {
+                    throw "Temporary letter ${candidateLetter}: could not be removed from Disk $diskNumber Partition $($candidate.PartitionNumber)."
+                }
+                $temporaryOsMounts = @($temporaryOsMounts | Where-Object {
+                    -not ($_.DiskNumber -eq $diskNumber -and
+                        $_.PartitionNumber -eq $candidate.PartitionNumber -and
+                        $_.DriveLetter -ieq $candidateLetter)
+                })
+            }
+        }
+
+        if ($targetVolume) {
+            $targetWindowsVolumes += $targetVolume
+            Log-Info "Validated Windows target on Disk $diskNumber Partition $($targetVolume.PartitionNumber) at $($targetVolume.DriveLetter):."
+        }
+        else {
+            $skippedCount++
+            Log-Warning "Disk $diskNumber has no partition containing both a Windows loader and SYSTEM hive."
+        }
+    }
+
+    if ($targetWindowsVolumes.Count -eq 0) {
+        throw 'No attached Windows OS disk passed loader and SYSTEM hive validation.'
+    }
+
+    $fixedDisks = @()
+    $failedDisks = @()
+
+    foreach ($targetVolume in $targetWindowsVolumes) {
+        $processedCount++
+        $diskb = [string]$targetVolume.DriveLetter
+        Log-Info "Processing validated target Disk $($targetVolume.DiskNumber) on letter $($diskb):"
         # Step 2 - Load the SYSTEM registry hive from the target disk
         $hiveName = "BROKENSYSTEM_$diskb"
         $hiveSource = "$($diskb):\Windows\System32\config\SYSTEM"
         $hiveCopy = $null
         $diskProcessedSuccessfully = $false
+        $diskChangesCompleted = $false
         & reg.exe unload "HKLM\$hiveName" 2>$null
         [System.GC]::Collect()
         Start-Sleep -Seconds 1
@@ -358,8 +510,10 @@ try {
             }
         }
         if ($LASTEXITCODE -ne 0) {
-            Log-Warning "Failed to load Registry Hive from $($diskb): $loadResult - skipping this partition"
+            Log-Error "Failed to load Registry Hive from $($diskb): $loadResult"
             if ($hiveCopy -and (Test-Path $hiveCopy)) { Remove-Item $hiveCopy -Force -ErrorAction SilentlyContinue }
+            $failedDisks += $diskb
+            $failedCount++
             continue
         }
         Start-Sleep -Seconds 2
@@ -393,10 +547,10 @@ try {
                 }
                 # Export healthy key from the current Rescue VM
                 $serviceExportResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("export", "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\$service", "$regFile", "/y") -Description "reg export service $service"
-                
+
                 if ($serviceExportResult.ExitCode -eq 0 -and (Test-Path $regFile)) {
                     $originalContent = Get-Content $regFile
-                    
+
                     # Update Primary Set
                     Log-Info "Updating $service in $primarySet on $($diskb):..."
                     $content = $originalContent -replace 'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet', "HKEY_LOCAL_MACHINE\$hiveName\$primarySet"
@@ -439,12 +593,20 @@ try {
             $destPath = "$($diskb):\WindowsAzure"
             $backupPath = "$($diskb):\WindowsazurefaultyGAbackup"
 
+            $sourceFiles = @(Get-ChildItem -LiteralPath $sourcePath -File -Recurse -Force -ErrorAction Stop)
+            if ($sourceFiles.Count -eq 0) {
+                throw "Rescue VM source folder '$sourcePath' contains no files. Refusing to replace the target WindowsAzure folder."
+            }
+
             if (Test-Path $destPath) {
                 Log-Info "Backing up existing WindowsAzure folder on $($diskb): to WindowsazurefaultyGAbackup..."
                 if (-not (Test-Path $backupPath)) { $null = New-Item -Path $backupPath -ItemType Directory -Force }
                 $backupCopyResult = Invoke-CriticalCommand -Command "xcopy" -Arguments @("$destPath", "$backupPath", "/E", "/Y", "/H", "/Q") -Description "xcopy backup WindowsAzure ($diskb)"
                 if ($backupCopyResult.ExitCode -ge 2) {
                     throw "Failed to back up existing WindowsAzure folder on $($diskb): $($backupCopyResult.Output -join '; ')"
+                }
+                if (-not (Get-ChildItem -LiteralPath $backupPath -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+                    throw "WindowsAzure backup on $($diskb): contains no files after xcopy."
                 }
                 Log-Info "Removing old WindowsAzure folder on $($diskb):..."
                 Remove-Item $destPath -Recurse -Force -ErrorAction SilentlyContinue
@@ -456,6 +618,9 @@ try {
             if ($restoreCopyResult.ExitCode -ge 2) {
                 throw "Failed to copy WindowsAzure folder to $($diskb): $($restoreCopyResult.Output -join '; ')"
             }
+            if (-not (Get-ChildItem -LiteralPath $destPath -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+                throw "Target WindowsAzure folder on $($diskb): contains no files after xcopy."
+            }
 
             # Remove Logs folder from copied content (not relevant to the target VM)
             $logsPath = "$destPath\Logs"
@@ -463,14 +628,11 @@ try {
                 Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
             }
 
-            $diskProcessedSuccessfully = $true
-            $fixedDisks += $diskb
-            $changedCount++
+            $diskChangesCompleted = $true
         }
         catch {
             Log-Error "Failed to process $($diskb):: $($_.Exception.Message)"
             $diskProcessedSuccessfully = $false
-            $failedCount++
         }
         finally {
             # Step 8 - Release handles and safely unload the registry hive
@@ -487,7 +649,8 @@ try {
                 Start-Sleep -Seconds 5
             }
             if (-not $unloaded) {
-                Log-Warning "Could not unload $hiveName hive - may need manual cleanup"
+                Log-Error "Could not unload $hiveName hive - marking Disk $diskb as failed."
+                $failedDisks += $diskb
             }
 
             # If we used the copy fallback, copy the modified hive back to the original location
@@ -495,36 +658,48 @@ try {
                 if ($unloaded) {
                     Log-Info "Copying modified hive back to $hiveSource..."
                     try {
+                        $expectedHiveHash = (Get-FileHash -LiteralPath $hiveCopy -Algorithm SHA256 -ErrorAction Stop).Hash
                         Copy-Item -Path $hiveCopy -Destination $hiveSource -Force -ErrorAction Stop
-                        Log-Info "Successfully copied modified hive back to $($diskb):"
+                        $actualHiveHash = (Get-FileHash -LiteralPath $hiveSource -Algorithm SHA256 -ErrorAction Stop).Hash
+                        if ($actualHiveHash -ne $expectedHiveHash) {
+                            throw "Hive copy-back verification failed: source and destination SHA256 hashes differ."
+                        }
+                        Log-Info "Successfully copied and verified the modified hive back to $($diskb):"
                     }
                     catch {
                         Log-Error "Failed to copy modified hive back to $($diskb):: $($_.Exception.Message)"
-                        $diskProcessedSuccessfully = $false
                         $failedDisks += $diskb
                     }
+                }
+                else {
+                    Log-Error "Modified fallback hive for $($diskb): cannot be copied back because $hiveName did not unload."
+                    $failedDisks += $diskb
                 }
                 Remove-Item $hiveCopy -Force -ErrorAction SilentlyContinue
             }
 
-            # Remove from fixed list if processing failed
-            if (-not $diskProcessedSuccessfully) {
-                $fixedDisks = @($fixedDisks | Where-Object { $_ -ne $diskb })
+            $diskProcessedSuccessfully = $diskChangesCompleted -and ($diskb -notin $failedDisks)
+            if ($diskProcessedSuccessfully) {
+                $fixedDisks += $diskb
+                $changedCount++
+            }
+            else {
                 if ($diskb -notin $failedDisks) {
                     $failedDisks += $diskb
                 }
+                $failedCount++
             }
         }
     }
 
     if ($failedDisks.Count -gt 0) {
-        Log-Error "Copy-back operation failed on disks: $($failedDisks -join ', ')"
-        throw "Hive copy-back failed on one or more disks: $($failedDisks -join ', '). Please review logs."
+        Log-Error "Processing failed on disks: $($failedDisks -join ', ')"
+        throw "One or more disks failed final hive unload or copy-back validation: $($failedDisks -join ', '). Please review logs."
     }
 
     Log-Info "Processing summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
     if ($fixedDisks.Count -gt 0) {
-        Log-Output "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Metadata: Host=$($vmMetadata.HostName), Region=$($vmMetadata.Region), SKU=$($vmMetadata.VMSku)"
+        Log-Output "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Host=$($vmMetadata.HostName)"
         $script_final_status = $STATUS_SUCCESS
     }
     else {
@@ -538,9 +713,30 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
-    # Log execution metadata for Application Insights correlation
-    if ($vmMetadata.Region -or $vmMetadata.VMSku -or $vmMetadata.OSVersion) {
-        Log-Info "Execution Context - Host: $($vmMetadata.HostName), Region: $($vmMetadata.Region), SKU: $($vmMetadata.VMSku), OS: $($vmMetadata.OSVersion)"
+    foreach ($mount in @($temporaryOsMounts | Sort-Object DiskNumber, PartitionNumber -Unique)) {
+        try {
+            Log-Info "Removing temporary OS letter $($mount.DriveLetter): from Disk $($mount.DiskNumber) Partition $($mount.PartitionNumber)."
+            Invoke-GaDiskPart -Operation 'os-cleanup' -Commands @(
+                "select disk $($mount.DiskNumber)"
+                "select partition $($mount.PartitionNumber)"
+                "remove letter=$($mount.DriveLetter) noerr"
+            )
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+            $cleanedPartition = Get-Partition -DiskNumber $mount.DiskNumber -PartitionNumber $mount.PartitionNumber -ErrorAction Stop
+            if ([string]$cleanedPartition.DriveLetter -ieq [string]$mount.DriveLetter) {
+                throw "Temporary drive letter removal could not be verified."
+            }
+            Log-Info "Temporary OS letter $($mount.DriveLetter): removal verified."
+        }
+        catch {
+            Log-Error "Failed to remove temporary OS letter $($mount.DriveLetter): $($_.Exception.Message)"
+            $script_final_status = $STATUS_ERROR
+        }
+    }
+
+    # Log local execution context only; this script performs no telemetry upload.
+    if ($vmMetadata.OSVersion) {
+        Log-Info "Execution Context - Host: $($vmMetadata.HostName), OS: $($vmMetadata.OSVersion)"
     }
 
     # Restore original service states
@@ -550,12 +746,22 @@ finally {
             $originalState = $serviceStates[$svc]
             Log-Info "Restoring $svc to state: $originalState"
             if ($originalState -eq 'Running') {
-                Start-Service -Name $svc -ErrorAction SilentlyContinue
+                Start-Service -Name $svc -ErrorAction Stop
+                $restoredService = Get-Service -Name $svc -ErrorAction Stop
+                $restoredService.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
             }
-            # If original state was Stopped, service remains stopped (already stopped)
+            elseif ($originalState -eq 'Stopped') {
+                Stop-Service -Name $svc -Force -ErrorAction Stop
+            }
+            $restoredState = [string](Get-Service -Name $svc -ErrorAction Stop).Status
+            if ($restoredState -ne $originalState) {
+                throw "$svc restoration verification failed: expected $originalState, found $restoredState."
+            }
+            Log-Info "$svc restored and verified in state $restoredState."
         }
         catch {
-            Log-Warning "Failed to restore $svc to state $originalState : $($_.Exception.Message)"
+            Log-Error "Failed to restore $svc to state $originalState : $($_.Exception.Message)"
+            $script_final_status = $STATUS_ERROR
         }
     }
 
