@@ -12,20 +12,24 @@
     5. Exports healthy service keys (WindowsAzureGuestAgent, WindowsAzureTelemetryService, RdAgent)
        from the rescue VM and injects them into both ControlSets on the target hive.
     6. Verifies the ImagePath value was written correctly.
-    7. Backs up the existing WindowsAzure folder (WindowsazurefaultyGAbackup), then replaces
-       it with the full rescue VM WindowsAzure copy.
+    7. Copies the latest GuestAgent installation folder from the rescue VM to the attached disk.
     8. Releases handles and safely unloads the registry hive (with retry logic).
 
 .NOTES
     Name:    GA_offlinefixer.ps1
-    Version: 1.4
+    Version: 1.3
     Original Author: Daniel Munoz L (damunozl@microsoft.com)
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.4: [August 2026] - Temporarily resolves attached-disk identity collisions and restores the
+    v1.3: [August 2026] - Copies only the newest versioned GuestAgent installation folder.
+                        - Uses the WindowsAzureGuestAgent ImagePath folder as a fallback.
+                        - Preserves unrelated content in the target WindowsAzure folder.
+                        - Bounds file-copy retries to avoid client repair jobs appearing stuck.
+                        - Unloads only stale repair hives that actually exist.
+                        - Temporarily resolves attached-disk identity collisions and restores the
                         - exact original MBR signature or GPT GUID before returning.
-    v1.3: [August 2026] - Identifies and excludes the rescue VM OS disk by physical disk number.
+                        - Identifies and excludes the rescue VM OS disk by physical disk number.
                         - Requires an attached Microsoft virtual disk before service or disk disruption.
                         - Groups candidates by physical disk and validates winload plus the SYSTEM hive.
                         - Temporarily mounts unlettered Windows partition candidates and cleans them up.
@@ -279,15 +283,16 @@ try {
 
     # Clean up stale hive mounts from previous failed runs
     Log-Info "Cleaning up any stale registry hive mounts..."
-    foreach ($staleKey in @("BROKENSYSTEM", "BROKENSW")) {
-        & reg.exe unload "HKLM\$staleKey" 2>$null
-        & reg.exe unload "HKU\$staleKey" 2>$null
+    $staleHivePaths = @(
+        & reg.exe query HKLM 2>$null
+        & reg.exe query HKU 2>$null
+    ) | Where-Object {
+        $_ -match '^HKEY_LOCAL_MACHINE\\(?:BROKENSYSTEM|BROKENSW)(?:_[C-Z])?$' -or
+        $_ -match '^HKEY_USERS\\(?:BROKENSYSTEM|BROKENSYS|BROKENSW)(?:_[C-Z])?$'
     }
-    'C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z' | ForEach-Object {
-        & reg.exe unload "HKLM\BROKENSYSTEM_$_" 2>$null
-        & reg.exe unload "HKLM\BROKENSW_$_" 2>$null
-        & reg.exe unload "HKU\BROKENSYS_$_" 2>$null
-        & reg.exe unload "HKU\BROKENSW_$_" 2>$null
+    foreach ($staleHivePath in $staleHivePaths) {
+        Log-Info "Unloading stale repair hive $staleHivePath..."
+        & reg.exe unload $staleHivePath 2>$null
     }
 
     # Log any externally loaded hives (diagnostic)
@@ -670,44 +675,75 @@ try {
                 Log-Info "Verification Success on $($diskb):: ImagePath is now $afterImagePath"
             }
 
-            # Step 7 - Backup existing WindowsAzure folder and replace with rescue VM copy
+            # Step 7 - Copy only the current VM Agent installation folder.
             $sourcePath = "C:\WindowsAzure"
             $destPath = "$($diskb):\WindowsAzure"
             $backupPath = "$($diskb):\WindowsazurefaultyGAbackup"
 
-            $sourceFiles = @(Get-ChildItem -LiteralPath $sourcePath -File -Recurse -Force -ErrorAction Stop)
-            if ($sourceFiles.Count -eq 0) {
-                throw "Rescue VM source folder '$sourcePath' contains no files. Refusing to replace the target WindowsAzure folder."
+            $guestAgentCandidates = @(Get-ChildItem -LiteralPath $sourcePath -Directory -Force -ErrorAction Stop |
+                ForEach-Object {
+                    if ($_.Name -match '^GuestAgent_(.+)$') {
+                        $parsedVersion = $null
+                        if ([version]::TryParse($matches[1], [ref]$parsedVersion)) {
+                            [pscustomobject]@{
+                                Directory = $_
+                                Version = $parsedVersion
+                            }
+                        }
+                    }
+                } | Sort-Object Version -Descending)
+
+            $sourceAgentFolder = $null
+            if ($guestAgentCandidates.Count -gt 0) {
+                $sourceAgentFolder = $guestAgentCandidates[0].Directory
+                Log-Info "Selected latest VM Agent installation folder $($sourceAgentFolder.Name)."
+            }
+            else {
+                $expandedImagePath = [Environment]::ExpandEnvironmentVariables([string]$afterImagePath).Trim()
+                $imageExecutable = if ($expandedImagePath.StartsWith('"')) {
+                    ($expandedImagePath -split '"')[1]
+                }
+                else {
+                    ($expandedImagePath -split '\s+')[0]
+                }
+                if (-not [string]::IsNullOrWhiteSpace($imageExecutable)) {
+                    $imageFolder = Split-Path -Parent $imageExecutable
+                    if (Test-Path -LiteralPath $imageFolder -PathType Container) {
+                        $sourceAgentFolder = Get-Item -LiteralPath $imageFolder -ErrorAction Stop
+                        Log-Warning "No versioned GuestAgent folder was found; using ImagePath folder '$imageFolder'."
+                    }
+                }
             }
 
-            if (Test-Path $destPath) {
-                Log-Info "Backing up existing WindowsAzure folder on $($diskb): to WindowsazurefaultyGAbackup..."
-                if (-not (Test-Path $backupPath)) { $null = New-Item -Path $backupPath -ItemType Directory -Force }
-                $backupCopyResult = Invoke-CriticalCommand -Command "xcopy" -Arguments @("$destPath", "$backupPath", "/E", "/Y", "/H", "/Q") -Description "xcopy backup WindowsAzure ($diskb)"
-                if ($backupCopyResult.ExitCode -ge 2) {
-                    throw "Failed to back up existing WindowsAzure folder on $($diskb): $($backupCopyResult.Output -join '; ')"
-                }
-                if (-not (Get-ChildItem -LiteralPath $backupPath -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-                    throw "WindowsAzure backup on $($diskb): contains no files after xcopy."
-                }
-                Log-Info "Removing old WindowsAzure folder on $($diskb):..."
-                Remove-Item $destPath -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not $sourceAgentFolder) {
+                throw "No GuestAgent installation folder was found under '$sourcePath' or through ImagePath '$afterImagePath'."
             }
 
-            Log-Info "Copying full WindowsAzure folder from rescue VM to $($diskb):..."
             $null = New-Item -Path $destPath -ItemType Directory -Force
-            $restoreCopyResult = Invoke-CriticalCommand -Command "xcopy" -Arguments @("$sourcePath", "$destPath", "/E", "/Y", "/H", "/Q") -Description "xcopy restore WindowsAzure ($diskb)"
-            if ($restoreCopyResult.ExitCode -ge 2) {
-                throw "Failed to copy WindowsAzure folder to $($diskb): $($restoreCopyResult.Output -join '; ')"
-            }
-            if (-not (Get-ChildItem -LiteralPath $destPath -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
-                throw "Target WindowsAzure folder on $($diskb): contains no files after xcopy."
+            $targetAgentFolder = Join-Path $destPath $sourceAgentFolder.Name
+            if (Test-Path -LiteralPath $targetAgentFolder) {
+                $null = New-Item -Path $backupPath -ItemType Directory -Force
+                $targetAgentBackup = Join-Path $backupPath "$($sourceAgentFolder.Name)_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                Log-Info "Moving existing $($sourceAgentFolder.Name) folder to $targetAgentBackup..."
+                Move-Item -LiteralPath $targetAgentFolder -Destination $targetAgentBackup -ErrorAction Stop
             }
 
-            # Remove Logs folder from copied content (not relevant to the target VM)
-            $logsPath = "$destPath\Logs"
-            if (Test-Path $logsPath) {
-                Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
+            Log-Info "Copying VM Agent folder $($sourceAgentFolder.FullName) to $targetAgentFolder..."
+            $restoreCopyResult = Invoke-CriticalCommand -Command "robocopy.exe" -Arguments @(
+                $sourceAgentFolder.FullName, $targetAgentFolder, '/E', '/COPY:DAT', '/DCOPY:DAT',
+                '/XJ', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP'
+            ) -Description "robocopy VM Agent $($sourceAgentFolder.Name) ($diskb)"
+            if ($restoreCopyResult.ExitCode -ge 8) {
+                throw "Failed to copy VM Agent folder to $($diskb): $($restoreCopyResult.Output -join '; ')"
+            }
+            $sourceAgentFile = Get-ChildItem -LiteralPath $sourceAgentFolder.FullName -File -Recurse -Force -ErrorAction Stop |
+                Select-Object -First 1
+            if (-not $sourceAgentFile) {
+                throw "Source VM Agent folder '$($sourceAgentFolder.FullName)' contains no files."
+            }
+            $relativeAgentFile = $sourceAgentFile.FullName.Substring($sourceAgentFolder.FullName.Length).TrimStart('\')
+            if (-not (Test-Path -LiteralPath (Join-Path $targetAgentFolder $relativeAgentFile) -PathType Leaf)) {
+                throw "VM Agent folder copy verification failed for '$relativeAgentFile'."
             }
 
             $diskChangesCompleted = $true
