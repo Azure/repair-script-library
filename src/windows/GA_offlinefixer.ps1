@@ -301,11 +301,31 @@ try {
     $rescueDiskNum = [int]$rescueOsPartition.DiskNumber
     Log-Info "Rescue VM OS disk identified as physical Disk $rescueDiskNum."
 
+    # Azure rescue VMs can place the pagefile on a separate temporary resource disk.
+    # Windows treats that disk as critical even though it is not the rescue OS disk.
+    $protectedDiskNumbers = @($rescueDiskNum)
+    $protectedDiskNumbers += @(Get-Disk -ErrorAction Stop |
+        Where-Object { $_.IsBoot -or $_.IsSystem } |
+        Select-Object -ExpandProperty Number)
+    $pageFileDriveLetters = @(Get-CimInstance -ClassName Win32_PageFileUsage -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            if ([string]$_.Name -match '^([A-Za-z]):\\') { $matches[1] }
+        } | Select-Object -Unique)
+    foreach ($pageFileDriveLetter in $pageFileDriveLetters) {
+        $pageFilePartition = Get-Partition -DriveLetter $pageFileDriveLetter -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($pageFilePartition) {
+            $protectedDiskNumbers += [int]$pageFilePartition.DiskNumber
+        }
+    }
+    $protectedDiskNumbers = @($protectedDiskNumbers | Sort-Object -Unique)
+    Log-Info "Protected rescue disk numbers excluded from repair: $($protectedDiskNumbers -join ', ')."
+
     $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
         Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
         ForEach-Object { [int]$_.Index })
     $attachedDisks = @(Get-Disk -ErrorAction Stop | Where-Object {
-        $_.Number -in $azureVirtualDiskNumbers -and $_.Number -ne $rescueDiskNum
+        $_.Number -in $azureVirtualDiskNumbers -and $_.Number -notin $protectedDiskNumbers
     })
     if ($attachedDisks.Count -eq 0) {
         throw 'REPAIR-ONLY SCRIPT: No attached Microsoft virtual disk was found. No service or disk changes were attempted.'
