@@ -20,11 +20,14 @@
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-06
-    Version:     1.6.0
+    Version:     1.6.1
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.6.1: [August 2026] - Repairs loader device/osdevice when they render as unknown.
+                            - Writes the validated Windows partition while the source retains its original GPT identity.
+                            - Re-queries and verifies the repaired loader mapping before enabling EMS.
     v1.6.0: [August 2026] - Preserves the Gen2 source disk GPT GUID for the entire repair.
                             - Resolves a GPT collision by temporarily changing only the disposable repair VM OS disk GUID.
                             - Offlines the source disk before restoring and verifying the repair OS disk GUID.
@@ -484,7 +487,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.6.0'
+$script:RepairScriptVersion = '1.6.1'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -704,7 +707,7 @@ $gptCollisionDiskNumbers = @()
 $repairDiskIdentityRecord = $null
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.6.0-preserve-source-gpt-identity"
+Log-Info "Build marker: v1.6.1-repair-unknown-loader-device"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -712,7 +715,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.6.0-preserve-source-gpt-identity'
+    BuildMarker = 'v1.6.1-repair-unknown-loader-device'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -1205,12 +1208,8 @@ try {
                     if ($originalLoaderPath -notmatch '(?i)^\\Windows\\System32\\winload\.(exe|efi)$') {
                         throw "Selected entry $defaultId does not reference winload.exe or winload.efi. Path: $originalLoaderPath. No BCD changes were made."
                     }
-                    if ($originalDevice -match '(?i)^unknown$') {
-                        throw "Selected loader $defaultId has device=unknown. Separate BCD repair is required; no BCD changes were made."
-                    }
-                    if ($originalOsDevice -match '(?i)^unknown$') {
-                        throw "Selected loader $defaultId has osdevice=unknown. Separate BCD repair is required; no BCD changes were made."
-                    }
+                    $repairLoaderDevice = $originalDevice -match '(?i)^unknown$'
+                    $repairLoaderOsDevice = $originalOsDevice -match '(?i)^unknown$'
 
                     # Offline BCD output uses the guest's drive-letter namespace (commonly C:),
                     # while the repair VM mounts that partition under a temporary letter.
@@ -1302,6 +1301,57 @@ try {
                     foreach ($line in $beforeBcd) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
                     Log-Output '--- BCD FULL STORE BEFORE SAC ENABLE ---'
                     foreach ($line in $beforeFullQuery.Output) { if (-not [string]::IsNullOrWhiteSpace([string]$line)) { Log-Output $line } }
+
+                    if ($repairLoaderDevice -or $repairLoaderOsDevice) {
+                        $validatedWindowsPartition = "partition=${windowsDrive}:"
+                        Log-Warning "Loader mapping contains an unknown descriptor. Repairing it to the validated Windows partition $validatedWindowsPartition while the source disk retains its original identity."
+                        $bcdWriteStarted = $true
+
+                        if ($repairLoaderDevice) {
+                            $setDeviceResult = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultId, 'device', $validatedWindowsPartition) -Operation 'repair-loader-device'
+                            if (-not $setDeviceResult.Success) {
+                                throw "Could not repair device for loader $defaultId. Exit code: $($setDeviceResult.ExitCode)."
+                            }
+                        }
+                        if ($repairLoaderOsDevice) {
+                            $setOsDeviceResult = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultId, 'osdevice', $validatedWindowsPartition) -Operation 'repair-loader-osdevice'
+                            if (-not $setOsDeviceResult.Success) {
+                                throw "Could not repair osdevice for loader $defaultId. Exit code: $($setOsDeviceResult.ExitCode)."
+                            }
+                        }
+
+                        $repairedLoaderQuery = Invoke-SacBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultId, '/v') -Operation 'verify-repaired-loader-mapping'
+                        if (-not $repairedLoaderQuery.Success) {
+                            throw "Could not verify repaired loader mapping for $defaultId."
+                        }
+
+                        $repairedLoaderText = $repairedLoaderQuery.Output -join "`n"
+                        $repairedPathMatch = [regex]::Match($repairedLoaderText, '(?im)^\s*path\s+(.+?)\s*$')
+                        $repairedDeviceMatch = [regex]::Match($repairedLoaderText, '(?im)^\s*device\s+(.+?)\s*$')
+                        $repairedOsDeviceMatch = [regex]::Match($repairedLoaderText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+                        $repairedSystemRootMatch = [regex]::Match($repairedLoaderText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+                        if (-not $repairedPathMatch.Success -or
+                            -not $repairedDeviceMatch.Success -or
+                            -not $repairedOsDeviceMatch.Success -or
+                            -not $repairedSystemRootMatch.Success -or
+                            $repairedDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+                            $repairedOsDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+                            $repairedPathMatch.Groups[1].Value.Trim() -ine $originalLoaderPath -or
+                            $repairedSystemRootMatch.Groups[1].Value.Trim() -ine $originalSystemRoot) {
+                            throw "Loader mapping repair verification failed for $defaultId."
+                        }
+
+                        $originalDevice = $repairedDeviceMatch.Groups[1].Value.Trim()
+                        $originalOsDevice = $repairedOsDeviceMatch.Groups[1].Value.Trim()
+                        Write-SacTelemetry -Event Operation -Message 'Unknown loader mapping repaired' -Properties @{
+                            DiskNumber = $diskNumber
+                            BcdPath = $bcdPath
+                            LoaderGuid = $defaultId
+                            Device = $originalDevice
+                            OsDevice = $originalOsDevice
+                            SourceIdentityChanged = $false
+                        }
+                    }
 
                     # Enable only the settings required by Microsoft's offline SAC procedure.
                     # Typed WMI setters update only the requested elements. For Gen2, the source
