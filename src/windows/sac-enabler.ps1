@@ -19,12 +19,14 @@
 .NOTES
     Name:        sac-enabler.ps1
     Author:      Tony.Mocanu@Microsoft.com
-    Last Modified: 2026-08-05
-    Version:     1.5.8
+    Last Modified: 2026-08-06
+    Version:     1.5.9
     Requirement: Azure repair VM with an attached Windows OS disk
     DeployMode:  az vm repair run (with --run-on-repair)
     
     .VERSION
+    v1.5.9: [August 2026] - Refuses to rewrite a collision-offlined GPT disk identity.
+                            - Requires a non-colliding repair OS disk or matching-generation nested repair for Gen2.
     v1.5.8: [August 2026] - Rebinds embedded BCD WMI results through their documented key properties.
                             - Avoids invalid ManagementBaseObject-to-ManagementObject casts.
     v1.5.7: [August 2026] - Uses typed BCD WMI element setters instead of BCDEdit for writes.
@@ -433,7 +435,7 @@ function Log-Debug {
 }
 
 # Structured telemetry is written through the existing dual-write logging path.
-$script:RepairScriptVersion = '1.5.8'
+$script:RepairScriptVersion = '1.5.9'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 $script:LastCommand = $null
@@ -651,7 +653,7 @@ $changedCount = 0
 $collisionDiskRecords = @()
 
 Log-Info "Starting repair-only SAC enabler. Logs: $logFile"
-Log-Info "Build marker: v1.5.8-bcd-wmi-key-rebind"
+Log-Info "Build marker: v1.5.9-gpt-collision-fail-closed"
 
 # VMRepairMint telemetry marker
 Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersion)"
@@ -659,7 +661,7 @@ Log-Info "[script_start] Script=sac-enabler Version=$($script:RepairScriptVersio
 Write-SacTelemetry -Event Start -Message 'script_start' -Properties @{
     ScriptName = 'sac-enabler.ps1'
     ScriptVersion = $script:RepairScriptVersion
-    BuildMarker = 'v1.5.8-bcd-wmi-key-rebind'
+    BuildMarker = 'v1.5.9-gpt-collision-fail-closed'
     StartTimeUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -721,9 +723,9 @@ try {
         Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
     }
 
-    # Get-Disk-Partitions onlines every Microsoft Virtual Disk. Prepare any
-    # colliding attached disk with a temporary identity first, then restore the
-    # exact original identity in the outer finally block before repair restore.
+    # Get-Disk-Partitions onlines every Microsoft Virtual Disk. A temporary MBR
+    # signature is retained for the boot-tested Gen1 path. Never rewrite a GPT
+    # disk GUID: a later restoration does not make that host online cycle boot-safe.
     $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
         Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
         ForEach-Object { [int]$_.Index })
@@ -734,16 +736,22 @@ try {
     })
     foreach ($collisionDisk in $collisionDisks) {
         $originalIdentity = Get-SacDiskIdentity -DiskNumber $collisionDisk.Number
-        if ($originalIdentity.PartitionStyle -eq 'MBR') {
-            do {
-                $temporaryValue = ([Convert]::ToUInt32(([guid]::NewGuid().ToString('N').Substring(0, 8)), 16)).ToString('X8')
-            } while ($temporaryValue -eq '00000000' -or $temporaryValue -ieq $originalIdentity.Value)
-            $temporaryDiskPartValue = $temporaryValue
+        if ($originalIdentity.PartitionStyle -eq 'GPT') {
+            $failureReason = "Disk $($collisionDisk.Number) is a collision-offlined GPT disk. Refusing to change its GPT disk GUID because the temporary-identity online cycle is not boot-safe for Gen2. Recreate the repair VM with an OS image whose disk identity does not collide, or keep this disk offline on the repair host and modify it from a matching-generation nested VM."
+            Write-SacTelemetry -Event Error -Message 'Unsafe GPT identity collision detected' -Properties @{
+                DiskNumber = [int]$collisionDisk.Number
+                PartitionStyle = $originalIdentity.PartitionStyle
+                OfflineReason = [string]$collisionDisk.OfflineReason
+                OriginalIdentity = $originalIdentity.Value
+                IdentityChanged = $false
+            }
+            throw $failureReason
         }
-        else {
-            $temporaryValue = ([guid]::NewGuid()).ToString('D')
-            $temporaryDiskPartValue = $temporaryValue
-        }
+
+        do {
+            $temporaryValue = ([Convert]::ToUInt32(([guid]::NewGuid().ToString('N').Substring(0, 8)), 16)).ToString('X8')
+        } while ($temporaryValue -eq '00000000' -or $temporaryValue -ieq $originalIdentity.Value)
+        $temporaryDiskPartValue = $temporaryValue
 
         $record = [pscustomobject]@{
             DiskNumber = [int]$collisionDisk.Number
