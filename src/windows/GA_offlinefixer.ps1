@@ -11,8 +11,9 @@
     4. Identifies the primary and backup ControlSets (001/002) from the Select key.
     5. Exports healthy service keys (WindowsAzureGuestAgent, WindowsAzureTelemetryService, RdAgent)
        from the rescue VM and injects them into both ControlSets on the target hive.
-    6. Verifies the ImagePath value was written correctly.
-    7. Copies the latest GuestAgent installation folder from the rescue VM to the attached disk.
+     6. Verifies both required services use automatic startup and have non-empty ImagePath values.
+     7. Copies the latest GuestAgent installation folder, or the documented ImagePath folder fallback,
+         and verifies the exact executables referenced by both required services.
     8. Releases handles and safely unloads the registry hive (with retry logic).
 
 .NOTES
@@ -73,16 +74,17 @@ Get-ChildItem F:\WindowsAzure\GuestAgent_* | Rename-Item -NewName { $_.Name + '_
 .VERIFICATION
     1. Check the log file for success:
 Get-ChildItem "$env:USERPROFILE\Desktop\GA_offlinefixer_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
-    Expected: "VMAgent Fix completed and verified successfully." and return code 0 ($STATUS_SUCCESS).
+    Expected: "VMAgent offline repair completed" and return code 0 ($STATUS_SUCCESS).
+    This verifies only the offline registry and file repair. Agent readiness must be verified after restore and boot.
     2. Reload the SYSTEM hive and verify agent service keys exist (replace F with disk letter):
 reg load HKLM\VERIFY F:\Windows\System32\config\SYSTEM
 Get-ItemProperty -Path "HKLM:\VERIFY\ControlSet001\Services\WindowsAzureGuestAgent" -Name ImagePath
 Get-ItemProperty -Path "HKLM:\VERIFY\ControlSet001\Services\RdAgent" -Name ImagePath
 reg unload HKLM\VERIFY
-    Expected: ImagePath values are populated for both services.
+    Expected: ImagePath values are populated and Start is 2 for both services.
     3. Verify GuestAgent binaries were copied to the target disk:
 Get-ChildItem F:\WindowsAzure\GuestAgent_*
-    Expected: One or more GuestAgent folders present.
+    Expected: The exact executables referenced by both service ImagePath values are present and non-empty.
 #>
 
 # Initialization (path-validated)
@@ -196,6 +198,30 @@ function Invoke-CriticalCommand {
         ExitCode = $exitCode
         Output = @($output)
     }
+}
+
+function Get-GaServiceExecutablePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ImagePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDriveLetter
+    )
+
+    $expandedImagePath = [Environment]::ExpandEnvironmentVariables($ImagePath).Trim()
+    $executablePath = if ($expandedImagePath.StartsWith('"')) {
+        ($expandedImagePath -split '"')[1]
+    }
+    else {
+        ($expandedImagePath -split '\s+')[0]
+    }
+
+    if ([string]::IsNullOrWhiteSpace($executablePath) -or $executablePath -notmatch '^[A-Za-z]:\\') {
+        throw "Service ImagePath '$ImagePath' does not contain an absolute executable path."
+    }
+
+    return ($executablePath -replace '^[A-Za-z]:', "${TargetDriveLetter}:")
 }
 
 function Get-AvailableTempDriveLetter {
@@ -781,15 +807,23 @@ try {
                 }
             }
 
-            # Step 6 - Verify the ImagePath value was written correctly
-            $wagaPath = "HKLM\$hiveName\$primarySet\Services\WindowsAzureGuestAgent"
-            $afterImagePath = (Get-ItemProperty -Path "Registry::$wagaPath" -ErrorAction SilentlyContinue).ImagePath
-            if ([string]::IsNullOrWhiteSpace($afterImagePath)) {
-                Log-Warning "Verification Warning on $($diskb): VMAgent ImagePath is empty after injection."
+            # Step 6 - Validate the required service configuration written to the target hive.
+            $requiredAgentServices = @('WindowsAzureGuestAgent', 'RdAgent')
+            $targetServiceConfigurations = @{}
+            foreach ($requiredService in $requiredAgentServices) {
+                $servicePath = "Registry::HKLM\$hiveName\$primarySet\Services\$requiredService"
+                $serviceConfiguration = Get-ItemProperty -Path $servicePath -ErrorAction Stop
+                if ([string]::IsNullOrWhiteSpace([string]$serviceConfiguration.ImagePath)) {
+                    throw "Required service '$requiredService' has an empty ImagePath in $primarySet."
+                }
+                if ([int]$serviceConfiguration.Start -ne 2) {
+                    throw "Required service '$requiredService' is not configured for automatic startup in ${primarySet} (Start=$($serviceConfiguration.Start))."
+                }
+
+                $targetServiceConfigurations[$requiredService] = $serviceConfiguration
+                Log-Info "Validated $requiredService configuration in ${primarySet}: Start=2, ImagePath=$($serviceConfiguration.ImagePath)"
             }
-            else {
-                Log-Info "Verification Success on $($diskb):: ImagePath is now $afterImagePath"
-            }
+            $afterImagePath = [string]$targetServiceConfigurations['WindowsAzureGuestAgent'].ImagePath
 
             # Step 7 - Copy only the current VM Agent installation folder.
             $sourcePath = "C:\WindowsAzure"
@@ -815,7 +849,7 @@ try {
                 Log-Info "Selected latest VM Agent installation folder $($sourceAgentFolder.Name)."
             }
             else {
-                $expandedImagePath = [Environment]::ExpandEnvironmentVariables([string]$afterImagePath).Trim()
+                $expandedImagePath = [Environment]::ExpandEnvironmentVariables($afterImagePath).Trim()
                 $imageExecutable = if ($expandedImagePath.StartsWith('"')) {
                     ($expandedImagePath -split '"')[1]
                 }
@@ -852,14 +886,18 @@ try {
             if ($restoreCopyResult.ExitCode -ge 8) {
                 throw "Failed to copy VM Agent folder to $($diskb): $($restoreCopyResult.Output -join '; ')"
             }
-            $sourceAgentFile = Get-ChildItem -LiteralPath $sourceAgentFolder.FullName -File -Recurse -Force -ErrorAction Stop |
-                Select-Object -First 1
-            if (-not $sourceAgentFile) {
-                throw "Source VM Agent folder '$($sourceAgentFolder.FullName)' contains no files."
-            }
-            $relativeAgentFile = $sourceAgentFile.FullName.Substring($sourceAgentFolder.FullName.Length).TrimStart('\')
-            if (-not (Test-Path -LiteralPath (Join-Path $targetAgentFolder $relativeAgentFile) -PathType Leaf)) {
-                throw "VM Agent folder copy verification failed for '$relativeAgentFile'."
+            foreach ($requiredService in $requiredAgentServices) {
+                $targetExecutable = Get-GaServiceExecutablePath `
+                    -ImagePath ([string]$targetServiceConfigurations[$requiredService].ImagePath) `
+                    -TargetDriveLetter $diskb
+                if (-not (Test-Path -LiteralPath $targetExecutable -PathType Leaf)) {
+                    throw "Required executable for service '$requiredService' was not found after copy: $targetExecutable"
+                }
+                $targetExecutableInfo = Get-Item -LiteralPath $targetExecutable -ErrorAction Stop
+                if ($targetExecutableInfo.Length -le 0) {
+                    throw "Required executable for service '$requiredService' is empty: $targetExecutable"
+                }
+                Log-Info "Validated $requiredService executable at $targetExecutable ($($targetExecutableInfo.Length) bytes)."
             }
 
             $diskChangesCompleted = $true
@@ -933,7 +971,7 @@ try {
 
     Log-Info "Processing summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
     if ($fixedDisks.Count -gt 0) {
-        $successMessage = "VMAgent Fix completed and verified successfully on drives: $($fixedDisks -join ', ') | Host=$($vmMetadata.HostName)"
+        $successMessage = "VMAgent offline repair completed on drives: $($fixedDisks -join ', '). Agent readiness must be verified after restore and boot. | Host=$($vmMetadata.HostName)"
         $script_final_status = $STATUS_SUCCESS
     }
     else {
