@@ -13,8 +13,10 @@
        from the rescue VM and injects them into both ControlSets on the target hive.
      6. Verifies both required services use automatic startup and have non-empty ImagePath values.
      7. Copies the latest GuestAgent installation folder, or the documented ImagePath folder fallback,
-         and verifies the exact executables referenced by both required services.
+         into a staging directory and verifies the exact executables referenced by both required services.
+         The existing Agent folder is restored if activation fails.
     8. Releases handles and safely unloads the registry hive (with retry logic).
+         If processing fails, restores and hash-verifies the original SYSTEM hive.
 
 .NOTES
     Name:    GA_offlinefixer.ps1
@@ -26,6 +28,8 @@
     v1.3: [August 2026] - Copies only the newest versioned GuestAgent installation folder.
                         - Uses the WindowsAzureGuestAgent ImagePath folder as a fallback.
                         - Preserves unrelated content in the target WindowsAzure folder.
+                        - Stages and validates replacement files before moving the existing Agent folder.
+                        - Rolls back the Agent folder and SYSTEM hive after partial repair failures.
                         - Bounds file-copy retries to avoid client repair jobs appearing stuck.
                         - Unloads only stale repair hives that actually exist.
                         - Uses the same partition discovery and collision handling as win-sac-onLatest.
@@ -54,19 +58,16 @@
     v0.1: Initial commit. This was the version 1.0 of the script.
 
 .SCENARIO_RECREATION
-    To recreate a testable broken Guest Agent scenario on a rescue VM with an attached OS disk:
-    1. Create a test VM in Azure and attach its OS disk to a rescue VM.
-    2. Load the SYSTEM hive from the attached disk (replace F with actual drive letter):
-reg load HKLM\TESTBREAK F:\Windows\System32\config\SYSTEM
-    3. Delete or corrupt the Guest Agent service keys:
-Remove-Item -Path "HKLM:\TESTBREAK\ControlSet001\Services\WindowsAzureGuestAgent" -Recurse -Force
-Remove-Item -Path "HKLM:\TESTBREAK\ControlSet001\Services\RdAgent" -Recurse -Force
-    4. Unload the hive:
-reg unload HKLM\TESTBREAK
-    5. Optionally rename/remove GuestAgent binary folders on the target disk:
-Get-ChildItem F:\WindowsAzure\GuestAgent_* | Rename-Item -NewName { $_.Name + '_BACKUP' }
-    6. Run the script. It should restore service keys from the rescue VM and copy binaries.
-    7. Verify via the .VERIFICATION steps below.
+    Use only on a disposable test VM with a snapshot or recoverable OS disk.
+    Run GA_offlinefixer_testbreaker.ps1 on the healthy test VM before detaching its OS disk:
+.\GA_offlinefixer_testbreaker.ps1 -Mode Break -ConfirmDestructiveTest
+    The breaker exports both required service keys and moves C:\WindowsAzure into a timestamped
+    backup. It intentionally preserves the Agent SOFTWARE keys and C:\Packages because those
+    artifacts are outside this fixer's documented offline recovery scope.
+    To undo the test without running the offline fixer:
+.\GA_offlinefixer_testbreaker.ps1 -Mode Restore -BackupPath 'C:\GAOfflineRepairTestBackups\<timestamp>'
+    After creating the test state, shut down the VM, run the offline fixer through VM Repair,
+    restore the repaired OS disk, boot the VM, and complete the .VERIFICATION checks below.
 
 .EXAMPLE
     az vm repair run -g <rg> -n <vm> --run-id win-GA-fix --run-on-repair
@@ -694,6 +695,8 @@ try {
         $hiveName = "BROKENSYSTEM_$diskb"
         $hiveSource = "$($diskb):\Windows\System32\config\SYSTEM"
         $hiveCopy = $null
+        $backupFile = $null
+        $restoreHiveBackup = $false
         $diskProcessedSuccessfully = $false
         $diskChangesCompleted = $false
         & reg.exe unload "HKLM\$hiveName" 2>$null
@@ -871,39 +874,72 @@ try {
 
             $null = New-Item -Path $destPath -ItemType Directory -Force
             $targetAgentFolder = Join-Path $destPath $sourceAgentFolder.Name
-            if (Test-Path -LiteralPath $targetAgentFolder) {
-                $null = New-Item -Path $backupPath -ItemType Directory -Force
-                $targetAgentBackup = Join-Path $backupPath "$($sourceAgentFolder.Name)_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-                Log-Info "Moving existing $($sourceAgentFolder.Name) folder to $targetAgentBackup..."
-                Move-Item -LiteralPath $targetAgentFolder -Destination $targetAgentBackup -ErrorAction Stop
-            }
+            $stagingAgentFolder = Join-Path $destPath ('.GA_repair_{0}_{1}' -f $sourceAgentFolder.Name, [guid]::NewGuid().ToString('N'))
+            $targetAgentBackup = $null
+            $existingAgentMoved = $false
 
-            Log-Info "Copying VM Agent folder $($sourceAgentFolder.FullName) to $targetAgentFolder..."
-            $restoreCopyResult = Invoke-CriticalCommand -Command "robocopy.exe" -Arguments @(
-                $sourceAgentFolder.FullName, $targetAgentFolder, '/E', '/COPY:DAT', '/DCOPY:DAT',
-                '/XJ', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP'
-            ) -Description "robocopy VM Agent $($sourceAgentFolder.Name) ($diskb)"
-            if ($restoreCopyResult.ExitCode -ge 8) {
-                throw "Failed to copy VM Agent folder to $($diskb): $($restoreCopyResult.Output -join '; ')"
+            try {
+                Log-Info "Staging VM Agent folder $($sourceAgentFolder.FullName) at $stagingAgentFolder..."
+                $restoreCopyResult = Invoke-CriticalCommand -Command "robocopy.exe" -Arguments @(
+                    $sourceAgentFolder.FullName, $stagingAgentFolder, '/E', '/COPY:DAT', '/DCOPY:DAT',
+                    '/XJ', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP'
+                ) -Description "robocopy VM Agent $($sourceAgentFolder.Name) ($diskb)"
+                if ($restoreCopyResult.ExitCode -ge 8) {
+                    throw "Failed to stage VM Agent folder on $($diskb): $($restoreCopyResult.Output -join '; ')"
+                }
+
+                foreach ($requiredService in $requiredAgentServices) {
+                    $targetExecutable = Get-GaServiceExecutablePath `
+                        -ImagePath ([string]$targetServiceConfigurations[$requiredService].ImagePath) `
+                        -TargetDriveLetter $diskb
+                    $targetAgentPrefix = $targetAgentFolder.TrimEnd('\') + '\'
+                    if (-not $targetExecutable.StartsWith($targetAgentPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw "Required service '$requiredService' points outside the selected Agent folder: $targetExecutable"
+                    }
+
+                    $relativeExecutable = $targetExecutable.Substring($targetAgentPrefix.Length)
+                    $stagedExecutable = Join-Path $stagingAgentFolder $relativeExecutable
+                    if (-not (Test-Path -LiteralPath $stagedExecutable -PathType Leaf)) {
+                        throw "Required executable for service '$requiredService' was not found in the staged copy: $stagedExecutable"
+                    }
+                    $stagedExecutableInfo = Get-Item -LiteralPath $stagedExecutable -ErrorAction Stop
+                    if ($stagedExecutableInfo.Length -le 0) {
+                        throw "Required executable for service '$requiredService' is empty in the staged copy: $stagedExecutable"
+                    }
+                    Log-Info "Validated staged $requiredService executable ($($stagedExecutableInfo.Length) bytes)."
+                }
+
+                if (Test-Path -LiteralPath $targetAgentFolder) {
+                    $null = New-Item -Path $backupPath -ItemType Directory -Force
+                    $targetAgentBackup = Join-Path $backupPath "$($sourceAgentFolder.Name)_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                    Log-Info "Moving existing $($sourceAgentFolder.Name) folder to $targetAgentBackup..."
+                    Move-Item -LiteralPath $targetAgentFolder -Destination $targetAgentBackup -ErrorAction Stop
+                    $existingAgentMoved = $true
+                }
+
+                Move-Item -LiteralPath $stagingAgentFolder -Destination $targetAgentFolder -ErrorAction Stop
+                Log-Info "Activated validated VM Agent folder at $targetAgentFolder."
             }
-            foreach ($requiredService in $requiredAgentServices) {
-                $targetExecutable = Get-GaServiceExecutablePath `
-                    -ImagePath ([string]$targetServiceConfigurations[$requiredService].ImagePath) `
-                    -TargetDriveLetter $diskb
-                if (-not (Test-Path -LiteralPath $targetExecutable -PathType Leaf)) {
-                    throw "Required executable for service '$requiredService' was not found after copy: $targetExecutable"
+            catch {
+                $activationError = $_
+                if (Test-Path -LiteralPath $stagingAgentFolder) {
+                    Remove-Item -LiteralPath $stagingAgentFolder -Recurse -Force -ErrorAction SilentlyContinue
                 }
-                $targetExecutableInfo = Get-Item -LiteralPath $targetExecutable -ErrorAction Stop
-                if ($targetExecutableInfo.Length -le 0) {
-                    throw "Required executable for service '$requiredService' is empty: $targetExecutable"
+                if ($existingAgentMoved -and $targetAgentBackup) {
+                    if (Test-Path -LiteralPath $targetAgentFolder) {
+                        Remove-Item -LiteralPath $targetAgentFolder -Recurse -Force -ErrorAction Stop
+                    }
+                    Move-Item -LiteralPath $targetAgentBackup -Destination $targetAgentFolder -ErrorAction Stop
+                    Log-Warning "Restored the original VM Agent folder after replacement failed."
                 }
-                Log-Info "Validated $requiredService executable at $targetExecutable ($($targetExecutableInfo.Length) bytes)."
+                throw $activationError
             }
 
             $diskChangesCompleted = $true
         }
         catch {
             Log-Error "Failed to process $($diskb):: $($_.Exception.Message)"
+            $restoreHiveBackup = $true
             $diskProcessedSuccessfully = $false
         }
         finally {
@@ -925,13 +961,35 @@ try {
                 $failedDisks += $diskb
             }
 
-            # If we used the copy fallback, copy the modified hive back to the original location
-            if ($hiveCopy -and (Test-Path $hiveCopy)) {
+            if ($restoreHiveBackup -and $backupFile -and (Test-Path -LiteralPath $backupFile)) {
+                if ($unloaded) {
+                    Log-Warning "Repair processing failed; restoring the original SYSTEM hive from $backupFile."
+                    try {
+                        $expectedHiveHash = (Get-FileHash -LiteralPath $backupFile -Algorithm SHA256 -ErrorAction Stop).Hash
+                        Copy-Item -LiteralPath $backupFile -Destination $hiveSource -Force -ErrorAction Stop
+                        $actualHiveHash = (Get-FileHash -LiteralPath $hiveSource -Algorithm SHA256 -ErrorAction Stop).Hash
+                        if ($actualHiveHash -ne $expectedHiveHash) {
+                            throw "SYSTEM hive rollback verification failed: backup and restored hashes differ."
+                        }
+                        Log-Info "Original SYSTEM hive restored and verified for $($diskb):."
+                    }
+                    catch {
+                        Log-Error "Failed to restore the original SYSTEM hive on $($diskb):: $($_.Exception.Message)"
+                        $failedDisks += $diskb
+                    }
+                }
+                else {
+                    Log-Error "Original SYSTEM hive for $($diskb): cannot be restored because $hiveName did not unload."
+                    $failedDisks += $diskb
+                }
+            }
+            # If direct loading failed, persist the fallback hive only after every repair check passed.
+            elseif ($hiveCopy -and (Test-Path $hiveCopy)) {
                 if ($unloaded) {
                     Log-Info "Copying modified hive back to $hiveSource..."
                     try {
                         $expectedHiveHash = (Get-FileHash -LiteralPath $hiveCopy -Algorithm SHA256 -ErrorAction Stop).Hash
-                        Copy-Item -Path $hiveCopy -Destination $hiveSource -Force -ErrorAction Stop
+                        Copy-Item -LiteralPath $hiveCopy -Destination $hiveSource -Force -ErrorAction Stop
                         $actualHiveHash = (Get-FileHash -LiteralPath $hiveSource -Algorithm SHA256 -ErrorAction Stop).Hash
                         if ($actualHiveHash -ne $expectedHiveHash) {
                             throw "Hive copy-back verification failed: source and destination SHA256 hashes differ."
@@ -947,6 +1005,9 @@ try {
                     Log-Error "Modified fallback hive for $($diskb): cannot be copied back because $hiveName did not unload."
                     $failedDisks += $diskb
                 }
+            }
+
+            if ($hiveCopy -and (Test-Path -LiteralPath $hiveCopy)) {
                 Remove-Item $hiveCopy -Force -ErrorAction SilentlyContinue
             }
 
