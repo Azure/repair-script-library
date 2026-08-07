@@ -5,7 +5,7 @@
 .DESCRIPTION
     This script runs from a rescue VM to repair a broken Azure Guest Agent on an attached OS disk.
     It performs the following steps:
-    1. Enumerates partitions only on validated attached repair disks to locate the faulty OS drive.
+    1. Uses the shared repair-library partition helper to locate the faulty OS drive.
     2. Loads the SYSTEM registry hive from the target disk into HKLM\BROKENSYSTEM.
     3. Creates and verifies a binary backup of the SYSTEM hive before loading it.
     4. Identifies the primary and backup ControlSets (001/002) from the Select key.
@@ -27,9 +27,10 @@
                         - Preserves unrelated content in the target WindowsAzure folder.
                         - Bounds file-copy retries to avoid client repair jobs appearing stuck.
                         - Unloads only stale repair hives that actually exist.
-                        - Avoids broad helper disk onlining and full registry text exports.
-                        - Temporarily resolves attached-disk identity collisions and restores the
-                        - exact original MBR signature or GPT GUID before returning.
+                        - Uses the same partition discovery and collision handling as win-sac-onLatest.
+                        - Preserves the Gen2 source GPT GUID by temporarily changing only the
+                        - matching disposable repair VM OS disk GUID.
+                        - Temporarily changes and restores source identity only for Gen1 MBR disks.
                         - Identifies and excludes the rescue VM OS disk by physical disk number.
                         - Requires an attached Microsoft virtual disk before service or disk disruption.
                         - Groups candidates by physical disk and validates winload plus the SYSTEM hive.
@@ -97,12 +98,25 @@ if ([string]::IsNullOrEmpty($resolvedScriptRoot)) {
 }
 
 $initPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\setup\init.ps1'
+$diskPartitionsPath = Join-Path -Path $resolvedScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
 if (-not (Test-Path -Path $initPath -PathType Leaf)) {
     Write-Error "Missing required dependency: $initPath"
     return 1
 }
 
 . $initPath
+
+if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
+    Log-Error "Missing required dependency: $diskPartitionsPath"
+    return $STATUS_ERROR
+}
+
+. $diskPartitionsPath
+
+if (-not (Get-Command -Name Get-Disk-Partitions -CommandType Function -ErrorAction SilentlyContinue)) {
+    Log-Error "Dependency did not define the required Get-Disk-Partitions function: $diskPartitionsPath"
+    return $STATUS_ERROR
+}
 
 # Log Configuration (desktop log standard)
 $desktopPath = [Environment]::GetFolderPath('Desktop')
@@ -213,6 +227,108 @@ function Invoke-GaDiskPart {
     }
 }
 
+function Get-GaDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$DiskNumber
+    )
+
+    $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
+    if ([string]$disk.PartitionStyle -eq 'MBR') {
+        $signature = [uint32]$disk.Signature
+        return [pscustomobject]@{
+            PartitionStyle = 'MBR'
+            Value = $signature.ToString('X8')
+            DiskPartValue = $signature.ToString('X8')
+        }
+    }
+
+    if ([string]$disk.PartitionStyle -eq 'GPT') {
+        $diskGuid = ([guid]$disk.Guid).ToString('D')
+        return [pscustomobject]@{
+            PartitionStyle = 'GPT'
+            Value = $diskGuid
+            DiskPartValue = $diskGuid
+        }
+    }
+
+    throw "Disk $DiskNumber has unsupported partition style '$($disk.PartitionStyle)'."
+}
+
+function Set-GaTemporarySourceIdentity {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    if ($Record.PartitionStyle -ne 'MBR') {
+        throw 'Temporary source disk identities are permitted only for the Gen1 MBR path.'
+    }
+
+    Invoke-GaDiskPart -Operation 'collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+        'online disk'
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-GaDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw "Disk $($Record.DiskNumber) could not be brought online with its verified temporary identity."
+    }
+}
+
+function Restore-GaOriginalSourceIdentity {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    if ($Record.PartitionStyle -ne 'MBR') {
+        throw 'Source disk identity restoration is permitted only for the Gen1 MBR path.'
+    }
+
+    Invoke-GaDiskPart -Operation 'collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        'offline disk'
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-GaDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if (-not $restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw "Disk $($Record.DiskNumber) did not return to its original offline identity."
+    }
+}
+
+function Set-GaTemporaryRepairDiskIdentity {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    Invoke-GaDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-GaDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw 'The repair VM OS disk did not retain a verified temporary GPT identity.'
+    }
+}
+
+function Restore-GaRepairDiskIdentity {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    Invoke-GaDiskPart -Operation 'repair-host-collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-GaDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw 'The repair VM OS disk did not return to its original GPT identity.'
+    }
+}
+
 # Status Tracking
 $script_final_status = $STATUS_ERROR
 $serviceStates = @{}  # Track original service states for restoration
@@ -221,7 +337,9 @@ $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
 $temporaryOsMounts = @()
-$temporaryDiskIdentities = @()
+$collisionDiskRecords = @()
+$gptCollisionDiskNumbers = @()
+$repairDiskIdentityRecord = $null
 $successMessage = $null
 
 # Local execution context for diagnostic logging. No data is transmitted off-box.
@@ -300,7 +418,8 @@ try {
         throw "CRITICAL SAFETY CHECK FAILED: Could not identify the rescue VM OS disk from $($env:SystemDrive)."
     }
     $rescueDiskNum = [int]$rescueOsPartition.DiskNumber
-    Log-Info "Rescue VM OS disk identified as physical Disk $rescueDiskNum."
+    $repairDiskIdentity = Get-GaDiskIdentity -DiskNumber $rescueDiskNum
+    Log-Info "Rescue VM OS disk identified as physical Disk $rescueDiskNum ($($repairDiskIdentity.PartitionStyle))."
 
     # Azure rescue VMs can place the pagefile on a separate temporary resource disk.
     # Windows treats that disk as critical even though it is not the rescue OS disk.
@@ -336,68 +455,84 @@ try {
         $_.IsOffline -and [string]$_.OfflineReason -eq 'Collision'
     })
     foreach ($collisionDisk in $collisionDisks) {
-        $diskNumber = [int]$collisionDisk.Number
-        $partitionStyle = [string]$collisionDisk.PartitionStyle
-        if ($partitionStyle -notin @('GPT', 'MBR')) {
-            throw "Disk $diskNumber has identity collision with unsupported partition style '$partitionStyle'."
-        }
-
-        $identityRecord = [pscustomobject]@{
-            DiskNumber = $diskNumber
-            PartitionStyle = $partitionStyle
-            OriginalGuid = [string]$collisionDisk.Guid
-            OriginalSignature = $collisionDisk.Signature
-            OriginalIsOffline = [bool]$collisionDisk.IsOffline
-            TemporaryGuid = $null
-            TemporarySignature = $null
-        }
-        $temporaryDiskIdentities += $identityRecord
-
-        if ($partitionStyle -eq 'GPT') {
-            if ([string]::IsNullOrWhiteSpace($identityRecord.OriginalGuid)) {
-                throw "Cannot preserve the original GPT GUID for collision Disk $diskNumber."
+        $originalIdentity = Get-GaDiskIdentity -DiskNumber $collisionDisk.Number
+        if ($originalIdentity.PartitionStyle -eq 'GPT') {
+            if ($repairDiskIdentity.PartitionStyle -ne 'GPT' -or $repairDiskIdentity.Value -ine $originalIdentity.Value) {
+                throw "Disk $($collisionDisk.Number) reports a GPT identity collision, but its GUID does not match the repair VM OS disk. Refusing an unverified identity change."
             }
-            do {
-                $identityRecord.TemporaryGuid = ([guid]::NewGuid()).ToString('B')
-            } while (Get-Disk -ErrorAction Stop | Where-Object {
-                [string]$_.Guid -ieq [string]$identityRecord.TemporaryGuid
-            })
-            Log-Warning "Disk $diskNumber has a GPT identity collision. Assigning a temporary GUID for offline repair."
-            Set-Disk -Number $diskNumber -Guid $identityRecord.TemporaryGuid -ErrorAction Stop
-        }
-        else {
-            if ($null -eq $identityRecord.OriginalSignature) {
-                throw "Cannot preserve the original MBR signature for collision Disk $diskNumber."
+
+            if (-not $repairDiskIdentityRecord) {
+                $temporaryRepairGuid = ([guid]::NewGuid()).ToString('D')
+                $repairDiskIdentityRecord = [pscustomobject]@{
+                    DiskNumber = $rescueDiskNum
+                    PartitionStyle = 'GPT'
+                    OriginalValue = $repairDiskIdentity.Value
+                    OriginalDiskPartValue = $repairDiskIdentity.DiskPartValue
+                    TemporaryValue = $temporaryRepairGuid
+                    TemporaryDiskPartValue = $temporaryRepairGuid
+                }
+
+                Log-Warning 'Temporarily changing only the repair VM OS disk GPT identity. The attached source disk GUID will remain unchanged.'
+                Set-GaTemporaryRepairDiskIdentity -Record $repairDiskIdentityRecord
             }
-            do {
-                $signatureBytes = New-Object byte[] 4
-                [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($signatureBytes)
-                $identityRecord.TemporarySignature = [BitConverter]::ToUInt32($signatureBytes, 0)
-            } while ($identityRecord.TemporarySignature -eq 0 -or (Get-Disk -ErrorAction Stop | Where-Object {
-                $_.PartitionStyle -eq 'MBR' -and $_.Signature -eq $identityRecord.TemporarySignature
-            }))
-            Log-Warning "Disk $diskNumber has an MBR identity collision. Assigning a temporary signature for offline repair."
-            Set-Disk -Number $diskNumber -Signature $identityRecord.TemporarySignature -ErrorAction Stop
+
+            $gptCollisionDiskNumbers += [int]$collisionDisk.Number
+            Invoke-GaDiskPart -Operation 'source-gpt-online' -Commands @(
+                "select disk $($collisionDisk.Number)"
+                'online disk'
+            )
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+            $releasedDisk = Get-Disk -Number $collisionDisk.Number -ErrorAction Stop
+            $sourceIdentityAfterRelease = Get-GaDiskIdentity -DiskNumber $collisionDisk.Number
+            if ($releasedDisk.IsOffline -or
+                [string]$releasedDisk.OfflineReason -eq 'Collision' -or
+                $sourceIdentityAfterRelease.Value -ine $originalIdentity.Value) {
+                throw "Disk $($collisionDisk.Number) could not be onlined with its original GPT identity unchanged."
+            }
+
+            Log-Info "Disk $($collisionDisk.Number) collision released; source GPT identity remains $($originalIdentity.Value)."
+            continue
         }
 
-        Set-Disk -Number $diskNumber -IsOffline $false -ErrorAction Stop
-        Set-Disk -Number $diskNumber -IsReadOnly $false -ErrorAction Stop
-        Update-HostStorageCache -ErrorAction SilentlyContinue
-        $updatedCollisionDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
-        $temporaryIdentityVerified = if ($partitionStyle -eq 'GPT') {
-            [string]$updatedCollisionDisk.Guid -ieq [string]$identityRecord.TemporaryGuid
+        do {
+            $temporaryValue = ([Convert]::ToUInt32(([guid]::NewGuid().ToString('N').Substring(0, 8)), 16)).ToString('X8')
+        } while ($temporaryValue -eq '00000000' -or $temporaryValue -ieq $originalIdentity.Value)
+
+        $record = [pscustomobject]@{
+            DiskNumber = [int]$collisionDisk.Number
+            PartitionStyle = $originalIdentity.PartitionStyle
+            OriginalValue = $originalIdentity.Value
+            OriginalDiskPartValue = $originalIdentity.DiskPartValue
+            TemporaryValue = $temporaryValue
+            TemporaryDiskPartValue = $temporaryValue
         }
-        else {
-            [uint32]$updatedCollisionDisk.Signature -eq [uint32]$identityRecord.TemporarySignature
-        }
-        if (-not $temporaryIdentityVerified -or $updatedCollisionDisk.IsOffline) {
-            throw "Temporary identity activation could not be verified for collision Disk $diskNumber."
-        }
-        Log-Info "Disk $diskNumber temporary identity applied and disk brought online. Original identity will be restored during cleanup."
+        $collisionDiskRecords += $record
+
+        Log-Warning "Disk $($record.DiskNumber) is offline due to an identity collision. Applying a temporary MBR identity for this repair run."
+        Set-GaTemporarySourceIdentity -Record $record
+        Log-Info "Disk $($record.DiskNumber) is online with a verified temporary MBR identity."
     }
+
     $attachedDisks = @($attachedDisks | ForEach-Object { Get-Disk -Number $_.Number -ErrorAction Stop })
     $attachedDiskNumbers = @($attachedDisks | Select-Object -ExpandProperty Number)
     Log-Info "Attached repair candidate disk numbers: $($attachedDiskNumbers -join ', ')"
+
+    $partitionlist = @(Get-Disk-Partitions)
+    if ($partitionlist.Count -eq 0) {
+        throw 'Get-Disk-Partitions returned no partitions from Azure virtual disks.'
+    }
+
+    $discoveredDiskNumbers = @($partitionlist | Select-Object -ExpandProperty DiskNumber -Unique)
+    Log-Info "Get-Disk-Partitions discovered disk numbers: $($discoveredDiskNumbers -join ', ')"
+    $targetDiskGroups = @($partitionlist |
+        Where-Object {
+            [int]$_.DiskNumber -in $attachedDiskNumbers -and
+            [int]$_.DiskNumber -notin $protectedDiskNumbers
+        } |
+        Group-Object DiskNumber)
+    if ($targetDiskGroups.Count -eq 0) {
+        throw 'REPAIR-ONLY SCRIPT: The shared partition helper returned no partitions from an attached repair disk.'
+    }
 
     # Pause indexing while attached hives are modified. Defender remains running.
     Log-Info "Stopping Windows Search temporarily to reduce attached-disk file locks..."
@@ -419,25 +554,11 @@ try {
         }
     }
 
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-
-    # Cycle only verified attached Microsoft virtual disks to release file handles.
-    Log-Info "Cycling attached disks offline/online to release file locks..."
-    $attachedDisks | Where-Object { -not $_.IsOffline } | ForEach-Object {
-        $dnum = $_.Number
-        Log-Info "Cycling disk $dnum offline/online..."
-        Set-Disk -Number $dnum -IsOffline $true -ErrorAction Stop
-        Start-Sleep -Seconds 2
-        Set-Disk -Number $dnum -IsOffline $false -ErrorAction Stop
-        Set-Disk -Number $dnum -IsReadOnly $false -ErrorAction Stop
-    }
-    Start-Sleep -Seconds 3
-
     # Step 1 - Find one validated Windows volume on each attached physical disk.
     $targetWindowsVolumes = @()
     $efiGptType = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
-    foreach ($diskNumber in $attachedDiskNumbers) {
+    foreach ($diskGroup in $targetDiskGroups) {
+        $diskNumber = [int]$diskGroup.Name
         $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
         if ($diskPartitions.Count -eq 0) {
             Log-Warning "Attached repair Disk $diskNumber has no partitions."
@@ -847,34 +968,54 @@ finally {
         }
     }
 
-    foreach ($identityRecord in @($temporaryDiskIdentities)) {
+    $identityRestorationFailed = $false
+
+    if ($repairDiskIdentityRecord) {
+        foreach ($diskNumber in @($gptCollisionDiskNumbers | Sort-Object -Unique)) {
+            try {
+                Invoke-GaDiskPart -Operation 'source-before-repair-host-restore' -Commands @(
+                    "select disk $diskNumber"
+                    'offline disk'
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                $sourceDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
+                $sourceIdentity = Get-GaDiskIdentity -DiskNumber $diskNumber
+                if (-not $sourceDisk.IsOffline -or $sourceIdentity.Value -ine $repairDiskIdentityRecord.OriginalValue) {
+                    throw "Source Disk $diskNumber was not offline with its unchanged original GPT identity."
+                }
+                Log-Info "Source Disk $diskNumber is offline with its original GPT identity verified before repair host restoration."
+            }
+            catch {
+                $identityRestorationFailed = $true
+                Log-Error "CRITICAL: Could not safely offline and verify source Disk ${diskNumber}: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $identityRestorationFailed) {
+            try {
+                Restore-GaRepairDiskIdentity -Record $repairDiskIdentityRecord
+                Log-Info 'Repair VM OS disk GPT identity restored and verified.'
+            }
+            catch {
+                $identityRestorationFailed = $true
+                Log-Error "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    foreach ($identityRecord in @($collisionDiskRecords | Sort-Object DiskNumber -Descending)) {
         try {
-            $diskNumber = [int]$identityRecord.DiskNumber
-            Log-Info "Restoring original $($identityRecord.PartitionStyle) identity on Disk $diskNumber."
-            Set-Disk -Number $diskNumber -IsOffline $true -ErrorAction Stop
-            if ($identityRecord.PartitionStyle -eq 'GPT') {
-                Set-Disk -Number $diskNumber -Guid $identityRecord.OriginalGuid -ErrorAction Stop
-            }
-            else {
-                Set-Disk -Number $diskNumber -Signature ([uint32]$identityRecord.OriginalSignature) -ErrorAction Stop
-            }
-            Update-HostStorageCache -ErrorAction SilentlyContinue
-            $restoredDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
-            $identityRestored = if ($identityRecord.PartitionStyle -eq 'GPT') {
-                [string]$restoredDisk.Guid -ieq [string]$identityRecord.OriginalGuid
-            }
-            else {
-                [uint32]$restoredDisk.Signature -eq [uint32]$identityRecord.OriginalSignature
-            }
-            if (-not $identityRestored) {
-                throw "Original disk identity verification failed."
-            }
-            Log-Info "Original $($identityRecord.PartitionStyle) identity restored and verified on Disk $diskNumber; disk left offline for repair restore."
+            Restore-GaOriginalSourceIdentity -Record $identityRecord
+            Log-Info "Disk $($identityRecord.DiskNumber) is offline with its verified original MBR identity restored."
         }
         catch {
+            $identityRestorationFailed = $true
             Log-Error "CRITICAL: Failed to restore original identity on Disk $($identityRecord.DiskNumber): $($_.Exception.Message)"
-            $script_final_status = $STATUS_ERROR
         }
+    }
+
+    if ($identityRestorationFailed) {
+        $script_final_status = $STATUS_ERROR
     }
 
     # Log local execution context only; this script performs no telemetry upload.
