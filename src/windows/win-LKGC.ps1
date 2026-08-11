@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Enables Last Known Good Configuration (LKGC) by incrementing the Select registry values.
+    Restores Last Known Good Configuration (LKGC) on attached Windows OS disks by updating
+    Select values in each offline SYSTEM registry hive.
 
 .DESCRIPTION
     This script runs from a rescue VM to activate LKGC on an attached faulty OS disk.
@@ -15,23 +16,29 @@
     7. Unloads the hive safely using a defensive 3x retry loop with explicit garbage collection.
 
 .NOTES
-    Name:    win-LKGC.ps1
-    Author:  Tony.Mocanu@Microsoft.com
+    Name:          win-LKGC.ps1
+    Author:        Tony.Mocanu@Microsoft.com
+    Last Modified: 2026-08-11
+    Version:       1.3
+    Requirement:   Azure repair VM with an attached Windows OS disk and the VMRepair common helpers
+    DeployMode:    az vm repair run (with --run-on-repair)
+    Telemetry:     Emits structured start, success, output, and error events through the VMRepair logger
 
-.EXAMPLE
-    az vm repair run -g <rg> -n <vm> --run-id win-LKGC --run-on-repair
-
-.VERIFICATION
+    Verification:
     1. Check the log file for success:
 Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
     2. Confirm the presence of the terminal confirmation string:
        "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE"
 
-.VERSION
-    v1.3: [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing 
-                         loop to group by DiskNumber and map drive properties exactly like the 
+    Version history:
+    v1.4: [Aug 2026] - Added structured VMRepair telemetry for LKGC restoration.
+    v1.3: [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing
+                         loop to group by DiskNumber and map drive properties exactly like the
                          validated sac-enabler.ps1 framework.
     v1.2: [May - Jul 2026] - Production Hardening & Handle Updates
+
+.EXAMPLE
+    az vm repair run -g <rg> -n <vm> --run-id win-LKGC --run-on-repair
 .LINK
     How to start Azure Windows VM with Last Known Good Configuration - Virtual Machines | Microsoft Learn
 #>
@@ -93,10 +100,28 @@ function Write-DesktopLogLine {
     }
 }
 
-function Log-Output { Param([PSObject[]]$message) & $script:OriginalLogOutput -message $message; Write-DesktopLogLine -Level 'Output' -Message $message }
+function Log-Output {
+    Param(
+        [PSObject[]]$Message,
+        [hashtable]$Properties
+    )
+    $parameters = @{ Message = $Message }
+    if ($PSBoundParameters.ContainsKey('Properties')) { $parameters.Properties = $Properties }
+    & $script:OriginalLogOutput @parameters
+    Write-DesktopLogLine -Level 'Output' -Message $Message
+}
 function Log-Info { Param([PSObject[]]$message) & $script:OriginalLogInfo -message $message; Write-DesktopLogLine -Level 'Info' -Message $message }
 function Log-Warning { Param([PSObject[]]$message) & $script:OriginalLogWarning -message $message; Write-DesktopLogLine -Level 'Warning' -Message $message }
-function Log-Error { Param([PSObject[]]$message) & $script:OriginalLogError -message $message; Write-DesktopLogLine -Level 'Error' -Message $message }
+function Log-Error {
+    Param(
+        [PSObject[]]$Message,
+        [hashtable]$Properties
+    )
+    $parameters = @{ Message = $Message }
+    if ($PSBoundParameters.ContainsKey('Properties')) { $parameters.Properties = $Properties }
+    & $script:OriginalLogError @parameters
+    Write-DesktopLogLine -Level 'Error' -Message $Message
+}
 function Log-Debug { Param([PSObject[]]$message) & $script:OriginalLogDebug -message $message; Write-DesktopLogLine -Level 'Debug' -Message $message }
 
 Log-Info "Starting AUTO LKGC Script. Desktop log: $logFilePath"
@@ -132,14 +157,14 @@ try {
         $processedCount++
         $diskNumber = $partitionGroup.Name
         $targetOSDrive = $null
-        
+
         Log-Info "Processing Disk $diskNumber"
 
         # Scan each drive letter within this disk group for a valid Windows OS directory
         foreach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter) {
-            if ([string]::IsNullOrWhiteSpace($drive) -or $drive -eq $rescueDrive) { 
+            if ([string]::IsNullOrWhiteSpace($drive) -or $drive -eq $rescueDrive) {
                 $skippedCount++
-                continue 
+                continue
             }
 
             if (Test-Path -Path "$(${drive}):\Windows\System32\config\SYSTEM") {
@@ -158,7 +183,7 @@ try {
 
         $systemHivePath = "$(${targetOSDrive}):\Windows\System32\config\SYSTEM"
         $systemHiveBackup = "$systemHivePath.LKGC.bak.$runTimestamp"
-        
+
         try {
             Copy-Item -LiteralPath $systemHivePath -Destination $systemHiveBackup -Force -ErrorAction Stop
             Log-Info "[$targetOSDrive] SYSTEM hive backup created: $systemHiveBackup"
@@ -173,7 +198,7 @@ try {
         $swHive = "HKLM\BROKENSW_$targetOSDrive"
         $null = & reg.exe unload $swHive 2>&1
         $swLoad = & reg.exe load $swHive "$(${targetOSDrive}):\Windows\System32\config\software" 2>&1
-        
+
         if ($LASTEXITCODE -ne 0) {
             $failedCount++
             Log-Warning "Failed to load SOFTWARE hive from $($targetOSDrive): $($swLoad -join ' | ') - skipping"
@@ -190,7 +215,7 @@ try {
         $sysHive = "HKLM\BROKENSYS_$targetOSDrive"
         $null = & reg.exe unload $sysHive 2>&1
         $sysLoad = & reg.exe load $sysHive $systemHivePath 2>&1
-        
+
         if ($LASTEXITCODE -ne 0) {
             $failedCount++
             Log-Warning "Failed to load SYSTEM hive from $($targetOSDrive): $($sysLoad -join ' | ') - skipping"
@@ -214,6 +239,19 @@ try {
             $failedVal     = [int]$regKey.GetValue('failed')
             $lastKnownGood = [int]$regKey.GetValue('LastKnownGood')
 
+            $before = [PSCustomObject]@{
+                Current       = $currentVal
+                Default       = $defaultVal
+                Failed        = $failedVal
+                LastKnownGood = $lastKnownGood
+            }
+
+            Log-Start -Message "Starting LKGC restoration on drive $targetOSDrive" -Properties @{
+                DiskNumber   = "$diskNumber"
+                TargetDrive  = "$targetOSDrive"
+                SelectBefore = "$($before.Current),$($before.Default),$($before.Failed),$($before.LastKnownGood)"
+            }
+
             Log-Info "[$targetOSDrive] REGISTRY STATE [BEFORE]: Current=$currentVal, Default=$defaultVal, Failed=$failedVal, LKG=$lastKnownGood"
 
             # Step 5 - Evaluate version thresholds using matching AND-logic sequences
@@ -228,6 +266,11 @@ try {
             if ($alreadySet) {
                 Log-Warning "[$targetOSDrive] LKGC WAS ALREADY SET, NO CHANGES DONE"
                 Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
+                Log-Success -Message "LKGC restoration not required on drive $targetOSDrive" -Properties @{
+                    DiskNumber  = "$diskNumber"
+                    TargetDrive = "$targetOSDrive"
+                    Changed     = 'false'
+                }
             }
             else {
                 # Step 6 - Increment configuration spaces via .NET context
@@ -243,7 +286,24 @@ try {
                 $afterFailed  = $regKey.GetValue('failed')
                 $afterLKG     = $regKey.GetValue('LastKnownGood')
 
+                $after = [PSCustomObject]@{
+                    Current       = $afterCurrent
+                    Default       = $afterDefault
+                    Failed        = $afterFailed
+                    LastKnownGood = $afterLKG
+                }
+
                 Log-Info "[$targetOSDrive] REGISTRY STATE [AFTER]: Current=$afterCurrent, Default=$afterDefault, Failed=$afterFailed, LKG=$afterLKG"
+
+                $telemetryProperties = @{
+                    DiskNumber  = "$diskNumber"
+                    TargetDrive = "$targetOSDrive"
+                    SelectAfter = "$($after.Current),$($after.Default),$($after.Failed),$($after.LastKnownGood)"
+                    Changed     = 'true'
+                }
+
+                Log-Output -Message "LKGC APPLIED" -Properties $telemetryProperties
+                Log-Success -Message "LKGC registry values updated on drive $targetOSDrive" -Properties $telemetryProperties
 
                 $lkgcAppliedAny = $true
                 $changedCount++
@@ -255,7 +315,11 @@ try {
         catch {
             $failedCount++
             if ($writeAttempted) { $restoreRequired = $true }
-            Log-Error "[$targetOSDrive] Failed to process registry modifications: $($_.Exception.Message)"
+            Log-Error -Message "[$targetOSDrive] Failed to process registry modifications: $($_.Exception.Message)" -Properties @{
+                DiskNumber    = "$diskNumber"
+                TargetDrive   = "$targetOSDrive"
+                WriteAttempted = "$writeAttempted"
+            }
             Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
         }
         finally {
@@ -275,7 +339,7 @@ try {
                 if ($LASTEXITCODE -eq 0) { $unloaded = $true; break }
                 Start-Sleep -Seconds 5
             }
-            
+
             if (-not $unloaded) { Log-Error "Could not unload $sysHive cleanly." }
 
             if ($restoreRequired) {
@@ -301,6 +365,21 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    $finalTelemetryProperties = @{
+        FinalStatus    = "$script_final_status"
+        DisksProcessed = "$processedCount"
+        DisksChanged   = "$changedCount"
+        DisksSkipped   = "$skippedCount"
+        DisksFailed    = "$failedCount"
+    }
+
+    if ($script_final_status -eq $STATUS_SUCCESS) {
+        Log-Success -Message 'LKGC restoration script completed successfully' -Properties $finalTelemetryProperties
+    }
+    else {
+        Log-Error -Message 'LKGC restoration script completed with errors' -Properties $finalTelemetryProperties
+    }
+
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
     Log-Info "Script ended at $(Get-Date)"
 }
