@@ -1,94 +1,308 @@
 <#
 .SYNOPSIS
-    Enables Last Known Good Configuration (LKGC) and logs registry state changes.
-    Increment Last Known Good Configuration registry values by 1.
-   Public docs: https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/start-vm-last-known-good, #     https://support.microsoft.com/en-us/topic/you-receive-error-stop-error-code-0x0000007b-inaccessible-boot-device-after-you-install-windows-updates-7cc844e4-4daf-a71c-cd23-f99b50d53e31
- 
- .RESOLVES
-   If Windows is not booting correctly due to recently installed software or related changes, modifying the LKGC values 
-   can revert the changes to attempt a successful boot.
-   If you've recently installed new software or changed some Windows settings, and your Azure Windows virtual machine (VM) stops booting correctly, 
-   you might have to start the VM by using the Last Known Good Configuration for troubleshooting. 
-   Created by Tony.Mocanu@Microsoft.com
+    Enables Last Known Good Configuration (LKGC) by incrementing the Select registry values.
+
+.DESCRIPTION
+    This script runs from a rescue VM to activate LKGC on an attached faulty OS disk.
+    Utilizes direct .NET Registry APIs to prevent handle locking and eliminate 0xc0000225 corruptions.
+    It performs the following steps:
+    1. Enumerates attached partitions via Get-Disk-Partitions, grouping by DiskNumber to isolate targets.
+    2. Creates a safety backup of the target SYSTEM hive before modification.
+    3. Loads the SOFTWARE hive temporarily to verify the specific Windows version threshold engine.
+    4. Opens the Select key using explicit .NET API frameworks to avoid provider caching.
+    5. Evaluates threshold logic metrics via strict AND-logic parameters.
+    6. Increments the configuration values (current, default, failed, LastKnownGood) to force LKGC validation.
+    7. Unloads the hive safely using a defensive 3x retry loop with explicit garbage collection.
+
+.NOTES
+    Name:    win-LKGC.ps1
+    Author:  Tony.Mocanu@Microsoft.com
+
+.EXAMPLE
+    az vm repair run -g <rg> -n <vm> --run-id win-LKGC --run-on-repair
+
+.VERIFICATION
+    1. Check the log file for success:
+Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
+    2. Confirm the presence of the terminal confirmation string:
+       "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE"
+
+.VERSION
+    v1.3: [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing 
+                         loop to group by DiskNumber and map drive properties exactly like the 
+                         validated sac-enabler.ps1 framework.
+    v1.2: [May - Jul 2026] - Production Hardening & Handle Updates
+.LINK
+    How to start Azure Windows VM with Last Known Good Configuration - Virtual Machines | Microsoft Learn
 #>
 
-# 1. Import common logic
-. .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\Get-Disk-Partitions.ps1
+# Initialization (path-validated - matching local file layout)
+$initPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\setup\init.ps1'
+$diskPartitionsPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\helpers\Get-Disk-Partitions-v2.ps1'
 
-$logFile = "$env:SystemDrive\Repair-LKGC.log"
-
-try {
-    Log-Info "Starting AUTO LKGC Script..." | Tee-Object -FilePath $logFile -Append
-
-    # 2. Finder for faulty OS letter
-    $diskb = "000"
-    $diskarray = "d","q","w","e","r","t","y","u","i","o","p","s","f","g","h","j","k","l","z","x","v","n","m"
-    foreach ($diskt in $diskarray) {
-        if (Test-Path -Path "$($diskt):\Windows") { $diskb = $diskt; break }
-    }
-
-    if ($diskb -eq "000") {
-        Log-Error "SCRIPT COULD NOT FIND A RESCUE OS DISK ATTACHED" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    # 3. OS Version Peek
-    reg.exe load "HKLM\BROKENSYSTEM" "$($diskb):\Windows\System32\config\software"
-    Start-Sleep -Seconds 2
-    $productName = (Get-ItemProperty -path 'registry::hklm\BROKENSYSTEM\microsoft\windows nt\currentversion').ProductName
-    $winosver = 0
-    if ($productName -match '(\d+)') { $winosver = [int]$matches[1] }
-    reg.exe unload "HKLM\BROKENSYSTEM"
-
-    # 4. Hive loader
-    Log-Info "Loading System hive from $($diskb):..." | Tee-Object -FilePath $logFile -Append
-    reg.exe load "HKU\BROKENSYSTEM" "$($diskb):\Windows\System32\config\SYSTEM"
-    Start-Sleep -Seconds 2
-
-    # 5. Capture "BEFORE" State
-    $selectPath = "Registry::HKU\BROKENSYSTEM\Select"
-    $before = Get-ItemProperty -path $selectPath
-    Log-Info "REGISTRY STATE [BEFORE]: Current=$($before.current), Default=$($before.default), Failed=$($before.failed), LKG=$($before.LastKnownGood)" | Tee-Object -FilePath $logFile -Append
-
-    # 6. Logic Filter
-    $alreadySet = $false
-    if (($winosver -eq 10) -or ($winosver -ge 2016)) {
-        if (($before.current -ge 2) -or ($before.default -ge 2) -or ($before.failed -ge 1) -or ($before.LastKnownGood -ge 2)) { $alreadySet = $true }
-    }
-    elseif ($winosver -eq 2012) {
-        if (($before.current -ge 2) -or ($before.default -ge 2) -or ($before.failed -ge 1) -or ($before.LastKnownGood -ge 3)) { $alreadySet = $true }
-    }
-
-    if ($alreadySet) {
-        reg.exe unload "HKU\BROKENSYSTEM"
-        Log-Warning "LKGC WAS ALREADY SET, NO CHANGES DONE" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    # 7. Apply Changes
-    Log-Info "Applying LKGC increments..." | Tee-Object -FilePath $logFile -Append
-    Set-Itemproperty -path $selectPath -Name 'current' -Type DWORD -value ($before.current + 1)
-    Set-Itemproperty -path $selectPath -Name 'default' -Type DWORD -value ($before.default + 1)
-    Set-Itemproperty -path $selectPath -Name 'failed' -Type DWORD -value ($before.failed + 1)
-    Set-Itemproperty -path $selectPath -Name 'LastKnownGood' -Type DWORD -value ($before.LastKnownGood + 1)
-
-    # 8. Capture "AFTER" State
-    $after = Get-ItemProperty -path $selectPath
-    Log-Info "REGISTRY STATE [AFTER]:  Current=$($after.current), Default=$($after.default), Failed=$($after.failed), LKG=$($after.LastKnownGood)" | Tee-Object -FilePath $logFile -Append
-
-    # 9. Cleanup
-    reg.exe unload "HKU\BROKENSYSTEM"
-    Log-Output "SCRIPT FINISHED PROPERLY, LKGC APPLIED" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
-
+if (-not (Test-Path -Path $initPath -PathType Leaf)) {
+    Write-Error "Missing required dependency: $initPath"
+    return 1
 }
-catch {
-    Log-Error "An unexpected error occurred: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
-    reg.exe unload "HKU\BROKENSYSTEM" 2>$null
-    reg.exe unload "HKLM\BROKENSYSTEM" 2>$null
+
+. $initPath
+
+if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
+    Log-Error "Missing required dependency: $diskPartitionsPath"
     return $STATUS_ERROR
 }
-finally {
-    Log-Info "Script execution ended at $(Get-Date)" | Tee-Object -FilePath $logFile -Append
+
+. $diskPartitionsPath
+
+# Script-level logging: create a plain text desktop log that mirrors Log-* output.
+$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
+$runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$runOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$logFilePath = Join-Path -Path $runOutputDir -ChildPath ("{0}-{1}.log" -f $scriptName, $runTimestamp)
+
+if (-not (Test-Path -Path $runOutputDir -PathType Container)) {
+    New-Item -Path $runOutputDir -ItemType Directory -Force | Out-Null
 }
+
+if (-not (Test-Path -Path $logFilePath -PathType Leaf)) {
+    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
+}
+
+$script:OriginalLogOutput = (Get-Command Log-Output -CommandType Function).ScriptBlock
+$script:OriginalLogInfo = (Get-Command Log-Info -CommandType Function).ScriptBlock
+$script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).ScriptBlock
+$script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
+$script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
+
+function Write-DesktopLogLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Level,
+        [Parameter(Mandatory = $true)]
+        [PSObject[]]$Message
+    )
+    try {
+        $renderedMessage = ($Message | ForEach-Object { "$_" }) -join ' '
+        $line = "[{0} {1}]{2}" -f $Level, (Get-Date), $renderedMessage
+        Add-Content -Path $logFilePath -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        if ($script:OriginalLogWarning) {
+            & $script:OriginalLogWarning -message "Failed to append to desktop log '$logFilePath': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Log-Output { Param([PSObject[]]$message) & $script:OriginalLogOutput -message $message; Write-DesktopLogLine -Level 'Output' -Message $message }
+function Log-Info { Param([PSObject[]]$message) & $script:OriginalLogInfo -message $message; Write-DesktopLogLine -Level 'Info' -Message $message }
+function Log-Warning { Param([PSObject[]]$message) & $script:OriginalLogWarning -message $message; Write-DesktopLogLine -Level 'Warning' -Message $message }
+function Log-Error { Param([PSObject[]]$message) & $script:OriginalLogError -message $message; Write-DesktopLogLine -Level 'Error' -Message $message }
+function Log-Debug { Param([PSObject[]]$message) & $script:OriginalLogDebug -message $message; Write-DesktopLogLine -Level 'Debug' -Message $message }
+
+Log-Info "Starting AUTO LKGC Script. Desktop log: $logFilePath"
+
+# Status Tracking
+$script_final_status = $STATUS_ERROR
+$lkgcAppliedAny = $false
+$processedCount = 0
+$skippedCount = 0
+$failedCount = 0
+$changedCount = 0
+
+try {
+    # Check if the Hyper-V module is available before performing nested VM checks
+    if (Get-Module -ListAvailable -Name Hyper-V) {
+        $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+        if ($guestHyperVVirtualMachine -and $guestHyperVVirtualMachine.State -eq 'Running') {
+            Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
+            try { Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force } catch { Log-Warning "Failed to stop nested guest VM" }
+        }
+    } else {
+        Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
+    }
+
+    # Step 1 - Enumerate and Group partitions matching the sac-enabler architecture
+    $partitionlist = Get-Disk-Partitions
+    $rescueDrive = $env:SystemDrive -replace ':', ''
+    $fixedDisks = @()
+
+    Log-Info 'Enumerating disk partitions for LKGC analysis...'
+
+    foreach ($partitionGroup in $partitionlist | Group-Object DiskNumber) {
+        $processedCount++
+        $diskNumber = $partitionGroup.Name
+        $targetOSDrive = $null
+        
+        Log-Info "Processing Disk $diskNumber"
+
+        # Scan each drive letter within this disk group for a valid Windows OS directory
+        foreach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter) {
+            if ([string]::IsNullOrWhiteSpace($drive) -or $drive -eq $rescueDrive) { 
+                $skippedCount++
+                continue 
+            }
+
+            if (Test-Path -Path "$(${drive}):\Windows\System32\config\SYSTEM") {
+                $targetOSDrive = $drive
+                break
+            }
+        }
+
+        if (-not $targetOSDrive) {
+            Log-Info "Disk $diskNumber skipped: no valid attached OS partition containing \Windows found."
+            $skippedCount++
+            continue
+        }
+
+        Log-Info "Target OS partition successfully matched on letter: $($targetOSDrive):"
+
+        $systemHivePath = "$(${targetOSDrive}):\Windows\System32\config\SYSTEM"
+        $systemHiveBackup = "$systemHivePath.LKGC.bak.$runTimestamp"
+        
+        try {
+            Copy-Item -LiteralPath $systemHivePath -Destination $systemHiveBackup -Force -ErrorAction Stop
+            Log-Info "[$targetOSDrive] SYSTEM hive backup created: $systemHiveBackup"
+        }
+        catch {
+            $failedCount++
+            Log-Error "[$targetOSDrive] Failed to create SYSTEM hive backup. Skipping disk. Error: $($_.Exception.Message)"
+            continue
+        }
+
+        # Step 2 - Load the SOFTWARE hive to detect the Windows version
+        $swHive = "HKLM\BROKENSW_$targetOSDrive"
+        $null = & reg.exe unload $swHive 2>&1
+        $swLoad = & reg.exe load $swHive "$(${targetOSDrive}):\Windows\System32\config\software" 2>&1
+        
+        if ($LASTEXITCODE -ne 0) {
+            $failedCount++
+            Log-Warning "Failed to load SOFTWARE hive from $($targetOSDrive): $($swLoad -join ' | ') - skipping"
+            continue
+        }
+
+        Start-Sleep -Seconds 2
+        $productName = (Get-ItemProperty -path "registry::$swHive\microsoft\windows nt\currentversion" -ErrorAction SilentlyContinue).ProductName
+        $winosver = 0
+        if ($productName -match '(\d+)') { $winosver = [int]$matches[1] }
+        $null = & reg.exe unload $swHive 2>&1
+
+        # Step 3 - Load the SYSTEM hive from the target disk
+        $sysHive = "HKLM\BROKENSYS_$targetOSDrive"
+        $null = & reg.exe unload $sysHive 2>&1
+        $sysLoad = & reg.exe load $sysHive $systemHivePath 2>&1
+        
+        if ($LASTEXITCODE -ne 0) {
+            $failedCount++
+            Log-Warning "Failed to load SYSTEM hive from $($targetOSDrive): $($sysLoad -join ' | ') - skipping"
+            continue
+        }
+
+        Start-Sleep -Seconds 2
+
+        $writeAttempted = $false
+        $restoreRequired = $false
+        $subKeyPath = "BROKENSYS_$targetOSDrive\Select"
+        $regKey = $null
+
+        try {
+            # Step 4 - Open via direct .NET API to eliminate PowerShell registry caching engine bugs
+            $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath, $true)
+            if ($null -eq $regKey) { throw "Failed to open Select key via explicit .NET path: HKLM:\$subKeyPath" }
+
+            $currentVal    = [int]$regKey.GetValue('current')
+            $defaultVal    = [int]$regKey.GetValue('default')
+            $failedVal     = [int]$regKey.GetValue('failed')
+            $lastKnownGood = [int]$regKey.GetValue('LastKnownGood')
+
+            Log-Info "[$targetOSDrive] REGISTRY STATE [BEFORE]: Current=$currentVal, Default=$defaultVal, Failed=$failedVal, LKG=$lastKnownGood"
+
+            # Step 5 - Evaluate version thresholds using matching AND-logic sequences
+            $alreadySet = $false
+            if (($winosver -eq 10) -or ($winosver -ge 2016)) {
+                if (($currentVal -ge 2) -and ($defaultVal -ge 2) -and ($failedVal -ge 1) -and ($lastKnownGood -ge 2)) { $alreadySet = $true }
+            }
+            elseif ($winosver -eq 2012) {
+                if (($currentVal -ge 2) -and ($defaultVal -ge 2) -and ($failedVal -ge 1) -and ($lastKnownGood -ge 3)) { $alreadySet = $true }
+            }
+
+            if ($alreadySet) {
+                Log-Warning "[$targetOSDrive] LKGC WAS ALREADY SET, NO CHANGES DONE"
+                Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
+            }
+            else {
+                # Step 6 - Increment configuration spaces via .NET context
+                $writeAttempted = $true
+                $regKey.SetValue('current', ($currentVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('default', ($defaultVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('failed', ($failedVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('LastKnownGood', ($lastKnownGood + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+
+                # Step 7 - Validate downstream configurations
+                $afterCurrent = $regKey.GetValue('current')
+                $afterDefault = $regKey.GetValue('default')
+                $afterFailed  = $regKey.GetValue('failed')
+                $afterLKG     = $regKey.GetValue('LastKnownGood')
+
+                Log-Info "[$targetOSDrive] REGISTRY STATE [AFTER]: Current=$afterCurrent, Default=$afterDefault, Failed=$afterFailed, LKG=$afterLKG"
+
+                $lkgcAppliedAny = $true
+                $changedCount++
+                Log-Info "[$targetOSDrive] LKGC_APPLIED=true"
+            }
+
+            $fixedDisks += $targetOSDrive
+        }
+        catch {
+            $failedCount++
+            if ($writeAttempted) { $restoreRequired = $true }
+            Log-Error "[$targetOSDrive] Failed to process registry modifications: $($_.Exception.Message)"
+            Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
+        }
+        finally {
+            if ($null -ne $regKey) {
+                $regKey.Flush()
+                $regKey.Close()
+                $regKey.Dispose()
+            }
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            Start-Sleep -Seconds 2
+
+            # Step 8 - Unload the registry hive using the 3x safety retry array
+            $unloaded = $false
+            for ($i=1; $i -le 3; $i++) {
+                $unloadOutput = & reg.exe unload $sysHive 2>&1
+                if ($LASTEXITCODE -eq 0) { $unloaded = $true; break }
+                Start-Sleep -Seconds 5
+            }
+            
+            if (-not $unloaded) { Log-Error "Could not unload $sysHive cleanly." }
+
+            if ($restoreRequired) {
+                try { Copy-Item -LiteralPath $systemHiveBackup -Destination $systemHivePath -Force -ErrorAction Stop } catch {}
+            }
+        }
+    }
+
+    if ($fixedDisks.Count -gt 0 -or $changedCount -gt 0) {
+        if ($lkgcAppliedAny) {
+            Log-Output "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE, LKGC APPLIED on drives: $($fixedDisks -join ', ')"
+        } else {
+            Log-Output "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=FALSE (NO CHANGES REQUIRED), drives processed: $($fixedDisks -join ', ')"
+        }
+        $script_final_status = $STATUS_SUCCESS
+    }
+    else {
+        throw "Could not find any rescue OS disk attached containing \Windows structure."
+    }
+}
+catch {
+    Log-Error "An unexpected error occurred: $($_.Exception.Message)"
+    $script_final_status = $STATUS_ERROR
+}
+finally {
+    Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
+    Log-Info "Script ended at $(Get-Date)"
+}
+
+return $script_final_status
