@@ -18,8 +18,8 @@
 .NOTES
     Name:          win-LKGC.ps1
     Author:        Tony.Mocanu@Microsoft.com
-    Last Modified: 2026-08-11
-    Version:       1.3
+    Last Modified: 2026-08-12
+    Version:       1.4
     Requirement:   Azure repair VM with an attached Windows OS disk and the VMRepair common helpers
     DeployMode:    az vm repair run (with --run-on-repair)
     Telemetry:     Emits structured start, success, output, and error events through the VMRepair logger
@@ -32,7 +32,7 @@ Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Obj
 
     Version history:
     v1.4: [Aug 2026] - Added structured VMRepair telemetry for LKGC restoration.
-    v1.3: [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing
+    v1.3 [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing
                          loop to group by DiskNumber and map drive properties exactly like the
                          validated sac-enabler.ps1 framework.
     v1.2: [May - Jul 2026] - Production Hardening & Handle Updates
@@ -101,30 +101,59 @@ function Write-DesktopLogLine {
 }
 
 function Log-Output {
-    Param(
-        [PSObject[]]$Message,
-        [hashtable]$Properties
-    )
-    $parameters = @{ Message = $Message }
-    if ($PSBoundParameters.ContainsKey('Properties')) { $parameters.Properties = $Properties }
-    & $script:OriginalLogOutput @parameters
-    Write-DesktopLogLine -Level 'Output' -Message $Message
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogOutput -message $message
+    Write-DesktopLogLine -Level 'Output' -Message $message
 }
 function Log-Info { Param([PSObject[]]$message) & $script:OriginalLogInfo -message $message; Write-DesktopLogLine -Level 'Info' -Message $message }
 function Log-Warning { Param([PSObject[]]$message) & $script:OriginalLogWarning -message $message; Write-DesktopLogLine -Level 'Warning' -Message $message }
 function Log-Error {
-    Param(
-        [PSObject[]]$Message,
-        [hashtable]$Properties
-    )
-    $parameters = @{ Message = $Message }
-    if ($PSBoundParameters.ContainsKey('Properties')) { $parameters.Properties = $Properties }
-    & $script:OriginalLogError @parameters
-    Write-DesktopLogLine -Level 'Error' -Message $Message
+    Param([Parameter(Mandatory = $true)][PSObject[]]$message)
+    & $script:OriginalLogError -message $message
+    Write-DesktopLogLine -Level 'Error' -Message $message
 }
 function Log-Debug { Param([PSObject[]]$message) & $script:OriginalLogDebug -message $message; Write-DesktopLogLine -Level 'Debug' -Message $message }
 
+$script:RepairScriptVersion = '1.3'
+$script:ExecutionStarted = Get-Date
+
+function Write-LkgcTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Start', 'Operation', 'Success', 'Error')]
+        [string]$Event,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [hashtable]$Properties = @{}
+    )
+
+    $payload = [ordered]@{
+        Event = $Event
+        Message = $Message
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+        RepairScriptVersion = $script:RepairScriptVersion
+        Properties = $Properties
+    }
+
+    $json = $payload | ConvertTo-Json -Compress -Depth 8
+    if ($Event -eq 'Error') {
+        Log-Error "[Telemetry] $json" | Out-Null
+    }
+    else {
+        Log-Info "[Telemetry] $json" | Out-Null
+    }
+}
+
 Log-Info "Starting AUTO LKGC Script. Desktop log: $logFilePath"
+Log-Info "[script_start] Script=win-LKGC Version=$($script:RepairScriptVersion)"
+Write-LkgcTelemetry -Event Start -Message 'Starting LKGC restoration' -Properties @{
+    ScriptName = 'win-LKGC.ps1'
+    ScriptVersion = $script:RepairScriptVersion
+    ExecutionMode = 'REPAIR_VM_ONLY'
+    DesktopLog = $logFilePath
+}
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
@@ -209,7 +238,20 @@ try {
         $productName = (Get-ItemProperty -path "registry::$swHive\microsoft\windows nt\currentversion" -ErrorAction SilentlyContinue).ProductName
         $winosver = 0
         if ($productName -match '(\d+)') { $winosver = [int]$matches[1] }
-        $null = & reg.exe unload $swHive 2>&1
+        $softwareHiveUnloaded = $false
+        for ($i = 1; $i -le 3; $i++) {
+            $swUnloadOutput = & reg.exe unload $swHive 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $softwareHiveUnloaded = $true
+                break
+            }
+            Start-Sleep -Seconds 2
+        }
+        if (-not $softwareHiveUnloaded) {
+            $failedCount++
+            Log-Error "[$targetOSDrive] Could not unload $swHive cleanly: $($swUnloadOutput -join ' | '). No SYSTEM hive changes were attempted."
+            continue
+        }
 
         # Step 3 - Load the SYSTEM hive from the target disk
         $sysHive = "HKLM\BROKENSYS_$targetOSDrive"
@@ -226,6 +268,7 @@ try {
 
         $writeAttempted = $false
         $restoreRequired = $false
+        $registryProcessingFailed = $false
         $subKeyPath = "BROKENSYS_$targetOSDrive\Select"
         $regKey = $null
 
@@ -246,7 +289,7 @@ try {
                 LastKnownGood = $lastKnownGood
             }
 
-            Log-Start -Message "Starting LKGC restoration on drive $targetOSDrive" -Properties @{
+            Write-LkgcTelemetry -Event Operation -Message "Starting LKGC restoration on drive $targetOSDrive" -Properties @{
                 DiskNumber   = "$diskNumber"
                 TargetDrive  = "$targetOSDrive"
                 SelectBefore = "$($before.Current),$($before.Default),$($before.Failed),$($before.LastKnownGood)"
@@ -256,7 +299,7 @@ try {
 
             # Step 5 - Evaluate version thresholds using matching AND-logic sequences
             $alreadySet = $false
-            if (($winosver -eq 10) -or ($winosver -ge 2016)) {
+            if ((($winosver -ge 10) -and ($winosver -lt 100)) -or ($winosver -ge 2016)) {
                 if (($currentVal -ge 2) -and ($defaultVal -ge 2) -and ($failedVal -ge 1) -and ($lastKnownGood -ge 2)) { $alreadySet = $true }
             }
             elseif ($winosver -eq 2012) {
@@ -266,7 +309,7 @@ try {
             if ($alreadySet) {
                 Log-Warning "[$targetOSDrive] LKGC WAS ALREADY SET, NO CHANGES DONE"
                 Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
-                Log-Success -Message "LKGC restoration not required on drive $targetOSDrive" -Properties @{
+                Write-LkgcTelemetry -Event Success -Message "LKGC restoration not required on drive $targetOSDrive" -Properties @{
                     DiskNumber  = "$diskNumber"
                     TargetDrive = "$targetOSDrive"
                     Changed     = 'false'
@@ -286,6 +329,13 @@ try {
                 $afterFailed  = $regKey.GetValue('failed')
                 $afterLKG     = $regKey.GetValue('LastKnownGood')
 
+                if (($afterCurrent -ne ($currentVal + 1)) -or
+                    ($afterDefault -ne ($defaultVal + 1)) -or
+                    ($afterFailed -ne ($failedVal + 1)) -or
+                    ($afterLKG -ne ($lastKnownGood + 1))) {
+                    throw 'SYSTEM hive Select values did not match the requested LKGC updates.'
+                }
+
                 $after = [PSCustomObject]@{
                     Current       = $afterCurrent
                     Default       = $afterDefault
@@ -302,8 +352,8 @@ try {
                     Changed     = 'true'
                 }
 
-                Log-Output -Message "LKGC APPLIED" -Properties $telemetryProperties
-                Log-Success -Message "LKGC registry values updated on drive $targetOSDrive" -Properties $telemetryProperties
+                Log-Output -Message "LKGC APPLIED"
+                Write-LkgcTelemetry -Event Success -Message "LKGC registry values updated on drive $targetOSDrive" -Properties $telemetryProperties
 
                 $lkgcAppliedAny = $true
                 $changedCount++
@@ -314,19 +364,34 @@ try {
         }
         catch {
             $failedCount++
+            $registryProcessingFailed = $true
             if ($writeAttempted) { $restoreRequired = $true }
-            Log-Error -Message "[$targetOSDrive] Failed to process registry modifications: $($_.Exception.Message)" -Properties @{
+            Log-Error -Message "[$targetOSDrive] Failed to process registry modifications: $($_.Exception.Message)"
+            Write-LkgcTelemetry -Event Error -Message 'Failed to process registry modifications' -Properties @{
                 DiskNumber    = "$diskNumber"
                 TargetDrive   = "$targetOSDrive"
                 WriteAttempted = "$writeAttempted"
+                Error = $_.Exception.Message
             }
             Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
         }
         finally {
             if ($null -ne $regKey) {
-                $regKey.Flush()
-                $regKey.Close()
-                $regKey.Dispose()
+                try {
+                    $regKey.Flush()
+                }
+                catch {
+                    if (-not $registryProcessingFailed) {
+                        $failedCount++
+                        $registryProcessingFailed = $true
+                    }
+                    $restoreRequired = $true
+                    Log-Error "[$targetOSDrive] Failed to flush the SYSTEM hive Select key: $($_.Exception.Message)"
+                }
+                finally {
+                    try { $regKey.Close() } catch {}
+                    try { $regKey.Dispose() } catch {}
+                }
             }
             [System.GC]::Collect()
             [System.GC]::WaitForPendingFinalizers()
@@ -340,15 +405,37 @@ try {
                 Start-Sleep -Seconds 5
             }
 
-            if (-not $unloaded) { Log-Error "Could not unload $sysHive cleanly." }
+            if (-not $unloaded) {
+                if (-not $registryProcessingFailed) {
+                    $failedCount++
+                    $registryProcessingFailed = $true
+                }
+                $restoreRequired = $true
+                Log-Error "Could not unload $sysHive cleanly. The disk will not be reported as successfully processed."
+                $fixedDisks = @($fixedDisks | Where-Object { $_ -ne $targetOSDrive })
+            }
 
             if ($restoreRequired) {
-                try { Copy-Item -LiteralPath $systemHiveBackup -Destination $systemHivePath -Force -ErrorAction Stop } catch {}
+                if (-not $unloaded) {
+                    Log-Error "[$targetOSDrive] SYSTEM hive backup cannot be restored while $sysHive remains loaded. Manual recovery may be required from $systemHiveBackup."
+                }
+                else {
+                    try {
+                        Copy-Item -LiteralPath $systemHiveBackup -Destination $systemHivePath -Force -ErrorAction Stop
+                        Log-Warning "[$targetOSDrive] Restored SYSTEM hive backup after the failed write attempt."
+                    }
+                    catch {
+                        Log-Error "[$targetOSDrive] CRITICAL: Failed to restore SYSTEM hive backup '$systemHiveBackup': $($_.Exception.Message)"
+                    }
+                }
             }
         }
     }
 
-    if ($fixedDisks.Count -gt 0 -or $changedCount -gt 0) {
+    if ($failedCount -gt 0) {
+        throw "LKGC processing failed on $failedCount disk(s). Review the preceding disk errors."
+    }
+    elseif ($fixedDisks.Count -gt 0 -or $changedCount -gt 0) {
         if ($lkgcAppliedAny) {
             Log-Output "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE, LKGC APPLIED on drives: $($fixedDisks -join ', ')"
         } else {
@@ -365,8 +452,10 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    $durationSeconds = [math]::Round(((Get-Date) - $script:ExecutionStarted).TotalSeconds, 3)
     $finalTelemetryProperties = @{
         FinalStatus    = "$script_final_status"
+        DurationSeconds = $durationSeconds
         DisksProcessed = "$processedCount"
         DisksChanged   = "$changedCount"
         DisksSkipped   = "$skippedCount"
@@ -374,12 +463,13 @@ finally {
     }
 
     if ($script_final_status -eq $STATUS_SUCCESS) {
-        Log-Success -Message 'LKGC restoration script completed successfully' -Properties $finalTelemetryProperties
+        Write-LkgcTelemetry -Event Success -Message 'LKGC restoration script completed successfully' -Properties $finalTelemetryProperties
     }
     else {
-        Log-Error -Message 'LKGC restoration script completed with errors' -Properties $finalTelemetryProperties
+        Write-LkgcTelemetry -Event Error -Message 'LKGC restoration script completed with errors' -Properties $finalTelemetryProperties
     }
 
+    Log-Info "[final_status] Status=$script_final_status"
     Log-Info "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount"
     Log-Info "Script ended at $(Get-Date)"
 }
