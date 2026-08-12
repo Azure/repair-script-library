@@ -11,8 +11,8 @@
     2. Creates a safety backup of the target SYSTEM hive before modification.
     3. Loads the SOFTWARE hive temporarily to verify the specific Windows version threshold engine.
     4. Opens the Select key using explicit .NET API frameworks to avoid provider caching.
-    5. Evaluates threshold logic metrics via strict AND-logic parameters.
-    6. Increments the configuration values (current, default, failed, LastKnownGood) to force LKGC validation.
+    5. Validates that every planned Select value maps to an existing ControlSet00N key.
+    6. Increments the configuration values (current, default, failed, LastKnownGood) only when safe.
     7. Unloads the hive safely using a defensive 3x retry loop with explicit garbage collection.
 
 .NOTES
@@ -29,10 +29,24 @@
 Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content
     2. Confirm the presence of the terminal confirmation string:
        "SCRIPT FINISHED PROPERLY, CHANGES_APPLIED=TRUE"
+     3. Confirm the log lists the referenced control sets before any write:
+         "AVAILABLE CONTROL SETS: ControlSet001, ControlSet002"
+
+     Safety behavior:
+     If the planned Select values reference a missing ControlSet00N key, the script returns an
+     error without changing the hive. A second valid control set cannot be created safely by
+     copying or renaming the current control set.
+
+     Recovery after 0xc0000225 referencing \Windows\System32\config\system:
+     Attach the OS disk to a repair VM and restore the pre-change SYSTEM.LKGC.bak.<timestamp>
+     backup, or load the hive offline and point Current, Default, and LastKnownGood only to an
+     existing ControlSet00N key. Always snapshot the OS disk before recovery.
 
     Version history:
-    v1.4: [Aug 2026] - Added structured VMRepair telemetry for LKGC restoration.
-    v1.3 [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing
+    v1.4: [Aug 2026] - Added fail-closed ControlSet validation before changing SYSTEM\Select.
+                       Prevents 0xc0000225 when incremented values reference a missing ControlSet.
+    v1.3: [Aug 2026] - Added structured VMRepair telemetry for LKGC restoration.
+    Update [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing
                          loop to group by DiskNumber and map drive properties exactly like the
                          validated sac-enabler.ps1 framework.
     v1.2: [May - Jul 2026] - Production Hardening & Handle Updates
@@ -114,7 +128,7 @@ function Log-Error {
 }
 function Log-Debug { Param([PSObject[]]$message) & $script:OriginalLogDebug -message $message; Write-DesktopLogLine -Level 'Debug' -Message $message }
 
-$script:RepairScriptVersion = '1.3'
+$script:RepairScriptVersion = '1.4'
 $script:ExecutionStarted = Get-Date
 
 function Write-LkgcTelemetry {
@@ -271,16 +285,39 @@ try {
         $registryProcessingFailed = $false
         $subKeyPath = "BROKENSYS_$targetOSDrive\Select"
         $regKey = $null
+        $systemRootKey = $null
 
         try {
             # Step 4 - Open via direct .NET API to eliminate PowerShell registry caching engine bugs
             $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKeyPath, $true)
             if ($null -eq $regKey) { throw "Failed to open Select key via explicit .NET path: HKLM:\$subKeyPath" }
 
+            $requiredSelectValues = @('current', 'default', 'failed', 'LastKnownGood')
+            $missingSelectValues = @($requiredSelectValues | Where-Object { $_ -notin $regKey.GetValueNames() })
+            if ($missingSelectValues.Count -gt 0) {
+                throw "SYSTEM hive Select key is missing required value(s): $($missingSelectValues -join ', ')."
+            }
+
             $currentVal    = [int]$regKey.GetValue('current')
             $defaultVal    = [int]$regKey.GetValue('default')
             $failedVal     = [int]$regKey.GetValue('failed')
             $lastKnownGood = [int]$regKey.GetValue('LastKnownGood')
+
+            $systemRootKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("BROKENSYS_$targetOSDrive", $false)
+            if ($null -eq $systemRootKey) {
+                throw "Failed to inspect control sets in HKLM:\BROKENSYS_$targetOSDrive."
+            }
+            $availableControlSets = @($systemRootKey.GetSubKeyNames() | Where-Object { $_ -match '^ControlSet\d{3}$' })
+            $availableControlSetNumbers = @($availableControlSets | ForEach-Object { [int]$_.Substring('ControlSet'.Length) })
+            Log-Info "[$targetOSDrive] AVAILABLE CONTROL SETS: $($availableControlSets -join ', ')"
+
+            $existingReferences = @(@($currentVal, $defaultVal, $failedVal, $lastKnownGood) |
+                Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+            $invalidExistingReferences = @($existingReferences | Where-Object { $_ -notin $availableControlSetNumbers })
+            if ($invalidExistingReferences.Count -gt 0) {
+                $invalidNames = @($invalidExistingReferences | ForEach-Object { 'ControlSet{0:D3}' -f $_ })
+                throw "SYSTEM hive Select already references missing control set(s): $($invalidNames -join ', '). No changes were attempted."
+            }
 
             $before = [PSCustomObject]@{
                 Current       = $currentVal
@@ -316,12 +353,24 @@ try {
                 }
             }
             else {
-                # Step 6 - Increment configuration spaces via .NET context
+                # Step 6 - Validate the KB increment pattern before changing Select.
+                $plannedCurrent = $currentVal + 1
+                $plannedDefault = $defaultVal + 1
+                $plannedFailed = $failedVal + 1
+                $plannedLastKnownGood = $lastKnownGood + 1
+                $plannedReferences = @(@($plannedCurrent, $plannedDefault, $plannedFailed, $plannedLastKnownGood) |
+                    Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+                $missingControlSets = @($plannedReferences | Where-Object { $_ -notin $availableControlSetNumbers })
+                if ($missingControlSets.Count -gt 0) {
+                    $missingNames = @($missingControlSets | ForEach-Object { 'ControlSet{0:D3}' -f $_ })
+                    throw "Unsafe LKGC Select update refused. Planned values reference missing control set(s): $($missingNames -join ', '). Available: $($availableControlSets -join ', ')."
+                }
+
                 $writeAttempted = $true
-                $regKey.SetValue('current', ($currentVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
-                $regKey.SetValue('default', ($defaultVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
-                $regKey.SetValue('failed', ($failedVal + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
-                $regKey.SetValue('LastKnownGood', ($lastKnownGood + 1), [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('current', $plannedCurrent, [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('default', $plannedDefault, [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('failed', $plannedFailed, [Microsoft.Win32.RegistryValueKind]::DWord)
+                $regKey.SetValue('LastKnownGood', $plannedLastKnownGood, [Microsoft.Win32.RegistryValueKind]::DWord)
 
                 # Step 7 - Validate downstream configurations
                 $afterCurrent = $regKey.GetValue('current')
@@ -329,10 +378,10 @@ try {
                 $afterFailed  = $regKey.GetValue('failed')
                 $afterLKG     = $regKey.GetValue('LastKnownGood')
 
-                if (($afterCurrent -ne ($currentVal + 1)) -or
-                    ($afterDefault -ne ($defaultVal + 1)) -or
-                    ($afterFailed -ne ($failedVal + 1)) -or
-                    ($afterLKG -ne ($lastKnownGood + 1))) {
+                if (($afterCurrent -ne $plannedCurrent) -or
+                    ($afterDefault -ne $plannedDefault) -or
+                    ($afterFailed -ne $plannedFailed) -or
+                    ($afterLKG -ne $plannedLastKnownGood)) {
                     throw 'SYSTEM hive Select values did not match the requested LKGC updates.'
                 }
 
@@ -376,6 +425,10 @@ try {
             Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
         }
         finally {
+            if ($null -ne $systemRootKey) {
+                try { $systemRootKey.Close() } catch {}
+                try { $systemRootKey.Dispose() } catch {}
+            }
             if ($null -ne $regKey) {
                 try {
                     $regKey.Flush()
