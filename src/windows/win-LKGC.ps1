@@ -48,6 +48,8 @@ Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Obj
                        Prevents 0xc0000225 from missing or incomplete ControlSet references.
                        Adds logger-compatible JSON telemetry, SYSTEM hive backup, post-write
                        verification, unload retries, and backup rollback after failed writes.
+                       Rejects invalid zero or negative boot control-set references before writes
+                       and retries stale offline-hive cleanup before loading each SYSTEM hive.
                        Adds SAC-aligned repair-context detection, repair-disk exclusion, unlettered
                        Windows partition discovery, temporary drive assignment, and cleanup.
     v1.3: [Aug 2026] - Added structured VMRepair telemetry for LKGC restoration.
@@ -371,7 +373,16 @@ try {
 
         # Step 2 - Load the SYSTEM hive from the target disk
         $sysHive = "HKLM\BROKENSYS_$targetOSDrive"
-        $null = & reg.exe unload $sysHive 2>&1
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        for ($preLoadUnloadAttempt = 1; $preLoadUnloadAttempt -le 3; $preLoadUnloadAttempt++) {
+            $preLoadUnloadOutput = & reg.exe unload $sysHive 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Log-Info "[$targetOSDrive] Removed a stale pre-existing hive mount on attempt $preLoadUnloadAttempt."
+                break
+            }
+            if ($preLoadUnloadAttempt -lt 3) { Start-Sleep -Seconds 2 }
+        }
         $sysLoad = & reg.exe load $sysHive $systemHivePath 2>&1
 
         if ($LASTEXITCODE -ne 0) {
@@ -404,6 +415,16 @@ try {
             $defaultVal    = [int]$regKey.GetValue('default')
             $failedVal     = [int]$regKey.GetValue('failed')
             $lastKnownGood = [int]$regKey.GetValue('LastKnownGood')
+
+            $invalidBootReferences = @(@(
+                [pscustomobject]@{ Name = 'Current'; Value = $currentVal }
+                [pscustomobject]@{ Name = 'Default'; Value = $defaultVal }
+                [pscustomobject]@{ Name = 'LastKnownGood'; Value = $lastKnownGood }
+            ) | Where-Object { $_.Value -lt 1 })
+            if ($invalidBootReferences.Count -gt 0) {
+                $invalidValues = @($invalidBootReferences | ForEach-Object { "$($_.Name)=$($_.Value)" })
+                throw "SYSTEM hive Select contains invalid boot control-set reference(s): $($invalidValues -join ', '). No changes were attempted."
+            }
 
             $systemRootKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("BROKENSYS_$targetOSDrive", $false)
             if ($null -eq $systemRootKey) {
