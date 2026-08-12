@@ -9,11 +9,10 @@
     It performs the following steps:
     1. Enumerates attached partitions via Get-Disk-Partitions, grouping by DiskNumber to isolate targets.
     2. Creates a safety backup of the target SYSTEM hive before modification.
-    3. Loads the SOFTWARE hive temporarily to verify the specific Windows version threshold engine.
-    4. Opens the Select key using explicit .NET API frameworks to avoid provider caching.
-    5. Validates that every planned Select value maps to an existing ControlSet00N key.
-    6. Increments the configuration values (current, default, failed, LastKnownGood) only when safe.
-    7. Unloads the hive safely using a defensive 3x retry loop with explicit garbage collection.
+    3. Opens the Select key using explicit .NET API frameworks to avoid provider caching.
+    4. Validates that referenced control sets contain core Control and Services trees.
+    5. Selects the existing LastKnownGood control set without inventing control-set numbers.
+    6. Unloads the hive safely using a defensive 3x retry loop with explicit garbage collection.
 
 .NOTES
     Name:          win-LKGC.ps1
@@ -33,9 +32,9 @@ Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Obj
          "AVAILABLE CONTROL SETS: ControlSet001, ControlSet002"
 
      Safety behavior:
-     If the planned Select values reference a missing ControlSet00N key, the script returns an
-     error without changing the hive. A second valid control set cannot be created safely by
-     copying or renaming the current control set.
+    If LastKnownGood references a missing ControlSet00N key, the script returns an error without
+    changing the hive. If LastKnownGood equals Current, no alternate LKGC exists and the script
+    returns success with no changes. A second valid control set cannot be created safely.
 
      Recovery after 0xc0000225 referencing \Windows\System32\config\system:
      Attach the OS disk to a repair VM and restore the pre-change SYSTEM.LKGC.bak.<timestamp>
@@ -43,8 +42,14 @@ Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Obj
      existing ControlSet00N key. Always snapshot the OS disk before recovery.
 
     Version history:
-    v1.4: [Aug 2026] - Added fail-closed ControlSet validation before changing SYSTEM\Select.
-                       Prevents 0xc0000225 when incremented values reference a missing ControlSet.
+    v1.4: [Aug 2026] - Selects the existing LastKnownGood control set instead of incrementing
+                       Select values and treats the absence of an alternate LKGC as a safe no-op.
+                       Validates referenced control sets and their core Control and Services trees.
+                       Prevents 0xc0000225 from missing or incomplete ControlSet references.
+                       Adds logger-compatible JSON telemetry, SYSTEM hive backup, post-write
+                       verification, unload retries, and backup rollback after failed writes.
+                       Adds SAC-aligned repair-context detection, repair-disk exclusion, unlettered
+                       Windows partition discovery, temporary drive assignment, and cleanup.
     v1.3: [Aug 2026] - Added structured VMRepair telemetry for LKGC restoration.
     Update [Jul 2026] - Partition Architecture Alignment: Refactored the core disk processing
                          loop to group by DiskNumber and map drive properties exactly like the
@@ -74,6 +79,52 @@ if (-not (Test-Path -Path $diskPartitionsPath -PathType Leaf)) {
 }
 
 . $diskPartitionsPath
+
+if (-not (Get-Command -Name Get-Disk-Partitions -CommandType Function -ErrorAction SilentlyContinue)) {
+    Log-Error "Dependency did not define the required Get-Disk-Partitions function: $diskPartitionsPath"
+    return $STATUS_ERROR
+}
+
+function Get-LkgcExecutionContext {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$TargetDiskGroups
+    )
+
+    if ($TargetDiskGroups.Count -gt 0) {
+        return 'REPAIR_VM'
+    }
+
+    return 'STANDARD_VM'
+}
+
+function Get-LkgcAvailableTempDriveLetter {
+    $usedLetters = @(Get-Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveLetter } |
+        Select-Object -ExpandProperty DriveLetter)
+    foreach ($letter in @('Z','Y','X','W','V','U','T','S','R','Q')) {
+        if ($letter -notin $usedLetters -and -not (Test-Path -Path "${letter}:\")) {
+            return $letter
+        }
+    }
+
+    return $null
+}
+
+function Test-LkgcGptType {
+    param(
+        [AllowNull()]
+        [object]$ActualType,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedType
+    )
+
+    $actual = ([string]$ActualType).Trim().Trim('{', '}')
+    $expected = $ExpectedType.Trim().Trim('{', '}')
+    return $actual -eq $expected
+}
 
 # Script-level logging: create a plain text desktop log that mirrors Log-* output.
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
@@ -176,6 +227,7 @@ $processedCount = 0
 $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
+$detectedExecutionContext = 'UNDETERMINED'
 
 try {
     # Check if the Hyper-V module is available before performing nested VM checks
@@ -189,40 +241,120 @@ try {
         Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
     }
 
-    # Step 1 - Enumerate and Group partitions matching the sac-enabler architecture
-    $partitionlist = Get-Disk-Partitions
-    $rescueDrive = $env:SystemDrive -replace ':', ''
+    # Step 1 - Identify the repair VM OS disk and enumerate only secondary disks.
+    $repairDrive = $env:SystemDrive -replace ':', ''
+    $repairOsPartition = Get-Partition -DriveLetter $repairDrive -ErrorAction Stop | Select-Object -First 1
+    if ($null -eq $repairOsPartition -or $null -eq $repairOsPartition.DiskNumber) {
+        throw "CRITICAL SAFETY CHECK FAILED: Could not identify the repair VM OS disk from $($env:SystemDrive)."
+    }
+    $repairDiskNumber = [int]$repairOsPartition.DiskNumber
+    Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber."
+
+    $partitionlist = @(Get-Disk-Partitions)
+    if ($partitionlist.Count -eq 0) {
+        throw 'Get-Disk-Partitions returned no partitions from Azure virtual disks.'
+    }
+
+    $targetDiskGroups = @($partitionlist | Group-Object DiskNumber |
+        Where-Object { [int]$_.Name -ne $repairDiskNumber })
+    $detectedExecutionContext = Get-LkgcExecutionContext -TargetDiskGroups $targetDiskGroups
+    Log-Info "Detected execution context: $detectedExecutionContext"
+    if ($detectedExecutionContext -ne 'REPAIR_VM') {
+        throw 'REPAIR-ONLY SCRIPT: No secondary disk was returned by the partition helper.'
+    }
+
     $fixedDisks = @()
 
     Log-Info 'Enumerating disk partitions for LKGC analysis...'
 
-    foreach ($partitionGroup in $partitionlist | Group-Object DiskNumber) {
+    foreach ($partitionGroup in $targetDiskGroups) {
         $processedCount++
-        $diskNumber = $partitionGroup.Name
+        $diskNumber = [int]$partitionGroup.Name
         $targetOSDrive = $null
+        $tempOsLetter = $null
+        $tempOsDiskNum = $null
+        $tempOsPartNum = $null
 
-        Log-Info "Processing Disk $diskNumber"
+        try {
+            Log-Info "Processing Disk $diskNumber"
+            $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
+            $efiGptType = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
 
-        # Scan each drive letter within this disk group for a valid Windows OS directory
-        foreach ($drive in $partitionGroup.Group | Select-Object -ExpandProperty DriveLetter) {
-            if ([string]::IsNullOrWhiteSpace($drive) -or $drive -eq $rescueDrive) {
+            # Scan every currently mounted partition on this target disk.
+            foreach ($partition in @($diskPartitions | Where-Object {
+                $_.DriveLetter -and $_.DriveLetter -ne [char]0
+            })) {
+                $drive = [string]$partition.DriveLetter
+                if ($drive -eq $repairDrive) { continue }
+
+                $systemCandidate = "${drive}:\Windows\System32\config\SYSTEM"
+                $candidateExists = Test-Path -LiteralPath $systemCandidate -PathType Leaf
+                Log-Info "Disk ${diskNumber}: checking ${drive}: for SYSTEM hive; exists=$candidateExists"
+                if ($candidateExists) {
+                    $targetOSDrive = $drive
+                    break
+                }
+            }
+
+            # Match SAC's Gen2-safe fallback by probing unlettered non-EFI partitions.
+            if (-not $targetOSDrive) {
+                $unletteredOsCandidates = @($diskPartitions | Where-Object {
+                    (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and
+                    -not (Test-LkgcGptType -ActualType $_.GptType -ExpectedType $efiGptType)
+                } | Sort-Object Size -Descending)
+
+                Log-Info "Disk ${diskNumber}: probing $($unletteredOsCandidates.Count) unlettered non-EFI partition(s) for Windows."
+                foreach ($osCandidate in $unletteredOsCandidates) {
+                    $candidateLetter = Get-LkgcAvailableTempDriveLetter
+                    if (-not $candidateLetter) {
+                        Log-Warning "Disk ${diskNumber}: no temporary drive letter is available for OS probing."
+                        break
+                    }
+
+                    $candidatePartNum = [int]$osCandidate.PartitionNumber
+                    Log-Info "Disk ${diskNumber}: assigning ${candidateLetter}: to Partition $candidatePartNum for OS probing."
+                    $assignOutput = @(
+                        "select disk $diskNumber"
+                        "select partition $candidatePartNum"
+                        "assign letter=$candidateLetter"
+                    ) | diskpart 2>&1
+                    foreach ($line in @($assignOutput)) {
+                        if ($line) { Log-Output "[diskpart][os-assign] $line" | Out-Null }
+                    }
+                    $tempOsLetter = $candidateLetter
+                    $tempOsDiskNum = $diskNumber
+                    $tempOsPartNum = $candidatePartNum
+                    Start-Sleep -Seconds 2
+
+                    $systemCandidate = "${candidateLetter}:\Windows\System32\config\SYSTEM"
+                    $candidateExists = Test-Path -LiteralPath $systemCandidate -PathType Leaf
+                    Log-Info "Disk ${diskNumber}: checked temporary ${candidateLetter}: for SYSTEM hive; exists=$candidateExists"
+                    if ($candidateExists) {
+                        $targetOSDrive = $candidateLetter
+                        break
+                    }
+
+                    $removeOutput = @(
+                        "select disk $diskNumber"
+                        "select partition $candidatePartNum"
+                        "remove letter=$candidateLetter noerr"
+                    ) | diskpart 2>&1
+                    foreach ($line in @($removeOutput)) {
+                        if ($line) { Log-Output "[diskpart][os-remove] $line" | Out-Null }
+                    }
+                    $tempOsLetter = $null
+                    $tempOsDiskNum = $null
+                    $tempOsPartNum = $null
+                }
+            }
+
+            if (-not $targetOSDrive) {
+                Log-Info "Disk $diskNumber skipped: no valid attached OS partition containing \Windows found."
                 $skippedCount++
                 continue
             }
 
-            if (Test-Path -Path "$(${drive}):\Windows\System32\config\SYSTEM") {
-                $targetOSDrive = $drive
-                break
-            }
-        }
-
-        if (-not $targetOSDrive) {
-            Log-Info "Disk $diskNumber skipped: no valid attached OS partition containing \Windows found."
-            $skippedCount++
-            continue
-        }
-
-        Log-Info "Target OS partition successfully matched on letter: $($targetOSDrive):"
+            Log-Info "Target OS partition successfully matched on letter: $($targetOSDrive):"
 
         $systemHivePath = "$(${targetOSDrive}):\Windows\System32\config\SYSTEM"
         $systemHiveBackup = "$systemHivePath.LKGC.bak.$runTimestamp"
@@ -237,37 +369,7 @@ try {
             continue
         }
 
-        # Step 2 - Load the SOFTWARE hive to detect the Windows version
-        $swHive = "HKLM\BROKENSW_$targetOSDrive"
-        $null = & reg.exe unload $swHive 2>&1
-        $swLoad = & reg.exe load $swHive "$(${targetOSDrive}):\Windows\System32\config\software" 2>&1
-
-        if ($LASTEXITCODE -ne 0) {
-            $failedCount++
-            Log-Warning "Failed to load SOFTWARE hive from $($targetOSDrive): $($swLoad -join ' | ') - skipping"
-            continue
-        }
-
-        Start-Sleep -Seconds 2
-        $productName = (Get-ItemProperty -path "registry::$swHive\microsoft\windows nt\currentversion" -ErrorAction SilentlyContinue).ProductName
-        $winosver = 0
-        if ($productName -match '(\d+)') { $winosver = [int]$matches[1] }
-        $softwareHiveUnloaded = $false
-        for ($i = 1; $i -le 3; $i++) {
-            $swUnloadOutput = & reg.exe unload $swHive 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                $softwareHiveUnloaded = $true
-                break
-            }
-            Start-Sleep -Seconds 2
-        }
-        if (-not $softwareHiveUnloaded) {
-            $failedCount++
-            Log-Error "[$targetOSDrive] Could not unload $swHive cleanly: $($swUnloadOutput -join ' | '). No SYSTEM hive changes were attempted."
-            continue
-        }
-
-        # Step 3 - Load the SYSTEM hive from the target disk
+        # Step 2 - Load the SYSTEM hive from the target disk
         $sysHive = "HKLM\BROKENSYS_$targetOSDrive"
         $null = & reg.exe unload $sysHive 2>&1
         $sysLoad = & reg.exe load $sysHive $systemHivePath 2>&1
@@ -319,6 +421,17 @@ try {
                 throw "SYSTEM hive Select already references missing control set(s): $($invalidNames -join ', '). No changes were attempted."
             }
 
+            foreach ($controlSetNumber in $existingReferences) {
+                $controlSetName = 'ControlSet{0:D3}' -f $controlSetNumber
+                foreach ($requiredSubKey in @('Control', 'Services')) {
+                    $validationKey = $systemRootKey.OpenSubKey("$controlSetName\$requiredSubKey", $false)
+                    if ($null -eq $validationKey) {
+                        throw "$controlSetName is incomplete: required $requiredSubKey tree is missing. No changes were attempted."
+                    }
+                    $validationKey.Dispose()
+                }
+            }
+
             $before = [PSCustomObject]@{
                 Current       = $currentVal
                 Default       = $defaultVal
@@ -334,37 +447,23 @@ try {
 
             Log-Info "[$targetOSDrive] REGISTRY STATE [BEFORE]: Current=$currentVal, Default=$defaultVal, Failed=$failedVal, LKG=$lastKnownGood"
 
-            # Step 5 - Evaluate version thresholds using matching AND-logic sequences
-            $alreadySet = $false
-            if ((($winosver -ge 10) -and ($winosver -lt 100)) -or ($winosver -ge 2016)) {
-                if (($currentVal -ge 2) -and ($defaultVal -ge 2) -and ($failedVal -ge 1) -and ($lastKnownGood -ge 2)) { $alreadySet = $true }
-            }
-            elseif ($winosver -eq 2012) {
-                if (($currentVal -ge 2) -and ($defaultVal -ge 2) -and ($failedVal -ge 1) -and ($lastKnownGood -ge 3)) { $alreadySet = $true }
-            }
-
-            if ($alreadySet) {
-                Log-Warning "[$targetOSDrive] LKGC WAS ALREADY SET, NO CHANGES DONE"
+            # Step 4 - Select the control set explicitly identified by LastKnownGood.
+            if ($lastKnownGood -eq $currentVal) {
+                Log-Warning "[$targetOSDrive] NO ALTERNATE LKGC EXISTS: LastKnownGood and Current both reference ControlSet$('{0:D3}' -f $currentVal)."
                 Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
-                Write-LkgcTelemetry -Event Success -Message "LKGC restoration not required on drive $targetOSDrive" -Properties @{
+                Write-LkgcTelemetry -Event Success -Message "No alternate LKGC is available on drive $targetOSDrive" -Properties @{
                     DiskNumber  = "$diskNumber"
                     TargetDrive = "$targetOSDrive"
                     Changed     = 'false'
+                    Reason      = 'LastKnownGoodEqualsCurrent'
                 }
             }
             else {
-                # Step 6 - Validate the KB increment pattern before changing Select.
-                $plannedCurrent = $currentVal + 1
-                $plannedDefault = $defaultVal + 1
-                $plannedFailed = $failedVal + 1
-                $plannedLastKnownGood = $lastKnownGood + 1
-                $plannedReferences = @(@($plannedCurrent, $plannedDefault, $plannedFailed, $plannedLastKnownGood) |
-                    Where-Object { $_ -gt 0 } | Sort-Object -Unique)
-                $missingControlSets = @($plannedReferences | Where-Object { $_ -notin $availableControlSetNumbers })
-                if ($missingControlSets.Count -gt 0) {
-                    $missingNames = @($missingControlSets | ForEach-Object { 'ControlSet{0:D3}' -f $_ })
-                    throw "Unsafe LKGC Select update refused. Planned values reference missing control set(s): $($missingNames -join ', '). Available: $($availableControlSets -join ', ')."
-                }
+                # Step 5 - Point boot selection to the existing LastKnownGood control set.
+                $plannedCurrent = $lastKnownGood
+                $plannedDefault = $lastKnownGood
+                $plannedFailed = $currentVal
+                $plannedLastKnownGood = $lastKnownGood
 
                 $writeAttempted = $true
                 $regKey.SetValue('current', $plannedCurrent, [Microsoft.Win32.RegistryValueKind]::DWord)
@@ -372,7 +471,7 @@ try {
                 $regKey.SetValue('failed', $plannedFailed, [Microsoft.Win32.RegistryValueKind]::DWord)
                 $regKey.SetValue('LastKnownGood', $plannedLastKnownGood, [Microsoft.Win32.RegistryValueKind]::DWord)
 
-                # Step 7 - Validate downstream configurations
+                # Step 6 - Validate downstream configurations
                 $afterCurrent = $regKey.GetValue('current')
                 $afterDefault = $regKey.GetValue('default')
                 $afterFailed  = $regKey.GetValue('failed')
@@ -450,7 +549,7 @@ try {
             [System.GC]::WaitForPendingFinalizers()
             Start-Sleep -Seconds 2
 
-            # Step 8 - Unload the registry hive using the 3x safety retry array
+            # Step 7 - Unload the registry hive using the 3x safety retry array
             $unloaded = $false
             for ($i=1; $i -le 3; $i++) {
                 $unloadOutput = & reg.exe unload $sysHive 2>&1
@@ -480,6 +579,24 @@ try {
                     catch {
                         Log-Error "[$targetOSDrive] CRITICAL: Failed to restore SYSTEM hive backup '$systemHiveBackup': $($_.Exception.Message)"
                     }
+                }
+            }
+        }
+        }
+        catch {
+            $failedCount++
+            Log-Error "Disk $diskNumber failed during OS discovery or LKGC processing: $($_.Exception.Message)"
+        }
+        finally {
+            if ($tempOsLetter) {
+                Log-Info "Removing temp letter ${tempOsLetter}: from Disk $tempOsDiskNum Partition $tempOsPartNum"
+                $cleanupOutput = @(
+                    "select disk $tempOsDiskNum"
+                    "select partition $tempOsPartNum"
+                    "remove letter=$tempOsLetter noerr"
+                ) | diskpart 2>&1
+                foreach ($line in @($cleanupOutput)) {
+                    if ($line) { Log-Output "[diskpart][os-cleanup] $line" | Out-Null }
                 }
             }
         }
