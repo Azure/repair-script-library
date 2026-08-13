@@ -20,18 +20,18 @@
 
 .NOTES
     Name:    GA_offlinefixer.ps1
-    Version: 1.4
+    Version: 1.3
     Original Author: Daniel Munoz L (damunozl@microsoft.com)
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.4: [August 2026] - Addressed production review findings and aligned disk safety,
+    v1.3: [August 2026] - Addressed production review findings and aligned disk safety,
                         backup verification, rollback accounting, and rescue service restoration
                         with win-LKGC and win-sac-onLatest.
                         - Uses a PowerShell 3-compatible streaming SHA-256 implementation.
                         - Emits structured telemetry only through the local VMRepair logger.
                         - Performs no IMDS lookup or other telemetry network request.
-    v1.3: [August 2026] - Copies only the newest versioned GuestAgent installation folder.
+                        - Copies only the newest versioned GuestAgent installation folder.
                         - Uses the WindowsAzureGuestAgent ImagePath folder as a fallback.
                         - Preserves unrelated content in the target WindowsAzure folder.
                         - Stages and validates replacement files before moving the existing Agent folder.
@@ -186,7 +186,7 @@ if ($script:_origLogOutput) {
     }
 }
 
-$script:RepairScriptVersion = '1.4'
+$script:RepairScriptVersion = '1.3'
 $script:ExecutionStarted = Get-Date
 $script:OperationCount = 0
 
