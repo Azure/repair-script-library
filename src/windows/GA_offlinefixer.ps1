@@ -8,15 +8,16 @@
     1. Uses the shared repair-library partition helper to locate the faulty OS drive.
     2. Loads the SYSTEM registry hive from the target disk into HKLM\BROKENSYSTEM.
     3. Creates and verifies a binary backup of the SYSTEM hive before loading it.
-    4. Identifies and validates the existing boot-referenced ControlSets from the Select key.
-    5. Exports healthy service keys (WindowsAzureGuestAgent, WindowsAzureTelemetryService, RdAgent)
-       from the rescue VM and injects them into both ControlSets on the target hive.
-     6. Verifies both required services use automatic startup and have non-empty ImagePath values.
-     7. Copies the latest GuestAgent installation folder, or the documented ImagePath folder fallback,
+     4. Validates the same-disk BCD loader and repairs unknown device mappings before registry writes.
+     5. Identifies and validates the existing boot-referenced ControlSets from the Select key.
+     6. Exports healthy service keys (WindowsAzureGuestAgent, WindowsAzureTelemetryService, RdAgent)
+         from the rescue VM and injects them into every boot-referenced ControlSet on the target hive.
+     7. Verifies both required services use automatic startup and have non-empty ImagePath values.
+     8. Copies the latest GuestAgent installation folder, or the documented ImagePath folder fallback,
          into a staging directory and verifies the exact executables referenced by both required services.
          The existing Agent folder is restored if activation fails.
-    8. Releases handles and safely unloads the registry hive (with retry logic).
-         If processing fails, restores and hash-verifies the original SYSTEM hive.
+     9. Releases handles, reloads the persisted SYSTEM hive, and verifies the required service keys.
+         If processing fails, restores and hash-verifies SYSTEM, Agent files, and any changed BCD.
 
 .NOTES
     Name:    GA_offlinefixer.ps1
@@ -25,14 +26,19 @@
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.3: [August 2026] - Addressed production review findings and aligned disk safety,
-                        backup verification, rollback accounting, and rescue service restoration
-                        with win-LKGC and win-sac-onLatest.
-                        - Uses a PowerShell 3-compatible streaming SHA-256 implementation.
-                        - Emits structured telemetry only through the local VMRepair logger.
-                        - Performs no IMDS lookup or other telemetry network request.
-                        - Copies only the newest versioned GuestAgent installation folder.
+    v1.3: [August 2026] - Copies only the newest versioned GuestAgent installation folder.
                         - Uses the WindowsAzureGuestAgent ImagePath folder as a fallback.
+                                                - Follows the Microsoft Learn offline VM Agent registry and binary-copy procedure.
+                                                - Aligns disk safety, rollback accounting, and rescue service restoration with
+                                                    win-LKGC and win-sac-onLatest.
+                                                - Validates the same-disk Gen1/Gen2 BCD store before Guest Agent changes.
+                                                - Repairs and verifies only unknown loader device/osdevice mappings.
+                                                - Restores the verified BCD backup after any later transaction failure.
+                                                - Reloads the persisted on-disk SYSTEM hive and re-verifies required services.
+                                                - Writes GA-OfflineRepair-Verification.json to correlate the repaired disk after restore.
+                                                - Uses a PowerShell 3-compatible streaming SHA-256 implementation.
+                                                - Emits structured telemetry only through the local VMRepair logger.
+                                                - Performs no IMDS lookup or other telemetry network request.
                         - Preserves unrelated content in the target WindowsAzure folder.
                         - Stages and validates replacement files before moving the existing Agent folder.
                         - Rolls back the Agent folder and SYSTEM hive after partial repair failures.
@@ -93,6 +99,9 @@ reg unload HKLM\VERIFY
     3. Verify GuestAgent binaries were copied to the target disk:
 Get-ChildItem F:\WindowsAzure\GuestAgent_*
     Expected: The exact executables referenced by both service ImagePath values are present and non-empty.
+    4. After az vm repair restore, verify that the repaired disk was actually reattached:
+Get-Content C:\ProgramData\GA-OfflineRepair-Verification.json
+    Expected: ScriptVersion is 1.3 and PersistedSystemHiveVerified is true.
 #>
 
 # Initialization (path-validated)
@@ -317,6 +326,32 @@ function Invoke-GaDiskPart {
     $output = $Commands | diskpart.exe 2>&1
     foreach ($line in @($output)) {
         if ($line) { Write-GaInfo "diskpart $Operation :: $line" }
+    }
+}
+
+function Invoke-GaBcdEdit {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Operation
+    )
+
+    $script:OperationCount++
+    $output = & bcdedit.exe @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in @($output)) {
+        if ($line) { Write-GaInfo "bcdedit $Operation :: $line" }
+    }
+    Write-GaTelemetry -Event Operation -Message "bcdedit $Operation" -Properties @{
+        ExitCode = "$exitCode"
+        Success = ($exitCode -eq 0)
+    }
+    return [pscustomobject]@{
+        Output = @($output)
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
     }
 }
 
@@ -784,9 +819,176 @@ try {
         $targetAgentBackup = $null
         $existingAgentMoved = $false
         $agentFolderActivated = $false
+        $bcdPath = $null
+        $bcdBackup = $null
+        $bcdWriteStarted = $false
+        $bcdBackupRestored = $false
         & reg.exe unload "HKLM\$hiveName" 2>$null
         [System.GC]::Collect()
         Start-Sleep -Seconds 1
+
+        try {
+            $diskNumber = [int]$targetVolume.DiskNumber
+            $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
+            $efiParts = @($diskPartitions | Where-Object {
+                ([string]$_.GptType).Trim().Trim('{', '}') -ieq $efiGptType
+            })
+            $isGen2Disk = $efiParts.Count -gt 0
+            $bcdCandidates = if ($isGen2Disk) { $efiParts } else { $diskPartitions }
+            Write-GaInfo "Disk ${diskNumber}: validating $(if ($isGen2Disk) { 'Gen2/UEFI' } else { 'Gen1/BIOS' }) BCD before Guest Agent changes."
+
+            foreach ($bcdCandidate in $bcdCandidates) {
+                $candidateLetter = $null
+                $letterAssignedByScript = $false
+                if ($bcdCandidate.DriveLetter -and $bcdCandidate.DriveLetter -ne [char]0) {
+                    $candidateLetter = [string]$bcdCandidate.DriveLetter
+                }
+                else {
+                    $candidateLetter = Get-AvailableTempDriveLetter
+                    if (-not $candidateLetter) { continue }
+                    Invoke-GaDiskPart -Operation 'bcd-assign' -Commands @(
+                        "select disk $diskNumber"
+                        "select partition $($bcdCandidate.PartitionNumber)"
+                        "assign letter=$candidateLetter"
+                    )
+                    Start-Sleep -Seconds 2
+                    $letterAssignedByScript = Test-Path -LiteralPath "${candidateLetter}:\" -PathType Container
+                    if ($letterAssignedByScript) {
+                        $temporaryOsMounts += [pscustomobject]@{
+                            DiskNumber = $diskNumber
+                            PartitionNumber = [int]$bcdCandidate.PartitionNumber
+                            DriveLetter = $candidateLetter
+                            TemporaryMount = $true
+                        }
+                    }
+                }
+
+                $candidateBcdPath = if ($isGen2Disk) {
+                    "${candidateLetter}:\EFI\Microsoft\Boot\BCD"
+                }
+                else {
+                    "${candidateLetter}:\Boot\BCD"
+                }
+                if ($candidateLetter -and (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf)) {
+                    $bcdPath = $candidateBcdPath
+                    Write-GaInfo "Disk ${diskNumber}: selected BCD store $bcdPath."
+                    break
+                }
+
+                if ($letterAssignedByScript) {
+                    Invoke-GaDiskPart -Operation 'bcd-probe-remove' -Commands @(
+                        "select disk $diskNumber"
+                        "select partition $($bcdCandidate.PartitionNumber)"
+                        "remove letter=$candidateLetter noerr"
+                    )
+                    Update-HostStorageCache -ErrorAction SilentlyContinue
+                    $temporaryOsMounts = @($temporaryOsMounts | Where-Object {
+                        -not ($_.DiskNumber -eq $diskNumber -and
+                            $_.PartitionNumber -eq [int]$bcdCandidate.PartitionNumber -and
+                            $_.DriveLetter -ieq $candidateLetter)
+                    })
+                }
+            }
+
+            if (-not $bcdPath) {
+                throw "Disk $diskNumber has no generation-appropriate BCD store. No Guest Agent changes were attempted."
+            }
+
+            $bootManagerQuery = Invoke-GaBcdEdit -Arguments @('/store', $bcdPath, '/enum', 'bootmgr', '/v') -Operation 'query-bootmgr'
+            if (-not $bootManagerQuery.Success) {
+                throw "Could not enumerate boot manager from $bcdPath."
+            }
+            $defaultLine = $bootManagerQuery.Output | Select-String -Pattern '^\s*default\s+' | Select-Object -First 1
+            if (-not $defaultLine -or $defaultLine -notmatch '\{([^}]+)\}') {
+                throw "Could not identify the default Windows loader in $bcdPath."
+            }
+            $defaultLoaderId = $matches[0]
+            if ($defaultLoaderId -notmatch '^(?i)\{[0-9a-f\-]{36}\}$') {
+                throw "Default BCD loader identifier '$defaultLoaderId' is invalid."
+            }
+
+            $loaderQuery = Invoke-GaBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'validate-loader'
+            $loaderText = $loaderQuery.Output -join "`n"
+            $loaderPathMatch = [regex]::Match($loaderText, '(?im)^\s*path\s+(.+?)\s*$')
+            $loaderDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*device\s+(.+?)\s*$')
+            $loaderOsDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+            $loaderSystemRootMatch = [regex]::Match($loaderText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+            if (-not $loaderQuery.Success -or -not $loaderPathMatch.Success -or
+                -not $loaderDeviceMatch.Success -or -not $loaderOsDeviceMatch.Success -or
+                -not $loaderSystemRootMatch.Success) {
+                throw "Default loader $defaultLoaderId is missing required mapping elements."
+            }
+
+            $originalLoaderPath = $loaderPathMatch.Groups[1].Value.Trim()
+            $originalLoaderSystemRoot = $loaderSystemRootMatch.Groups[1].Value.Trim()
+            if ($originalLoaderPath -notmatch '(?i)^\\Windows\\System32\\winload\.(exe|efi)$') {
+                throw "Default loader $defaultLoaderId references unsupported path '$originalLoaderPath'."
+            }
+            $resolvedLoaderFile = Join-Path -Path "${diskb}:\" -ChildPath $originalLoaderPath.TrimStart('\')
+            if (-not (Test-Path -LiteralPath $resolvedLoaderFile -PathType Leaf)) {
+                throw "Default loader references '$originalLoaderPath', but '$resolvedLoaderFile' does not exist."
+            }
+
+            $repairLoaderDevice = $loaderDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$'
+            $repairLoaderOsDevice = $loaderOsDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$'
+            if ($repairLoaderDevice -or $repairLoaderOsDevice) {
+                $bcdBackup = $bcdPath + '.GA.bak.' + $timestamp
+                Copy-Item -LiteralPath $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+                if (-not (Test-Path -LiteralPath $bcdBackup -PathType Leaf) -or
+                    (Get-Item -LiteralPath $bcdBackup -Force -ErrorAction Stop).Length -ne
+                    (Get-Item -LiteralPath $bcdPath -Force -ErrorAction Stop).Length) {
+                    throw "BCD backup verification failed for '$bcdBackup'."
+                }
+                Write-GaInfo "Disk ${diskNumber}: BCD backup created and verified at $bcdBackup."
+
+                $validatedWindowsPartition = "partition=${diskb}:"
+                $bcdWriteStarted = $true
+                if ($repairLoaderDevice) {
+                    $setDevice = Invoke-GaBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'device', $validatedWindowsPartition) -Operation 'repair-loader-device'
+                    if (-not $setDevice.Success) { throw "Could not repair device for loader $defaultLoaderId." }
+                }
+                if ($repairLoaderOsDevice) {
+                    $setOsDevice = Invoke-GaBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'osdevice', $validatedWindowsPartition) -Operation 'repair-loader-osdevice'
+                    if (-not $setOsDevice.Success) { throw "Could not repair osdevice for loader $defaultLoaderId." }
+                }
+
+                $verifyLoader = Invoke-GaBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'verify-loader-mapping'
+                $verifyText = $verifyLoader.Output -join "`n"
+                $verifyPath = [regex]::Match($verifyText, '(?im)^\s*path\s+(.+?)\s*$')
+                $verifyDevice = [regex]::Match($verifyText, '(?im)^\s*device\s+(.+?)\s*$')
+                $verifyOsDevice = [regex]::Match($verifyText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+                $verifySystemRoot = [regex]::Match($verifyText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+                if (-not $verifyLoader.Success -or -not $verifyPath.Success -or
+                    -not $verifyDevice.Success -or -not $verifyOsDevice.Success -or
+                    -not $verifySystemRoot.Success -or
+                    $verifyDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+                    $verifyOsDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+                    $verifyPath.Groups[1].Value.Trim() -ine $originalLoaderPath -or
+                    $verifySystemRoot.Groups[1].Value.Trim() -ine $originalLoaderSystemRoot) {
+                    throw "Loader mapping repair verification failed for $defaultLoaderId."
+                }
+                Write-GaInfo "Disk ${diskNumber}: BCD loader mapping repaired and verified."
+            }
+            else {
+                Write-GaInfo "Disk ${diskNumber}: BCD loader mapping validated without changes."
+            }
+        }
+        catch {
+            Write-GaError "BCD preflight failed for Disk $($targetVolume.DiskNumber): $($_.Exception.Message)"
+            if ($bcdWriteStarted -and $bcdBackup -and (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+                try {
+                    Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+                    $bcdBackupRestored = $true
+                    Write-GaWarning "Restored BCD backup after failed preflight: $bcdBackup"
+                }
+                catch {
+                    Write-GaError "CRITICAL: Failed to restore BCD backup '$bcdBackup': $($_.Exception.Message)"
+                }
+            }
+            $failedDisks += $diskb
+            $failedCount++
+            continue
+        }
 
         try {
             $backupFile = "$($diskb):\SYSTEM_before_GA_changes_$diskb.hiv"
@@ -1113,6 +1315,92 @@ try {
             }
 
             $diskProcessedSuccessfully = $diskChangesCompleted -and ($diskb -notin $failedDisks)
+            if ($diskProcessedSuccessfully) {
+                $verificationHiveName = "GAVERIFY_$diskb"
+                $verificationHiveLoaded = $false
+                try {
+                    & reg.exe unload "HKLM\$verificationHiveName" 2>$null | Out-Null
+                    $verificationLoad = & reg.exe load "HKLM\$verificationHiveName" $hiveSource 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Could not reload persisted SYSTEM hive: $($verificationLoad -join '; ')"
+                    }
+                    $verificationHiveLoaded = $true
+
+                    foreach ($targetControlSet in $targetControlSets) {
+                        foreach ($requiredService in $requiredAgentServices) {
+                            $persistedServicePath = "Registry::HKLM\$verificationHiveName\$targetControlSet\Services\$requiredService"
+                            $persistedConfiguration = Get-ItemProperty -Path $persistedServicePath -ErrorAction Stop
+                            if ([int]$persistedConfiguration.Start -ne 2 -or
+                                [string]::IsNullOrWhiteSpace([string]$persistedConfiguration.ImagePath)) {
+                                throw "Persisted verification failed for $requiredService in $targetControlSet."
+                            }
+                        }
+                    }
+                    Write-GaInfo "Reloaded persisted SYSTEM hive and verified required Agent services for $($diskb):."
+                }
+                catch {
+                    Write-GaError "Persisted SYSTEM verification failed for $($diskb):: $($_.Exception.Message)"
+                    if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
+                    $diskProcessedSuccessfully = $false
+                }
+                finally {
+                    if ($verificationHiveLoaded) {
+                        [System.GC]::Collect()
+                        [System.GC]::WaitForPendingFinalizers()
+                        $verificationUnload = & reg.exe unload "HKLM\$verificationHiveName" 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-GaError "Could not unload verification hive $verificationHiveName`: $($verificationUnload -join '; ')"
+                            if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
+                            $diskProcessedSuccessfully = $false
+                        }
+                    }
+                }
+            }
+
+            if ($diskProcessedSuccessfully) {
+                try {
+                    $verificationMarkerPath = "$($diskb):\ProgramData\GA-OfflineRepair-Verification.json"
+                    $targetIdentity = Get-GaDiskIdentity -DiskNumber $targetVolume.DiskNumber
+                    [ordered]@{
+                        CompletedUtc = (Get-Date).ToUniversalTime().ToString('o')
+                        ScriptVersion = $script:RepairScriptVersion
+                        DiskNumberOnRepairVm = [int]$targetVolume.DiskNumber
+                        DiskPartitionStyle = $targetIdentity.PartitionStyle
+                        DiskIdentityDuringRepair = $targetIdentity.Value
+                        WindowsPartition = "$($diskb):"
+                        ControlSets = @($targetControlSets)
+                        RequiredServices = @($requiredAgentServices)
+                        AgentFolder = $targetAgentFolder
+                        BcdPath = $bcdPath
+                        BcdMappingChanged = [bool]$bcdWriteStarted
+                        PersistedSystemHiveVerified = $true
+                    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $verificationMarkerPath -Encoding UTF8 -ErrorAction Stop
+                    Write-GaInfo "Wrote post-restore correlation marker: $verificationMarkerPath"
+                }
+                catch {
+                    Write-GaError "Could not write the repair correlation marker on $($diskb):: $($_.Exception.Message)"
+                    if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
+                    $diskProcessedSuccessfully = $false
+                }
+            }
+
+            if (-not $diskProcessedSuccessfully -and $diskChangesCompleted -and
+                $backupFile -and (Test-Path -LiteralPath $backupFile -PathType Leaf)) {
+                try {
+                    $expectedHiveHash = Get-GaFileSha256 -LiteralPath $backupFile
+                    Copy-Item -LiteralPath $backupFile -Destination $hiveSource -Force -ErrorAction Stop
+                    $actualHiveHash = Get-GaFileSha256 -LiteralPath $hiveSource
+                    if ($actualHiveHash -ne $expectedHiveHash) {
+                        throw 'SYSTEM hive rollback verification failed after a late transaction failure.'
+                    }
+                    Write-GaWarning "Restored original SYSTEM hive because the complete transaction did not finish for $($diskb):."
+                }
+                catch {
+                    Write-GaError "CRITICAL: Failed to restore SYSTEM after a late transaction failure on $($diskb):: $($_.Exception.Message)"
+                    if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
+                }
+            }
+
             if (-not $diskProcessedSuccessfully -and $agentFolderActivated -and $targetAgentFolder) {
                 try {
                     if (Test-Path -LiteralPath $targetAgentFolder) {
@@ -1132,6 +1420,20 @@ try {
                 }
                 catch {
                     Write-GaError "Failed to roll back the VM Agent folder on $($diskb):: $($_.Exception.Message)"
+                    if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
+                }
+            }
+
+            if (-not $diskProcessedSuccessfully -and $bcdWriteStarted -and
+                -not $bcdBackupRestored -and $bcdBackup -and
+                (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+                try {
+                    Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+                    $bcdBackupRestored = $true
+                    Write-GaWarning "Restored BCD backup because Guest Agent processing did not complete: $bcdBackup"
+                }
+                catch {
+                    Write-GaError "CRITICAL: Failed to restore BCD backup '$bcdBackup': $($_.Exception.Message)"
                     if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
                 }
             }
