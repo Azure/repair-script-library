@@ -18,7 +18,7 @@
     Name:          win-LKGC.ps1
     Author:        Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-12
-    Version:       1.4
+    Version:       1.5
     Requirement:   Azure repair VM with an attached Windows OS disk and the VMRepair common helpers
     DeployMode:    az vm repair run (with --run-on-repair)
     Telemetry:     Emits structured start, success, output, and error events through the VMRepair logger
@@ -42,11 +42,11 @@ Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Obj
      existing ControlSet00N key. Always snapshot the OS disk before recovery.
 
     Version history:
-    v1.4: [Aug 2026] - Aligns disk collision handling with the latest SAC repair path.
+    v1.5: [Aug 2026] - Aligns disk collision handling with the latest SAC repair path.
                        Preserves the attached source disk identity, temporarily changes only the
                        disposable repair OS disk for matching Gen2 GPT collisions, and restores
                        and verifies every temporary identity before reporting success.
-                       Selects the existing LastKnownGood control set instead of incrementing
+    v1.4: [Aug 2026] - Selects the existing LastKnownGood control set instead of incrementing
                        Select values and treats the absence of an alternate LKGC as a safe no-op.
                        Validates referenced control sets and their core Control and Services trees.
                        Prevents 0xc0000225 from missing or incomplete ControlSet references.
