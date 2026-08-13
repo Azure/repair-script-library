@@ -694,8 +694,11 @@ try {
             if ($repairLoaderDevice -or $repairLoaderOsDevice -or $restoreTestBootPolicy) {
                 $bcdBackup = $bcdPath + '.LKGC.bak.' + $runTimestamp
                 Copy-Item -LiteralPath $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
-                if ((Get-Item -LiteralPath $bcdBackup -ErrorAction Stop).Length -ne
-                    (Get-Item -LiteralPath $bcdPath -ErrorAction Stop).Length) {
+                if (-not (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+                    throw "BCD backup was not created at '$bcdBackup'. No BCD changes were attempted."
+                }
+                if ((Get-Item -LiteralPath $bcdBackup -Force -ErrorAction Stop).Length -ne
+                    (Get-Item -LiteralPath $bcdPath -Force -ErrorAction Stop).Length) {
                     throw "BCD backup verification failed for '$bcdBackup'. No BCD changes were attempted."
                 }
                 Log-Info "Disk ${diskNumber}: BCD backup created and verified: $bcdBackup"
