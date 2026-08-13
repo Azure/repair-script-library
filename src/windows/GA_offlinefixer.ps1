@@ -8,7 +8,7 @@
     1. Uses the shared repair-library partition helper to locate the faulty OS drive.
     2. Loads the SYSTEM registry hive from the target disk into HKLM\BROKENSYSTEM.
     3. Creates and verifies a binary backup of the SYSTEM hive before loading it.
-    4. Identifies the primary and backup ControlSets (001/002) from the Select key.
+    4. Identifies and validates the existing boot-referenced ControlSets from the Select key.
     5. Exports healthy service keys (WindowsAzureGuestAgent, WindowsAzureTelemetryService, RdAgent)
        from the rescue VM and injects them into both ControlSets on the target hive.
      6. Verifies both required services use automatic startup and have non-empty ImagePath values.
@@ -20,11 +20,17 @@
 
 .NOTES
     Name:    GA_offlinefixer.ps1
-    Version: 1.3
+    Version: 1.4
     Original Author: Daniel Munoz L (damunozl@microsoft.com)
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
+    v1.4: [August 2026] - Addressed production review findings and aligned disk safety,
+                        backup verification, rollback accounting, and rescue service restoration
+                        with win-LKGC and win-sac-onLatest.
+                        - Uses a PowerShell 3-compatible streaming SHA-256 implementation.
+                        - Emits structured telemetry only through the local VMRepair logger.
+                        - Performs no IMDS lookup or other telemetry network request.
     v1.3: [August 2026] - Copies only the newest versioned GuestAgent installation folder.
                         - Uses the WindowsAzureGuestAgent ImagePath folder as a fallback.
                         - Preserves unrelated content in the target WindowsAzure folder.
@@ -45,7 +51,7 @@
                         - No longer stops Windows Defender on the rescue VM.
                         - Makes fallback hive copy-back part of per-disk success accounting.
                         - Removes the unnecessary Azure Instance Metadata Service request.
-                        - Validates WindowsAzure xcopy source and destination content.
+                        - Validates the WindowsAzure robocopy source and staged destination content.
                         - Updated the script (current)
                         - Aligned nested VM detection with win-LKGC guard pattern.
                         - Skips Get-VM safely when Hyper-V module is unavailable.
@@ -79,8 +85,9 @@ Get-ChildItem "$env:USERPROFILE\Desktop\GA_offlinefixer_*.log" | Sort-Object Las
     This verifies only the offline registry and file repair. Agent readiness must be verified after restore and boot.
     2. Reload the SYSTEM hive and verify agent service keys exist (replace F with disk letter):
 reg load HKLM\VERIFY F:\Windows\System32\config\SYSTEM
-Get-ItemProperty -Path "HKLM:\VERIFY\ControlSet001\Services\WindowsAzureGuestAgent" -Name ImagePath
-Get-ItemProperty -Path "HKLM:\VERIFY\ControlSet001\Services\RdAgent" -Name ImagePath
+$defaultSet = 'ControlSet{0:D3}' -f (Get-ItemProperty -Path 'HKLM:\VERIFY\Select').Default
+Get-ItemProperty -Path "HKLM:\VERIFY\$defaultSet\Services\WindowsAzureGuestAgent" -Name Start, ImagePath
+Get-ItemProperty -Path "HKLM:\VERIFY\$defaultSet\Services\RdAgent" -Name Start, ImagePath
 reg unload HKLM\VERIFY
     Expected: ImagePath values are populated and Start is 2 for both services.
     3. Verify GuestAgent binaries were copied to the target disk:
@@ -151,31 +158,63 @@ $script:_origLogError   = (Get-Command Log-Error   -ErrorAction SilentlyContinue
 $script:_origLogOutput  = (Get-Command Log-Output  -ErrorAction SilentlyContinue).ScriptBlock
 
 if ($script:_origLogInfo) {
-    function Log-Info {
+    function Write-GaInfo {
         param([string]$Message)
         & $script:_origLogInfo $Message
         Write-DesktopLogLine "[INFO] $Message"
     }
 }
 if ($script:_origLogWarning) {
-    function Log-Warning {
+    function Write-GaWarning {
         param([string]$Message)
         & $script:_origLogWarning $Message
         Write-DesktopLogLine "[WARN] $Message"
     }
 }
 if ($script:_origLogError) {
-    function Log-Error {
+    function Write-GaError {
         param([string]$Message)
         & $script:_origLogError $Message
         Write-DesktopLogLine "[ERROR] $Message"
     }
 }
 if ($script:_origLogOutput) {
-    function Log-Output {
+    function Write-GaOutput {
         param([string]$Message)
         & $script:_origLogOutput $Message
         Write-DesktopLogLine "[OUTPUT] $Message"
+    }
+}
+
+$script:RepairScriptVersion = '1.4'
+$script:ExecutionStarted = Get-Date
+$script:OperationCount = 0
+
+function Write-GaTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Start', 'Operation', 'Success', 'Error')]
+        [string]$Event,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [hashtable]$Properties = @{}
+    )
+
+    $payload = [ordered]@{
+        Event = $Event
+        Message = $Message
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+        RepairScriptVersion = $script:RepairScriptVersion
+        Properties = $Properties
+    }
+    $json = $payload | ConvertTo-Json -Compress -Depth 8
+    if ($Event -eq 'Error') {
+        Write-GaError "[Telemetry] $json" | Out-Null
+    }
+    else {
+        Write-GaInfo "[Telemetry] $json" | Out-Null
     }
 }
 
@@ -186,18 +225,45 @@ function Invoke-CriticalCommand {
         [Parameter(Mandatory=$true)][string]$Description
     )
 
+    $script:OperationCount++
     $output = & $Command @Arguments 2>&1
     $exitCode = $LASTEXITCODE
 
     if ($output) {
         foreach ($line in @($output)) {
-            Log-Info "$Description :: $line"
+            Write-GaInfo "$Description :: $line"
         }
+    }
+
+    Write-GaTelemetry -Event Operation -Message $Description -Properties @{
+        Command = $Command
+        ExitCode = "$exitCode"
+        Success = ($exitCode -eq 0)
     }
 
     return [PSCustomObject]@{
         ExitCode = $exitCode
         Output = @($output)
+    }
+}
+
+function Get-GaFileSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath
+    )
+
+    $stream = $null
+    $sha256 = $null
+    try {
+        $stream = [System.IO.File]::Open($LiteralPath, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    }
+    finally {
+        if ($sha256) { $sha256.Dispose() }
+        if ($stream) { $stream.Dispose() }
     }
 }
 
@@ -250,7 +316,7 @@ function Invoke-GaDiskPart {
 
     $output = $Commands | diskpart.exe 2>&1
     foreach ($line in @($output)) {
-        if ($line) { Log-Info "diskpart $Operation :: $line" }
+        if ($line) { Write-GaInfo "diskpart $Operation :: $line" }
     }
 }
 
@@ -384,7 +450,7 @@ try {
         }
     }
     catch {
-        Log-Warning "OS metadata discovery failed: $($_.Exception.Message)"
+        Write-GaWarning "OS metadata discovery failed: $($_.Exception.Message)"
     }
 
     # Create metadata context string for logging
@@ -392,8 +458,18 @@ try {
     if ($vmMetadata.OSVersion) { $metadataContext += " OS:$($vmMetadata.OSVersion)" }
     $metadataContext += "]"
 
-    Log-Info "Starting VMAgent Offline Fixer... $metadataContext"
-    Log-Info "Desktop log file path: $logFile"
+    Write-GaInfo "Starting VMAgent Offline Fixer... $metadataContext"
+    Write-GaInfo "Desktop log file path: $logFile"
+    Write-GaInfo "[script_start] Script=GA_offlinefixer Version=$($script:RepairScriptVersion)"
+    Write-GaTelemetry -Event Start -Message 'Starting VMAgent offline repair' -Properties @{
+        ScriptName = 'GA_offlinefixer.ps1'
+        ScriptVersion = $script:RepairScriptVersion
+        ExecutionMode = 'REPAIR_VM_ONLY'
+        HostName = $vmMetadata.HostName
+        OSVersion = $vmMetadata.OSVersion
+        DesktopLog = $logFile
+        NetworkTelemetry = $false
+    }
     # Stop nested guest VM if running
     # Guard Get-VM if Hyper-V module is not available
     try {
@@ -401,25 +477,25 @@ try {
             $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
             if ($guestHyperVVirtualMachine) {
                 if ($guestHyperVVirtualMachine.State -eq 'Running') {
-                    Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
+                    Write-GaInfo "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
                     try {
                         Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                     }
                     catch {
-                        Log-Warning "Failed to stop nested guest VM, will continue but may have limited success"
+                        Write-GaWarning "Failed to stop nested guest VM, will continue but may have limited success"
                     }
                 }
             }
         } else {
-            Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
+            Write-GaInfo "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
         }
     }
     catch {
-        Log-Warning "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)"
+        Write-GaWarning "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)"
     }
 
     # Clean up stale hive mounts from previous failed runs
-    Log-Info "Cleaning up any stale registry hive mounts..."
+    Write-GaInfo "Cleaning up any stale registry hive mounts..."
     $staleHivePaths = @(
         & reg.exe query HKLM 2>$null
         & reg.exe query HKU 2>$null
@@ -428,15 +504,15 @@ try {
         $_ -match '^HKEY_USERS\\(?:BROKENSYSTEM|BROKENSYS|BROKENSW)(?:_[C-Z])?$'
     }
     foreach ($staleHivePath in $staleHivePaths) {
-        Log-Info "Unloading stale repair hive $staleHivePath..."
+        Write-GaInfo "Unloading stale repair hive $staleHivePath..."
         & reg.exe unload $staleHivePath 2>$null
     }
 
     # Log any externally loaded hives (diagnostic)
     $hklmKeys = & reg.exe query HKLM 2>$null | Where-Object { $_ -match 'BROKEN|OFFLINE|SYSTEM_' }
     $hkuKeys = & reg.exe query HKU 2>$null | Where-Object { $_ -match 'BROKEN|OFFLINE|SYSTEM_' }
-    if ($hklmKeys) { Log-Info "Loaded HKLM hives: $($hklmKeys -join ', ')" }
-    if ($hkuKeys) { Log-Info "Loaded HKU hives: $($hkuKeys -join ', ')" }
+    if ($hklmKeys) { Write-GaInfo "Loaded HKLM hives: $($hklmKeys -join ', ')" }
+    if ($hkuKeys) { Write-GaInfo "Loaded HKU hives: $($hkuKeys -join ', ')" }
 
     # Identify the rescue OS disk before stopping services or touching any disk.
     $rescueDrive = $env:SystemDrive -replace ':', ''
@@ -446,7 +522,7 @@ try {
     }
     $rescueDiskNum = [int]$rescueOsPartition.DiskNumber
     $repairDiskIdentity = Get-GaDiskIdentity -DiskNumber $rescueDiskNum
-    Log-Info "Rescue VM OS disk identified as physical Disk $rescueDiskNum ($($repairDiskIdentity.PartitionStyle))."
+    Write-GaInfo "Rescue VM OS disk identified as physical Disk $rescueDiskNum ($($repairDiskIdentity.PartitionStyle))."
 
     # Azure rescue VMs can place the pagefile on a separate temporary resource disk.
     # Windows treats that disk as critical even though it is not the rescue OS disk.
@@ -466,7 +542,7 @@ try {
         }
     }
     $protectedDiskNumbers = @($protectedDiskNumbers | Sort-Object -Unique)
-    Log-Info "Protected rescue disk numbers excluded from repair: $($protectedDiskNumbers -join ', ')."
+    Write-GaInfo "Protected rescue disk numbers excluded from repair: $($protectedDiskNumbers -join ', ')."
 
     $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
         Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
@@ -499,7 +575,7 @@ try {
                     TemporaryDiskPartValue = $temporaryRepairGuid
                 }
 
-                Log-Warning 'Temporarily changing only the repair VM OS disk GPT identity. The attached source disk GUID will remain unchanged.'
+                Write-GaWarning 'Temporarily changing only the repair VM OS disk GPT identity. The attached source disk GUID will remain unchanged.'
                 Set-GaTemporaryRepairDiskIdentity -Record $repairDiskIdentityRecord
             }
 
@@ -517,7 +593,7 @@ try {
                 throw "Disk $($collisionDisk.Number) could not be onlined with its original GPT identity unchanged."
             }
 
-            Log-Info "Disk $($collisionDisk.Number) collision released; source GPT identity remains $($originalIdentity.Value)."
+            Write-GaInfo "Disk $($collisionDisk.Number) collision released; source GPT identity remains $($originalIdentity.Value)."
             continue
         }
 
@@ -535,14 +611,14 @@ try {
         }
         $collisionDiskRecords += $record
 
-        Log-Warning "Disk $($record.DiskNumber) is offline due to an identity collision. Applying a temporary MBR identity for this repair run."
+        Write-GaWarning "Disk $($record.DiskNumber) is offline due to an identity collision. Applying a temporary MBR identity for this repair run."
         Set-GaTemporarySourceIdentity -Record $record
-        Log-Info "Disk $($record.DiskNumber) is online with a verified temporary MBR identity."
+        Write-GaInfo "Disk $($record.DiskNumber) is online with a verified temporary MBR identity."
     }
 
     $attachedDisks = @($attachedDisks | ForEach-Object { Get-Disk -Number $_.Number -ErrorAction Stop })
     $attachedDiskNumbers = @($attachedDisks | Select-Object -ExpandProperty Number)
-    Log-Info "Attached repair candidate disk numbers: $($attachedDiskNumbers -join ', ')"
+    Write-GaInfo "Attached repair candidate disk numbers: $($attachedDiskNumbers -join ', ')"
 
     $partitionlist = @(Get-Disk-Partitions)
     if ($partitionlist.Count -eq 0) {
@@ -550,7 +626,7 @@ try {
     }
 
     $discoveredDiskNumbers = @($partitionlist | Select-Object -ExpandProperty DiskNumber -Unique)
-    Log-Info "Get-Disk-Partitions discovered disk numbers: $($discoveredDiskNumbers -join ', ')"
+    Write-GaInfo "Get-Disk-Partitions discovered disk numbers: $($discoveredDiskNumbers -join ', ')"
     $targetDiskGroups = @($partitionlist |
         Where-Object {
             [int]$_.DiskNumber -in $attachedDiskNumbers -and
@@ -562,17 +638,17 @@ try {
     }
 
     # Pause indexing while attached hives are modified. Defender remains running.
-    Log-Info "Stopping Windows Search temporarily to reduce attached-disk file locks..."
+    Write-GaInfo "Stopping Windows Search temporarily to reduce attached-disk file locks..."
     foreach ($svc in @('WSearch')) {
         try {
             $svcObj = Get-Service -Name $svc -ErrorAction Stop
             if ($svcObj) {
                 $serviceStates[$svc] = [string]$svcObj.Status
-                Log-Info "Captured original state of $svc : $($svcObj.Status)"
+                Write-GaInfo "Captured original state of $svc : $($svcObj.Status)"
                 if ($svcObj.Status -ne 'Stopped') {
                     Stop-Service -Name $svc -ErrorAction Stop
                     $svcObj.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
-                    Log-Info "$svc stopped temporarily."
+                    Write-GaInfo "$svc stopped temporarily."
                 }
             }
         }
@@ -588,7 +664,7 @@ try {
         $diskNumber = [int]$diskGroup.Name
         $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
         if ($diskPartitions.Count -eq 0) {
-            Log-Warning "Attached repair Disk $diskNumber has no partitions."
+            Write-GaWarning "Attached repair Disk $diskNumber has no partitions."
             $skippedCount++
             continue
         }
@@ -672,11 +748,11 @@ try {
 
         if ($targetVolume) {
             $targetWindowsVolumes += $targetVolume
-            Log-Info "Validated Windows target on Disk $diskNumber Partition $($targetVolume.PartitionNumber) at $($targetVolume.DriveLetter):."
+            Write-GaInfo "Validated Windows target on Disk $diskNumber Partition $($targetVolume.PartitionNumber) at $($targetVolume.DriveLetter):."
         }
         else {
             $skippedCount++
-            Log-Warning "Disk $diskNumber has no partition containing both a Windows loader and SYSTEM hive."
+            Write-GaWarning "Disk $diskNumber has no partition containing both a Windows loader and SYSTEM hive."
         }
     }
 
@@ -690,7 +766,12 @@ try {
     foreach ($targetVolume in $targetWindowsVolumes) {
         $processedCount++
         $diskb = [string]$targetVolume.DriveLetter
-        Log-Info "Processing validated target Disk $($targetVolume.DiskNumber) on letter $($diskb):"
+        Write-GaInfo "Processing validated target Disk $($targetVolume.DiskNumber) on letter $($diskb):"
+        Write-GaTelemetry -Event Operation -Message 'Starting Guest Agent repair on validated disk' -Properties @{
+            DiskNumber = "$($targetVolume.DiskNumber)"
+            PartitionNumber = "$($targetVolume.PartitionNumber)"
+            DriveLetter = $diskb
+        }
         # Step 2 - Load the SYSTEM registry hive from the target disk
         $hiveName = "BROKENSYSTEM_$diskb"
         $hiveSource = "$($diskb):\Windows\System32\config\SYSTEM"
@@ -699,33 +780,37 @@ try {
         $restoreHiveBackup = $false
         $diskProcessedSuccessfully = $false
         $diskChangesCompleted = $false
+        $targetAgentFolder = $null
+        $targetAgentBackup = $null
+        $existingAgentMoved = $false
+        $agentFolderActivated = $false
         & reg.exe unload "HKLM\$hiveName" 2>$null
         [System.GC]::Collect()
         Start-Sleep -Seconds 1
 
         try {
             $backupFile = "$($diskb):\SYSTEM_before_GA_changes_$diskb.hiv"
-            Log-Info "Creating binary SYSTEM hive backup at $backupFile..."
+            Write-GaInfo "Creating binary SYSTEM hive backup at $backupFile..."
             Copy-Item -LiteralPath $hiveSource -Destination $backupFile -Force -ErrorAction Stop
-            $sourceHiveHash = (Get-FileHash -LiteralPath $hiveSource -Algorithm SHA256 -ErrorAction Stop).Hash
-            $backupHiveHash = (Get-FileHash -LiteralPath $backupFile -Algorithm SHA256 -ErrorAction Stop).Hash
+            $sourceHiveHash = Get-GaFileSha256 -LiteralPath $hiveSource
+            $backupHiveHash = Get-GaFileSha256 -LiteralPath $backupFile
             if ($sourceHiveHash -ne $backupHiveHash) {
                 throw "Source and backup SHA256 hashes differ."
             }
-            Log-Info "Binary SYSTEM hive backup created and verified for $($diskb):."
+            Write-GaInfo "Binary SYSTEM hive backup created and verified for $($diskb):."
         }
         catch {
-            Log-Error "Failed to create and verify SYSTEM hive backup for $($diskb):: $($_.Exception.Message)"
+            Write-GaError "Failed to create and verify SYSTEM hive backup for $($diskb):: $($_.Exception.Message)"
             $failedDisks += $diskb
             $failedCount++
             continue
         }
 
-        Log-Info "Loading SYSTEM hive from $($diskb): as $hiveName..."
+        Write-GaInfo "Loading SYSTEM hive from $($diskb): as $hiveName..."
         $loadResult = & reg.exe load "HKLM\$hiveName" $hiveSource 2>&1
         if ($LASTEXITCODE -ne 0) {
             # Retry once after a short wait
-            Log-Warning "First reg load attempt failed for $($diskb):, retrying in 5 seconds..."
+            Write-GaWarning "First reg load attempt failed for $($diskb):, retrying in 5 seconds..."
             Start-Sleep -Seconds 5
             [System.GC]::Collect()
             [System.GC]::WaitForPendingFinalizers()
@@ -733,24 +818,24 @@ try {
         }
         if ($LASTEXITCODE -ne 0) {
             # Fallback: use esentutl.exe /y to copy locked hive via Windows Backup API semantics
-            Log-Warning "Direct load failed. Trying esentutl copy fallback for $($diskb):..."
+            Write-GaWarning "Direct load failed. Trying esentutl copy fallback for $($diskb):..."
             $hiveCopy = "$env:TEMP\SYSTEM_COPY_$diskb"
             try {
                 $esentResult = & esentutl.exe /y $hiveSource /d $hiveCopy /o 2>&1
                 if ($LASTEXITCODE -eq 0 -and (Test-Path $hiveCopy)) {
-                    Log-Info "Hive copied successfully to $hiveCopy via esentutl"
+                    Write-GaInfo "Hive copied successfully to $hiveCopy via esentutl"
                     $loadResult = & reg.exe load "HKLM\$hiveName" $hiveCopy 2>&1
                 }
                 else {
-                    Log-Warning "esentutl copy failed for $($diskb): $esentResult"
+                    Write-GaWarning "esentutl copy failed for $($diskb): $esentResult"
                 }
             }
             catch {
-                Log-Warning "esentutl fallback failed for $($diskb):: $($_.Exception.Message)"
+                Write-GaWarning "esentutl fallback failed for $($diskb):: $($_.Exception.Message)"
             }
         }
         if ($LASTEXITCODE -ne 0) {
-            Log-Error "Failed to load Registry Hive from $($diskb): $loadResult"
+            Write-GaError "Failed to load Registry Hive from $($diskb): $loadResult"
             if ($hiveCopy -and (Test-Path $hiveCopy)) { Remove-Item $hiveCopy -Force -ErrorAction SilentlyContinue }
             $failedDisks += $diskb
             $failedCount++
@@ -759,14 +844,35 @@ try {
         Start-Sleep -Seconds 2
 
         try {
-            # Step 4 - Identify the primary and backup ControlSets from the Select key
+            # Step 4 - Identify existing boot-referenced ControlSets from the Select key.
             $selectPath = "Registry::HKLM\$hiveName\Select"
-            $defaultSetID = (Get-ItemProperty -path $selectPath).default
-            $primarySet = "ControlSet00$defaultSetID"
-            $otherSet = if ($primarySet -eq "ControlSet001") { "ControlSet002" } else { "ControlSet001" }
+            $selectConfiguration = Get-ItemProperty -Path $selectPath -ErrorAction Stop
+            $defaultSetID = [int]$selectConfiguration.Default
+            if ($defaultSetID -lt 1) {
+                throw "SYSTEM hive Select contains an invalid Default control-set reference: $defaultSetID."
+            }
 
-            Log-Info "Primary ControlSet identified: $primarySet"
-            # Step 5 - Export healthy service keys and inject into both ControlSets
+            $primarySet = 'ControlSet{0:D3}' -f $defaultSetID
+            $targetControlSets = @(@(
+                [int]$selectConfiguration.Current
+                [int]$selectConfiguration.Default
+                [int]$selectConfiguration.LastKnownGood
+            ) | Where-Object { $_ -gt 0 } | Sort-Object -Unique | ForEach-Object {
+                'ControlSet{0:D3}' -f $_
+            })
+            foreach ($targetControlSet in $targetControlSets) {
+                if (-not (Test-Path -Path "Registry::HKLM\$hiveName\$targetControlSet\Services")) {
+                    throw "SYSTEM hive Select references missing or incomplete $targetControlSet."
+                }
+            }
+
+            if ($primarySet -notin $targetControlSets) {
+                throw "Default control set $primarySet was not included in the validated repair targets."
+            }
+            Write-GaInfo "Validated boot-referenced ControlSets: $($targetControlSets -join ', ') (Default=$primarySet)"
+
+            # Step 5 - Export healthy service keys and inject into every boot-referenced ControlSet.
+            $requiredAgentServices = @('WindowsAzureGuestAgent', 'RdAgent')
             $services = @("WindowsAzureGuestAgent", "WindowsAzureTelemetryService", "RdAgent")
 
             foreach ($service in $services) {
@@ -774,7 +880,10 @@ try {
                 # Check if service key exists on the rescue VM before attempting export
                 $rescueServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$service"
                 if (-not (Test-Path -Path $rescueServiceKey)) {
-                    Log-Warning "Service '$service' not found on rescue VM registry - skipping (not present on this OS version)"
+                    if ($service -in $requiredAgentServices) {
+                        throw "Required service '$service' was not found in the rescue VM registry."
+                    }
+                    Write-GaWarning "Optional service '$service' was not found in the rescue VM registry; skipping it."
                     continue
                 }
                 # Export healthy key from the current Rescue VM
@@ -782,24 +891,13 @@ try {
 
                 if ($serviceExportResult.ExitCode -eq 0 -and (Test-Path $regFile)) {
                     $originalContent = Get-Content $regFile
-
-                    # Update Primary Set
-                    Log-Info "Updating $service in $primarySet on $($diskb):..."
-                    $content = $originalContent -replace 'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet', "HKEY_LOCAL_MACHINE\$hiveName\$primarySet"
-                    $content | Set-Content $regFile
-                    $primaryImportResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("import", $regFile) -Description "reg import $service into $primarySet ($diskb)"
-                    if ($primaryImportResult.ExitCode -ne 0) {
-                        throw "Failed to import $service into $primarySet for $($diskb): $($primaryImportResult.Output -join '; ')"
-                    }
-
-                    # Update Secondary Set (if it exists on disk)
-                    if (Test-Path "Registry::HKLM\$hiveName\$otherSet") {
-                        Log-Info "Updating $service in backup $otherSet on $($diskb):..."
-                        $content = $originalContent -replace 'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet', "HKEY_LOCAL_MACHINE\$hiveName\$otherSet"
+                    foreach ($targetControlSet in $targetControlSets) {
+                        Write-GaInfo "Updating $service in $targetControlSet on $($diskb):..."
+                        $content = $originalContent -replace 'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet', "HKEY_LOCAL_MACHINE\$hiveName\$targetControlSet"
                         $content | Set-Content $regFile
-                        $secondaryImportResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("import", $regFile) -Description "reg import $service into $otherSet ($diskb)"
-                        if ($secondaryImportResult.ExitCode -ne 0) {
-                            throw "Failed to import $service into $otherSet for $($diskb): $($secondaryImportResult.Output -join '; ')"
+                        $importResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("import", $regFile) -Description "reg import $service into $targetControlSet ($diskb)"
+                        if ($importResult.ExitCode -ne 0) {
+                            throw "Failed to import $service into $targetControlSet for $($diskb): $($importResult.Output -join '; ')"
                         }
                     }
                     Remove-Item $regFile -Force
@@ -810,21 +908,24 @@ try {
                 }
             }
 
-            # Step 6 - Validate the required service configuration written to the target hive.
-            $requiredAgentServices = @('WindowsAzureGuestAgent', 'RdAgent')
+            # Step 6 - Validate required service configuration in every updated ControlSet.
             $targetServiceConfigurations = @{}
-            foreach ($requiredService in $requiredAgentServices) {
-                $servicePath = "Registry::HKLM\$hiveName\$primarySet\Services\$requiredService"
-                $serviceConfiguration = Get-ItemProperty -Path $servicePath -ErrorAction Stop
-                if ([string]::IsNullOrWhiteSpace([string]$serviceConfiguration.ImagePath)) {
-                    throw "Required service '$requiredService' has an empty ImagePath in $primarySet."
-                }
-                if ([int]$serviceConfiguration.Start -ne 2) {
-                    throw "Required service '$requiredService' is not configured for automatic startup in ${primarySet} (Start=$($serviceConfiguration.Start))."
-                }
+            foreach ($targetControlSet in $targetControlSets) {
+                foreach ($requiredService in $requiredAgentServices) {
+                    $servicePath = "Registry::HKLM\$hiveName\$targetControlSet\Services\$requiredService"
+                    $serviceConfiguration = Get-ItemProperty -Path $servicePath -ErrorAction Stop
+                    if ([string]::IsNullOrWhiteSpace([string]$serviceConfiguration.ImagePath)) {
+                        throw "Required service '$requiredService' has an empty ImagePath in $targetControlSet."
+                    }
+                    if ([int]$serviceConfiguration.Start -ne 2) {
+                        throw "Required service '$requiredService' is not configured for automatic startup in ${targetControlSet} (Start=$($serviceConfiguration.Start))."
+                    }
 
-                $targetServiceConfigurations[$requiredService] = $serviceConfiguration
-                Log-Info "Validated $requiredService configuration in ${primarySet}: Start=2, ImagePath=$($serviceConfiguration.ImagePath)"
+                    if ($targetControlSet -eq $primarySet) {
+                        $targetServiceConfigurations[$requiredService] = $serviceConfiguration
+                    }
+                    Write-GaInfo "Validated $requiredService in ${targetControlSet}: Start=2, ImagePath=$($serviceConfiguration.ImagePath)"
+                }
             }
             $afterImagePath = [string]$targetServiceConfigurations['WindowsAzureGuestAgent'].ImagePath
 
@@ -849,7 +950,7 @@ try {
             $sourceAgentFolder = $null
             if ($guestAgentCandidates.Count -gt 0) {
                 $sourceAgentFolder = $guestAgentCandidates[0].Directory
-                Log-Info "Selected latest VM Agent installation folder $($sourceAgentFolder.Name)."
+                Write-GaInfo "Selected latest VM Agent installation folder $($sourceAgentFolder.Name)."
             }
             else {
                 $expandedImagePath = [Environment]::ExpandEnvironmentVariables($afterImagePath).Trim()
@@ -863,7 +964,7 @@ try {
                     $imageFolder = Split-Path -Parent $imageExecutable
                     if (Test-Path -LiteralPath $imageFolder -PathType Container) {
                         $sourceAgentFolder = Get-Item -LiteralPath $imageFolder -ErrorAction Stop
-                        Log-Warning "No versioned GuestAgent folder was found; using ImagePath folder '$imageFolder'."
+                        Write-GaWarning "No versioned GuestAgent folder was found; using ImagePath folder '$imageFolder'."
                     }
                 }
             }
@@ -875,11 +976,9 @@ try {
             $null = New-Item -Path $destPath -ItemType Directory -Force
             $targetAgentFolder = Join-Path $destPath $sourceAgentFolder.Name
             $stagingAgentFolder = Join-Path $destPath ('.GA_repair_{0}_{1}' -f $sourceAgentFolder.Name, [guid]::NewGuid().ToString('N'))
-            $targetAgentBackup = $null
-            $existingAgentMoved = $false
 
             try {
-                Log-Info "Staging VM Agent folder $($sourceAgentFolder.FullName) at $stagingAgentFolder..."
+                Write-GaInfo "Staging VM Agent folder $($sourceAgentFolder.FullName) at $stagingAgentFolder..."
                 $restoreCopyResult = Invoke-CriticalCommand -Command "robocopy.exe" -Arguments @(
                     $sourceAgentFolder.FullName, $stagingAgentFolder, '/E', '/COPY:DAT', '/DCOPY:DAT',
                     '/XJ', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP'
@@ -906,19 +1005,20 @@ try {
                     if ($stagedExecutableInfo.Length -le 0) {
                         throw "Required executable for service '$requiredService' is empty in the staged copy: $stagedExecutable"
                     }
-                    Log-Info "Validated staged $requiredService executable ($($stagedExecutableInfo.Length) bytes)."
+                    Write-GaInfo "Validated staged $requiredService executable ($($stagedExecutableInfo.Length) bytes)."
                 }
 
                 if (Test-Path -LiteralPath $targetAgentFolder) {
                     $null = New-Item -Path $backupPath -ItemType Directory -Force
                     $targetAgentBackup = Join-Path $backupPath "$($sourceAgentFolder.Name)_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-                    Log-Info "Moving existing $($sourceAgentFolder.Name) folder to $targetAgentBackup..."
+                    Write-GaInfo "Moving existing $($sourceAgentFolder.Name) folder to $targetAgentBackup..."
                     Move-Item -LiteralPath $targetAgentFolder -Destination $targetAgentBackup -ErrorAction Stop
                     $existingAgentMoved = $true
                 }
 
                 Move-Item -LiteralPath $stagingAgentFolder -Destination $targetAgentFolder -ErrorAction Stop
-                Log-Info "Activated validated VM Agent folder at $targetAgentFolder."
+                $agentFolderActivated = $true
+                Write-GaInfo "Activated validated VM Agent folder at $targetAgentFolder."
             }
             catch {
                 $activationError = $_
@@ -930,7 +1030,8 @@ try {
                         Remove-Item -LiteralPath $targetAgentFolder -Recurse -Force -ErrorAction Stop
                     }
                     Move-Item -LiteralPath $targetAgentBackup -Destination $targetAgentFolder -ErrorAction Stop
-                    Log-Warning "Restored the original VM Agent folder after replacement failed."
+                    $agentFolderActivated = $false
+                    Write-GaWarning "Restored the original VM Agent folder after replacement failed."
                 }
                 throw $activationError
             }
@@ -938,13 +1039,13 @@ try {
             $diskChangesCompleted = $true
         }
         catch {
-            Log-Error "Failed to process $($diskb):: $($_.Exception.Message)"
+            Write-GaError "Failed to process $($diskb):: $($_.Exception.Message)"
             $restoreHiveBackup = $true
             $diskProcessedSuccessfully = $false
         }
         finally {
             # Step 8 - Release handles and safely unload the registry hive
-            Log-Info "Unloading registry hive $hiveName..."
+            Write-GaInfo "Unloading registry hive $hiveName..."
             [System.GC]::Collect()
             [System.GC]::WaitForPendingFinalizers()
             Start-Sleep -Seconds 3
@@ -953,56 +1054,56 @@ try {
             for ($i=1; $i -le 3; $i++) {
                 $unloadResult = Invoke-CriticalCommand -Command "reg.exe" -Arguments @("unload", "HKLM\$hiveName") -Description "reg unload $hiveName attempt $i"
                 if ($unloadResult.ExitCode -eq 0) { $unloaded = $true; break }
-                Log-Warning "Unload attempt $i for $hiveName failed, retrying..."
+                Write-GaWarning "Unload attempt $i for $hiveName failed, retrying..."
                 Start-Sleep -Seconds 5
             }
             if (-not $unloaded) {
-                Log-Error "Could not unload $hiveName hive - marking Disk $diskb as failed."
+                Write-GaError "Could not unload $hiveName hive - marking Disk $diskb as failed."
                 $failedDisks += $diskb
             }
 
             if ($restoreHiveBackup -and $backupFile -and (Test-Path -LiteralPath $backupFile)) {
                 if ($unloaded) {
-                    Log-Warning "Repair processing failed; restoring the original SYSTEM hive from $backupFile."
+                    Write-GaWarning "Repair processing failed; restoring the original SYSTEM hive from $backupFile."
                     try {
-                        $expectedHiveHash = (Get-FileHash -LiteralPath $backupFile -Algorithm SHA256 -ErrorAction Stop).Hash
+                        $expectedHiveHash = Get-GaFileSha256 -LiteralPath $backupFile
                         Copy-Item -LiteralPath $backupFile -Destination $hiveSource -Force -ErrorAction Stop
-                        $actualHiveHash = (Get-FileHash -LiteralPath $hiveSource -Algorithm SHA256 -ErrorAction Stop).Hash
+                        $actualHiveHash = Get-GaFileSha256 -LiteralPath $hiveSource
                         if ($actualHiveHash -ne $expectedHiveHash) {
                             throw "SYSTEM hive rollback verification failed: backup and restored hashes differ."
                         }
-                        Log-Info "Original SYSTEM hive restored and verified for $($diskb):."
+                        Write-GaInfo "Original SYSTEM hive restored and verified for $($diskb):."
                     }
                     catch {
-                        Log-Error "Failed to restore the original SYSTEM hive on $($diskb):: $($_.Exception.Message)"
+                        Write-GaError "Failed to restore the original SYSTEM hive on $($diskb):: $($_.Exception.Message)"
                         $failedDisks += $diskb
                     }
                 }
                 else {
-                    Log-Error "Original SYSTEM hive for $($diskb): cannot be restored because $hiveName did not unload."
+                    Write-GaError "Original SYSTEM hive for $($diskb): cannot be restored because $hiveName did not unload."
                     $failedDisks += $diskb
                 }
             }
             # If direct loading failed, persist the fallback hive only after every repair check passed.
             elseif ($hiveCopy -and (Test-Path $hiveCopy)) {
                 if ($unloaded) {
-                    Log-Info "Copying modified hive back to $hiveSource..."
+                    Write-GaInfo "Copying modified hive back to $hiveSource..."
                     try {
-                        $expectedHiveHash = (Get-FileHash -LiteralPath $hiveCopy -Algorithm SHA256 -ErrorAction Stop).Hash
+                        $expectedHiveHash = Get-GaFileSha256 -LiteralPath $hiveCopy
                         Copy-Item -LiteralPath $hiveCopy -Destination $hiveSource -Force -ErrorAction Stop
-                        $actualHiveHash = (Get-FileHash -LiteralPath $hiveSource -Algorithm SHA256 -ErrorAction Stop).Hash
+                        $actualHiveHash = Get-GaFileSha256 -LiteralPath $hiveSource
                         if ($actualHiveHash -ne $expectedHiveHash) {
                             throw "Hive copy-back verification failed: source and destination SHA256 hashes differ."
                         }
-                        Log-Info "Successfully copied and verified the modified hive back to $($diskb):"
+                        Write-GaInfo "Successfully copied and verified the modified hive back to $($diskb):"
                     }
                     catch {
-                        Log-Error "Failed to copy modified hive back to $($diskb):: $($_.Exception.Message)"
+                        Write-GaError "Failed to copy modified hive back to $($diskb):: $($_.Exception.Message)"
                         $failedDisks += $diskb
                     }
                 }
                 else {
-                    Log-Error "Modified fallback hive for $($diskb): cannot be copied back because $hiveName did not unload."
+                    Write-GaError "Modified fallback hive for $($diskb): cannot be copied back because $hiveName did not unload."
                     $failedDisks += $diskb
                 }
             }
@@ -1012,6 +1113,29 @@ try {
             }
 
             $diskProcessedSuccessfully = $diskChangesCompleted -and ($diskb -notin $failedDisks)
+            if (-not $diskProcessedSuccessfully -and $agentFolderActivated -and $targetAgentFolder) {
+                try {
+                    if (Test-Path -LiteralPath $targetAgentFolder) {
+                        Remove-Item -LiteralPath $targetAgentFolder -Recurse -Force -ErrorAction Stop
+                    }
+                    if ($existingAgentMoved -and $targetAgentBackup) {
+                        if (-not (Test-Path -LiteralPath $targetAgentBackup -PathType Container)) {
+                            throw "Original VM Agent backup is missing: $targetAgentBackup"
+                        }
+                        Move-Item -LiteralPath $targetAgentBackup -Destination $targetAgentFolder -ErrorAction Stop
+                        Write-GaWarning "Restored the original VM Agent folder because registry persistence did not complete."
+                    }
+                    else {
+                        Write-GaWarning "Removed the newly introduced VM Agent folder because registry persistence did not complete."
+                    }
+                    $agentFolderActivated = $false
+                }
+                catch {
+                    Write-GaError "Failed to roll back the VM Agent folder on $($diskb):: $($_.Exception.Message)"
+                    if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
+                }
+            }
+
             if ($diskProcessedSuccessfully) {
                 $fixedDisks += $diskb
                 $changedCount++
@@ -1026,11 +1150,11 @@ try {
     }
 
     if ($failedDisks.Count -gt 0) {
-        Log-Error "Processing failed on disks: $($failedDisks -join ', ')"
+        Write-GaError "Processing failed on disks: $($failedDisks -join ', ')"
         throw "One or more disks failed backup, hive processing, unload, or copy-back validation: $($failedDisks -join ', '). Please review logs."
     }
 
-    Log-Info "Processing summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
+    Write-GaInfo "Processing summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
     if ($fixedDisks.Count -gt 0) {
         $successMessage = "VMAgent offline repair completed on drives: $($fixedDisks -join ', '). Agent readiness must be verified after restore and boot. | Host=$($vmMetadata.HostName)"
         $script_final_status = $STATUS_SUCCESS
@@ -1042,13 +1166,16 @@ try {
 }
 catch {
     $errorMessage = $_.Exception.Message
-    Log-Error "SCRIPT FAILED: $errorMessage"
+    Write-GaError "SCRIPT FAILED: $errorMessage"
+    Write-GaTelemetry -Event Error -Message 'VMAgent offline repair failed' -Properties @{
+        Error = $errorMessage
+    }
     $script_final_status = $STATUS_ERROR
 }
 finally {
     foreach ($mount in @($temporaryOsMounts | Sort-Object DiskNumber, PartitionNumber -Unique)) {
         try {
-            Log-Info "Removing temporary OS letter $($mount.DriveLetter): from Disk $($mount.DiskNumber) Partition $($mount.PartitionNumber)."
+            Write-GaInfo "Removing temporary OS letter $($mount.DriveLetter): from Disk $($mount.DiskNumber) Partition $($mount.PartitionNumber)."
             Invoke-GaDiskPart -Operation 'os-cleanup' -Commands @(
                 "select disk $($mount.DiskNumber)"
                 "select partition $($mount.PartitionNumber)"
@@ -1059,10 +1186,10 @@ finally {
             if ([string]$cleanedPartition.DriveLetter -ieq [string]$mount.DriveLetter) {
                 throw "Temporary drive letter removal could not be verified."
             }
-            Log-Info "Temporary OS letter $($mount.DriveLetter): removal verified."
+            Write-GaInfo "Temporary OS letter $($mount.DriveLetter): removal verified."
         }
         catch {
-            Log-Error "Failed to remove temporary OS letter $($mount.DriveLetter): $($_.Exception.Message)"
+            Write-GaError "Failed to remove temporary OS letter $($mount.DriveLetter): $($_.Exception.Message)"
             $script_final_status = $STATUS_ERROR
         }
     }
@@ -1082,22 +1209,22 @@ finally {
                 if (-not $sourceDisk.IsOffline -or $sourceIdentity.Value -ine $repairDiskIdentityRecord.OriginalValue) {
                     throw "Source Disk $diskNumber was not offline with its unchanged original GPT identity."
                 }
-                Log-Info "Source Disk $diskNumber is offline with its original GPT identity verified before repair host restoration."
+                Write-GaInfo "Source Disk $diskNumber is offline with its original GPT identity verified before repair host restoration."
             }
             catch {
                 $identityRestorationFailed = $true
-                Log-Error "CRITICAL: Could not safely offline and verify source Disk ${diskNumber}: $($_.Exception.Message)"
+                Write-GaError "CRITICAL: Could not safely offline and verify source Disk ${diskNumber}: $($_.Exception.Message)"
             }
         }
 
         if (-not $identityRestorationFailed) {
             try {
                 Restore-GaRepairDiskIdentity -Record $repairDiskIdentityRecord
-                Log-Info 'Repair VM OS disk GPT identity restored and verified.'
+                Write-GaInfo 'Repair VM OS disk GPT identity restored and verified.'
             }
             catch {
                 $identityRestorationFailed = $true
-                Log-Error "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)"
+                Write-GaError "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)"
             }
         }
     }
@@ -1105,11 +1232,11 @@ finally {
     foreach ($identityRecord in @($collisionDiskRecords | Sort-Object DiskNumber -Descending)) {
         try {
             Restore-GaOriginalSourceIdentity -Record $identityRecord
-            Log-Info "Disk $($identityRecord.DiskNumber) is offline with its verified original MBR identity restored."
+            Write-GaInfo "Disk $($identityRecord.DiskNumber) is offline with its verified original MBR identity restored."
         }
         catch {
             $identityRestorationFailed = $true
-            Log-Error "CRITICAL: Failed to restore original identity on Disk $($identityRecord.DiskNumber): $($_.Exception.Message)"
+            Write-GaError "CRITICAL: Failed to restore original identity on Disk $($identityRecord.DiskNumber): $($_.Exception.Message)"
         }
     }
 
@@ -1119,15 +1246,15 @@ finally {
 
     # Log local execution context only; this script performs no telemetry upload.
     if ($vmMetadata.OSVersion) {
-        Log-Info "Execution Context - Host: $($vmMetadata.HostName), OS: $($vmMetadata.OSVersion)"
+        Write-GaInfo "Execution Context - Host: $($vmMetadata.HostName), OS: $($vmMetadata.OSVersion)"
     }
 
     # Restore original service states
-    Log-Info "Restoring original service states..."
+    Write-GaInfo "Restoring original service states..."
     foreach ($svc in $serviceStates.Keys) {
         try {
             $originalState = $serviceStates[$svc]
-            Log-Info "Restoring $svc to state: $originalState"
+            Write-GaInfo "Restoring $svc to state: $originalState"
             if ($originalState -eq 'Running') {
                 Start-Service -Name $svc -ErrorAction Stop
                 $restoredService = Get-Service -Name $svc -ErrorAction Stop
@@ -1140,20 +1267,39 @@ finally {
             if ($restoredState -ne $originalState) {
                 throw "$svc restoration verification failed: expected $originalState, found $restoredState."
             }
-            Log-Info "$svc restored and verified in state $restoredState."
+            Write-GaInfo "$svc restored and verified in state $restoredState."
         }
         catch {
-            Log-Error "Failed to restore $svc to state $originalState : $($_.Exception.Message)"
+            Write-GaError "Failed to restore $svc to state $originalState : $($_.Exception.Message)"
             $script_final_status = $STATUS_ERROR
         }
     }
 
     if ($script_final_status -eq $STATUS_SUCCESS -and $successMessage) {
-        Log-Output $successMessage
+        Write-GaOutput $successMessage
     }
 
-    Log-Info "Execution ended at $(Get-Date)"
-    Log-Info "Desktop log file path: $logFile"
+    $durationSeconds = [math]::Round(((Get-Date) - $script:ExecutionStarted).TotalSeconds, 3)
+    $finalTelemetryProperties = @{
+        FinalStatus = "$script_final_status"
+        DurationSeconds = "$durationSeconds"
+        Operations = "$($script:OperationCount)"
+        DisksProcessed = "$processedCount"
+        DisksChanged = "$changedCount"
+        DisksSkipped = "$skippedCount"
+        DisksFailed = "$failedCount"
+    }
+    if ($script_final_status -eq $STATUS_SUCCESS) {
+        Write-GaTelemetry -Event Success -Message 'VMAgent offline repair completed successfully' -Properties $finalTelemetryProperties
+    }
+    else {
+        Write-GaTelemetry -Event Error -Message 'VMAgent offline repair completed with errors' -Properties $finalTelemetryProperties
+    }
+
+    Write-GaInfo "[final_status] Status=$script_final_status"
+    Write-GaInfo "Summary: processed=$processedCount changed=$changedCount skipped=$skippedCount failed=$failedCount operations=$($script:OperationCount)"
+    Write-GaInfo "Execution ended at $(Get-Date)"
+    Write-GaInfo "Desktop log file path: $logFile"
 }
 
 return $script_final_status
