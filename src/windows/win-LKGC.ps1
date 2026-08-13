@@ -18,7 +18,7 @@
     Name:          win-LKGC.ps1
     Author:        Tony.Mocanu@Microsoft.com
     Last Modified: 2026-08-12
-    Version:       1.4
+    Version:       1.5
     Requirement:   Azure repair VM with an attached Windows OS disk and the VMRepair common helpers
     DeployMode:    az vm repair run (with --run-on-repair)
     Telemetry:     Emits structured start, success, output, and error events through the VMRepair logger
@@ -42,6 +42,10 @@ Get-ChildItem "C:\Users\Public\Desktop\win-LKGC-run-*\win-LKGC-*.log" | Sort-Obj
      existing ControlSet00N key. Always snapshot the OS disk before recovery.
 
     Version history:
+    v1.5: [Aug 2026] - Aligns disk collision handling with the latest SAC repair path.
+                       Preserves the attached source disk identity, temporarily changes only the
+                       disposable repair OS disk for matching Gen2 GPT collisions, and restores
+                       and verifies every temporary identity before reporting success.
     v1.4: [Aug 2026] - Selects the existing LastKnownGood control set instead of incrementing
                        Select values and treats the absence of an alternate LKGC as a safe no-op.
                        Validates referenced control sets and their core Control and Services trees.
@@ -128,6 +132,151 @@ function Test-LkgcGptType {
     return $actual -eq $expected
 }
 
+function Get-LkgcDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$DiskNumber
+    )
+
+    $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
+    if ([string]$disk.PartitionStyle -eq 'MBR') {
+        $signature = [uint32]$disk.Signature
+        return [pscustomobject]@{
+            PartitionStyle = 'MBR'
+            Value = $signature.ToString('X8')
+            DiskPartValue = $signature.ToString('X8')
+        }
+    }
+    if ([string]$disk.PartitionStyle -eq 'GPT') {
+        $diskGuid = ([guid]$disk.Guid).ToString('D')
+        return [pscustomobject]@{
+            PartitionStyle = 'GPT'
+            Value = $diskGuid
+            DiskPartValue = $diskGuid
+        }
+    }
+
+    throw "Disk $DiskNumber has unsupported partition style '$($disk.PartitionStyle)'."
+}
+
+function Invoke-LkgcDiskPart {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Commands,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Operation
+    )
+
+    $output = $Commands | diskpart 2>&1
+    foreach ($line in @($output)) {
+        if ($line) { Log-Output "[diskpart][$Operation] $line" | Out-Null }
+    }
+}
+
+function Invoke-LkgcBcdEdit {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Operation
+    )
+
+    $output = & bcdedit.exe @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in @($output)) {
+        if ($line) { Log-Output "[bcdedit][$Operation] $line" | Out-Null }
+    }
+    return [pscustomobject]@{
+        Output = @($output)
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
+    }
+}
+
+function Set-LkgcTemporarySourceDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    if ($Record.PartitionStyle -ne 'MBR') {
+        throw 'Temporary source disk identities are permitted only for the Gen1 MBR path.'
+    }
+
+    Invoke-LkgcDiskPart -Operation 'collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+        'online disk'
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw "Disk $($Record.DiskNumber) could not be brought online with its verified temporary identity."
+    }
+}
+
+function Restore-LkgcSourceDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    Invoke-LkgcDiskPart -Operation 'collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        'offline disk'
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if (-not $restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw "Disk $($Record.DiskNumber) did not return to its original offline identity."
+    }
+}
+
+function Set-LkgcTemporaryRepairDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    Invoke-LkgcDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw 'The repair VM OS disk did not retain a verified temporary GPT identity.'
+    }
+}
+
+function Restore-LkgcRepairDiskIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Record
+    )
+
+    Invoke-LkgcDiskPart -Operation 'repair-host-collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw 'The repair VM OS disk did not return to its original GPT identity.'
+    }
+}
+
 # Script-level logging: create a plain text desktop log that mirrors Log-* output.
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -181,7 +330,7 @@ function Log-Error {
 }
 function Log-Debug { Param([PSObject[]]$message) & $script:OriginalLogDebug -message $message; Write-DesktopLogLine -Level 'Debug' -Message $message }
 
-$script:RepairScriptVersion = '1.4'
+$script:RepairScriptVersion = '1.5'
 $script:ExecutionStarted = Get-Date
 
 function Write-LkgcTelemetry {
@@ -230,6 +379,9 @@ $skippedCount = 0
 $failedCount = 0
 $changedCount = 0
 $detectedExecutionContext = 'UNDETERMINED'
+$collisionDiskRecords = @()
+$gptCollisionDiskNumbers = @()
+$repairDiskIdentityRecord = $null
 
 try {
     # Check if the Hyper-V module is available before performing nested VM checks
@@ -250,7 +402,74 @@ try {
         throw "CRITICAL SAFETY CHECK FAILED: Could not identify the repair VM OS disk from $($env:SystemDrive)."
     }
     $repairDiskNumber = [int]$repairOsPartition.DiskNumber
-    Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber."
+    $repairDiskIdentity = Get-LkgcDiskIdentity -DiskNumber $repairDiskNumber
+    Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber ($($repairDiskIdentity.PartitionStyle))."
+
+    # Match the latest SAC path: resolve identity collisions before the helper onlines disks.
+    $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
+        Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
+        ForEach-Object { [int]$_.Index })
+    $collisionDisks = @(Get-Disk -ErrorAction Stop | Where-Object {
+        $_.Number -in $azureVirtualDiskNumbers -and
+        $_.IsOffline -and
+        ([string]$_.OfflineReason -eq 'Collision')
+    })
+
+    foreach ($collisionDisk in $collisionDisks) {
+        $originalIdentity = Get-LkgcDiskIdentity -DiskNumber $collisionDisk.Number
+        if ($originalIdentity.PartitionStyle -eq 'GPT') {
+            if ($repairDiskIdentity.PartitionStyle -ne 'GPT' -or
+                $repairDiskIdentity.Value -ine $originalIdentity.Value) {
+                throw "Disk $($collisionDisk.Number) reports a GPT identity collision that does not match the repair VM OS disk. Refusing an unverified identity change."
+            }
+
+            if (-not $repairDiskIdentityRecord) {
+                $temporaryRepairGuid = ([guid]::NewGuid()).ToString('D')
+                $repairDiskIdentityRecord = [pscustomobject]@{
+                    DiskNumber = $repairDiskNumber
+                    PartitionStyle = 'GPT'
+                    OriginalValue = $repairDiskIdentity.Value
+                    OriginalDiskPartValue = $repairDiskIdentity.DiskPartValue
+                    TemporaryValue = $temporaryRepairGuid
+                    TemporaryDiskPartValue = $temporaryRepairGuid
+                }
+                Log-Warning 'Temporarily changing only the repair VM OS disk GPT identity to release the attached Gen2 collision. The source disk GUID will not be changed.'
+                Set-LkgcTemporaryRepairDiskIdentity -Record $repairDiskIdentityRecord
+            }
+
+            $gptCollisionDiskNumbers += [int]$collisionDisk.Number
+            Invoke-LkgcDiskPart -Operation 'source-gpt-online' -Commands @(
+                "select disk $($collisionDisk.Number)"
+                'online disk'
+            )
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+            $releasedDisk = Get-Disk -Number $collisionDisk.Number -ErrorAction Stop
+            $sourceIdentityAfterRelease = Get-LkgcDiskIdentity -DiskNumber $collisionDisk.Number
+            if ($releasedDisk.IsOffline -or
+                [string]$releasedDisk.OfflineReason -eq 'Collision' -or
+                $sourceIdentityAfterRelease.Value -ine $originalIdentity.Value) {
+                throw "Disk $($collisionDisk.Number) could not be onlined with its original GPT identity unchanged."
+            }
+            Log-Info "Disk $($collisionDisk.Number) collision released; source GPT identity remains $($originalIdentity.Value)."
+            continue
+        }
+
+        do {
+            $temporaryValue = ([Convert]::ToUInt32(([guid]::NewGuid().ToString('N').Substring(0, 8)), 16)).ToString('X8')
+        } while ($temporaryValue -eq '00000000' -or $temporaryValue -ieq $originalIdentity.Value)
+
+        $record = [pscustomobject]@{
+            DiskNumber = [int]$collisionDisk.Number
+            PartitionStyle = $originalIdentity.PartitionStyle
+            OriginalValue = $originalIdentity.Value
+            OriginalDiskPartValue = $originalIdentity.DiskPartValue
+            TemporaryValue = $temporaryValue
+            TemporaryDiskPartValue = $temporaryValue
+        }
+        $collisionDiskRecords += $record
+        Log-Warning "Disk $($record.DiskNumber) is offline due to an identity collision. Applying a temporary MBR identity for this repair run."
+        Set-LkgcTemporarySourceDiskIdentity -Record $record
+    }
 
     $partitionlist = @(Get-Disk-Partitions)
     if ($partitionlist.Count -eq 0) {
@@ -276,6 +495,14 @@ try {
         $tempOsLetter = $null
         $tempOsDiskNum = $null
         $tempOsPartNum = $null
+        $tempBcdLetter = $null
+        $tempBcdDiskNum = $null
+        $tempBcdPartNum = $null
+        $bcdPath = $null
+        $bcdBackup = $null
+        $bcdWriteStarted = $false
+        $bcdBackupRestored = $false
+        $registryProcessingFailed = $false
 
         try {
             Log-Info "Processing Disk $diskNumber"
@@ -358,6 +585,148 @@ try {
 
             Log-Info "Target OS partition successfully matched on letter: $($targetOSDrive):"
 
+            # Match latest SAC: validate and, only when necessary, repair the
+            # default loader mapping before changing the offline SYSTEM hive.
+            $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
+            $efiParts = @($diskPartitions | Where-Object {
+                Test-LkgcGptType -ActualType $_.GptType -ExpectedType $efiGptType
+            })
+            $isGen2Disk = $efiParts.Count -gt 0
+            Log-Info "Disk ${diskNumber}: generation detection result = $(if ($isGen2Disk) { 'Gen2/UEFI' } else { 'Gen1/BIOS' })"
+
+            $bcdCandidates = if ($isGen2Disk) { $efiParts } else { $diskPartitions }
+            foreach ($bcdCandidate in $bcdCandidates) {
+                $candidateLetter = $null
+                $letterAssignedByScript = $false
+                if ($bcdCandidate.DriveLetter -and $bcdCandidate.DriveLetter -ne [char]0) {
+                    $candidateLetter = [string]$bcdCandidate.DriveLetter
+                }
+                else {
+                    $candidateLetter = Get-LkgcAvailableTempDriveLetter
+                    if (-not $candidateLetter) { continue }
+                    $candidatePartNum = [int]$bcdCandidate.PartitionNumber
+                    Invoke-LkgcDiskPart -Operation 'bcd-assign' -Commands @(
+                        "select disk $diskNumber"
+                        "select partition $candidatePartNum"
+                        "assign letter=$candidateLetter"
+                    )
+                    Start-Sleep -Seconds 2
+                    $letterAssignedByScript = Test-Path -LiteralPath "${candidateLetter}:\" -PathType Container
+                }
+
+                $candidateBcdPath = if ($isGen2Disk) {
+                    "${candidateLetter}:\EFI\Microsoft\Boot\BCD"
+                }
+                else {
+                    "${candidateLetter}:\Boot\BCD"
+                }
+                if ($candidateLetter -and (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf)) {
+                    $bcdPath = $candidateBcdPath
+                    if ($letterAssignedByScript) {
+                        $tempBcdLetter = $candidateLetter
+                        $tempBcdDiskNum = $diskNumber
+                        $tempBcdPartNum = [int]$bcdCandidate.PartitionNumber
+                    }
+                    Log-Info "Disk ${diskNumber}: selected BCD store: $bcdPath"
+                    break
+                }
+
+                if ($letterAssignedByScript) {
+                    Invoke-LkgcDiskPart -Operation 'bcd-remove' -Commands @(
+                        "select disk $diskNumber"
+                        "select partition $([int]$bcdCandidate.PartitionNumber)"
+                        "remove letter=$candidateLetter noerr"
+                    )
+                }
+            }
+
+            if (-not $bcdPath) {
+                throw "Disk $diskNumber has no generation-appropriate BCD store. No registry changes were attempted."
+            }
+
+            $bootManagerQuery = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/enum', 'bootmgr', '/v') -Operation 'query-bootmgr'
+            if (-not $bootManagerQuery.Success) {
+                throw "Could not enumerate boot manager from $bcdPath. No registry changes were attempted."
+            }
+            $defaultLine = $bootManagerQuery.Output | Select-String -Pattern '^\s*default\s+' | Select-Object -First 1
+            if (-not $defaultLine -or $defaultLine -notmatch '\{([^}]+)\}') {
+                throw "Could not identify the default Windows loader in $bcdPath. No registry changes were attempted."
+            }
+            $defaultLoaderId = $matches[0]
+            if ($defaultLoaderId -notmatch '^(?i)\{[0-9a-f\-]{36}\}$') {
+                throw "Default BCD loader identifier '$defaultLoaderId' is invalid. No registry changes were attempted."
+            }
+
+            $loaderQuery = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'validate-loader'
+            if (-not $loaderQuery.Success) {
+                throw "Could not enumerate default loader $defaultLoaderId. No registry changes were attempted."
+            }
+            $loaderText = $loaderQuery.Output -join "`n"
+            $loaderPathMatch = [regex]::Match($loaderText, '(?im)^\s*path\s+(.+?)\s*$')
+            $loaderDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*device\s+(.+?)\s*$')
+            $loaderOsDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+            $loaderSystemRootMatch = [regex]::Match($loaderText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+            if (-not $loaderPathMatch.Success -or
+                -not $loaderDeviceMatch.Success -or
+                -not $loaderOsDeviceMatch.Success -or
+                -not $loaderSystemRootMatch.Success) {
+                throw "Default loader $defaultLoaderId is missing required mapping elements. No registry changes were attempted."
+            }
+
+            $originalLoaderPath = $loaderPathMatch.Groups[1].Value.Trim()
+            $originalLoaderDevice = $loaderDeviceMatch.Groups[1].Value.Trim()
+            $originalLoaderOsDevice = $loaderOsDeviceMatch.Groups[1].Value.Trim()
+            $originalLoaderSystemRoot = $loaderSystemRootMatch.Groups[1].Value.Trim()
+            if ($originalLoaderPath -notmatch '(?i)^\\Windows\\System32\\winload\.(exe|efi)$') {
+                throw "Default loader $defaultLoaderId references unsupported path '$originalLoaderPath'. No registry changes were attempted."
+            }
+            $resolvedLoaderFile = Join-Path -Path "${targetOSDrive}:\" -ChildPath $originalLoaderPath.TrimStart('\')
+            if (-not (Test-Path -LiteralPath $resolvedLoaderFile -PathType Leaf)) {
+                throw "Default loader references '$originalLoaderPath', but '$resolvedLoaderFile' does not exist. No registry changes were attempted."
+            }
+
+            $repairLoaderDevice = $originalLoaderDevice -match '(?i)^unknown$'
+            $repairLoaderOsDevice = $originalLoaderOsDevice -match '(?i)^unknown$'
+            if ($repairLoaderDevice -or $repairLoaderOsDevice) {
+                $bcdBackup = $bcdPath + '.LKGC.bak.' + $runTimestamp
+                Copy-Item -LiteralPath $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+                if ((Get-Item -LiteralPath $bcdBackup -ErrorAction Stop).Length -ne
+                    (Get-Item -LiteralPath $bcdPath -ErrorAction Stop).Length) {
+                    throw "BCD backup verification failed for '$bcdBackup'. No BCD changes were attempted."
+                }
+
+                $validatedWindowsPartition = "partition=${targetOSDrive}:"
+                $bcdWriteStarted = $true
+                Log-Warning "Loader mapping contains an unknown descriptor. Repairing it to $validatedWindowsPartition using the validated Windows partition."
+                if ($repairLoaderDevice) {
+                    $setDevice = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'device', $validatedWindowsPartition) -Operation 'repair-loader-device'
+                    if (-not $setDevice.Success) { throw "Could not repair device for loader $defaultLoaderId." }
+                }
+                if ($repairLoaderOsDevice) {
+                    $setOsDevice = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'osdevice', $validatedWindowsPartition) -Operation 'repair-loader-osdevice'
+                    if (-not $setOsDevice.Success) { throw "Could not repair osdevice for loader $defaultLoaderId." }
+                }
+
+                $verifyLoader = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'verify-loader-mapping'
+                $verifyText = $verifyLoader.Output -join "`n"
+                $verifyPath = [regex]::Match($verifyText, '(?im)^\s*path\s+(.+?)\s*$')
+                $verifyDevice = [regex]::Match($verifyText, '(?im)^\s*device\s+(.+?)\s*$')
+                $verifyOsDevice = [regex]::Match($verifyText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+                $verifySystemRoot = [regex]::Match($verifyText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+                if (-not $verifyLoader.Success -or
+                    -not $verifyPath.Success -or
+                    -not $verifyDevice.Success -or
+                    -not $verifyOsDevice.Success -or
+                    -not $verifySystemRoot.Success -or
+                    $verifyDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+                    $verifyOsDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+                    $verifyPath.Groups[1].Value.Trim() -ine $originalLoaderPath -or
+                    $verifySystemRoot.Groups[1].Value.Trim() -ine $originalLoaderSystemRoot) {
+                    throw "Loader mapping repair verification failed for $defaultLoaderId."
+                }
+                Log-Info "Disk ${diskNumber}: BCD loader mapping repaired and verified."
+            }
+
         $systemHivePath = "$(${targetOSDrive}):\Windows\System32\config\SYSTEM"
         $systemHiveBackup = "$systemHivePath.LKGC.bak.$runTimestamp"
 
@@ -395,7 +764,6 @@ try {
 
         $writeAttempted = $false
         $restoreRequired = $false
-        $registryProcessingFailed = $false
         $subKeyPath = "BROKENSYS_$targetOSDrive\Select"
         $regKey = $null
         $systemRootKey = $null
@@ -607,8 +975,39 @@ try {
         catch {
             $failedCount++
             Log-Error "Disk $diskNumber failed during OS discovery or LKGC processing: $($_.Exception.Message)"
+            if ($bcdWriteStarted -and -not $bcdBackupRestored -and
+                $bcdBackup -and (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+                try {
+                    Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+                    $bcdBackupRestored = $true
+                    Log-Warning "Restored BCD backup after failed disk processing: $bcdBackup"
+                }
+                catch {
+                    Log-Error "CRITICAL: Failed to restore BCD backup '$bcdBackup': $($_.Exception.Message)"
+                }
+            }
         }
         finally {
+            if ($registryProcessingFailed -and $bcdWriteStarted -and
+                -not $bcdBackupRestored -and $bcdBackup -and
+                (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+                try {
+                    Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+                    $bcdBackupRestored = $true
+                    Log-Warning "Restored BCD backup because registry processing did not complete successfully: $bcdBackup"
+                }
+                catch {
+                    Log-Error "CRITICAL: Failed to restore BCD backup '$bcdBackup': $($_.Exception.Message)"
+                }
+            }
+            if ($tempBcdLetter) {
+                Log-Info "Removing temp BCD letter ${tempBcdLetter}: from Disk $tempBcdDiskNum Partition $tempBcdPartNum"
+                Invoke-LkgcDiskPart -Operation 'bcd-cleanup' -Commands @(
+                    "select disk $tempBcdDiskNum"
+                    "select partition $tempBcdPartNum"
+                    "remove letter=$tempBcdLetter noerr"
+                )
+            }
             if ($tempOsLetter) {
                 Log-Info "Removing temp letter ${tempOsLetter}: from Disk $tempOsDiskNum Partition $tempOsPartNum"
                 $cleanupOutput = @(
@@ -643,6 +1042,56 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    $identityRestorationFailed = $false
+
+    if ($repairDiskIdentityRecord) {
+        foreach ($diskNumber in @($gptCollisionDiskNumbers | Sort-Object -Unique)) {
+            try {
+                Invoke-LkgcDiskPart -Operation 'source-before-repair-host-restore' -Commands @(
+                    "select disk $diskNumber"
+                    'offline disk'
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                $sourceDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
+                $sourceIdentity = Get-LkgcDiskIdentity -DiskNumber $diskNumber
+                if (-not $sourceDisk.IsOffline -or
+                    $sourceIdentity.Value -ine $repairDiskIdentityRecord.OriginalValue) {
+                    throw "Source Disk $diskNumber was not offline with its unchanged original GPT identity."
+                }
+                Log-Info "Source Disk $diskNumber is offline with its original GPT identity verified."
+            }
+            catch {
+                $identityRestorationFailed = $true
+                Log-Error "CRITICAL: Could not safely offline and verify source Disk ${diskNumber}: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $identityRestorationFailed) {
+            try {
+                Restore-LkgcRepairDiskIdentity -Record $repairDiskIdentityRecord
+                Log-Info 'Repair VM OS disk GPT identity restored and verified.'
+            }
+            catch {
+                $identityRestorationFailed = $true
+                Log-Error "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    foreach ($record in @($collisionDiskRecords | Sort-Object DiskNumber -Descending)) {
+        try {
+            Restore-LkgcSourceDiskIdentity -Record $record
+            Log-Info "Disk $($record.DiskNumber) is offline with its verified original MBR identity restored."
+        }
+        catch {
+            $identityRestorationFailed = $true
+            Log-Error "CRITICAL: Failed to restore the original identity of Disk $($record.DiskNumber): $($_.Exception.Message)"
+        }
+    }
+    if ($identityRestorationFailed) {
+        $script_final_status = $STATUS_ERROR
+    }
+
     $durationSeconds = [math]::Round(((Get-Date) - $script:ExecutionStarted).TotalSeconds, 3)
     $finalTelemetryProperties = @{
         FinalStatus    = "$script_final_status"
