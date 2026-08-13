@@ -503,6 +503,8 @@ try {
         $bcdWriteStarted = $false
         $bcdBackupRestored = $false
         $registryProcessingFailed = $false
+        $bootPolicyMarkerPath = $null
+        $bootPolicyRestored = $false
 
         try {
             Log-Info "Processing Disk $diskNumber"
@@ -687,14 +689,19 @@ try {
 
             $repairLoaderDevice = $originalLoaderDevice -match '(?i)^unknown$'
             $repairLoaderOsDevice = $originalLoaderOsDevice -match '(?i)^unknown$'
-            if ($repairLoaderDevice -or $repairLoaderOsDevice) {
+            $bootPolicyMarkerPath = "${targetOSDrive}:\ProgramData\LKGC-Test-BootPolicy.json"
+            $restoreTestBootPolicy = Test-Path -LiteralPath $bootPolicyMarkerPath -PathType Leaf
+            if ($repairLoaderDevice -or $repairLoaderOsDevice -or $restoreTestBootPolicy) {
                 $bcdBackup = $bcdPath + '.LKGC.bak.' + $runTimestamp
                 Copy-Item -LiteralPath $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
                 if ((Get-Item -LiteralPath $bcdBackup -ErrorAction Stop).Length -ne
                     (Get-Item -LiteralPath $bcdPath -ErrorAction Stop).Length) {
                     throw "BCD backup verification failed for '$bcdBackup'. No BCD changes were attempted."
                 }
+                Log-Info "Disk ${diskNumber}: BCD backup created and verified: $bcdBackup"
+            }
 
+            if ($repairLoaderDevice -or $repairLoaderOsDevice) {
                 $validatedWindowsPartition = "partition=${targetOSDrive}:"
                 $bcdWriteStarted = $true
                 Log-Warning "Loader mapping contains an unknown descriptor. Repairing it to $validatedWindowsPartition using the validated Windows partition."
@@ -725,6 +732,28 @@ try {
                     throw "Loader mapping repair verification failed for $defaultLoaderId."
                 }
                 Log-Info "Disk ${diskNumber}: BCD loader mapping repaired and verified."
+            }
+
+            if ($restoreTestBootPolicy) {
+                $bcdWriteStarted = $true
+                $removeBootPolicy = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/deletevalue', $defaultLoaderId, 'bootstatuspolicy') -Operation 'restore-bootstatuspolicy'
+                if (-not $removeBootPolicy.Success) {
+                    throw "Could not remove the lab bootstatuspolicy from loader $defaultLoaderId."
+                }
+                $enableRecovery = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'recoveryenabled', 'Yes') -Operation 'restore-recoveryenabled'
+                if (-not $enableRecovery.Success) {
+                    throw "Could not restore recoveryenabled=Yes on loader $defaultLoaderId."
+                }
+
+                $verifyBootPolicy = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'verify-restored-boot-policy'
+                $verifyBootPolicyText = $verifyBootPolicy.Output -join "`n"
+                if (-not $verifyBootPolicy.Success -or
+                    $verifyBootPolicyText -match '(?im)^\s*bootstatuspolicy\s+IgnoreAllFailures\s*$' -or
+                    $verifyBootPolicyText -notmatch '(?im)^\s*recoveryenabled\s+Yes\s*$') {
+                    throw "Normal boot recovery policy verification failed for loader $defaultLoaderId."
+                }
+                $bootPolicyRestored = $true
+                Log-Info "Disk ${diskNumber}: normal boot recovery policy restored and verified."
             }
 
         $systemHivePath = "$(${targetOSDrive}):\Windows\System32\config\SYSTEM"
@@ -970,6 +999,10 @@ try {
                     }
                 }
             }
+        }
+        if (-not $registryProcessingFailed -and $unloaded -and $bootPolicyRestored) {
+            Remove-Item -LiteralPath $bootPolicyMarkerPath -Force -ErrorAction Stop
+            Log-Info "[$targetOSDrive] Removed consumed lab boot-policy marker: $bootPolicyMarkerPath"
         }
         }
         catch {
