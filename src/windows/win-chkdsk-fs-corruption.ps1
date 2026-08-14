@@ -1,53 +1,62 @@
 <#
 .SYNOPSIS
-    Detects attached Windows OS disks from a repair VM and safely repairs verified NTFS file system corruption with CHKDSK.
+    Detects attached Windows OS disks from a repair VM and safely repairs verified
+    NTFS file system corruption with CHKDSK.
+
 .DESCRIPTION
     This script runs from a rescue VM to check and repair NTFS file system corruption
-    on all partitions of the attached faulty OS disk.
+    on the validated Windows partition of each attached faulty OS disk.
+
     It performs the following steps:
     1. Identifies and excludes repair-host OS, boot, system, and pagefile disks.
     2. Enumerates attached partitions via Get-Disk-Partitions and validates Windows targets.
     3. Temporarily mounts eligible unlettered data partitions and restores all mount state.
-    4. Queries each NTFS dirty bit using fsutil plus locale-independent Win32_Volume data.
-    5. If the dirty bit is set, runs chkdsk /f and verifies that the bit is cleared.
+    4. Queries the Windows partition dirty bit using fsutil and Win32_Volume data.
+    5. Runs CHKDSK /f when the dirty bit is set and verifies that it is cleared.
     6. Preserves source disk identity across GPT and MBR collision handling.
 
     This resolves VMs stuck at boot showing "Scanning and repairing drive" or
-    "Checking file system on C:" messages. Running chkdsk from a rescue VM avoids
+    "Checking file system on C:" messages. Running CHKDSK from a rescue VM avoids
     interruptions that occur when the OS runs it during boot.
+
 .PARAMETER None
-    This script does not accept custom parameters. It processes all attached non-system partitions automatically.
+    This script does not accept custom parameters. It automatically processes the
+    validated Windows partition on each attached target OS disk.
+
 .EXECUTION_CONTEXT
-    This is a repair-VM-only script. Run it through the VMRepair workflow against an attached
-    copy of the affected Windows OS disk. It refuses to process the repair VM's OS, boot,
-    system, and pagefile disks.
+    This is a repair-VM-only script. Run it through the VMRepair workflow against an
+    attached copy of the affected Windows OS disk. It refuses to process the repair
+    VM's OS, boot, system, and pagefile disks.
+
 .SCENARIO_RECREATION
-    Use only a disposable test VM and take an OS disk snapshot before injecting the test state.
-    Setting the dirty bit exercises this script's detection and CHKDSK path; it does not create
-    arbitrary NTFS metadata corruption.
+    Use only a disposable test VM and take an OS disk snapshot before injecting the
+    test state. Setting the dirty bit exercises this script's detection and CHKDSK
+    path; it does not create arbitrary NTFS metadata corruption.
 
-    From Azure Cloud Shell or an authenticated PowerShell terminal, set and verify the dirty bit
-    through Azure Run Command:
+    From Azure Cloud Shell or an authenticated PowerShell terminal, set and verify
+    the dirty bit through Azure Run Command:
 
-az vm run-command invoke `
-    --resource-group <resource-group> `
-    --name <disposable-test-vm> `
-    --command-id RunPowerShellScript `
-Start-Process -FilePath "fsutil.exe" -ArgumentList "dirty query C:" -Wait -NoNewWindow
-Start-Process -FilePath "fsutil.exe" -ArgumentList "dirty set C:" -Wait -NoNewWindow
-Start-Process -FilePath "fsutil.exe" -ArgumentList "dirty query C:" -Wait -NoNewWindow
+    az vm run-command invoke `
+        --resource-group <resource-group> `
+        --name <disposable-test-vm> `
+        --command-id RunPowerShellScript `
+        Start-Process -FilePath "fsutil.exe" -ArgumentList "dirty query C:" -Wait -NoNewWindow
+        Start-Process -FilePath "fsutil.exe" -ArgumentList "dirty set C:" -Wait -NoNewWindow
+        Start-Process -FilePath "fsutil.exe" -ArgumentList "dirty query C:" -Wait -NoNewWindow
 
-    The final query should report that C: is dirty. The exact message can vary with the guest OS
-    display language. Do not reboot the test VM after setting the bit, because startup CHKDSK may
-    consume and clear the test condition before the repair script runs.
+    The final query should report that C: is dirty. The exact message can vary with
+    the guest OS display language. Do not reboot the test VM after setting the bit,
+    because startup CHKDSK may consume and clear the test condition before the repair
+    script runs.
 
-    Next, use the normal VMRepair create/attach workflow and run this script on the repair VM:
+    Next, use the normal VMRepair create/attach workflow and run this script on the
+    repair VM:
 
-az vm repair run `
-    --resource-group <resource-group> `
-    --name <disposable-test-vm> `
-    --run-id win-chkdsk-fs-corruption `
-    --run-on-repair
+    az vm repair run `
+        --resource-group <resource-group> `
+        --name <disposable-test-vm> `
+        --run-id win-chkdsk-fs-corruption `
+        --run-on-repair
 
     Expected repair log sequence:
     1. The attached Windows disk and NTFS partition are validated.
@@ -55,30 +64,38 @@ az vm repair run `
     3. CHKDSK /f runs and returns an accepted exit code.
     4. The dirty bit is re-queried and verified clear.
     5. Temporary drive letters and disk identities are restored.
+
 .VERIFICATION
     After restoring and starting the disposable test VM, verify the volume state:
 
-Start-Process -FilePath "fsutil.exe" -ArgumentList "dirty query C:" -Wait -NoNewWindow
+    fsutil.exe dirty query C:
 
-    Expected: C: is not dirty. Also confirm that the repair log reports final status success,
-    Failed=0, and either Fixed=1 or a larger value when multiple dirty NTFS partitions were repaired.
+    Expected: C: is not dirty. Also confirm that the repair log reports final status
+    success, Failed=0, and Repaired=1 for the single attached test OS disk.
+
 .EXAMPLE
     .\win-chkdsk-fs-corruption.ps1
+
 .NOTES
     Name:    win-chkdsk-fs-corruption.ps1
     Version: 1.3
     Author:  Tony.Mocanu@Microsoft.com
+
 .VERSION
     v1.3: [August 2026] - Aligned physical disk discovery and collision handling with
-                          win-sac-on, win-LKGC, and GA_offlinefixer. Excludes all repair-host
-                          critical disks, validates Windows targets, supports safe temporary
-                          mounts, preserves source disk identities, and verifies native exit codes.
-    v1.2: [July 2026] - Refactored logging to support desktop-first paths with SYSTEM fallback.
-                       - Aligned dependency path validation and added explicit loop logging summaries.
-    v1.1: [May 2026]  - Fixed breaking exception when the Hyper-V module is not installed on the host.
-                       - Added explicit checking via Get-Module before executing nested VM discovery.
-                       - Included advanced Gen2 unlettered EFI fallback and dynamic drive-letter assignment.
+                          win-sac-on, win-LKGC, and GA_offlinefixer.
+                        - Excludes repair-host critical disks and validates Windows targets.
+                        - Supports safe temporary mounts and preserves source disk identities.
+                        - Verifies native exit codes and the cleared NTFS dirty bit.
+                        - Restricts CHKDSK to the validated Windows partition.
+                        - Emits CHKDSK evidence while keeping DiskPart diagnostics out of
+                          result output.
+    v1.2: [July 2026]   - Refactored logging to support desktop-first paths with SYSTEM fallback.
+                        - Aligned dependency path validation and added explicit loop summaries.
+    v1.1: [May 2026]    - Guarded nested VM discovery when Hyper-V is unavailable.
+                        - Added Gen2 unlettered EFI fallback and dynamic letter assignment.
     v1.0: Initial commit.
+
 .LINK
     https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/troubleshoot-check-disk-boot-error
 #>
@@ -247,7 +264,7 @@ function Invoke-ChkdskDiskPart {
     $output = $Commands | diskpart 2>&1
     foreach ($outputLine in @($output)) {
         if ($outputLine) {
-            Write-ScriptLog "[diskpart][$Operation] $outputLine" 'OUTPUT'
+            Write-ScriptLog "[diskpart][$Operation] $outputLine" 'INFO'
         }
     }
 }
@@ -483,7 +500,8 @@ try {
     foreach ($targetDiskGroup in $targetDiskGroups) {
         $diskNumber = [int]$targetDiskGroup.Name
         $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
-        $windowsPartitionFound = $false
+        $targetWindowsPartition = $null
+        $targetWindowsDriveLetter = $null
 
         # Prove this is a Windows OS disk before checking any volume on it.
         foreach ($partition in @($diskPartitions | Sort-Object Size -Descending)) {
@@ -517,53 +535,27 @@ try {
             if ((Test-Path -LiteralPath $systemHive -PathType Leaf) -and
                 ((Test-Path -LiteralPath $winloadExe -PathType Leaf) -or
                  (Test-Path -LiteralPath $winloadEfi -PathType Leaf))) {
-                $windowsPartitionFound = $true
+                $targetWindowsPartition = $partition
+                $targetWindowsDriveLetter = $candidateLetter
                 break
             }
         }
 
-        if (-not $windowsPartitionFound) {
+        if (-not $targetWindowsPartition) {
             Write-ScriptLog "Skipping Disk $diskNumber because no Windows loader and SYSTEM hive were found." 'WARNING'
             $skippedCount++
             continue
         }
         $targetDiskCount++
 
-        # Check every safe NTFS data partition on the validated Windows disk.
-        $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
-        foreach ($partition in $diskPartitions) {
-            if (-not (Test-ChkdskDataPartition -Partition $partition)) {
-                $skippedCount++
-                continue
-            }
+        $partition = $targetWindowsPartition
+        $driveLetter = $targetWindowsDriveLetter
+        Write-ScriptLog "Validated Windows target on Disk $diskNumber Partition $($partition.PartitionNumber) at ${driveLetter}:." 'INFO'
 
-            $driveLetter = [string]$partition.DriveLetter
-            if (-not $driveLetter -or $driveLetter -eq [char]0) {
-                $driveLetter = Get-ChkdskAvailableTempDriveLetter
-                if (-not $driveLetter) {
-                    throw "No temporary drive letter is available for Disk $diskNumber Partition $($partition.PartitionNumber)."
-                }
-                Invoke-ChkdskDiskPart -Operation 'volume-assign' -Commands @(
-                    "select disk $diskNumber"
-                    "select partition $($partition.PartitionNumber)"
-                    "assign letter=$driveLetter"
-                )
-                Update-HostStorageCache -ErrorAction SilentlyContinue
-                if (-not (Test-Path -LiteralPath "${driveLetter}:\" -PathType Container)) {
-                    throw "Temporary mount ${driveLetter}: failed for Disk $diskNumber Partition $($partition.PartitionNumber)."
-                }
-                $temporaryMounts += [pscustomobject]@{
-                    DiskNumber = $diskNumber
-                    PartitionNumber = [int]$partition.PartitionNumber
-                    DriveLetter = $driveLetter
-                }
-            }
-
+        try {
             $volume = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
             if ([string]$volume.FileSystem -ine 'NTFS') {
-                Write-ScriptLog "Skipping ${driveLetter}: because its file system is '$($volume.FileSystem)', not NTFS." 'INFO'
-                $skippedCount++
-                continue
+                throw "Validated Windows partition ${driveLetter}: uses '$($volume.FileSystem)', not NTFS."
             }
 
             $processedCount++
@@ -600,6 +592,14 @@ try {
                 }
             }
 
+            $summaryLines = @($chkdskResults | Where-Object {
+                ([string]$_).Trim() -match '(Windows has scanned|Windows made corrections|Windows has made corrections|found no problems|corrected errors|failed to transfer|could not fix|total disk space|KB in bad sectors|No further action)'
+            })
+            foreach ($summaryLine in $summaryLines) {
+                Write-ScriptLog "[chkdsk] $(([string]$summaryLine).Trim())" 'OUTPUT'
+            }
+            Write-ScriptLog "[chkdsk] Drive=$letter ExitCode=$chkdskExitCode SummaryLines=$($summaryLines.Count)" 'OUTPUT'
+
             if ($chkdskExitCode -notin @(0, 1, 2)) {
                 Write-ScriptLog "CHKDSK failed on $letter with exit code $chkdskExitCode." 'ERROR'
                 $failedCount++
@@ -618,6 +618,10 @@ try {
             $fixedCount++
             Write-ScriptLog "CHKDSK completed on $letter with exit code $chkdskExitCode and a verified clear dirty bit." 'INFO'
         }
+        catch {
+            $failedCount++
+            Write-ScriptLog "Failed processing validated Windows partition on Disk ${diskNumber}: $($_.Exception.Message)" 'ERROR'
+        }
     }
 
     if ($targetDiskCount -eq 0) {
@@ -627,6 +631,7 @@ try {
         throw "CHKDSK failed on $failedCount partition(s)."
     }
 
+    Write-ScriptLog "SCRIPT FINISHED PROPERLY, WINDOWS_PARTITIONS=$processedCount, REPAIRED=$fixedCount, FAILED=$failedCount" 'OUTPUT'
     $script_final_status = $STATUS_SUCCESS
 }
 catch {
