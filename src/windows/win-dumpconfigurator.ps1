@@ -10,17 +10,17 @@
     It performs the following steps:
     1. Audits current crash control settings using both Registry and CIM (for pagefile accuracy)
     2. Enables NMICrashDump (DWORD 1) to allow NMI triggering from the Azure Portal
-    3. Optionally configures automatic reboot after crash (use -ConfigureAutomaticReboot to enable)
+    3. Optionally configures automatic reboot after crash (use -ConfigureAutomaticReboot true to enable)
     4. INTELLIGENTLY configures dump file placement to work around temporary drive issues
     5. Uses dedicated dump files when necessary to ensure reliability on Azure VMs
     6. Uses kdbgctrl.exe to apply the selected dump type to the live kernel immediately
-    7. If -OneDump is specified, restores original CrashDumpEnabled after kernel update
+    7. If -OneDump true is specified, restores original CrashDumpEnabled after kernel update
     8. Validates C: drive free space (minimum 20%) before pagefile relocation to prevent VM crashes
     9. NO REBOOT REQUIRED - All changes take effect immediately
 
 .PARAMETER OneDump
-    Switch to restore the original CrashDumpEnabled value after the kernel has been updated.
-    Useful for single-event debugging.
+    String boolean ('true' or 'false'). When true, restores the original CrashDumpEnabled
+    value after the kernel has been updated. Useful for single-event debugging.
 
 .PARAMETER DumpType
     The type of dump to configure. Valid values: active, automatic, full, kernel, mini.
@@ -33,20 +33,21 @@
     Use "delete" to remove an existing dedicated dump file configuration.
 
 .PARAMETER MovePagefile
-    Switch to relocate pagefile from temporary D: drive to persistent storage (C: or F: drive).
+    String boolean ('true' or 'false'). When true, relocates the pagefile from temporary
+    D: drive to persistent C: storage.
     WARNING: This change requires restoration after troubleshooting. The script will log
     detailed restoration instructions including the original pagefile location and
     explicit CIM commands to restore it.
 
 .PARAMETER ConfigureAutomaticReboot
-    Switch to configure automatic reboot after system crash (BootStatusPolicy=1).
-    By default, automatic reboot is NOT configured. Enable this parameter to opt-in.
+    String boolean ('true' or 'false'). When true, configures automatic reboot after a
+    system crash (BootStatusPolicy=1). By default, automatic reboot is NOT configured.
     Useful for production systems, but may not be desired on Citrix VMs or other
     specialized environments.
 
 .PARAMETER EnableDebugDefaults
-    Applies local test defaults only when set to true and only for values not provided
-    by runtime parameters.
+    String boolean ('true' or 'false'). Applies local test defaults only when true and
+    only for values not provided by runtime parameters.
 
 .EXAMPLE
     .\win-dumpconfigurator.ps1 -DumpType kernel -DumpFile "%SystemRoot%\MEMORY.DMP" -ConfigureAutomaticReboot true
@@ -58,12 +59,17 @@
 
 .VERSION
     Name:     win-dumpconfigurator.ps1
-    Version:  1.3 (Critical fixes, safety enhancements, and PowerShell 7 compatibility)
+    Version:  1.3.1 (Parameter contract and failure-status corrections)
     Author:   Michael.Smith@microsoft.com for v1.0, Tony.Mocanu@Microsoft.com for the rest.
 
 .VERSION
-    v1.3: [July 2026] - CRITICAL FIXES & SAFETY ENHANCEMENTS (current)
-                       - FIXED: Changed [switch] parameters to [string] for CLI compatibility
+    v1.3.1: [August 2026] - PARAMETER CONTRACT & STATUS CORRECTIONS (current)
+                       - DOCUMENTED: Boolean-like parameters require explicit 'true' or 'false' string values
+                       - DOCUMENTED: Bare switch syntax now requires an explicit value (for example, -OneDump true)
+                       - FIXED: A requested pagefile relocation failure now sets the final script status to error
+                       - FIXED: Corrected the EnableDebugDefaults local-test example
+    v1.3: [July 2026] - CRITICAL FIXES & SAFETY ENHANCEMENTS
+                       - FIXED: Changed [switch] parameters to explicit 'true'/'false' [string] values for CLI compatibility
                        - FIXED: Added early parameter validation to catch invalid parameters before execution
                        - FIXED: Migrated all Get-WmiObject to Get-CimInstance (PowerShell 7 compatibility)
                        - FIXED: Added guard for empty $DumpFile path
@@ -237,7 +243,7 @@ Log-Info "Plain text log initialized (collected copy): $collectedLogFilePath"
 #   $DumpType = 'full'
 #   $OneDump = 'false'
 #   $MovePagefile = 'false'
-#   $EnableDebugDefaults = 'true
+#   $EnableDebugDefaults = 'true'
 # Then run: .\win-dumpconfigurator.ps1
 
 # Normalize incoming parameter names (vm-repair commonly passes lowercase names).
@@ -572,6 +578,7 @@ try {
         }
         catch {
             Log-Error "Failed to relocate pagefile: $($_.Exception.Message)"
+            $verificationFailed = $true
         }
     }
 
