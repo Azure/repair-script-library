@@ -13,9 +13,9 @@
      6. Exports healthy service keys (WindowsAzureGuestAgent, WindowsAzureTelemetryService, RdAgent)
          from the rescue VM and injects them into every boot-referenced ControlSet on the target hive.
      7. Verifies both required services use automatic startup and have non-empty ImagePath values.
-     8. Copies the latest GuestAgent installation folder, or the documented ImagePath folder fallback,
-         into a staging directory and verifies the exact executables referenced by both required services.
-         The existing Agent folder is restored if activation fails.
+     8. Stages the complete WindowsAzure repository from the rescue VM and verifies the exact
+         executables referenced by both required services. The existing repository is restored
+         if activation fails.
      9. Releases handles, reloads the persisted SYSTEM hive, and verifies the required service keys.
          If processing fails, restores and hash-verifies SYSTEM, Agent files, and any changed BCD.
 
@@ -26,8 +26,8 @@
     Modified by: Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.3: [August 2026] - Copies only the newest versioned GuestAgent installation folder.
-                        - Uses the WindowsAzureGuestAgent ImagePath folder as a fallback.
+    v1.3: [August 2026] - Stages and atomically replaces the complete WindowsAzure repository.
+                        - Verifies both required service executables in the staged repository.
                                                 - Follows the Microsoft Learn offline VM Agent registry and binary-copy procedure.
                                                 - Aligns disk safety, rollback accounting, and rescue service restoration with
                                                     win-LKGC and win-sac-onLatest.
@@ -73,9 +73,8 @@
     Use only on a disposable test VM with a snapshot or recoverable OS disk.
     Run GA_offlinefixer_testbreaker.ps1 on the healthy test VM before detaching its OS disk:
 .\GA_offlinefixer_testbreaker.ps1 -Mode Break -ConfirmDestructiveTest
-    The breaker exports both required service keys and moves C:\WindowsAzure into a timestamped
-    backup. It intentionally preserves the Agent SOFTWARE keys and C:\Packages because those
-    artifacts are outside this fixer's documented offline recovery scope.
+    The breaker exports both required service keys and moves the complete WindowsAzure repository
+    into a timestamped backup. It intentionally preserves the Agent SOFTWARE keys and C:\Packages.
     To undo the test without running the offline fixer:
 .\GA_offlinefixer_testbreaker.ps1 -Mode Restore -BackupPath 'C:\GAOfflineRepairTestBackups\<timestamp>'
     After creating the test state, shut down the VM, run the offline fixer through VM Repair,
@@ -96,8 +95,8 @@ Get-ItemProperty -Path "HKLM:\VERIFY\$defaultSet\Services\WindowsAzureGuestAgent
 Get-ItemProperty -Path "HKLM:\VERIFY\$defaultSet\Services\RdAgent" -Name Start, ImagePath
 reg unload HKLM\VERIFY
     Expected: ImagePath values are populated and Start is 2 for both services.
-    3. Verify GuestAgent binaries were copied to the target disk:
-Get-ChildItem F:\WindowsAzure\GuestAgent_*
+    3. Verify the WindowsAzure repository was copied to the target disk:
+Get-ChildItem F:\WindowsAzure -Force
     Expected: The exact executables referenced by both service ImagePath values are present and non-empty.
     4. After az vm repair restore, verify that the repaired disk was actually reattached:
 Get-Content C:\ProgramData\GA-OfflineRepair-Verification.json
@@ -1129,76 +1128,43 @@ try {
                     Write-GaInfo "Validated $requiredService in ${targetControlSet}: Start=2, ImagePath=$($serviceConfiguration.ImagePath)"
                 }
             }
-            $afterImagePath = [string]$targetServiceConfigurations['WindowsAzureGuestAgent'].ImagePath
-
-            # Step 7 - Copy only the current VM Agent installation folder.
+            # Step 7 - Stage and activate the complete, internally consistent Agent repository.
             $sourcePath = "C:\WindowsAzure"
             $destPath = "$($diskb):\WindowsAzure"
             $backupPath = "$($diskb):\WindowsazurefaultyGAbackup"
 
-            $guestAgentCandidates = @(Get-ChildItem -LiteralPath $sourcePath -Directory -Force -ErrorAction Stop |
-                ForEach-Object {
-                    if ($_.Name -match '^GuestAgent_(.+)$') {
-                        $parsedVersion = $null
-                        if ([version]::TryParse($matches[1], [ref]$parsedVersion)) {
-                            [pscustomobject]@{
-                                Directory = $_
-                                Version = $parsedVersion
-                            }
-                        }
-                    }
-                } | Sort-Object Version -Descending)
-
-            $sourceAgentFolder = $null
-            if ($guestAgentCandidates.Count -gt 0) {
-                $sourceAgentFolder = $guestAgentCandidates[0].Directory
-                Write-GaInfo "Selected latest VM Agent installation folder $($sourceAgentFolder.Name)."
-            }
-            else {
-                $expandedImagePath = [Environment]::ExpandEnvironmentVariables($afterImagePath).Trim()
-                $imageExecutable = if ($expandedImagePath.StartsWith('"')) {
-                    ($expandedImagePath -split '"')[1]
-                }
-                else {
-                    ($expandedImagePath -split '\s+')[0]
-                }
-                if (-not [string]::IsNullOrWhiteSpace($imageExecutable)) {
-                    $imageFolder = Split-Path -Parent $imageExecutable
-                    if (Test-Path -LiteralPath $imageFolder -PathType Container) {
-                        $sourceAgentFolder = Get-Item -LiteralPath $imageFolder -ErrorAction Stop
-                        Write-GaWarning "No versioned GuestAgent folder was found; using ImagePath folder '$imageFolder'."
-                    }
-                }
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) {
+                throw "The rescue VM Agent repository does not exist: $sourcePath"
             }
 
-            if (-not $sourceAgentFolder) {
-                throw "No GuestAgent installation folder was found under '$sourcePath' or through ImagePath '$afterImagePath'."
-            }
-
-            $null = New-Item -Path $destPath -ItemType Directory -Force
-            $targetAgentFolder = Join-Path $destPath $sourceAgentFolder.Name
-            $stagingAgentFolder = Join-Path $destPath ('.GA_repair_{0}_{1}' -f $sourceAgentFolder.Name, [guid]::NewGuid().ToString('N'))
+            $targetAgentFolder = $destPath
+            $stagingAgentFolder = "$($diskb):\.GA_WindowsAzure_repair_$([guid]::NewGuid().ToString('N'))"
 
             try {
-                Write-GaInfo "Staging VM Agent folder $($sourceAgentFolder.FullName) at $stagingAgentFolder..."
+                Write-GaInfo "Staging the complete VM Agent repository $sourcePath at $stagingAgentFolder..."
                 $restoreCopyResult = Invoke-CriticalCommand -Command "robocopy.exe" -Arguments @(
-                    $sourceAgentFolder.FullName, $stagingAgentFolder, '/E', '/COPY:DAT', '/DCOPY:DAT',
+                    $sourcePath, $stagingAgentFolder, '/E', '/COPY:DAT', '/DCOPY:DAT',
                     '/XJ', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP'
-                ) -Description "robocopy VM Agent $($sourceAgentFolder.Name) ($diskb)"
+                ) -Description "robocopy complete WindowsAzure repository ($diskb)"
                 if ($restoreCopyResult.ExitCode -ge 8) {
-                    throw "Failed to stage VM Agent folder on $($diskb): $($restoreCopyResult.Output -join '; ')"
+                    throw "Failed to stage the VM Agent repository on $($diskb): $($restoreCopyResult.Output -join '; ')"
+                }
+
+                $stagedLogsPath = Join-Path $stagingAgentFolder 'Logs'
+                if (Test-Path -LiteralPath $stagedLogsPath) {
+                    Remove-Item -LiteralPath $stagedLogsPath -Recurse -Force -ErrorAction Stop
                 }
 
                 foreach ($requiredService in $requiredAgentServices) {
-                    $targetExecutable = Get-GaServiceExecutablePath `
+                    $sourceExecutable = Get-GaServiceExecutablePath `
                         -ImagePath ([string]$targetServiceConfigurations[$requiredService].ImagePath) `
-                        -TargetDriveLetter $diskb
-                    $targetAgentPrefix = $targetAgentFolder.TrimEnd('\') + '\'
-                    if (-not $targetExecutable.StartsWith($targetAgentPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                        throw "Required service '$requiredService' points outside the selected Agent folder: $targetExecutable"
+                        -TargetDriveLetter 'C'
+                    $sourceAgentPrefix = $sourcePath.TrimEnd('\') + '\'
+                    if (-not $sourceExecutable.StartsWith($sourceAgentPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw "Required service '$requiredService' points outside the rescue VM Agent repository: $sourceExecutable"
                     }
 
-                    $relativeExecutable = $targetExecutable.Substring($targetAgentPrefix.Length)
+                    $relativeExecutable = $sourceExecutable.Substring($sourceAgentPrefix.Length)
                     $stagedExecutable = Join-Path $stagingAgentFolder $relativeExecutable
                     if (-not (Test-Path -LiteralPath $stagedExecutable -PathType Leaf)) {
                         throw "Required executable for service '$requiredService' was not found in the staged copy: $stagedExecutable"
@@ -1210,17 +1176,17 @@ try {
                     Write-GaInfo "Validated staged $requiredService executable ($($stagedExecutableInfo.Length) bytes)."
                 }
 
-                if (Test-Path -LiteralPath $targetAgentFolder) {
+                if (Test-Path -LiteralPath $destPath) {
                     $null = New-Item -Path $backupPath -ItemType Directory -Force
-                    $targetAgentBackup = Join-Path $backupPath "$($sourceAgentFolder.Name)_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-                    Write-GaInfo "Moving existing $($sourceAgentFolder.Name) folder to $targetAgentBackup..."
-                    Move-Item -LiteralPath $targetAgentFolder -Destination $targetAgentBackup -ErrorAction Stop
+                    $targetAgentBackup = Join-Path $backupPath "WindowsAzure_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                    Write-GaInfo "Moving the existing WindowsAzure repository to $targetAgentBackup..."
+                    Move-Item -LiteralPath $destPath -Destination $targetAgentBackup -ErrorAction Stop
                     $existingAgentMoved = $true
                 }
 
-                Move-Item -LiteralPath $stagingAgentFolder -Destination $targetAgentFolder -ErrorAction Stop
+                Move-Item -LiteralPath $stagingAgentFolder -Destination $destPath -ErrorAction Stop
                 $agentFolderActivated = $true
-                Write-GaInfo "Activated validated VM Agent folder at $targetAgentFolder."
+                Write-GaInfo "Activated the validated complete VM Agent repository at $destPath."
             }
             catch {
                 $activationError = $_
@@ -1233,7 +1199,7 @@ try {
                     }
                     Move-Item -LiteralPath $targetAgentBackup -Destination $targetAgentFolder -ErrorAction Stop
                     $agentFolderActivated = $false
-                    Write-GaWarning "Restored the original VM Agent folder after replacement failed."
+                    Write-GaWarning "Restored the original VM Agent repository after replacement failed."
                 }
                 throw $activationError
             }
@@ -1411,15 +1377,15 @@ try {
                             throw "Original VM Agent backup is missing: $targetAgentBackup"
                         }
                         Move-Item -LiteralPath $targetAgentBackup -Destination $targetAgentFolder -ErrorAction Stop
-                        Write-GaWarning "Restored the original VM Agent folder because registry persistence did not complete."
+                        Write-GaWarning "Restored the original VM Agent repository because registry persistence did not complete."
                     }
                     else {
-                        Write-GaWarning "Removed the newly introduced VM Agent folder because registry persistence did not complete."
+                        Write-GaWarning "Removed the newly introduced VM Agent repository because registry persistence did not complete."
                     }
                     $agentFolderActivated = $false
                 }
                 catch {
-                    Write-GaError "Failed to roll back the VM Agent folder on $($diskb):: $($_.Exception.Message)"
+                    Write-GaError "Failed to roll back the VM Agent repository on $($diskb):: $($_.Exception.Message)"
                     if ($diskb -notin $failedDisks) { $failedDisks += $diskb }
                 }
             }
