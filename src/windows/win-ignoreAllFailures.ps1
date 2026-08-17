@@ -26,6 +26,8 @@
                            - Aligns BCD target validation and no-boot protections with the proven repair scripts.
                            - Excludes repair-host critical disks and preserves source disk identities across collisions.
                            - Restores and verifies every temporary GPT or MBR identity before reporting success.
+                           - Verifies DiskPart mounts by access path to avoid stale Get-Partition drive-letter data.
+                           - Probes unlettered non-EFI partitions and cleans up every temporary OS mount.
     v1.2: [May 2026] - Updated the script
                        - Added guarded nested VM handling to prevent Get-VM failures when Hyper-V module is unavailable.
                        - Switched partition discovery from inline CIM enumeration to shared Get-Disk-Partitions-v2 helper.
@@ -121,6 +123,7 @@ if (-not (Test-Path $logFile)) { $null = New-Item -ItemType File -Path $logFile 
 $successReport = New-Object System.Collections.Generic.List[string]
 $script_final_status = $STATUS_ERROR
 $assignedEfiLetters = @()  # Track EFI partition drive letters for cleanup
+$assignedOsLetters = @()   # Track Windows partition drive letters for cleanup
 $processedDisks = 0
 $skippedDisks = 0
 $failedDisks = 0
@@ -442,15 +445,11 @@ try {
                 )
                 Update-HostStorageCache -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 2
-                $mountedPartition = Get-Partition -DiskNumber $diskGroup.Name -PartitionNumber $part.PartitionNumber -ErrorAction Stop
-                if ([string]$mountedPartition.DriveLetter -ine [string]$newLetter) {
+                if (-not (Test-Path -LiteralPath "${newLetter}:\" -PathType Container)) {
                     throw "Disk $($diskGroup.Name): temporary EFI mount on ${newLetter}: could not be verified."
                 }
                 $assignedEfiLetters += @{ Letter = $newLetter; DiskNumber = $diskGroup.Name; PartitionNumber = $part.PartitionNumber }
                 $mountTracked = $true
-                if (-not (Test-Path -LiteralPath "${newLetter}:\" -PathType Container)) {
-                    throw "Disk $($diskGroup.Name): verified letter ${newLetter}: is not accessible."
-                }
             }
             catch {
                 if (-not $mountTracked) {
@@ -465,7 +464,14 @@ try {
             }
         }
 
-        $currentDrives = Get-Partition -DiskNumber $diskGroup.Name | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne [char]0 } | Select-Object -ExpandProperty DriveLetter
+        $currentDrives = @(
+            @(Get-Partition -DiskNumber $diskGroup.Name -ErrorAction Stop |
+                Where-Object { $_.DriveLetter -and $_.DriveLetter -ne [char]0 } |
+                Select-Object -ExpandProperty DriveLetter)
+            @($assignedEfiLetters |
+                Where-Object { [int]$_.DiskNumber -eq [int]$diskGroup.Name } |
+                Select-Object -ExpandProperty Letter)
+        ) | Sort-Object -Unique
         foreach ($drive in $currentDrives) {
             $driveStr = "$($drive):"
             if ($null -eq $currentDiskBcdPath) {
@@ -485,6 +491,62 @@ try {
                     ((Test-Path -LiteralPath "$driveStr\windows\system32\winload.exe" -PathType Leaf) -or
                      (Test-Path -LiteralPath "$driveStr\windows\system32\winload.efi" -PathType Leaf))) {
                     $currentDiskOsDrive = [string]$drive
+                }
+            }
+        }
+
+        if (-not $currentDiskOsDrive) {
+            $unletteredOsCandidates = @($diskPartitions | Where-Object {
+                (-not $_.DriveLetter -or $_.DriveLetter -eq [char]0) -and
+                ([string]$_.GptType).Trim().Trim('{', '}') -ine $efiGptType -and
+                $_.Type -ne 'System'
+            } | Sort-Object Size -Descending)
+
+            Write-ScriptLog -Message "Disk $($diskGroup.Name): probing $($unletteredOsCandidates.Count) unlettered non-EFI partition(s) for Windows"
+            foreach ($osCandidate in $unletteredOsCandidates) {
+                $osLetter = Get-NextFreeDriveLetter
+                if (-not $osLetter) {
+                    Write-ScriptLog -Level Warning -Message "Disk $($diskGroup.Name): no temporary drive letter is available for Windows partition probing"
+                    break
+                }
+
+                $osMountTracked = $false
+                try {
+                    Invoke-IgnoreAllFailuresDiskPart -Operation 'os-assign' -Commands @(
+                        "select disk $($diskGroup.Name)"
+                        "select partition $($osCandidate.PartitionNumber)"
+                        "assign letter=$osLetter"
+                    )
+                    Update-HostStorageCache -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                    $osMounted = Test-Path -LiteralPath "${osLetter}:\" -PathType Container
+                    $systemHivePath = "${osLetter}:\Windows\System32\config\SYSTEM"
+                    $hasSystemHive = $osMounted -and (Test-Path -LiteralPath $systemHivePath -PathType Leaf)
+                    $hasWindowsLoader = $osMounted -and
+                        ((Test-Path -LiteralPath "${osLetter}:\Windows\System32\winload.exe" -PathType Leaf) -or
+                         (Test-Path -LiteralPath "${osLetter}:\Windows\System32\winload.efi" -PathType Leaf))
+
+                    Write-ScriptLog -Message "Disk $($diskGroup.Name): checked temporary ${osLetter}: for Windows; mounted=$osMounted systemHive=$hasSystemHive loader=$hasWindowsLoader"
+                    if ($hasSystemHive -and $hasWindowsLoader) {
+                        $assignedOsLetters += @{ Letter = $osLetter; DiskNumber = $diskGroup.Name; PartitionNumber = $osCandidate.PartitionNumber }
+                        $osMountTracked = $true
+                        $currentDiskOsDrive = [string]$osLetter
+                        break
+                    }
+                }
+                finally {
+                    if (-not $osMountTracked) {
+                        Invoke-IgnoreAllFailuresDiskPart -Operation 'os-probe-remove' -Commands @(
+                            "select disk $($diskGroup.Name)"
+                            "select partition $($osCandidate.PartitionNumber)"
+                            "remove letter=$osLetter noerr"
+                        )
+                        Update-HostStorageCache -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 1
+                        if (Test-Path -LiteralPath "${osLetter}:\" -PathType Container) {
+                            throw "Disk $($diskGroup.Name): temporary OS probe letter ${osLetter}: could not be removed."
+                        }
+                    }
                 }
             }
         }
@@ -607,6 +669,28 @@ catch {
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    if ($assignedOsLetters.Count -gt 0) {
+        Write-ScriptLog -Message "Cleaning up temporarily assigned Windows partition drive letters..."
+        foreach ($osMount in $assignedOsLetters) {
+            try {
+                Invoke-IgnoreAllFailuresDiskPart -Operation 'os-remove' -Commands @(
+                    "select disk $($osMount.DiskNumber)"
+                    "select partition $($osMount.PartitionNumber)"
+                    "remove letter=$($osMount.Letter) noerr"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+                if (Test-Path -LiteralPath "$($osMount.Letter):\" -PathType Container) {
+                    throw 'Temporary Windows partition drive letter removal could not be verified.'
+                }
+            }
+            catch {
+                Write-ScriptLog -Level Error -Message "Failed to remove temporary Windows partition letter $($osMount.Letter): $($_.Exception.Message)"
+                $script_final_status = $STATUS_ERROR
+            }
+        }
+    }
+
     # Cleanup: Remove temporarily assigned EFI drive letters to avoid leaving orphaned mounts on rescue host
     if ($assignedEfiLetters.Count -gt 0) {
         Write-ScriptLog -Message "Cleaning up temporarily assigned EFI partition drive letters..."
@@ -620,8 +704,7 @@ finally {
                 )
                 Update-HostStorageCache -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 1
-                $cleanedPartition = Get-Partition -DiskNumber $efiMount.DiskNumber -PartitionNumber $efiMount.PartitionNumber -ErrorAction Stop
-                if ([string]$cleanedPartition.DriveLetter -ieq [string]$efiMount.Letter) {
+                if (Test-Path -LiteralPath "$($efiMount.Letter):\" -PathType Container) {
                     throw 'Temporary EFI drive letter removal could not be verified.'
                 }
             }
