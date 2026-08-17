@@ -28,6 +28,8 @@
                            - Restores and verifies every temporary GPT or MBR identity before reporting success.
                            - Verifies DiskPart mounts by access path to avoid stale Get-Partition drive-letter data.
                            - Probes unlettered non-EFI partitions and cleans up every temporary OS mount.
+                           - Uses typed temporary-mount records for Windows PowerShell 5.1 compatibility.
+                           - Repairs only unknown default-loader device mappings and verifies mapping invariance.
     v1.2: [May 2026] - Updated the script
                        - Added guarded nested VM handling to prevent Get-VM failures when Hyper-V module is unavailable.
                        - Switched partition discovery from inline CIM enumeration to shared Get-Disk-Partitions-v2 helper.
@@ -36,17 +38,20 @@
     v1.0: Initial commit - Sets BCD boot status policy to IgnoreAllFailures to break Automatic Repair loops
         
 .SCENARIO_RECREATION
-    To recreate a testable scenario on a rescue VM with an attached OS disk:
-    1. Create a test VM in Azure and attach its OS disk to a rescue VM.
-    2. Find the attached disk's drive letter and locate the BCD store:
+    To recreate a testable scenario on a disposable test VM:
+    1. Set the default loader to DisplayAllFailures before stopping the test VM:
+bcdedit /set {default} bootstatuspolicy DisplayAllFailures
+    2. Verify the policy:
+bcdedit /enum {default}
+    Expected: bootstatuspolicy = DisplayAllFailures.
+    3. Trigger an unclean stop of the disposable VM, then use Azure VM Repair to attach its OS disk to a rescue VM.
+    4. Find the attached disk's drive letter and locate the BCD store:
        Gen1: <drive>:\boot\bcd  |  Gen2: <drive>:\efi\microsoft\boot\bcd
-    3. Remove or reset the bootstatuspolicy to simulate an Automatic Repair loop (replace <bcdpath> with your actual BCD path):
-bcdedit /store <bcdpath> /deletevalue {default} bootstatuspolicy
-    4. Verify bootstatuspolicy is absent:
+    5. Verify the offline store still has the failure-display policy (replace <bcdpath> with the actual BCD path):
 bcdedit /store <bcdpath> /enum {default}
-    Expected: No bootstatuspolicy line in the output.
-    5. Run the script. It should set bootstatuspolicy to IgnoreAllFailures.
-    6. Verify the change:
+    Expected: bootstatuspolicy = DisplayAllFailures.
+    6. Run the script. It should set bootstatuspolicy to IgnoreAllFailures.
+    7. Verify the change:
 bcdedit /store <bcdpath> /enum {default}
     Expected: bootstatuspolicy = IgnoreAllFailures.
 
@@ -448,7 +453,11 @@ try {
                 if (-not (Test-Path -LiteralPath "${newLetter}:\" -PathType Container)) {
                     throw "Disk $($diskGroup.Name): temporary EFI mount on ${newLetter}: could not be verified."
                 }
-                $assignedEfiLetters += @{ Letter = $newLetter; DiskNumber = $diskGroup.Name; PartitionNumber = $part.PartitionNumber }
+                $assignedEfiLetters += [pscustomobject]@{
+                    Letter = [string]$newLetter
+                    DiskNumber = [int]$diskGroup.Name
+                    PartitionNumber = [int]$part.PartitionNumber
+                }
                 $mountTracked = $true
             }
             catch {
@@ -528,7 +537,11 @@ try {
 
                     Write-ScriptLog -Message "Disk $($diskGroup.Name): checked temporary ${osLetter}: for Windows; mounted=$osMounted systemHive=$hasSystemHive loader=$hasWindowsLoader"
                     if ($hasSystemHive -and $hasWindowsLoader) {
-                        $assignedOsLetters += @{ Letter = $osLetter; DiskNumber = $diskGroup.Name; PartitionNumber = $osCandidate.PartitionNumber }
+                        $assignedOsLetters += [pscustomobject]@{
+                            Letter = [string]$osLetter
+                            DiskNumber = [int]$diskGroup.Name
+                            PartitionNumber = [int]$osCandidate.PartitionNumber
+                        }
                         $osMountTracked = $true
                         $currentDiskOsDrive = [string]$osLetter
                         break
@@ -582,15 +595,34 @@ try {
 
                 $loaderText = $beforeRaw -join "`n"
                 $loaderPathMatch = [regex]::Match($loaderText, '(?im)^\s*path\s+(.+?)\s*$')
+                $loaderDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*device\s+(.+?)\s*$')
+                $loaderOsDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*osdevice\s+(.+?)\s*$')
                 $loaderSystemRootMatch = [regex]::Match($loaderText, '(?im)^\s*systemroot\s+(.+?)\s*$')
-                if (-not $loaderPathMatch.Success -or -not $loaderSystemRootMatch.Success) {
+                if (-not $loaderPathMatch.Success -or
+                    -not $loaderDeviceMatch.Success -or
+                    -not $loaderOsDeviceMatch.Success -or
+                    -not $loaderSystemRootMatch.Success) {
                     $failedDisks++
-                    Write-ScriptLog -Level Error -Message "Disk $($diskGroup.Name): default loader $defaultId is missing path or systemroot; refusing BCD changes"
+                    Write-ScriptLog -Level Error -Message "Disk $($diskGroup.Name): default loader $defaultId is missing required mapping elements; refusing BCD changes"
                     continue
                 }
 
                 $loaderPath = $loaderPathMatch.Groups[1].Value.Trim()
+                $loaderDevice = $loaderDeviceMatch.Groups[1].Value.Trim()
+                $loaderOsDevice = $loaderOsDeviceMatch.Groups[1].Value.Trim()
                 $loaderSystemRoot = $loaderSystemRootMatch.Groups[1].Value.Trim()
+                $expectedDeviceAfterWrite = if ($loaderDevice -match '(?i)^unknown$') {
+                    "partition=${currentDiskOsDrive}:"
+                }
+                else {
+                    $loaderDevice
+                }
+                $expectedOsDeviceAfterWrite = if ($loaderOsDevice -match '(?i)^unknown$') {
+                    "partition=${currentDiskOsDrive}:"
+                }
+                else {
+                    $loaderOsDevice
+                }
                 $expectedLoaderPath = if ($isGen2Disk) { '\Windows\System32\winload.efi' } else { '\Windows\System32\winload.exe' }
                 if ($loaderPath -ine $expectedLoaderPath -or
                     $loaderSystemRoot -ine '\Windows') {
@@ -618,6 +650,24 @@ try {
                     Write-ScriptLog -Message "Disk $($diskGroup.Name): verified BCD backup created at $bcdBackupPath"
 
                     $bcdWriteStarted = $true
+                    $validatedWindowsPartition = "partition=${currentDiskOsDrive}:"
+                    if ($loaderDevice -match '(?i)^unknown$') {
+                        $setDeviceOutput = bcdedit /store $currentDiskBcdPath /set $defaultId device $validatedWindowsPartition 2>&1
+                        $setDeviceExitCode = $LASTEXITCODE
+                        Add-CommandOutput -Header "--- BCD REPAIR DEVICE OUTPUT (Disk $($diskGroup.Name)) ---" -Output $setDeviceOutput
+                        if ($setDeviceExitCode -ne 0) {
+                            throw "Failed to repair unknown device mapping on $defaultId (exit code $setDeviceExitCode)."
+                        }
+                    }
+                    if ($loaderOsDevice -match '(?i)^unknown$') {
+                        $setOsDeviceOutput = bcdedit /store $currentDiskBcdPath /set $defaultId osdevice $validatedWindowsPartition 2>&1
+                        $setOsDeviceExitCode = $LASTEXITCODE
+                        Add-CommandOutput -Header "--- BCD REPAIR OSDEVICE OUTPUT (Disk $($diskGroup.Name)) ---" -Output $setOsDeviceOutput
+                        if ($setOsDeviceExitCode -ne 0) {
+                            throw "Failed to repair unknown osdevice mapping on $defaultId (exit code $setOsDeviceExitCode)."
+                        }
+                    }
+
                     $setPolicyOutput = bcdedit /store $currentDiskBcdPath /set $defaultId bootstatuspolicy IgnoreAllFailures 2>&1
                     $setPolicyExitCode = $LASTEXITCODE
                     Add-CommandOutput -Header "--- BCD SET BOOTSTATUSPOLICY OUTPUT (Disk $($diskGroup.Name)) ---" -Output $setPolicyOutput
@@ -628,7 +678,21 @@ try {
                     $afterRaw = bcdedit /store $currentDiskBcdPath /enum $defaultId /v 2>&1
                     $afterExitCode = $LASTEXITCODE
                     Add-CommandOutput -Header "--- BCD AFTER CHANGE (Disk $($diskGroup.Name)) ---" -Output $afterRaw
-                    if ($afterExitCode -ne 0 -or ($afterRaw -join "`n") -notmatch '(?im)^\s*bootstatuspolicy\s+IgnoreAllFailures\s*$') {
+                    $afterText = $afterRaw -join "`n"
+                    $afterPathMatch = [regex]::Match($afterText, '(?im)^\s*path\s+(.+?)\s*$')
+                    $afterDeviceMatch = [regex]::Match($afterText, '(?im)^\s*device\s+(.+?)\s*$')
+                    $afterOsDeviceMatch = [regex]::Match($afterText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+                    $afterSystemRootMatch = [regex]::Match($afterText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+                    if ($afterExitCode -ne 0 -or
+                        -not $afterPathMatch.Success -or
+                        -not $afterDeviceMatch.Success -or
+                        -not $afterOsDeviceMatch.Success -or
+                        -not $afterSystemRootMatch.Success -or
+                        $afterPathMatch.Groups[1].Value.Trim() -ine $loaderPath -or
+                        $afterDeviceMatch.Groups[1].Value.Trim() -ine $expectedDeviceAfterWrite -or
+                        $afterOsDeviceMatch.Groups[1].Value.Trim() -ine $expectedOsDeviceAfterWrite -or
+                        $afterSystemRootMatch.Groups[1].Value.Trim() -ine $loaderSystemRoot -or
+                        $afterText -notmatch '(?im)^\s*bootstatuspolicy\s+IgnoreAllFailures\s*$') {
                         throw "Post-change verification failed for default loader $defaultId."
                     }
 
