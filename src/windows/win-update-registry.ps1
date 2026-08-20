@@ -203,13 +203,13 @@ if ($controlSet) {
         return $STATUS_ERROR
     }
 }
-Write-InfoLog "DEBUG rootKey=[$rootKey]"
-Write-InfoLog "DEBUG hive=[$hive]"
-Write-InfoLog "DEBUG controlSet=[$controlSet]"
-Write-InfoLog "DEBUG relativePath=[$relativePath]"
-Write-InfoLog "DEBUG propertyName=[$propertyName]"
-Write-InfoLog "DEBUG propertyValue=[$propertyValue]"
-Write-InfoLog "DEBUG propertyType=[$propertyType]"
+Write-Host "DEBUG rootKey=[$rootKey]"
+Write-Host "DEBUG hive=[$hive]"
+Write-Host "DEBUG controlSet=[$controlSet]"
+Write-Host "DEBUG relativePath=[$relativePath]"
+Write-Host "DEBUG propertyName=[$propertyName]"
+Write-Host "DEBUG propertyValue=[$propertyValue]"
+Write-Host "DEBUG propertyType=[$propertyType]"
 if ([string]::IsNullOrEmpty($relativePath)) {
     Log-Error "relativePath parameter is required."
     return $STATUS_ERROR
