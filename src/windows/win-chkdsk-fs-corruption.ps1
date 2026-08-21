@@ -82,7 +82,7 @@
     Author:  Tony.Mocanu@Microsoft.com
 
 .VERSION
-    v1.3: [August 2026] - Aligned physical disk discovery and collision handling with
+        v1.3: [August 2026] - Aligned physical disk discovery and collision handling with
                           win-sac-on, win-LKGC, and GA_offlinefixer.
                         - Excludes repair-host critical disks and validates Windows targets.
                         - Supports safe temporary mounts and preserves source disk identities.
@@ -90,6 +90,9 @@
                         - Restricts CHKDSK to the validated Windows partition.
                         - Emits CHKDSK evidence while keeping DiskPart diagnostics out of
                           result output.
+                                                - Emits structured VMRepair telemetry for lifecycle, target validation,
+                                                    CHKDSK outcomes, and every catch block.
+                                                - Adds ShouldProcess support to disk identity mutation helpers.
     v1.2: [July 2026]   - Refactored logging to support desktop-first paths with SYSTEM fallback.
                         - Aligned dependency path validation and added explicit loop summaries.
     v1.1: [May 2026]    - Guarded nested VM discovery when Hyper-V is unavailable.
@@ -153,8 +156,8 @@ if ([string]::IsNullOrEmpty($logDir)) {
     }
 }
 
-if (-not (Test-Path -Path $logDir)) { 
-    $null = New-Item -ItemType Directory -Path $logDir -Force 
+if (-not (Test-Path -Path $logDir)) {
+    $null = New-Item -ItemType Directory -Path $logDir -Force
 }
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -169,29 +172,81 @@ function Write-ScriptLog {
         [string]$Level = 'INFO'
     )
     $formattedMsg = "[$(Get-Date -Format 'MM/dd/yyyy HH:mm:ss')] [$Level] $Message"
-    
+
     # Direct to correct stream or custom framework logger
     switch ($Level) {
         'ERROR' {
-            if (Get-Command Log-Error -ErrorAction SilentlyContinue) { Log-Error $Message } 
+            if (Get-Command Log-Error -ErrorAction SilentlyContinue) { Log-Error $Message }
             else { Write-Error $formattedMsg }
         }
         'WARNING' {
-            if (Get-Command Log-Warning -ErrorAction SilentlyContinue) { Log-Warning $Message } 
+            if (Get-Command Log-Warning -ErrorAction SilentlyContinue) { Log-Warning $Message }
             else { Write-Warning $formattedMsg }
         }
         'OUTPUT' {
-            if (Get-Command Log-Output -ErrorAction SilentlyContinue) { Log-Output $Message } 
+            if (Get-Command Log-Output -ErrorAction SilentlyContinue) { Log-Output $Message }
             else { Write-Information $formattedMsg -InformationAction Continue }
         }
         Default {
-            if (Get-Command Log-Info -ErrorAction SilentlyContinue) { Log-Info $Message } 
+            if (Get-Command Log-Info -ErrorAction SilentlyContinue) { Log-Info $Message }
             else { Write-Information $formattedMsg -InformationAction Continue }
         }
     }
 
     # Write to local physical file
     $formattedMsg | Out-File -FilePath $logFile -Append -Encoding utf8
+}
+
+$script:RepairScriptVersion = '1.3'
+$script:ExecutionStarted = Get-Date
+
+function Write-ChkdskTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Start', 'Operation', 'Success', 'Error')]
+        [string]$Event,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [hashtable]$Properties = @{}
+    )
+
+    $payload = [ordered]@{
+        Event = $Event
+        Message = $Message
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+        RepairScriptVersion = $script:RepairScriptVersion
+        Properties = $Properties
+    }
+    $json = $payload | ConvertTo-Json -Compress -Depth 8
+    $level = if ($Event -eq 'Error') { 'ERROR' } else { 'INFO' }
+    Write-ScriptLog -Message "[Telemetry] $json" -Level $level
+}
+
+function Write-ChkdskCatchTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CatchName,
+
+        [string]$Stage = '',
+
+        [string]$DiskNumber = '',
+
+        [string]$TargetDrive = '',
+
+        [Parameter(Mandatory = $true)]
+        [string]$ErrorMessage
+    )
+
+    Write-ChkdskTelemetry -Event Error -Message "Catch block: $CatchName" -Properties @{
+        CoverageCategory = 'CatchBlock'
+        CatchName = $CatchName
+        Stage = $Stage
+        DiskNumber = $DiskNumber
+        TargetDrive = $TargetDrive
+        Error = $ErrorMessage
+    }
 }
 
 function Get-ChkdskAvailableTempDriveLetter {
@@ -270,6 +325,7 @@ function Invoke-ChkdskDiskPart {
 }
 
 function Set-ChkdskTemporarySourceDiskIdentity {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
     param(
         [Parameter(Mandatory = $true)]
         [pscustomobject]$Record
@@ -277,6 +333,10 @@ function Set-ChkdskTemporarySourceDiskIdentity {
 
     if ($Record.PartitionStyle -ne 'MBR') {
         throw 'Temporary source disk identities are permitted only for MBR disks.'
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("Disk $($Record.DiskNumber)", 'Assign a temporary MBR identity and online the disk')) {
+        return
     }
 
     Invoke-ChkdskDiskPart -Operation 'collision-prepare' -Commands @(
@@ -314,10 +374,15 @@ function Restore-ChkdskSourceDiskIdentity {
 }
 
 function Set-ChkdskTemporaryRepairDiskIdentity {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
     param(
         [Parameter(Mandatory = $true)]
         [pscustomobject]$Record
     )
+
+    if (-not $PSCmdlet.ShouldProcess("Repair host Disk $($Record.DiskNumber)", 'Assign a temporary GPT identity')) {
+        return
+    }
 
     Invoke-ChkdskDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
         "select disk $($Record.DiskNumber)"
@@ -367,6 +432,12 @@ $targetDiskCount = 0
 
 try {
     Write-ScriptLog "Script execution started. Logging active at: $logFile" "INFO"
+    Write-ChkdskTelemetry -Event Start -Message 'Starting CHKDSK file-system repair' -Properties @{
+        ScriptName = 'win-chkdsk-fs-corruption.ps1'
+        ScriptVersion = $script:RepairScriptVersion
+        ExecutionMode = 'REPAIR_VM_ONLY'
+        LogFile = $logFile
+    }
 
     # Stop nested guest VM if running (Only calls Hyper-V cmdlets after validation - DEP-02)
     $hyperVModuleAvailable = @(Get-Module -ListAvailable -Name 'Hyper-V').Count -gt 0
@@ -379,7 +450,9 @@ try {
                     Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
                 }
                 catch {
-                    Write-ScriptLog "Failed to stop nested guest VM '$($guestHyperVVirtualMachine.VMName)' via Stop-VM: $($_.Exception.Message). Continuing but with limited raw write access risks." "WARNING"
+                    $errorMessage = $_.Exception.Message
+                    Write-ScriptLog "Failed to stop nested guest VM '$($guestHyperVVirtualMachine.VMName)' via Stop-VM: $errorMessage. Continuing but with limited raw write access risks." "WARNING"
+                    Write-ChkdskCatchTelemetry -CatchName 'NestedVmStop' -Stage 'Preflight' -TargetDrive $env:SystemDrive -ErrorMessage $errorMessage
                 }
             }
         }
@@ -449,6 +522,12 @@ try {
                     TemporaryDiskPartValue = $temporaryRepairGuid
                 }
                 Write-ScriptLog 'Temporarily changing only the repair VM OS disk GPT identity; the source identity remains unchanged.' 'WARNING'
+                Write-ChkdskTelemetry -Event Operation -Message 'Preparing GPT collision resolution' -Properties @{
+                    CoverageCategory = 'Safety'
+                    Operation = 'RepairHostTemporaryIdentity'
+                    SourceDiskNumber = [string]$collisionDisk.Number
+                    RepairDiskNumber = [string]$rescueDiskNumber
+                }
                 Set-ChkdskTemporaryRepairDiskIdentity -Record $repairDiskIdentityRecord
             }
 
@@ -551,6 +630,12 @@ try {
         $partition = $targetWindowsPartition
         $driveLetter = $targetWindowsDriveLetter
         Write-ScriptLog "Validated Windows target on Disk $diskNumber Partition $($partition.PartitionNumber) at ${driveLetter}:." 'INFO'
+        Write-ChkdskTelemetry -Event Operation -Message 'Validated Windows repair target' -Properties @{
+            CoverageCategory = 'TargetValidation'
+            DiskNumber = [string]$diskNumber
+            PartitionNumber = [string]$partition.PartitionNumber
+            TargetDrive = "${driveLetter}:"
+        }
 
         try {
             $volume = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
@@ -580,10 +665,24 @@ try {
 
             if (-not [bool]$volumeState.DirtyBitSet) {
                 Write-ScriptLog "$letter dirty bit is not set; CHKDSK /f is not required." 'INFO'
+                Write-ChkdskTelemetry -Event Success -Message 'CHKDSK repair not required' -Properties @{
+                    CoverageCategory = 'RepairOutcome'
+                    Outcome = 'NoOp'
+                    DiskNumber = [string]$diskNumber
+                    TargetDrive = $letter
+                    DirtyBitSet = $false
+                }
                 continue
             }
 
             Write-ScriptLog "$letter dirty bit is set; executing CHKDSK /f." 'WARNING'
+            Write-ChkdskTelemetry -Event Operation -Message 'Starting CHKDSK repair' -Properties @{
+                CoverageCategory = 'RepairOperation'
+                Operation = 'ChkdskFix'
+                DiskNumber = [string]$diskNumber
+                TargetDrive = $letter
+                DirtyBitSet = $true
+            }
             $chkdskResults = & chkdsk.exe $letter /f 2>&1
             $chkdskExitCode = $LASTEXITCODE
             foreach ($resultLine in @($chkdskResults)) {
@@ -602,6 +701,13 @@ try {
 
             if ($chkdskExitCode -notin @(0, 1, 2)) {
                 Write-ScriptLog "CHKDSK failed on $letter with exit code $chkdskExitCode." 'ERROR'
+                Write-ChkdskTelemetry -Event Error -Message 'CHKDSK returned an unsupported exit code' -Properties @{
+                    CoverageCategory = 'RepairOutcome'
+                    Outcome = 'Failed'
+                    DiskNumber = [string]$diskNumber
+                    TargetDrive = $letter
+                    ExitCode = $chkdskExitCode
+                }
                 $failedCount++
                 continue
             }
@@ -611,16 +717,33 @@ try {
             if ($null -eq $repairedVolumeState -or $null -eq $repairedVolumeState.DirtyBitSet -or
                 [bool]$repairedVolumeState.DirtyBitSet) {
                 Write-ScriptLog "CHKDSK returned exit code $chkdskExitCode, but $letter still reports a dirty or unknown state." 'ERROR'
+                Write-ChkdskTelemetry -Event Error -Message 'CHKDSK post-repair dirty-bit verification failed' -Properties @{
+                    CoverageCategory = 'RepairOutcome'
+                    Outcome = 'VerificationFailed'
+                    DiskNumber = [string]$diskNumber
+                    TargetDrive = $letter
+                    ExitCode = $chkdskExitCode
+                }
                 $failedCount++
                 continue
             }
 
             $fixedCount++
             Write-ScriptLog "CHKDSK completed on $letter with exit code $chkdskExitCode and a verified clear dirty bit." 'INFO'
+            Write-ChkdskTelemetry -Event Success -Message 'CHKDSK repair completed and verified' -Properties @{
+                CoverageCategory = 'RepairOutcome'
+                Outcome = 'Repaired'
+                DiskNumber = [string]$diskNumber
+                TargetDrive = $letter
+                ExitCode = $chkdskExitCode
+                DirtyBitSet = $false
+            }
         }
         catch {
+            $errorMessage = $_.Exception.Message
             $failedCount++
-            Write-ScriptLog "Failed processing validated Windows partition on Disk ${diskNumber}: $($_.Exception.Message)" 'ERROR'
+            Write-ScriptLog "Failed processing validated Windows partition on Disk ${diskNumber}: $errorMessage" 'ERROR'
+            Write-ChkdskCatchTelemetry -CatchName 'WindowsPartitionProcessing' -Stage 'DiscoveryOrRepair' -DiskNumber "$diskNumber" -TargetDrive "${driveLetter}:" -ErrorMessage $errorMessage
         }
     }
 
@@ -635,7 +758,9 @@ try {
     $script_final_status = $STATUS_SUCCESS
 }
 catch {
-    Write-ScriptLog "An unhandled execution crash occurred: $($_.Exception.Message)" "ERROR"
+    $errorMessage = $_.Exception.Message
+    Write-ScriptLog "An unhandled execution crash occurred: $errorMessage" "ERROR"
+    Write-ChkdskCatchTelemetry -CatchName 'UnhandledExecution' -Stage 'Main' -ErrorMessage $errorMessage
     $script_final_status = $STATUS_ERROR
 }
 finally {
@@ -653,7 +778,9 @@ finally {
             }
         }
         catch {
-            Write-ScriptLog "Failed to remove temporary letter $($mount.DriveLetter): $($_.Exception.Message)" 'ERROR'
+            $errorMessage = $_.Exception.Message
+            Write-ScriptLog "Failed to remove temporary letter $($mount.DriveLetter): $errorMessage" 'ERROR'
+            Write-ChkdskCatchTelemetry -CatchName 'TemporaryMountCleanup' -Stage 'Cleanup' -DiskNumber "$($mount.DiskNumber)" -TargetDrive "$($mount.DriveLetter):" -ErrorMessage $errorMessage
             $script_final_status = $STATUS_ERROR
         }
     }
@@ -675,8 +802,10 @@ finally {
                 }
             }
             catch {
+                $errorMessage = $_.Exception.Message
                 $identityRestorationFailed = $true
-                Write-ScriptLog "CRITICAL: Could not safely offline source Disk ${diskNumber}: $($_.Exception.Message)" 'ERROR'
+                Write-ScriptLog "CRITICAL: Could not safely offline source Disk ${diskNumber}: $errorMessage" 'ERROR'
+                Write-ChkdskCatchTelemetry -CatchName 'SourceGptOffline' -Stage 'IdentityRestore' -DiskNumber "$diskNumber" -ErrorMessage $errorMessage
             }
         }
 
@@ -686,8 +815,10 @@ finally {
                 Write-ScriptLog 'Repair VM OS disk GPT identity restored and verified.' 'INFO'
             }
             catch {
+                $errorMessage = $_.Exception.Message
                 $identityRestorationFailed = $true
-                Write-ScriptLog "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)" 'ERROR'
+                Write-ScriptLog "CRITICAL: Failed to restore the repair VM OS disk identity: $errorMessage" 'ERROR'
+                Write-ChkdskCatchTelemetry -CatchName 'RepairDiskIdentityRestore' -Stage 'IdentityRestore' -DiskNumber "$($repairDiskIdentityRecord.DiskNumber)" -ErrorMessage $errorMessage
             }
         }
     }
@@ -698,8 +829,10 @@ finally {
             Write-ScriptLog "Disk $($identityRecord.DiskNumber) original MBR identity restored and verified." 'INFO'
         }
         catch {
+            $errorMessage = $_.Exception.Message
             $identityRestorationFailed = $true
-            Write-ScriptLog "CRITICAL: Failed to restore Disk $($identityRecord.DiskNumber) identity: $($_.Exception.Message)" 'ERROR'
+            Write-ScriptLog "CRITICAL: Failed to restore Disk $($identityRecord.DiskNumber) identity: $errorMessage" 'ERROR'
+            Write-ChkdskCatchTelemetry -CatchName 'SourceMbrIdentityRestore' -Stage 'IdentityRestore' -DiskNumber "$($identityRecord.DiskNumber)" -ErrorMessage $errorMessage
         }
     }
     if ($identityRestorationFailed) {
@@ -708,6 +841,16 @@ finally {
 
     Write-ScriptLog "Partition Summary: Processed=$processedCount | Skipped=$skippedCount | Fixed=$fixedCount | Failed=$failedCount" 'INFO'
     Write-ScriptLog "Final script status: $script_final_status" "INFO"
+    $completionEvent = if ($script_final_status -eq $STATUS_SUCCESS) { 'Success' } else { 'Error' }
+    Write-ChkdskTelemetry -Event $completionEvent -Message 'CHKDSK repair script completed' -Properties @{
+        CoverageCategory = 'ScriptOutcome'
+        Status = [string]$script_final_status
+        Processed = $processedCount
+        Skipped = $skippedCount
+        Repaired = $fixedCount
+        Failed = $failedCount
+        DurationMilliseconds = [int64]((Get-Date) - $script:ExecutionStarted).TotalMilliseconds
+    }
     Write-ScriptLog "Script finalized. Destination log package details: $logFile" "INFO"
 }
 
