@@ -170,7 +170,7 @@ function Invoke-LkgcDiskPart {
 
     $output = $Commands | diskpart 2>&1
     foreach ($line in @($output)) {
-        if ($line) { Log-Output "[diskpart][$Operation] $line" | Out-Null }
+        if ($line) { Write-LogOutput "[diskpart][$Operation] $line" | Out-Null }
     }
 }
 
@@ -186,7 +186,7 @@ function Invoke-LkgcBcdEdit {
     $output = & bcdedit.exe @Arguments 2>&1
     $exitCode = $LASTEXITCODE
     foreach ($line in @($output)) {
-        if ($line) { Log-Output "[bcdedit][$Operation] $line" | Out-Null }
+        if ($line) { Write-LogOutput "[bcdedit][$Operation] $line" | Out-Null }
     }
     return [pscustomobject]@{
         Output = @($output)
@@ -196,6 +196,7 @@ function Invoke-LkgcBcdEdit {
 }
 
 function Set-LkgcTemporarySourceDiskIdentity {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [pscustomobject]$Record
@@ -205,17 +206,19 @@ function Set-LkgcTemporarySourceDiskIdentity {
         throw 'Temporary source disk identities are permitted only for the Gen1 MBR path.'
     }
 
-    Invoke-LkgcDiskPart -Operation 'collision-prepare' -Commands @(
-        "select disk $($Record.DiskNumber)"
-        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
-        'online disk'
-    )
-    Update-HostStorageCache -ErrorAction SilentlyContinue
+    if ($PSCmdlet.ShouldProcess("Disk $($Record.DiskNumber)", "temporarily set identity to $($Record.TemporaryValue)")) {
+        Invoke-LkgcDiskPart -Operation 'collision-prepare' -Commands @(
+            "select disk $($Record.DiskNumber)"
+            "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+            'online disk'
+        )
+        Update-HostStorageCache -ErrorAction SilentlyContinue
 
-    $currentIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
-    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
-    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
-        throw "Disk $($Record.DiskNumber) could not be brought online with its verified temporary identity."
+        $currentIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
+        $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+        if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+            throw "Disk $($Record.DiskNumber) could not be brought online with its verified temporary identity."
+        }
     }
 }
 
@@ -240,21 +243,24 @@ function Restore-LkgcSourceDiskIdentity {
 }
 
 function Set-LkgcTemporaryRepairDiskIdentity {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [pscustomobject]$Record
     )
 
-    Invoke-LkgcDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
-        "select disk $($Record.DiskNumber)"
-        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
-    )
-    Update-HostStorageCache -ErrorAction SilentlyContinue
+    if ($PSCmdlet.ShouldProcess("Repair disk $($Record.DiskNumber)", "temporarily set GPT identity to $($Record.TemporaryValue)")) {
+        Invoke-LkgcDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
+            "select disk $($Record.DiskNumber)"
+            "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+        )
+        Update-HostStorageCache -ErrorAction SilentlyContinue
 
-    $currentIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
-    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
-    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
-        throw 'The repair VM OS disk did not retain a verified temporary GPT identity.'
+        $currentIdentity = Get-LkgcDiskIdentity -DiskNumber $Record.DiskNumber
+        $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+        if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+            throw 'The repair VM OS disk did not retain a verified temporary GPT identity.'
+        }
     }
 }
 
@@ -297,7 +303,7 @@ $script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).Scr
 $script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
 $script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
 
-function Write-DesktopLogLine {
+function Write-DesktopLogEntry {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Level,
@@ -316,19 +322,19 @@ function Write-DesktopLogLine {
     }
 }
 
-function Log-Output {
+function Write-LogOutput {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogOutput -message $message
-    Write-DesktopLogLine -Level 'Output' -Message $message
+    Write-DesktopLogEntry -Level 'Output' -Message $message
 }
-function Log-Info { Param([PSObject[]]$message) & $script:OriginalLogInfo -message $message; Write-DesktopLogLine -Level 'Info' -Message $message }
-function Log-Warning { Param([PSObject[]]$message) & $script:OriginalLogWarning -message $message; Write-DesktopLogLine -Level 'Warning' -Message $message }
-function Log-Error {
+function Write-LogInfo { Param([PSObject[]]$message) & $script:OriginalLogInfo -message $message; Write-DesktopLogEntry -Level 'Info' -Message $message }
+function Write-LogWarning { Param([PSObject[]]$message) & $script:OriginalLogWarning -message $message; Write-DesktopLogEntry -Level 'Warning' -Message $message }
+function Write-LogError {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogError -message $message
-    Write-DesktopLogLine -Level 'Error' -Message $message
+    Write-DesktopLogEntry -Level 'Error' -Message $message
 }
-function Log-Debug { Param([PSObject[]]$message) & $script:OriginalLogDebug -message $message; Write-DesktopLogLine -Level 'Debug' -Message $message }
+function Write-LogDebug { Param([PSObject[]]$message) & $script:OriginalLogDebug -message $message; Write-DesktopLogEntry -Level 'Debug' -Message $message }
 
 $script:RepairScriptVersion = '1.3'
 $script:ExecutionStarted = Get-Date
@@ -362,8 +368,67 @@ function Write-LkgcTelemetry {
     }
 }
 
-Log-Info "Starting AUTO LKGC Script. Desktop log: $logFilePath"
-Log-Info "[script_start] Script=win-LKGC Version=$($script:RepairScriptVersion)"
+function Write-LkgcResolutionTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ResolutionPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Outcome,
+
+        [string]$DiskNumber = '',
+
+        [string]$TargetDrive = '',
+
+        [hashtable]$Properties = @{}
+    )
+
+    $props = @{
+        CoverageCategory = 'ResolutionPath'
+        ResolutionPath = $ResolutionPath
+        Outcome = $Outcome
+        DiskNumber = $DiskNumber
+        TargetDrive = $TargetDrive
+    }
+
+    foreach ($key in $Properties.Keys) {
+        $props[$key] = $Properties[$key]
+    }
+
+    Write-LkgcTelemetry -Event Operation -Message "Resolution path: $ResolutionPath" -Properties $props
+}
+
+function Write-LkgcCatchTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CatchName,
+
+        [string]$DiskNumber = '',
+
+        [string]$TargetDrive = '',
+
+        [string]$Stage = '',
+
+        [hashtable]$Properties = @{}
+    )
+
+    $props = @{
+        CoverageCategory = 'CatchBlock'
+        CatchName = $CatchName
+        DiskNumber = $DiskNumber
+        TargetDrive = $TargetDrive
+        Stage = $Stage
+    }
+
+    foreach ($key in $Properties.Keys) {
+        $props[$key] = $Properties[$key]
+    }
+
+    Write-LkgcTelemetry -Event Error -Message "Catch block: $CatchName" -Properties $props
+}
+
+Write-LogInfo "Starting AUTO LKGC Script. Desktop log: $logFilePath"
+Write-LogInfo "[script_start] Script=win-LKGC Version=$($script:RepairScriptVersion)"
 Write-LkgcTelemetry -Event Start -Message 'Starting LKGC restoration' -Properties @{
     ScriptName = 'win-LKGC.ps1'
     ScriptVersion = $script:RepairScriptVersion
@@ -389,7 +454,14 @@ try {
         $guestHyperVVirtualMachine = Get-VM -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
         if ($guestHyperVVirtualMachine -and $guestHyperVVirtualMachine.State -eq 'Running') {
             Log-Info "Stopping nested guest VM $($guestHyperVVirtualMachine.VMName)"
-            try { Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force } catch { Log-Warning "Failed to stop nested guest VM" }
+            try {
+            Stop-VM $guestHyperVVirtualMachine -ErrorAction Stop -Force
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+            Write-LogWarning "Failed to stop nested guest VM: $errorMessage"
+            Write-LkgcCatchTelemetry -CatchName 'NestedVmStop' -DiskNumber '' -TargetDrive $env:SystemDrive -Stage 'Preflight' -Properties @{ Error = $errorMessage }
+        }
         }
     } else {
         Log-Info "Hyper-V PowerShell module is not available on this host. Skipping nested VM validation."
@@ -403,7 +475,7 @@ try {
     }
     $repairDiskNumber = [int]$repairOsPartition.DiskNumber
     $repairDiskIdentity = Get-LkgcDiskIdentity -DiskNumber $repairDiskNumber
-    Log-Info "Repair VM OS disk identified as Disk $repairDiskNumber ($($repairDiskIdentity.PartitionStyle))."
+    Write-LogInfo "Repair VM OS disk identified as Disk $repairDiskNumber ($($repairDiskIdentity.PartitionStyle))."
 
     # Match the latest SAC path: resolve identity collisions before the helper onlines disks.
     $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
@@ -434,10 +506,12 @@ try {
                     TemporaryDiskPartValue = $temporaryRepairGuid
                 }
                 Log-Warning 'Temporarily changing only the repair VM OS disk GPT identity to release the attached Gen2 collision. The source disk GUID will not be changed.'
+                Write-LkgcResolutionTelemetry -ResolutionPath 'RepairDiskIdentityCollisionRelease' -Outcome 'Preparing' -DiskNumber "$repairDiskNumber" -TargetDrive "$repairDrive" -Properties @{ OriginalIdentity = $repairDiskIdentity.Value; TemporaryIdentity = $temporaryRepairGuid }
                 Set-LkgcTemporaryRepairDiskIdentity -Record $repairDiskIdentityRecord
             }
 
             $gptCollisionDiskNumbers += [int]$collisionDisk.Number
+            Write-LkgcResolutionTelemetry -ResolutionPath 'SourceDiskCollisionRelease' -Outcome 'Proceeding' -DiskNumber "$($collisionDisk.Number)" -TargetDrive "$repairDrive" -Properties @{ OriginalIdentity = $originalIdentity.Value }
             Invoke-LkgcDiskPart -Operation 'source-gpt-online' -Commands @(
                 "select disk $($collisionDisk.Number)"
                 'online disk'
@@ -468,6 +542,7 @@ try {
         }
         $collisionDiskRecords += $record
         Log-Warning "Disk $($record.DiskNumber) is offline due to an identity collision. Applying a temporary MBR identity for this repair run."
+        Write-LkgcResolutionTelemetry -ResolutionPath 'SourceDiskTemporaryIdentity' -Outcome 'Prepared' -DiskNumber "$($record.DiskNumber)" -TargetDrive "$repairDrive" -Properties @{ OriginalIdentity = $originalIdentity.Value; TemporaryIdentity = $temporaryValue }
         Set-LkgcTemporarySourceDiskIdentity -Record $record
     }
 
@@ -581,6 +656,7 @@ try {
 
             if (-not $targetOSDrive) {
                 Log-Info "Disk $diskNumber skipped: no valid attached OS partition containing \Windows found."
+                Write-LkgcResolutionTelemetry -ResolutionPath 'TargetDiskSkip' -Outcome 'Skipped' -DiskNumber "$diskNumber" -TargetDrive '' -Properties @{ Reason = 'No valid Windows SYSTEM hive found on attached partitions' }
                 $skippedCount++
                 continue
             }
@@ -643,6 +719,7 @@ try {
             }
 
             if (-not $bcdPath) {
+                Write-LkgcResolutionTelemetry -ResolutionPath 'BCDDiscovery' -Outcome 'Failed' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Properties @{ Reason = 'No generation-appropriate BCD store found' }
                 throw "Disk $diskNumber has no generation-appropriate BCD store. No registry changes were attempted."
             }
 
@@ -707,7 +784,8 @@ try {
             if ($repairLoaderDevice -or $repairLoaderOsDevice) {
                 $validatedWindowsPartition = "partition=${targetOSDrive}:"
                 $bcdWriteStarted = $true
-                Log-Warning "Loader mapping contains an unknown descriptor. Repairing it to $validatedWindowsPartition using the validated Windows partition."
+                Write-LkgcResolutionTelemetry -ResolutionPath 'LoaderMappingRepair' -Outcome 'Repairing' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Properties @{ LoaderId = $defaultLoaderId; RepairDevice = [bool]$repairLoaderDevice; RepairOsDevice = [bool]$repairLoaderOsDevice }
+                Write-LogWarning "Loader mapping contains an unknown descriptor. Repairing it to $validatedWindowsPartition using the validated Windows partition."
                 if ($repairLoaderDevice) {
                     $setDevice = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'device', $validatedWindowsPartition) -Operation 'repair-loader-device'
                     if (-not $setDevice.Success) { throw "Could not repair device for loader $defaultLoaderId." }
@@ -739,6 +817,7 @@ try {
 
             if ($restoreTestBootPolicy) {
                 $bcdWriteStarted = $true
+                Write-LkgcResolutionTelemetry -ResolutionPath 'BootPolicyRestore' -Outcome 'Repairing' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Properties @{ LoaderId = $defaultLoaderId }
                 $removeBootPolicy = Invoke-LkgcBcdEdit -Arguments @('/store', $bcdPath, '/deletevalue', $defaultLoaderId, 'bootstatuspolicy') -Operation 'restore-bootstatuspolicy'
                 if (-not $removeBootPolicy.Success) {
                     throw "Could not remove the lab bootstatuspolicy from loader $defaultLoaderId."
@@ -759,46 +838,45 @@ try {
                 Log-Info "Disk ${diskNumber}: normal boot recovery policy restored and verified."
             }
 
-        $systemHivePath = "$(${targetOSDrive}):\Windows\System32\config\SYSTEM"
-        $systemHiveBackup = "$systemHivePath.LKGC.bak.$runTimestamp"
+            $systemHivePath = "$(${targetOSDrive}):\Windows\System32\config\SYSTEM"
+            $systemHiveBackup = "$systemHivePath.LKGC.bak.$runTimestamp"
 
-        try {
-            Copy-Item -LiteralPath $systemHivePath -Destination $systemHiveBackup -Force -ErrorAction Stop
-            Log-Info "[$targetOSDrive] SYSTEM hive backup created: $systemHiveBackup"
-        }
-        catch {
-            $failedCount++
-            Log-Error "[$targetOSDrive] Failed to create SYSTEM hive backup. Skipping disk. Error: $($_.Exception.Message)"
-            continue
-        }
-
-        # Step 2 - Load the SYSTEM hive from the target disk
-        $sysHive = "HKLM\BROKENSYS_$targetOSDrive"
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-        for ($preLoadUnloadAttempt = 1; $preLoadUnloadAttempt -le 3; $preLoadUnloadAttempt++) {
-            $preLoadUnloadOutput = & reg.exe unload $sysHive 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Log-Info "[$targetOSDrive] Removed a stale pre-existing hive mount on attempt $preLoadUnloadAttempt."
-                break
+            try {
+                Copy-Item -LiteralPath $systemHivePath -Destination $systemHiveBackup -Force -ErrorAction Stop
+                Write-LkgcResolutionTelemetry -ResolutionPath 'SystemHiveBackup' -Outcome 'Created' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Properties @{ BackupPath = $systemHiveBackup }
+                Log-Info "[$targetOSDrive] SYSTEM hive backup created: $systemHiveBackup"
             }
-            if ($preLoadUnloadAttempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
-        $sysLoad = & reg.exe load $sysHive $systemHivePath 2>&1
+            catch {
+                $failedCount++
+            Write-LkgcCatchTelemetry -CatchName 'SystemHiveBackupCreate' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Stage 'Backup' -Properties @{ BackupPath = $systemHiveBackup; Error = $_.Exception.Message }
+            }
 
-        if ($LASTEXITCODE -ne 0) {
-            $failedCount++
-            Log-Warning "Failed to load SYSTEM hive from $($targetOSDrive): $($sysLoad -join ' | ') - skipping"
-            continue
-        }
+            # Step 2 - Load the SYSTEM hive from the target disk
+            $sysHive = "HKLM\BROKENSYS_$targetOSDrive"
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            for ($preLoadUnloadAttempt = 1; $preLoadUnloadAttempt -le 3; $preLoadUnloadAttempt++) {
+                $preLoadUnloadOutput = & reg.exe unload $sysHive 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-LogInfo "[$targetOSDrive] Removed a stale pre-existing hive mount on attempt $preLoadUnloadAttempt. Output: $($preLoadUnloadOutput -join ' ')"
+                    break
+                }
+                if ($preLoadUnloadAttempt -lt 3) { Start-Sleep -Seconds 2 }
+            }
+            $sysLoad = & reg.exe load $sysHive $systemHivePath 2>&1
 
-        Start-Sleep -Seconds 2
+            if ($LASTEXITCODE -ne 0) {
+                $failedCount++
+            Write-LkgcCatchTelemetry -CatchName 'SystemHiveLoad' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Stage 'Load' -Properties @{ HivePath = $systemHivePath; Error = ($sysLoad -join ' | ') }
+            }
 
-        $writeAttempted = $false
-        $restoreRequired = $false
-        $subKeyPath = "BROKENSYS_$targetOSDrive\Select"
-        $regKey = $null
-        $systemRootKey = $null
+            Write-LkgcResolutionTelemetry -ResolutionPath 'SystemHiveLoad' -Outcome 'Loaded' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Properties @{ HiveName = $sysHive; HivePath = $systemHivePath }
+
+            $writeAttempted = $false
+            $restoreRequired = $false
+            $subKeyPath = "BROKENSYS_$targetOSDrive\Select"
+            $regKey = $null
+            $systemRootKey = $null
 
         try {
             # Step 4 - Open via direct .NET API to eliminate PowerShell registry caching engine bugs
@@ -872,6 +950,7 @@ try {
             if ($lastKnownGood -eq $currentVal) {
                 Log-Warning "[$targetOSDrive] NO ALTERNATE LKGC EXISTS: LastKnownGood and Current both reference ControlSet$('{0:D3}' -f $currentVal)."
                 Log-Info "[$targetOSDrive] LKGC_APPLIED=false"
+                Write-LkgcResolutionTelemetry -ResolutionPath 'LKGCNoAlternate' -Outcome 'No-Op' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Properties @{ Current = $currentVal; LastKnownGood = $lastKnownGood }
                 Write-LkgcTelemetry -Event Success -Message "No alternate LKGC is available on drive $targetOSDrive" -Properties @{
                     DiskNumber  = "$diskNumber"
                     TargetDrive = "$targetOSDrive"
@@ -922,6 +1001,7 @@ try {
                 }
 
                 Log-Output -Message "LKGC APPLIED"
+                Write-LkgcResolutionTelemetry -ResolutionPath 'LKGCWrite' -Outcome 'Applied' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Properties @{ Current = $afterCurrent; Default = $afterDefault; Failed = $afterFailed; LastKnownGood = $afterLKG }
                 Write-LkgcTelemetry -Event Success -Message "LKGC registry values updated on drive $targetOSDrive" -Properties $telemetryProperties
 
                 $lkgcAppliedAny = $true
@@ -935,8 +1015,11 @@ try {
             $failedCount++
             $registryProcessingFailed = $true
             if ($writeAttempted) { $restoreRequired = $true }
+            Write-LkgcCatchTelemetry -CatchName 'RegistryMutation' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Stage 'RegistryWrite' -Properties @{ WriteAttempted = "$writeAttempted"; Error = $_.Exception.Message }
             Log-Error -Message "[$targetOSDrive] Failed to process registry modifications: $($_.Exception.Message)"
             Write-LkgcTelemetry -Event Error -Message 'Failed to process registry modifications' -Properties @{
+                CoverageCategory = 'CatchBlock'
+                CatchName = 'RegistryMutation'
                 DiskNumber    = "$diskNumber"
                 TargetDrive   = "$targetOSDrive"
                 WriteAttempted = "$writeAttempted"
@@ -946,8 +1029,8 @@ try {
         }
         finally {
             if ($null -ne $systemRootKey) {
-                try { $systemRootKey.Close() } catch {}
-                try { $systemRootKey.Dispose() } catch {}
+                try { $systemRootKey.Close() } catch { Write-LogDebug "[$targetOSDrive] Unable to close the SYSTEM root key cleanly: $($_.Exception.Message)" }
+                try { $systemRootKey.Dispose() } catch { Write-LogDebug "[$targetOSDrive] Unable to dispose the SYSTEM root key cleanly: $($_.Exception.Message)" }
             }
             if ($null -ne $regKey) {
                 try {
@@ -959,11 +1042,11 @@ try {
                         $registryProcessingFailed = $true
                     }
                     $restoreRequired = $true
-                    Log-Error "[$targetOSDrive] Failed to flush the SYSTEM hive Select key: $($_.Exception.Message)"
+                    Write-LogError "[$targetOSDrive] Failed to flush the SYSTEM hive Select key: $($_.Exception.Message)"
                 }
                 finally {
-                    try { $regKey.Close() } catch {}
-                    try { $regKey.Dispose() } catch {}
+                    try { $regKey.Close() } catch { Write-LogDebug "[$targetOSDrive] Unable to close the SYSTEM Select key cleanly: $($_.Exception.Message)" }
+                    try { $regKey.Dispose() } catch { Write-LogDebug "[$targetOSDrive] Unable to dispose the SYSTEM Select key cleanly: $($_.Exception.Message)" }
                 }
             }
             [System.GC]::Collect()
@@ -974,7 +1057,11 @@ try {
             $unloaded = $false
             for ($i=1; $i -le 3; $i++) {
                 $unloadOutput = & reg.exe unload $sysHive 2>&1
-                if ($LASTEXITCODE -eq 0) { $unloaded = $true; break }
+                if ($LASTEXITCODE -eq 0) {
+                    $unloaded = $true
+                    Write-LogDebug "[$targetOSDrive] Hive unload succeeded on attempt $i. Output: $($unloadOutput -join ' ')"
+                    break
+                }
                 Start-Sleep -Seconds 5
             }
 
@@ -1010,6 +1097,7 @@ try {
         }
         catch {
             $failedCount++
+            Write-LkgcCatchTelemetry -CatchName 'DiskProcessing' -DiskNumber "$diskNumber" -TargetDrive "$targetOSDrive" -Stage 'DiscoveryOrRepair' -Properties @{ Error = $_.Exception.Message }
             Log-Error "Disk $diskNumber failed during OS discovery or LKGC processing: $($_.Exception.Message)"
             if ($bcdWriteStarted -and -not $bcdBackupRestored -and
                 $bcdBackup -and (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
