@@ -1,26 +1,30 @@
 <#
 .SYNOPSIS
-    Configures Azure VM memory dumps with intelligent placement strategies to work around temporary storage issues - no reboot required.
+    Configures Azure VM memory dumps with verified backups, transactional pagefile relocation,
+    automatic rollback, and operation telemetry - no reboot required.
 
 .DESCRIPTION
-    This script runs on the live VM (not a rescue VM) to configure crash dump settings  
-    WITHOUT REQUIRING A REBOOT. Includes smart placement strategies to work around  
-    Azure VM temporary storage limitations.
-    
+    This script runs on the live VM (not a rescue VM) to configure crash dump settings
+    WITHOUT REQUIRING A REBOOT. Includes smart placement strategies for Azure temporary
+    storage, strict post-apply verification, automatic rollback, and collected operation logs.
+
     It performs the following steps:
     1. Audits current crash control settings using both Registry and CIM (for pagefile accuracy)
     2. Enables NMICrashDump (DWORD 1) to allow NMI triggering from the Azure Portal
-    3. Optionally configures automatic reboot after crash (use -ConfigureAutomaticReboot to enable)
+    3. Optionally configures automatic reboot after crash (use -ConfigureAutomaticReboot true to enable)
     4. INTELLIGENTLY configures dump file placement to work around temporary drive issues
     5. Uses dedicated dump files when necessary to ensure reliability on Azure VMs
     6. Uses kdbgctrl.exe to apply the selected dump type to the live kernel immediately
-    7. If -OneDump is specified, restores original CrashDumpEnabled after kernel update
-    8. Validates C: drive free space (minimum 20%) before pagefile relocation to prevent VM crashes
-    9. NO REBOOT REQUIRED - All changes take effect immediately
+    7. If -OneDump true is specified, restores original CrashDumpEnabled after kernel update
+    8. Validates C: drive free space (minimum 20%) before transactional pagefile relocation
+    9. Automatically restores pagefile and registry settings when a fatal operation fails
+    10. Verifies the effective dump, reboot, and pagefile configuration after changes
+    11. Emits lifecycle, operation-duration, success, failure, and rollback telemetry
+    12. NO REBOOT REQUIRED - All changes take effect immediately
 
 .PARAMETER OneDump
-    Switch to restore the original CrashDumpEnabled value after the kernel has been updated.
-    Useful for single-event debugging.
+    String boolean ('true' or 'false'). When true, restores the original CrashDumpEnabled
+    value after the kernel has been updated. Useful for single-event debugging.
 
 .PARAMETER DumpType
     The type of dump to configure. Valid values: active, automatic, full, kernel, mini.
@@ -33,20 +37,21 @@
     Use "delete" to remove an existing dedicated dump file configuration.
 
 .PARAMETER MovePagefile
-    Switch to relocate pagefile from temporary D: drive to persistent storage (C: or F: drive).
+    String boolean ('true' or 'false'). When true, relocates the pagefile from temporary
+    D: drive to persistent C: storage.
     WARNING: This change requires restoration after troubleshooting. The script will log
     detailed restoration instructions including the original pagefile location and
     explicit CIM commands to restore it.
 
 .PARAMETER ConfigureAutomaticReboot
-    Switch to configure automatic reboot after system crash (BootStatusPolicy=1).
-    By default, automatic reboot is NOT configured. Enable this parameter to opt-in.
+    String boolean ('true' or 'false'). When true, configures automatic reboot after a
+    system crash (BootStatusPolicy=1). By default, automatic reboot is NOT configured.
     Useful for production systems, but may not be desired on Citrix VMs or other
     specialized environments.
 
 .PARAMETER EnableDebugDefaults
-    Applies local test defaults only when set to true and only for values not provided
-    by runtime parameters.
+    String boolean ('true' or 'false'). Applies local test defaults only when true and
+    only for values not provided by runtime parameters.
 
 .EXAMPLE
     .\win-dumpconfigurator.ps1 -DumpType kernel -DumpFile "%SystemRoot%\MEMORY.DMP" -ConfigureAutomaticReboot true
@@ -58,12 +63,25 @@
 
 .VERSION
     Name:     win-dumpconfigurator.ps1
-    Version:  1.3 (Critical fixes, safety enhancements, and PowerShell 7 compatibility)
+    Version:  1.3.1 (Safety, rollback, verification, and telemetry enhancements)
     Author:   Michael.Smith@microsoft.com for v1.0, Tony.Mocanu@Microsoft.com for the rest.
 
 .VERSION
-    v1.3: [July 2026] - CRITICAL FIXES & SAFETY ENHANCEMENTS (current)
-                       - FIXED: Changed [switch] parameters to [string] for CLI compatibility
+    v1.3.1: [August 2026] - SAFETY, ROLLBACK, VERIFICATION & TELEMETRY (current)
+                       - DOCUMENTED: Boolean-like parameters require explicit 'true' or 'false' string values
+                       - DOCUMENTED: Bare switch syntax now requires an explicit value (for example, -OneDump true)
+                       - FIXED: A requested pagefile relocation failure now sets the final script status to error
+                       - FIXED: Corrected the EnableDebugDefaults local-test example
+                       - FIXED: Registry backup failure now stops execution before any registry mutation
+                       - FIXED: DumpFile verification now normalizes expandable environment-variable paths
+                       - IMPROVED: Added verified CrashControl and optional Reliability registry backups
+                       - IMPROVED: Creates the C: pagefile configuration before removing temporary-drive entries
+                       - IMPROVED: Automatically restores pagefile and registry state after fatal failures
+                       - IMPROVED: Added strict verification for dump, NMI, reboot, dedicated dump, and pagefile settings
+                       - IMPROVED: Added structured lifecycle events, operation timings, counters, and rollback telemetry
+                       - TESTED: Added non-destructive induced-failure coverage for pagefile and registry rollback paths
+    v1.3: [July 2026] - CRITICAL FIXES & SAFETY ENHANCEMENTS
+                       - FIXED: Changed [switch] parameters to explicit 'true'/'false' [string] values for CLI compatibility
                        - FIXED: Added early parameter validation to catch invalid parameters before execution
                        - FIXED: Migrated all Get-WmiObject to Get-CimInstance (PowerShell 7 compatibility)
                        - FIXED: Added guard for empty $DumpFile path
@@ -100,16 +118,16 @@ Param(
     [string]$DedicatedDumpFile = '',
 
     [Parameter(Mandatory = $false)]
-    [string]$OneDump = '',
+    [string]$OneDump = 'false',
 
     [Parameter(Mandatory = $false)]
-    [string]$MovePagefile = '',
+    [string]$MovePagefile = 'false',
 
     [Parameter(Mandatory = $false)]
-    [string]$ConfigureAutomaticReboot = '',
+    [string]$ConfigureAutomaticReboot = 'false',
 
     [Parameter(Mandatory = $false)]
-    [string]$EnableDebugDefaults = ''
+    [string]$EnableDebugDefaults = 'false'
 )
 
 # Initialization
@@ -120,11 +138,13 @@ if (-not (Test-Path -Path $initScriptPath -PathType Leaf)) {
 }
 
 . $initScriptPath
+$scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Script-level logging: create desktop and collected plain text logs that mirror Log-* output.
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 $runTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$desktopRunOutputDir = Join-Path -Path $env:PUBLIC -ChildPath ("Desktop\\{0}-run-{1}" -f $scriptName, $runTimestamp)
+$publicDesktopPath = Join-Path -Path $env:PUBLIC -ChildPath 'Desktop'
+$desktopRunOutputDir = Join-Path -Path $publicDesktopPath -ChildPath ("{0}-run-{1}" -f $scriptName, $runTimestamp)
 $collectedLogsBaseDir = Join-Path -Path $PSScriptRoot -ChildPath 'logs'
 
 # In RunCommand scenarios, prefer a shorter collection path under the repair-files root
@@ -169,6 +189,9 @@ $script:OriginalLogInfo = (Get-Command Log-Info -CommandType Function).ScriptBlo
 $script:OriginalLogWarning = (Get-Command Log-Warning -CommandType Function).ScriptBlock
 $script:OriginalLogError = (Get-Command Log-Error -CommandType Function).ScriptBlock
 $script:OriginalLogDebug = (Get-Command Log-Debug -CommandType Function).ScriptBlock
+$script:OperationAttempted = 0
+$script:OperationSucceeded = 0
+$script:OperationFailed = 0
 
 function Write-RunLogLine {
     param(
@@ -196,38 +219,81 @@ function Write-RunLogLine {
     }
 }
 
-function Log-Output {
+function Write-RunOutput {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogOutput -message $message
     Write-RunLogLine -Level 'Output' -Message $message
 }
 
-function Log-Info {
+function Write-RunInformation {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogInfo -message $message
     Write-RunLogLine -Level 'Info' -Message $message
 }
 
-function Log-Warning {
+function Write-RunWarning {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogWarning -message $message
     Write-RunLogLine -Level 'Warning' -Message $message
 }
 
-function Log-Error {
+function Write-RunError {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogError -message $message
     Write-RunLogLine -Level 'Error' -Message $message
 }
 
-function Log-Debug {
+function Write-RunDebug {
     Param([Parameter(Mandatory = $true)][PSObject[]]$message)
     & $script:OriginalLogDebug -message $message
     Write-RunLogLine -Level 'Debug' -Message $message
 }
 
-Log-Info "Plain text log initialized (desktop copy): $desktopLogFilePath"
-Log-Info "Plain text log initialized (collected copy): $collectedLogFilePath"
+function Write-OperationTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Operation,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Started', 'Succeeded', 'Failed', 'RolledBack')]
+        [string]$Status,
+
+        [Parameter(Mandatory = $false)]
+        [long]$DurationMilliseconds = 0,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Detail = ''
+    )
+
+    if ($Status -eq 'Started') {
+        $script:OperationAttempted++
+    }
+    elseif ($Status -eq 'Succeeded') {
+        $script:OperationSucceeded++
+    }
+    elseif ($Status -eq 'Failed') {
+        $script:OperationFailed++
+    }
+
+    $message = "operation=$Operation status=$Status durationMs=$DurationMilliseconds"
+    if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+        $message += " detail=$Detail"
+    }
+
+    if ($Status -eq 'Failed') {
+        Write-RunError $message
+    }
+    elseif ($Status -eq 'RolledBack') {
+        Write-RunWarning $message
+    }
+    else {
+        Write-RunInformation $message
+    }
+}
+
+Write-RunInformation "event=script_start version=1.3.1 elapsedMs=$($scriptStopwatch.ElapsedMilliseconds)"
+Write-RunInformation "Plain text log initialized (desktop copy): $desktopLogFilePath"
+Write-RunInformation "Plain text log initialized (collected copy): $collectedLogFilePath"
 
 # LOCAL TEST DEFAULTS: Uncomment the variables below to test locally without --parameters
 # You can either:
@@ -237,7 +303,7 @@ Log-Info "Plain text log initialized (collected copy): $collectedLogFilePath"
 #   $DumpType = 'full'
 #   $OneDump = 'false'
 #   $MovePagefile = 'false'
-#   $EnableDebugDefaults = 'true
+#   $EnableDebugDefaults = 'true'
 # Then run: .\win-dumpconfigurator.ps1
 
 # Normalize incoming parameter names (vm-repair commonly passes lowercase names).
@@ -263,7 +329,7 @@ if ($debugDefaultsEnabled) {
     if (-not $DedicatedDumpFile) { $DedicatedDumpFile = 'Z:\dd.sys' }
     if (-not $OneDump) { $OneDump = 'false' }
     if (-not $MovePagefile) { $MovePagefile = 'true' }
-    Log-Info "EnableDebugDefaults is active. Applying local fallback defaults for missing parameters."
+    Write-RunInformation "EnableDebugDefaults is active. Applying local fallback defaults for missing parameters."
 }
 
 # === PARAMETER VALIDATION (EARLY FAIL) ===
@@ -272,8 +338,8 @@ $validDumpTypes = @('active', 'automatic', 'full', 'kernel', 'mini')
 
 # 1. Validate DumpType if provided
 $userProvidedDumpType = -not [string]::IsNullOrWhiteSpace("$DumpType")
-if (-not $userProvidedDumpType) { 
-    $DumpType = 'full' 
+if (-not $userProvidedDumpType) {
+    $DumpType = 'full'
 } else {
     if ($DumpType -notin $validDumpTypes) {
         throw "Invalid DumpType '$DumpType'. Valid values: $($validDumpTypes -join ', '). Check your --parameters syntax."
@@ -350,41 +416,41 @@ function Get-KdbgctrlOutputSummary {
 
 function Get-AuditSnapshot {
     param($Title)
-    
+
     $Path = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
     $MMPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
     $RelPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability"
-    
+
     # Read core dump settings
     $NMI = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).NMICrashDump
     $BSP = (Get-ItemProperty -Path $RelPath -ErrorAction SilentlyContinue).BootStatusPolicy
-    
+
     # PAGEFILE DETECTION: Query CIM for the active configuration.
-    $ConfiguredPageFiles = Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue | 
+    $ConfiguredPageFiles = Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue |
                            Select-Object -ExpandProperty Name
-    
-    Log-Output ">>> $Title <<<"
+
+    Write-RunOutput ">>> $Title <<<"
     $crashDumpEnabled = (Get-ItemProperty -Path $Path).CrashDumpEnabled
 
     $currentDumpFile = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).DumpFile
     $currentDedicatedDumpFile = (Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue).DedicatedDumpFile
 
-    Log-Output "DumpFile           : $(if([string]::IsNullOrWhiteSpace("$currentDumpFile")){"NOT FOUND"}else{$currentDumpFile})"
-    Log-Output "DedicatedDumpFile  : $(if([string]::IsNullOrWhiteSpace("$currentDedicatedDumpFile")){"NOT FOUND"}else{$currentDedicatedDumpFile})"
-    Log-Output "CrashDumpEnabled   : $(Get-DumpTypeLabel -Value $crashDumpEnabled)"
-    Log-Output "NMICrashDump       : $(if($null -eq $NMI){"NOT FOUND"}else{$NMI})"
-    Log-Output "BootStatusPolicy   : $(if($null -eq $BSP){"NOT FOUND"}else{$BSP})"
-    
+    Write-RunOutput "DumpFile           : $(if([string]::IsNullOrWhiteSpace("$currentDumpFile")){"NOT FOUND"}else{$currentDumpFile})"
+    Write-RunOutput "DedicatedDumpFile  : $(if([string]::IsNullOrWhiteSpace("$currentDedicatedDumpFile")){"NOT FOUND"}else{$currentDedicatedDumpFile})"
+    Write-RunOutput "CrashDumpEnabled   : $(Get-DumpTypeLabel -Value $crashDumpEnabled)"
+    Write-RunOutput "NMICrashDump       : $(if($null -eq $NMI){"NOT FOUND"}else{$NMI})"
+    Write-RunOutput "BootStatusPolicy   : $(if($null -eq $BSP){"NOT FOUND"}else{$BSP})"
+
     if ($ConfiguredPageFiles) {
-        Log-Output "ConfiguredPageFiles (LIVE): $($ConfiguredPageFiles -join ', ')"
+        Write-RunOutput "ConfiguredPageFiles (LIVE): $($ConfiguredPageFiles -join ', ')"
     } else {
         # Fallback to registry if WMI returns nothing (unusual)
         $PFile = (Get-ItemProperty -Path $MMPath -ErrorAction SilentlyContinue).ExistingPageFiles
-        Log-Output "ExistingPageFiles  : $(if($null -eq $PFile){"NOT FOUND"}else{$PFile})"
+        Write-RunOutput "ExistingPageFiles  : $(if($null -eq $PFile){"NOT FOUND"}else{$PFile})"
     }
 }
 
-function Get-PagefileRestoreCommands {
+function Get-PagefileRestoreCommand {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$OriginalPagefileLocations
@@ -413,13 +479,94 @@ function Write-PagefileRestoreGuidance {
         return
     }
 
-    Log-Warning "RESTORATION REQUIRED: original pagefile settings were $($OriginalPagefileLocations -join ', ')"
-    Log-Warning "To restore the original pagefile configuration after debugging, run:"
+    Write-RunWarning "RESTORATION REQUIRED: original pagefile settings were $($OriginalPagefileLocations -join ', ')"
+    Write-RunWarning "To restore the original pagefile configuration after debugging, run:"
 
-    foreach ($command in (Get-PagefileRestoreCommands -OriginalPagefileLocations $OriginalPagefileLocations)) {
-        Log-Warning "  $command"
+    foreach ($command in (Get-PagefileRestoreCommand -OriginalPagefileLocations $OriginalPagefileLocations)) {
+        Write-RunWarning "  $command"
     }
 }
+
+function Invoke-PagefileRollback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$OriginalPagefileLocations,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPagefile
+    )
+
+    $rollbackStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OperationTelemetry -Operation 'PagefileRollback' -Status 'Started'
+
+    try {
+        $targetSetting = Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -eq $TargetPagefile }
+        if ($targetSetting) {
+            $targetSetting | Remove-CimInstance -ErrorAction Stop
+        }
+
+        $configuredLocations = @(Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue |
+                                 Select-Object -ExpandProperty Name)
+        foreach ($location in $OriginalPagefileLocations) {
+            if (-not [string]::IsNullOrWhiteSpace($location) -and $location -notin $configuredLocations) {
+                New-CimInstance -ClassName Win32_PageFileSetting -Property @{
+                    Name = $location
+                    InitialSize = 0
+                    MaximumSize = 0
+                } -ErrorAction Stop | Out-Null
+            }
+        }
+
+        $rollbackStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'PagefileRollback' -Status 'RolledBack' -DurationMilliseconds $rollbackStopwatch.ElapsedMilliseconds -Detail "restored=$($OriginalPagefileLocations -join ',')"
+        return $true
+    }
+    catch {
+        $rollbackStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'PagefileRollback' -Status 'Failed' -DurationMilliseconds $rollbackStopwatch.ElapsedMilliseconds -Detail $_.Exception.Message
+        return $false
+    }
+}
+
+function Invoke-RegistryRollback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$RegistryBackupPaths
+    )
+
+    $rollbackStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OperationTelemetry -Operation 'RegistryRollback' -Status 'Started'
+
+    try {
+        foreach ($backupPath in $RegistryBackupPaths) {
+            if ([string]::IsNullOrWhiteSpace($backupPath) -or -not (Test-Path -Path $backupPath -PathType Leaf)) {
+                continue
+            }
+
+            $rollbackResult = & reg.exe import $backupPath 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Registry import failed for '$backupPath': $($rollbackResult -join ' | ')"
+            }
+        }
+
+        $rollbackStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'RegistryRollback' -Status 'RolledBack' -DurationMilliseconds $rollbackStopwatch.ElapsedMilliseconds
+        return $true
+    }
+    catch {
+        $rollbackStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'RegistryRollback' -Status 'Failed' -DurationMilliseconds $rollbackStopwatch.ElapsedMilliseconds -Detail $_.Exception.Message
+        return $false
+    }
+}
+
+$crashControlBackupPath = ''
+$reliabilityBackupPath = ''
+$registryChangesApplied = $false
+$pagefileWasMoved = $false
+$originalPagefileLocations = @()
+$targetPagefile = 'C:\pagefile.sys'
 
 try {
     # Step 1 - Audit BEFORE
@@ -427,12 +574,35 @@ try {
 
     $CrashCtrlPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl"
     $crashControlBackupPath = Join-Path -Path $runOutputDir -ChildPath ("CrashControl-backup-{0}.reg" -f $runTimestamp)
+    $backupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OperationTelemetry -Operation 'CrashControlBackup' -Status 'Started'
     $backupResult = & reg.exe export "HKLM\SYSTEM\CurrentControlSet\Control\CrashControl" $crashControlBackupPath /y 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Log-Info "Created registry backup: $crashControlBackupPath"
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -Path $crashControlBackupPath -PathType Leaf) -and (Get-Item -Path $crashControlBackupPath).Length -gt 0) {
+        $backupStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'CrashControlBackup' -Status 'Succeeded' -DurationMilliseconds $backupStopwatch.ElapsedMilliseconds -Detail $crashControlBackupPath
+        Write-RunInformation "Created registry backup: $crashControlBackupPath"
     }
     else {
-        Log-Warning "Could not create registry backup. Output: $($backupResult -join ' | ')"
+        $backupStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'CrashControlBackup' -Status 'Failed' -DurationMilliseconds $backupStopwatch.ElapsedMilliseconds -Detail ($backupResult -join ' | ')
+        throw "CrashControl backup could not be verified. No registry changes were applied."
+    }
+
+    if ($ConfigureAutomaticReboot -eq 'true') {
+        $reliabilityBackupPath = Join-Path -Path $runOutputDir -ChildPath ("Reliability-backup-{0}.reg" -f $runTimestamp)
+        $reliabilityBackupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        Write-OperationTelemetry -Operation 'ReliabilityBackup' -Status 'Started'
+        $reliabilityBackupResult = & reg.exe export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability" $reliabilityBackupPath /y 2>&1
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -Path $reliabilityBackupPath -PathType Leaf) -and (Get-Item -Path $reliabilityBackupPath).Length -gt 0) {
+            $reliabilityBackupStopwatch.Stop()
+            Write-OperationTelemetry -Operation 'ReliabilityBackup' -Status 'Succeeded' -DurationMilliseconds $reliabilityBackupStopwatch.ElapsedMilliseconds -Detail $reliabilityBackupPath
+            Write-RunInformation "Created Reliability registry backup: $reliabilityBackupPath"
+        }
+        else {
+            $reliabilityBackupStopwatch.Stop()
+            Write-OperationTelemetry -Operation 'ReliabilityBackup' -Status 'Failed' -DurationMilliseconds $reliabilityBackupStopwatch.ElapsedMilliseconds -Detail ($reliabilityBackupResult -join ' | ')
+            throw "Reliability backup could not be verified. Automatic reboot configuration was not changed."
+        }
     }
 
     $initialValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
@@ -440,21 +610,22 @@ try {
     $requestedDumpValue = $dumpTypeMap[$DumpType]
     $verificationFailed = $false
 
-    Log-Output "Current dump configuration: $(Get-DumpTypeLabel -Value $initialValue)"
-    Log-Output "Requested dump type: $DumpType ($(Get-DumpTypeLabel -Value $requestedDumpValue))"
-    Log-Output "Requested DumpFile: $(if([string]::IsNullOrWhiteSpace("$DumpFile")){"NOT SPECIFIED"}else{$DumpFile})"
-    Log-Output "Requested DedicatedDumpFile: $(if([string]::IsNullOrWhiteSpace("$DedicatedDumpFile")){"NOT SPECIFIED"}else{$DedicatedDumpFile})"
+    Write-RunOutput "Current dump configuration: $(Get-DumpTypeLabel -Value $initialValue)"
+    Write-RunOutput "Requested dump type: $DumpType ($(Get-DumpTypeLabel -Value $requestedDumpValue))"
+    Write-RunOutput "Requested DumpFile: $(if([string]::IsNullOrWhiteSpace("$DumpFile")){"NOT SPECIFIED"}else{$DumpFile})"
+    Write-RunOutput "Requested DedicatedDumpFile: $(if([string]::IsNullOrWhiteSpace("$DedicatedDumpFile")){"NOT SPECIFIED"}else{$DedicatedDumpFile})"
 
     # Step 2 - Enable NMI
+    $registryChangesApplied = $true
     Set-ItemProperty -Path $CrashCtrlPath -Name NMICrashDump -Value 1 -Type DWord
 
     # Step 3 - Configure automatic reboot (optional)
     if ($ConfigureAutomaticReboot -eq $true -or $ConfigureAutomaticReboot -eq 'true') {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability" -Name BootStatusPolicy -Value 1 -Type DWord
-        Log-Info "Automatic reboot on crash configured (BootStatusPolicy=1)."
+        Write-RunInformation "Automatic reboot on crash configured (BootStatusPolicy=1)."
     }
     else {
-        Log-Info "Automatic reboot on crash NOT configured. Use -ConfigureAutomaticReboot to enable."
+        Write-RunInformation "Automatic reboot on crash NOT configured. Use -ConfigureAutomaticReboot true to enable."
     }
 
     # Step 4 - Pagefile Detection for Smart Placement
@@ -462,27 +633,26 @@ try {
     $currentPFiles = Get-CimInstance -ClassName Win32_PageFileSetting | Select-Object -ExpandProperty Name
     $pagefileOnTempDrive = $false
     $originalPagefileLocations = $currentPFiles
-    $pagefileWasMoved = $false
     $pagefileScanProcessed = 0
     $pagefileScanTempMatches = 0
-    
+
     foreach ($pf in $currentPFiles) {
         $pagefileScanProcessed++
-        Log-Debug "Detected pagefile setting: $pf"
+        Write-RunDebug "Detected pagefile setting: $pf"
         if ($pf -like "D:*" -or $pf -like "*D:\*") {
             $pagefileOnTempDrive = $true
             $pagefileScanTempMatches++
-            Log-Warning "Pagefile detected on D: drive: $pf"
+            Write-RunWarning "Pagefile detected on D: drive: $pf"
             break
         }
     }
-    Log-Info "Pagefile scan summary: processed=$pagefileScanProcessed tempDriveMatches=$pagefileScanTempMatches"
-    
+    Write-RunInformation "Pagefile scan summary: processed=$pagefileScanProcessed tempDriveMatches=$pagefileScanTempMatches"
+
     # INTELLIGENT DUMP PLACEMENT
     # Respect explicit user-provided values exactly as passed.
     if ($DumpFile) {
         Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
-        Log-Info "Applied user-provided DumpFile: $DumpFile"
+        Write-RunInformation "Applied user-provided DumpFile: $DumpFile"
     }
     else {
         if ($pagefileOnTempDrive) {
@@ -498,36 +668,46 @@ try {
 
     # Step 5 - OPTIONAL PAGEFILE RELOCATION
     if (($MovePagefile -eq $true -or $MovePagefile -eq 'true') -and $pagefileOnTempDrive) {
-        Log-Warning "PAGEFILE RELOCATION REQUESTED"
-        Log-Warning "⚠️  IMPORTANT: Pagefile relocation from D: to C: is DESTRUCTIVE and NOT EASILY REVERSIBLE:"
-        Log-Warning "    1. If C: drive runs out of space, the VM may crash"
-        Log-Warning "    2. To restore pagefile to D: after troubleshooting, manual intervention or script re-run is required"
-        Log-Warning "    3. Ensure C: drive has sufficient free space (recommend minimum 50% free) before proceeding"
-        Log-Warning "    4. For production VMs, consider scheduling this change during maintenance window"
+        Write-RunWarning "PAGEFILE RELOCATION REQUESTED"
+        Write-RunWarning "IMPORTANT: Pagefile relocation from D: to C: is DESTRUCTIVE and NOT EASILY REVERSIBLE:"
+        Write-RunWarning "    1. If C: drive runs out of space, the VM may crash"
+        Write-RunWarning "    2. To restore pagefile to D: after troubleshooting, manual intervention or script re-run is required"
+        Write-RunWarning "    3. Ensure C: drive has sufficient free space (recommend minimum 50% free) before proceeding"
+        Write-RunWarning "    4. For production VMs, consider scheduling this change during maintenance window"
         Write-PagefileRestoreGuidance -OriginalPagefileLocations $originalPagefileLocations
-        
+
+        $pagefileRelocationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        Write-OperationTelemetry -Operation 'PagefileRelocation' -Status 'Started'
         try {
             # FIX: Explicitly target C: if logic loop fails, bypass the CIM free space comparison bug
             $cDrive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
-            
+
             if ($null -ne $cDrive) {
-                $targetPagefile = "C:\pagefile.sys"
-                
                 # Validate C: drive has sufficient free space
                 $cDriveFreeSpaceGB = [math]::Round($cDrive.FreeSpace / 1GB, 2)
                 $cDriveTotalSpaceGB = [math]::Round($cDrive.Size / 1GB, 2)
                 $cDriveFreePercent = [math]::Round(($cDrive.FreeSpace / $cDrive.Size) * 100, 0)
-                
-                Log-Info "C: Drive space status: $cDriveFreeSpaceGB GB free of $cDriveTotalSpaceGB GB ($cDriveFreePercent% free)"
-                
+
+                Write-RunInformation "C: Drive space status: $cDriveFreeSpaceGB GB free of $cDriveTotalSpaceGB GB ($cDriveFreePercent% free)"
+
                 if ($cDriveFreePercent -lt 20) {
-                    Log-Error "C: Drive free space is below 20% ($cDriveFreePercent%). Relocation aborted to prevent VM crash."
+                    Write-RunError "C: Drive free space is below 20% ($cDriveFreePercent%). Relocation aborted to prevent VM crash."
                     throw "Insufficient C: drive free space. Minimum 20% recommended, current: $cDriveFreePercent%"
                 }
-                
-                Log-Info "C: Drive detected via CIM. Proceeding with relocation..."
-                
+
+                Write-RunInformation "C: Drive detected via CIM. Proceeding with relocation..."
+
                 $pageFileSettings = Get-CimInstance -ClassName Win32_PageFileSetting
+                $targetPagefileSetting = $pageFileSettings | Where-Object { $_.Name -eq $targetPagefile }
+                if (-not $targetPagefileSetting) {
+                    New-CimInstance -ClassName Win32_PageFileSetting -Property @{
+                        Name = $targetPagefile
+                        InitialSize = 0
+                        MaximumSize = 0
+                    } -ErrorAction Stop | Out-Null
+                    Write-RunInformation "Created target pagefile configuration before removing the original: $targetPagefile"
+                }
+
                 $pagefileDeleteProcessed = 0
                 $pagefileDeleteDeleted = 0
                 $pagefileDeleteFailed = 0
@@ -537,82 +717,89 @@ try {
                     $pagefileDeleteProcessed++
                     if ($pf.Name -like "D:*" -or $pf.Name -like "*D:\*") {
                         try {
-                            Log-Info "Deleting current pagefile instance: $($pf.Name)"
+                            Write-RunInformation "Deleting current pagefile instance: $($pf.Name)"
                             $pf | Remove-CimInstance -ErrorAction Stop
                             $pagefileDeleteDeleted++
                         }
                         catch {
                             $pagefileDeleteFailed++
-                            Log-Warning "Failed to delete pagefile instance '$($pf.Name)': $($_.Exception.Message)"
+                            Write-RunWarning "Failed to delete pagefile instance '$($pf.Name)': $($_.Exception.Message)"
                         }
                     }
                     else {
                         $pagefileDeleteSkipped++
                     }
                 }
-                Log-Info "Pagefile delete summary: processed=$pagefileDeleteProcessed deleted=$pagefileDeleteDeleted skipped=$pagefileDeleteSkipped failed=$pagefileDeleteFailed"
+                Write-RunInformation "Pagefile delete summary: processed=$pagefileDeleteProcessed deleted=$pagefileDeleteDeleted skipped=$pagefileDeleteSkipped failed=$pagefileDeleteFailed"
 
                 if ($pagefileDeleteFailed -gt 0) {
                     throw "One or more D: pagefile entries could not be removed. See logs for details."
                 }
 
-                $newPageFile = New-CimInstance -ClassName Win32_PageFileSetting -Property @{
-                    Name = $targetPagefile
-                    InitialSize = 0
-                    MaximumSize = 0
-                } -ErrorAction Stop
-
-                if ($null -ne $newPageFile) {
-                    $pagefileWasMoved = $true
-                    Log-Info "Successfully updated WMI configuration to: $targetPagefile"
-                }
+                $pagefileWasMoved = $true
+                $pagefileRelocationStopwatch.Stop()
+                Write-OperationTelemetry -Operation 'PagefileRelocation' -Status 'Succeeded' -DurationMilliseconds $pagefileRelocationStopwatch.ElapsedMilliseconds -Detail "target=$targetPagefile removed=$pagefileDeleteDeleted"
+                Write-RunInformation "Successfully updated CIM configuration to: $targetPagefile"
             } else {
                 throw "C: drive could not be verified via CIM. Relocation aborted."
             }
         }
         catch {
-            Log-Error "Failed to relocate pagefile: $($_.Exception.Message)"
+            $pagefileRelocationStopwatch.Stop()
+            Write-OperationTelemetry -Operation 'PagefileRelocation' -Status 'Failed' -DurationMilliseconds $pagefileRelocationStopwatch.ElapsedMilliseconds -Detail $_.Exception.Message
+            Write-RunError "Failed to relocate pagefile: $($_.Exception.Message)"
+            $rollbackSucceeded = Invoke-PagefileRollback -OriginalPagefileLocations $originalPagefileLocations -TargetPagefile $targetPagefile
+            if (-not $rollbackSucceeded) {
+                Write-RunError "Automatic pagefile rollback failed. Use the logged restoration commands immediately."
+            }
+            $verificationFailed = $true
         }
     }
 
     # Step 6 - DedicatedDumpFile
-    if ($DedicatedDumpFile -eq "delete") { 
-        Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -ErrorAction SilentlyContinue 
-        Log-Info "Applied user request: DedicatedDumpFile deleted."
+    if ($DedicatedDumpFile -eq "delete") {
+        Remove-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -ErrorAction SilentlyContinue
+        Write-RunInformation "Applied user request: DedicatedDumpFile deleted."
     }
-    elseif ($DedicatedDumpFile) { 
-        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile 
-        Log-Info "Applied user-provided DedicatedDumpFile: $DedicatedDumpFile"
+    elseif ($DedicatedDumpFile) {
+        Set-ItemProperty -Path $CrashCtrlPath -Name DedicatedDumpFile -Value $DedicatedDumpFile
+        Write-RunInformation "Applied user-provided DedicatedDumpFile: $DedicatedDumpFile"
     }
 
     # Step 7 - Guard for empty DumpFile (ensure valid path before kdbgctrl)
     if ([string]::IsNullOrEmpty($DumpFile)) {
-        Log-Warning "DumpFile is empty. Using Windows default: %SystemRoot%\MEMORY.DMP"
+        Write-RunWarning "DumpFile is empty. Using Windows default: %SystemRoot%\MEMORY.DMP"
         $DumpFile = "%SystemRoot%\MEMORY.DMP"
         Set-ItemProperty -Path $CrashCtrlPath -Name DumpFile -Value $DumpFile
     }
 
     # Step 8 - Apply to LIVE KERNEL
-    Log-Info "Applying dump type '$DumpType' via kdbgctrl..."
+    Write-RunInformation "Applying dump type '$DumpType' via kdbgctrl..."
     Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value 0
-    
+
     $toolPath = Join-Path -Path $PSScriptRoot -ChildPath 'common\tools\kdbgctrl.exe'
     if (-not (Test-Path -Path $toolPath -PathType Leaf)) {
         throw "Missing required dependency: $toolPath"
     }
+    $kdbgStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OperationTelemetry -Operation 'KdbgctrlApply' -Status 'Started'
     $kdbgResult = & $toolPath -sd $DumpType 2>&1
     $kdbgExitCode = $LASTEXITCODE
     $parsedKdbg = Get-KdbgctrlOutputSummary -OutputLines $kdbgResult
 
     if ($parsedKdbg.Suppressed.Count -gt 0) {
-        Log-Debug "Suppressed non-actionable kdbgctrl messages: $($parsedKdbg.Suppressed -join ' | ')"
+        Write-RunDebug "Suppressed non-actionable kdbgctrl messages: $($parsedKdbg.Suppressed -join ' | ')"
     }
 
     if ($kdbgExitCode -ne 0) {
+        $kdbgStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'KdbgctrlApply' -Status 'Failed' -DurationMilliseconds $kdbgStopwatch.ElapsedMilliseconds -Detail "exitCode=$kdbgExitCode"
         $verificationFailed = $true
-        Log-Error "kdbgctrl failed with exit code $kdbgExitCode. Output: $($parsedKdbg.Filtered -join ' | ')"
+        Write-RunError "kdbgctrl failed with exit code $kdbgExitCode. Output: $($parsedKdbg.Filtered -join ' | ')"
     }
     else {
+        $kdbgStopwatch.Stop()
+        Write-OperationTelemetry -Operation 'KdbgctrlApply' -Status 'Succeeded' -DurationMilliseconds $kdbgStopwatch.ElapsedMilliseconds -Detail "dumpType=$DumpType"
         $successMatched = $false
         foreach ($line in $parsedKdbg.Filtered) {
             if ($line -match '(?i)success|successfully updated dump settings') {
@@ -622,10 +809,10 @@ try {
         }
 
         if ($successMatched) {
-            Log-Output "Successfully updated dump settings to '$DumpType' via kdbgctrl."
+            Write-RunOutput "Successfully updated dump settings to '$DumpType' via kdbgctrl."
         }
         elseif ($parsedKdbg.Filtered.Count -gt 0) {
-            Log-Warning "kdbgctrl completed with unexpected output: $($parsedKdbg.Filtered -join ' | ')"
+            Write-RunWarning "kdbgctrl completed with unexpected output: $($parsedKdbg.Filtered -join ' | ')"
         }
     }
 
@@ -635,57 +822,137 @@ try {
     }
 
     # Step 9 - OneDump
-    if ($OneDump -eq $true -or $OneDump -eq 'true') { 
-        Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $initialValue 
+    if ($OneDump -eq $true -or $OneDump -eq 'true') {
+        Set-ItemProperty -Path $CrashCtrlPath -Name CrashDumpEnabled -Value $initialValue
     }
 
     # Step 10 - Verification Summary
-    Log-Info "Dump configuration task completed."
+    Write-RunInformation "Dump configuration task completed."
 
     # Step 11 - Final Audit AFTER
+    $verificationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OperationTelemetry -Operation 'PostApplyVerification' -Status 'Started'
     Get-AuditSnapshot "VERIFYING UPDATED SETTINGS (AFTER)"
 
-    $currentDumpValue = (Get-ItemProperty -Path $CrashCtrlPath).CrashDumpEnabled
+    $effectiveCrashControl = Get-ItemProperty -Path $CrashCtrlPath -ErrorAction SilentlyContinue
+    $currentDumpValue = $effectiveCrashControl.CrashDumpEnabled
     if ($OneDump -eq $true -or $OneDump -eq 'true') {
-        Log-Output "OneDump requested. CrashDumpEnabled restored to $(Get-DumpTypeLabel -Value $currentDumpValue)."
+        if ($currentDumpValue -ne $initialValue) {
+            $verificationFailed = $true
+            Write-RunError "OneDump verification failed. Expected original value $(Get-DumpTypeLabel -Value $initialValue), found $(Get-DumpTypeLabel -Value $currentDumpValue)."
+        }
+        else {
+            Write-RunOutput "OneDump requested. CrashDumpEnabled restored to $(Get-DumpTypeLabel -Value $currentDumpValue)."
+        }
     }
     elseif ($currentDumpValue -ne $requestedDumpValue) {
         $verificationFailed = $true
-        Log-Error "Dump configuration verification failed. Expected $(Get-DumpTypeLabel -Value $requestedDumpValue), found $(Get-DumpTypeLabel -Value $currentDumpValue)."
+        Write-RunError "Dump configuration verification failed. Expected $(Get-DumpTypeLabel -Value $requestedDumpValue), found $(Get-DumpTypeLabel -Value $currentDumpValue)."
     }
     else {
-        Log-Output "Verified dump configuration: $(Get-DumpTypeLabel -Value $currentDumpValue)."
+        Write-RunOutput "Verified dump configuration: $(Get-DumpTypeLabel -Value $currentDumpValue)."
     }
 
-    $effectiveCrashControl = Get-ItemProperty -Path $CrashCtrlPath -ErrorAction SilentlyContinue
-    Log-Output "Effective DumpFile: $($effectiveCrashControl.DumpFile)"
-    Log-Output "Effective DedicatedDumpFile: $($effectiveCrashControl.DedicatedDumpFile)"
-    
+    if ($effectiveCrashControl.NMICrashDump -ne 1) {
+        $verificationFailed = $true
+        Write-RunError "NMICrashDump verification failed. Expected 1, found $($effectiveCrashControl.NMICrashDump)."
+    }
+
+    $expectedDumpFile = [Environment]::ExpandEnvironmentVariables($DumpFile)
+    $actualDumpFile = [Environment]::ExpandEnvironmentVariables("$($effectiveCrashControl.DumpFile)")
+    if ($actualDumpFile -ne $expectedDumpFile) {
+        $verificationFailed = $true
+        Write-RunError "DumpFile verification failed. Expected '$expectedDumpFile', found '$actualDumpFile'."
+    }
+
+    if ($DedicatedDumpFile -eq 'delete' -and -not [string]::IsNullOrWhiteSpace("$($effectiveCrashControl.DedicatedDumpFile)")) {
+        $verificationFailed = $true
+        Write-RunError "DedicatedDumpFile verification failed. The value should have been removed."
+    }
+    elseif ($DedicatedDumpFile -and $DedicatedDumpFile -ne 'delete' -and $effectiveCrashControl.DedicatedDumpFile -ne $DedicatedDumpFile) {
+        $verificationFailed = $true
+        Write-RunError "DedicatedDumpFile verification failed. Expected '$DedicatedDumpFile', found '$($effectiveCrashControl.DedicatedDumpFile)'."
+    }
+    elseif (-not $DedicatedDumpFile -and $pagefileOnTempDrive -and $effectiveCrashControl.DedicatedDumpFile -ne 'C:\dd.sys') {
+        $verificationFailed = $true
+        Write-RunError "DedicatedDumpFile fallback verification failed. Expected 'C:\dd.sys', found '$($effectiveCrashControl.DedicatedDumpFile)'."
+    }
+
+    if ($ConfigureAutomaticReboot -eq 'true') {
+        $effectiveBootStatusPolicy = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability" -ErrorAction SilentlyContinue).BootStatusPolicy
+        if ($effectiveBootStatusPolicy -ne 1) {
+            $verificationFailed = $true
+            Write-RunError "BootStatusPolicy verification failed. Expected 1, found $effectiveBootStatusPolicy."
+        }
+    }
+
     if ($pagefileWasMoved) {
-        Log-Output "PAGEFILE RELOCATION COMPLETED: Pagefile moved from temporary D: drive."
+        $effectivePagefiles = @(Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+        $remainingOriginalPagefiles = @($originalPagefileLocations | Where-Object { $_ -like 'D:*' -and $_ -in $effectivePagefiles })
+        if ($targetPagefile -notin $effectivePagefiles -or $remainingOriginalPagefiles.Count -gt 0) {
+            $verificationFailed = $true
+            Write-RunError "Pagefile relocation verification failed. Current settings: $($effectivePagefiles -join ', ')."
+        }
+    }
+
+    Write-RunOutput "Effective DumpFile: $($effectiveCrashControl.DumpFile)"
+    Write-RunOutput "Effective DedicatedDumpFile: $($effectiveCrashControl.DedicatedDumpFile)"
+
+    if ($pagefileWasMoved) {
+        Write-RunOutput "PAGEFILE RELOCATION COMPLETED: Pagefile moved from temporary D: drive."
         Write-PagefileRestoreGuidance -OriginalPagefileLocations $originalPagefileLocations
     }
-    
+
+    $verificationStopwatch.Stop()
     if ($verificationFailed) {
-        Log-Error "Configuration completed with one or more validation errors."
+        Write-OperationTelemetry -Operation 'PostApplyVerification' -Status 'Failed' -DurationMilliseconds $verificationStopwatch.ElapsedMilliseconds
+    }
+    else {
+        Write-OperationTelemetry -Operation 'PostApplyVerification' -Status 'Succeeded' -DurationMilliseconds $verificationStopwatch.ElapsedMilliseconds
+    }
+
+    if ($verificationFailed) {
+        Write-RunError "event=script_failure reason=post_apply_verification"
+        Write-RunError "Configuration completed with one or more validation errors."
         $script_final_status = $STATUS_ERROR
     }
     else {
-        Log-Output "SUCCESS: Configuration applied immediately - NO REBOOT REQUIRED"
-        Log-Info "Desktop log file: $desktopLogFilePath"
-        Log-Info "Collected log file: $collectedLogFilePath"
+        Write-RunInformation "event=script_success"
+        Write-RunOutput "SUCCESS: Configuration applied immediately - NO REBOOT REQUIRED"
+        Write-RunInformation "Desktop log file: $desktopLogFilePath"
+        Write-RunInformation "Collected log file: $collectedLogFilePath"
         $script_final_status = $STATUS_SUCCESS
     }
 }
 catch {
-    Log-Error "Failure: $($_.Exception.Message)"
-    if ($crashControlBackupPath -and (Test-Path -Path $crashControlBackupPath -PathType Leaf)) {
-        Log-Warning "Rollback available. To restore previous CrashControl values, run: reg import `"$crashControlBackupPath`""
+    Write-RunError "event=script_failure reason=exception"
+    Write-RunError "Failure: $($_.Exception.Message)"
+    if ($pagefileWasMoved) {
+        $pagefileRollbackSucceeded = Invoke-PagefileRollback -OriginalPagefileLocations $originalPagefileLocations -TargetPagefile $targetPagefile
+        if (-not $pagefileRollbackSucceeded) {
+            Write-RunError "Automatic pagefile rollback failed. Use the logged restoration commands immediately."
+            Write-PagefileRestoreGuidance -OriginalPagefileLocations $originalPagefileLocations
+        }
+    }
+
+    if ($registryChangesApplied) {
+        $registryRollbackSucceeded = Invoke-RegistryRollback -RegistryBackupPaths @($crashControlBackupPath, $reliabilityBackupPath)
+        if (-not $registryRollbackSucceeded) {
+            if ($crashControlBackupPath -and (Test-Path -Path $crashControlBackupPath -PathType Leaf)) {
+                Write-RunWarning "Manual rollback required. Run: reg import `"$crashControlBackupPath`""
+            }
+            if ($reliabilityBackupPath -and (Test-Path -Path $reliabilityBackupPath -PathType Leaf)) {
+                Write-RunWarning "Manual rollback required. Run: reg import `"$reliabilityBackupPath`""
+            }
+        }
     }
     $script_final_status = $STATUS_ERROR
 }
 finally {
-    Log-Info "Script ended at $(Get-Date)"
+    $scriptStopwatch.Stop()
+    Write-RunInformation "operationSummary attempted=$script:OperationAttempted succeeded=$script:OperationSucceeded failed=$script:OperationFailed"
+    Write-RunInformation "event=final_status status=$script_final_status durationSeconds=$([math]::Round($scriptStopwatch.Elapsed.TotalSeconds, 3))"
+    Write-RunInformation "Script ended at $(Get-Date)"
 }
 
 return $script_final_status
