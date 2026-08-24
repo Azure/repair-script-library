@@ -239,7 +239,10 @@ function Write-ChkdskCatchTelemetry {
         [string]$TargetDrive = '',
 
         [Parameter(Mandatory = $true)]
-        [string]$ErrorMessage
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [AllowNull()]
+        [Nullable[int]]$ChkdskExitCode = $null
     )
 
     Write-ChkdskTelemetry -Event Error -Message "Catch block: $CatchName" -Properties @{
@@ -248,7 +251,9 @@ function Write-ChkdskCatchTelemetry {
         Stage = $Stage
         DiskNumber = $DiskNumber
         TargetDrive = $TargetDrive
-        Error = $ErrorMessage
+        ExceptionType = $ErrorRecord.Exception.GetType().FullName
+        ChkdskExitCode = if ($null -eq $ChkdskExitCode) { '' } else { $ChkdskExitCode }
+        Error = $ErrorRecord.Exception.Message
     }
 }
 
@@ -547,7 +552,7 @@ function Repair-ChkdskUnknownBcdMapping {
     }
     catch {
         $repairError = $_.Exception.Message
-        Write-ChkdskCatchTelemetry -CatchName 'BcdMappingPreflight' -Stage 'BootSafety' -DiskNumber "$DiskNumber" -TargetDrive "${WindowsDrive}:" -ErrorMessage $repairError
+        Write-ChkdskCatchTelemetry -CatchName 'BcdMappingPreflight' -Stage 'BootSafety' -DiskNumber "$DiskNumber" -TargetDrive "${WindowsDrive}:" -ErrorRecord $_
         if ($bcdWriteStarted -and (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
             Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
             if ((Get-Item -LiteralPath $bcdPath -Force -ErrorAction Stop).Length -ne
@@ -694,7 +699,7 @@ try {
                 catch {
                     $errorMessage = $_.Exception.Message
                     Write-ScriptLog "Failed to stop nested guest VM '$($guestHyperVVirtualMachine.VMName)' via Stop-VM: $errorMessage. Continuing but with limited raw write access risks." "WARNING"
-                    Write-ChkdskCatchTelemetry -CatchName 'NestedVmStop' -Stage 'Preflight' -TargetDrive $env:SystemDrive -ErrorMessage $errorMessage
+                    Write-ChkdskCatchTelemetry -CatchName 'NestedVmStop' -Stage 'Preflight' -TargetDrive $env:SystemDrive -ErrorRecord $_
                 }
             }
         }
@@ -879,6 +884,7 @@ try {
             TargetDrive = "${driveLetter}:"
         }
 
+        $chkdskExitCode = $null
         try {
             Repair-ChkdskUnknownBcdMapping -DiskNumber $diskNumber -DiskPartitions $diskPartitions -WindowsDrive $driveLetter
 
@@ -987,7 +993,7 @@ try {
             $errorMessage = $_.Exception.Message
             $failedCount++
             Write-ScriptLog "Failed processing validated Windows partition on Disk ${diskNumber}: $errorMessage" 'ERROR'
-            Write-ChkdskCatchTelemetry -CatchName 'WindowsPartitionProcessing' -Stage 'DiscoveryOrRepair' -DiskNumber "$diskNumber" -TargetDrive "${driveLetter}:" -ErrorMessage $errorMessage
+            Write-ChkdskCatchTelemetry -CatchName 'WindowsPartitionProcessing' -Stage 'DiscoveryOrRepair' -DiskNumber "$diskNumber" -TargetDrive "${driveLetter}:" -ErrorRecord $_ -ChkdskExitCode $chkdskExitCode
         }
     }
 
@@ -1004,7 +1010,7 @@ try {
 catch {
     $errorMessage = $_.Exception.Message
     Write-ScriptLog "An unhandled execution crash occurred: $errorMessage" "ERROR"
-    Write-ChkdskCatchTelemetry -CatchName 'UnhandledExecution' -Stage 'Main' -ErrorMessage $errorMessage
+    Write-ChkdskCatchTelemetry -CatchName 'UnhandledExecution' -Stage 'Main' -ErrorRecord $_
     $script_final_status = $STATUS_ERROR
 }
 finally {
@@ -1024,7 +1030,7 @@ finally {
         catch {
             $errorMessage = $_.Exception.Message
             Write-ScriptLog "Failed to remove temporary letter $($mount.DriveLetter): $errorMessage" 'ERROR'
-            Write-ChkdskCatchTelemetry -CatchName 'TemporaryMountCleanup' -Stage 'Cleanup' -DiskNumber "$($mount.DiskNumber)" -TargetDrive "$($mount.DriveLetter):" -ErrorMessage $errorMessage
+            Write-ChkdskCatchTelemetry -CatchName 'TemporaryMountCleanup' -Stage 'Cleanup' -DiskNumber "$($mount.DiskNumber)" -TargetDrive "$($mount.DriveLetter):" -ErrorRecord $_
             $script_final_status = $STATUS_ERROR
         }
     }
@@ -1049,7 +1055,7 @@ finally {
                 $errorMessage = $_.Exception.Message
                 $identityRestorationFailed = $true
                 Write-ScriptLog "CRITICAL: Could not safely offline source Disk ${diskNumber}: $errorMessage" 'ERROR'
-                Write-ChkdskCatchTelemetry -CatchName 'SourceGptOffline' -Stage 'IdentityRestore' -DiskNumber "$diskNumber" -ErrorMessage $errorMessage
+                Write-ChkdskCatchTelemetry -CatchName 'SourceGptOffline' -Stage 'IdentityRestore' -DiskNumber "$diskNumber" -ErrorRecord $_
             }
         }
 
@@ -1062,7 +1068,7 @@ finally {
                 $errorMessage = $_.Exception.Message
                 $identityRestorationFailed = $true
                 Write-ScriptLog "CRITICAL: Failed to restore the repair VM OS disk identity: $errorMessage" 'ERROR'
-                Write-ChkdskCatchTelemetry -CatchName 'RepairDiskIdentityRestore' -Stage 'IdentityRestore' -DiskNumber "$($repairDiskIdentityRecord.DiskNumber)" -ErrorMessage $errorMessage
+                Write-ChkdskCatchTelemetry -CatchName 'RepairDiskIdentityRestore' -Stage 'IdentityRestore' -DiskNumber "$($repairDiskIdentityRecord.DiskNumber)" -ErrorRecord $_
             }
         }
     }
@@ -1076,7 +1082,7 @@ finally {
             $errorMessage = $_.Exception.Message
             $identityRestorationFailed = $true
             Write-ScriptLog "CRITICAL: Failed to restore Disk $($identityRecord.DiskNumber) identity: $errorMessage" 'ERROR'
-            Write-ChkdskCatchTelemetry -CatchName 'SourceMbrIdentityRestore' -Stage 'IdentityRestore' -DiskNumber "$($identityRecord.DiskNumber)" -ErrorMessage $errorMessage
+            Write-ChkdskCatchTelemetry -CatchName 'SourceMbrIdentityRestore' -Stage 'IdentityRestore' -DiskNumber "$($identityRecord.DiskNumber)" -ErrorRecord $_
         }
     }
     if ($identityRestorationFailed) {
