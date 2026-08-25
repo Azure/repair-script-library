@@ -49,6 +49,10 @@
     Name:    win-update-registry.ps1
     Version: 1.3
     Author:  Tony Mocanu / Tony.Mocanu@Microsoft.com
+    Platform: Windows Server 2016 and later; Windows PowerShell 5.1.
+    Execution: Azure VMRepair repair VM with an attached Windows OS disk.
+    Telemetry: Emits structured lifecycle and error events through the local VMRepair logger.
+               No telemetry network requests are made by this script.
 
 .VERSION
     v1.3: [August 2026] - Restricted offline hive mounts to HKLM and HKU.
@@ -103,8 +107,6 @@ Get-ChildItem "$([Environment]::GetFolderPath('Desktop'))\update-registry_*.log"
 reg load HKLM\VERIFY F:\Windows\System32\config\SYSTEM
 Get-ItemProperty -Path "HKLM:\VERIFY\ControlSet001\Control\Terminal Server" -Name fDenyTSConnections
 reg unload HKLM\VERIFY
-    3. For local testing, uncomment the DEBUG variables block below the init section,
-    set them to the desired test values, run the script, then re-comment before deploying.
 #>
 
 # Initialization (no Param() block to avoid ParserErrors and argument transformation failures)
@@ -144,16 +146,6 @@ if (-not (Get-Command -Name Get-Disk-Partitions -CommandType Function -ErrorActi
     Log-Error "Dependency did not define the required Get-Disk-Partitions function: $partitionsHelperPath"
     return $STATUS_ERROR
 }
-
-# DEBUG: Uncomment below to test locally without --parameters
-# $rootKey = 'HKLM'
-# $hive = 'System'
-# $controlSet = '1'
-# $relativePath = 'Control\Terminal Server'
-# $propertyName = 'fDenyTSConnections'
-# $propertyValue = '1'
-# $propertyType = 'dword'
-# $createPathIfMissing = $false
 
 # Parameter Validation (variables injected by az vm repair run --parameters)
 if (-not $rootKey) { $rootKey = "HKLM" }
@@ -203,13 +195,6 @@ if ($controlSet) {
         return $STATUS_ERROR
     }
 }
-Write-Host "DEBUG rootKey=[$rootKey]"
-Write-Host "DEBUG hive=[$hive]"
-Write-Host "DEBUG controlSet=[$controlSet]"
-Write-Host "DEBUG relativePath=[$relativePath]"
-Write-Host "DEBUG propertyName=[$propertyName]"
-Write-Host "DEBUG propertyValue=[$propertyValue]"
-Write-Host "DEBUG propertyType=[$propertyType]"
 if ([string]::IsNullOrEmpty($relativePath)) {
     Log-Error "relativePath parameter is required."
     return $STATUS_ERROR
@@ -286,6 +271,59 @@ function Write-OutputLog {
     Write-DesktopLog -Level 'OUTPUT' -Message $Message
 }
 
+$script:RepairScriptVersion = '1.3'
+$script:ExecutionStarted = Get-Date
+
+function Write-UpdateRegistryTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Start', 'Operation', 'Success', 'Error')]
+        [string]$Event,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [hashtable]$Properties = @{}
+    )
+
+    $payload = [ordered]@{
+        Event = $Event
+        Message = $Message
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+        RepairScriptVersion = $script:RepairScriptVersion
+        Properties = $Properties
+    }
+    $json = $payload | ConvertTo-Json -Compress -Depth 8
+    if ($Event -eq 'Error') {
+        Write-ErrorLog "[Telemetry] $json"
+    }
+    else {
+        Write-InfoLog "[Telemetry] $json"
+    }
+}
+
+function Write-UpdateRegistryCatchTelemetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$CatchName,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory = $true)][string]$RootCause,
+        [string]$DiskNumber = '',
+        [string]$TargetDrive = ''
+    )
+
+    Write-UpdateRegistryTelemetry -Event Error -Message "Catch block: $CatchName" -Properties @{
+        CoverageCategory = 'CatchBlock'
+        CatchName = $CatchName
+        Stage = $Stage
+        RootCause = $RootCause
+        DiskNumber = $DiskNumber
+        TargetDrive = $TargetDrive
+        ExceptionType = $ErrorRecord.Exception.GetType().FullName
+        Error = $ErrorRecord.Exception.Message
+    }
+}
+
 function Get-UpdateRegistryFileSha256 {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -313,7 +351,10 @@ function Test-UpdateRegistryValue {
     switch -Regex ($Type) {
         '^(?i:DWord|Qword)$' {
             try { return [decimal]$ActualValue -eq [decimal]$ExpectedValue }
-            catch { return $false }
+            catch {
+                Write-UpdateRegistryCatchTelemetry -CatchName 'NumericValueComparison' -Stage 'PostWriteVerification' -RootCause 'ValueConversionFailure' -ErrorRecord $_
+                return $false
+            }
         }
         '^(?i:Binary)$' {
             $actualItems = @($ActualValue)
@@ -323,7 +364,10 @@ function Test-UpdateRegistryValue {
                 try {
                     if ([byte]$actualItems[$index] -ne [byte]$expectedItems[$index]) { return $false }
                 }
-                catch { return $false }
+                catch {
+                    Write-UpdateRegistryCatchTelemetry -CatchName 'BinaryValueComparison' -Stage 'PostWriteVerification' -RootCause 'ValueConversionFailure' -ErrorRecord $_
+                    return $false
+                }
             }
             return $true
         }
@@ -405,6 +449,7 @@ function Get-UpdateRegistryDiskIdentity {
 }
 
 function Set-UpdateRegistryTemporarySourceIdentity {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Internal noninteractive repair primitive; the caller owns transaction safety and restoration.')]
     param([Parameter(Mandatory = $true)][pscustomobject]$Record)
 
     if ($Record.PartitionStyle -ne 'MBR') {
@@ -442,6 +487,7 @@ function Restore-UpdateRegistrySourceIdentity {
 }
 
 function Set-UpdateRegistryTemporaryRepairIdentity {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Internal noninteractive repair primitive; the caller owns transaction safety and restoration.')]
     param([Parameter(Mandatory = $true)][pscustomobject]$Record)
 
     Invoke-UpdateRegistryDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
@@ -484,6 +530,15 @@ try {
     Write-InfoLog "START: Running script win-update-registry.ps1"
     Write-InfoLog "Log file path: $logFile"
     Write-InfoLog "Parameters: rootKey=$rootKey, hive=$hive, controlSet=$controlSet, relativePath=$relativePath, propertyName=$propertyName, propertyValue=$propertyValue, propertyType=$propertyType, createPathIfMissing=$createPathIfMissing"
+    Write-UpdateRegistryTelemetry -Event Start -Message 'Starting offline registry update' -Properties @{
+        ScriptName = 'win-update-registry.ps1'
+        ScriptVersion = $script:RepairScriptVersion
+        ExecutionMode = 'REPAIR_VM_ONLY'
+        RootKey = $rootKey
+        Hive = $hive
+        PropertyType = $propertyType
+        CreatePathIfMissing = [bool]$createPathIfMissing
+    }
 
     $processedCount = 0
     $skippedCount = 0
@@ -504,6 +559,7 @@ try {
                     }
                     catch {
                         Write-WarningLog "Failed to stop nested guest VM $guestHyperVVirtualMachineName, will continue but may have limited success"
+                        Write-UpdateRegistryCatchTelemetry -CatchName 'NestedVmStop' -Stage 'Preflight' -RootCause 'NestedVmControlFailure' -TargetDrive $env:SystemDrive -ErrorRecord $_
                     }
                 }
             }
@@ -517,6 +573,7 @@ try {
     }
     catch {
         Write-WarningLog "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)"
+        Write-UpdateRegistryCatchTelemetry -CatchName 'NestedVmDiscovery' -Stage 'Preflight' -RootCause 'NestedVmDiscoveryFailure' -TargetDrive $env:SystemDrive -ErrorRecord $_
     }
 
     # Step 2 - Identify every repair-host disk before touching attached disks.
@@ -656,6 +713,7 @@ try {
                     $mountTracked = $true
                 }
                 catch {
+                    Write-UpdateRegistryCatchTelemetry -CatchName 'TemporaryOsMount' -Stage 'TargetValidation' -RootCause 'TemporaryMountFailure' -DiskNumber "$diskNumber" -TargetDrive "${candidateLetter}:" -ErrorRecord $_
                     if (-not $mountTracked) {
                         Invoke-UpdateRegistryDiskPart -Operation 'failed-os-probe-cleanup' -Commands @(
                             "select disk $diskNumber"
@@ -732,6 +790,7 @@ try {
             }
             catch {
                 Write-ErrorLog "Failed to create a hive backup for drive ${drive}: $($_.Exception.Message)"
+                Write-UpdateRegistryCatchTelemetry -CatchName 'HiveBackupCreate' -Stage 'Backup' -RootCause 'BackupFailure' -DiskNumber "$($partition.DiskNumber)" -TargetDrive "${drive}:" -ErrorRecord $_
                 $failedCount++
                 continue
             }
@@ -828,6 +887,7 @@ try {
             catch {
                 Write-ErrorLog "Failed to modify registry hive on $($drive): $($_.Exception.Message)"
                 Write-ErrorLog "Will attempt rollback from backup after unloading hive."
+                Write-UpdateRegistryCatchTelemetry -CatchName 'RegistryMutation' -Stage 'RegistryWrite' -RootCause 'RegistryWriteFailure' -DiskNumber "$($partition.DiskNumber)" -TargetDrive "${drive}:" -ErrorRecord $_
                 $script_final_status = $STATUS_ERROR
                 $failedCount++
                 $restoreRequired = $writeAttempted
@@ -872,6 +932,7 @@ try {
                         }
                         catch {
                             Write-ErrorLog "Rollback failed for drive $drive using backup '$backupFile': $($_.Exception.Message)"
+                            Write-UpdateRegistryCatchTelemetry -CatchName 'HiveRollback' -Stage 'Rollback' -RootCause 'BackupFailure' -DiskNumber "$($partition.DiskNumber)" -TargetDrive "${drive}:" -ErrorRecord $_
                             $script_final_status = $STATUS_ERROR
                         }
                     }
@@ -894,6 +955,7 @@ try {
 }
 catch {
     Write-ErrorLog "An unexpected error occurred: $($_.Exception.Message)"
+    Write-UpdateRegistryCatchTelemetry -CatchName 'UnhandledExecution' -Stage 'Main' -RootCause 'UnexpectedError' -ErrorRecord $_
     $script_final_status = $STATUS_ERROR
 }
 finally {
@@ -912,6 +974,7 @@ finally {
         }
         catch {
             Write-ErrorLog "Failed to remove temporary letter $($mount.DriveLetter): $($_.Exception.Message)"
+            Write-UpdateRegistryCatchTelemetry -CatchName 'TemporaryMountCleanup' -Stage 'Cleanup' -RootCause 'CleanupFailure' -DiskNumber "$($mount.DiskNumber)" -TargetDrive "$($mount.DriveLetter):" -ErrorRecord $_
             $script_final_status = $STATUS_ERROR
         }
     }
@@ -935,6 +998,7 @@ finally {
             catch {
                 $identityRestorationFailed = $true
                 Write-ErrorLog "CRITICAL: Could not safely offline source Disk ${diskNumber}: $($_.Exception.Message)"
+                Write-UpdateRegistryCatchTelemetry -CatchName 'SourceGptOffline' -Stage 'IdentityRestore' -RootCause 'DiskIdentityRestoreFailure' -DiskNumber "$diskNumber" -ErrorRecord $_
             }
         }
         if (-not $identityRestorationFailed) {
@@ -945,6 +1009,7 @@ finally {
             catch {
                 $identityRestorationFailed = $true
                 Write-ErrorLog "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)"
+                Write-UpdateRegistryCatchTelemetry -CatchName 'RepairDiskIdentityRestore' -Stage 'IdentityRestore' -RootCause 'DiskIdentityRestoreFailure' -DiskNumber "$($repairDiskIdentityRecord.DiskNumber)" -ErrorRecord $_
             }
         }
     }
@@ -957,11 +1022,22 @@ finally {
         catch {
             $identityRestorationFailed = $true
             Write-ErrorLog "CRITICAL: Failed to restore Disk $($identityRecord.DiskNumber) identity: $($_.Exception.Message)"
+            Write-UpdateRegistryCatchTelemetry -CatchName 'SourceMbrIdentityRestore' -Stage 'IdentityRestore' -RootCause 'DiskIdentityRestoreFailure' -DiskNumber "$($identityRecord.DiskNumber)" -ErrorRecord $_
         }
     }
     if ($identityRestorationFailed) { $script_final_status = $STATUS_ERROR }
 
     Write-InfoLog "Final status: $script_final_status"
+    $completionEvent = if ($script_final_status -eq $STATUS_SUCCESS) { 'Success' } else { 'Error' }
+    Write-UpdateRegistryTelemetry -Event $completionEvent -Message 'Offline registry update completed' -Properties @{
+        CoverageCategory = 'ScriptOutcome'
+        Status = [string]$script_final_status
+        Processed = $processedCount
+        Skipped = $skippedCount
+        Changed = $changedCount
+        Failed = $failedCount
+        DurationMilliseconds = [int64]((Get-Date) - $script:ExecutionStarted).TotalMilliseconds
+    }
     Write-InfoLog "Script ended at $(Get-Date)"
     Write-InfoLog "Log file path: $logFile"
 }
