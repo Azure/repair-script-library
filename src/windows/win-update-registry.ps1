@@ -56,6 +56,8 @@
 
 .VERSION
     v1.3: [August 2026] - Restricted offline hive mounts to HKLM and HKU.
+                          - Added an explicit param block for VMRepair driver named-argument delivery.
+                          - Dual-writes plain-text logs to the desktop and VMRepair collection path.
                           - Uses native command exit codes as the authoritative load/unload result.
                           - Creates the hive backup before loading and rolls back failed writes.
                                                 - Requires explicit opt-in before creating a missing registry path.
@@ -109,7 +111,20 @@ Get-ItemProperty -Path "HKLM:\VERIFY\ControlSet001\Control\Terminal Server" -Nam
 reg unload HKLM\VERIFY
 #>
 
-# Initialization (no Param() block to avoid ParserErrors and argument transformation failures)
+[CmdletBinding()]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'Unbound parameters intentionally fall back to legacy VMRepair test variables; named arguments remain authoritative.')]
+param(
+    [string]$rootKey = $global:rootKey,
+    [string]$hive = $global:hive,
+    [string]$controlSet = $global:controlSet,
+    [string]$relativePath = $global:relativePath,
+    [string]$propertyName = $global:propertyName,
+    [string]$propertyValue = $global:propertyValue,
+    [string]$propertyType = $global:propertyType,
+    [string]$createPathIfMissing = $global:createPathIfMissing
+)
+
+# Initialization
 
 # ==============================================================================
 # 1. DEPENDENCY PATH VALIDATION & INITIALIZATION (DEP-01)
@@ -232,8 +247,23 @@ if ([string]::IsNullOrWhiteSpace($logDir) -or -not (Test-Path -LiteralPath $logD
 }
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$logDir\update-registry_$timestamp.log"
+$collectedLogsBaseDir = Join-Path -Path $resolvedScriptRoot -ChildPath 'logs'
+if ($resolvedScriptRoot -match '^(.*?\\repair-files-\d{14})(\\|$)') {
+    $collectedLogsBaseDir = Join-Path -Path $Matches[1] -ChildPath 'plugin-logs'
+}
+$collectedLogDir = Join-Path -Path $collectedLogsBaseDir -ChildPath "win-update-registry-run-$timestamp"
+$collectedLogFile = Join-Path -Path $collectedLogDir -ChildPath "update-registry_$timestamp.log"
+$script:LogFilePaths = @($logFile)
 
-function Write-DesktopLog {
+try {
+    $null = New-Item -ItemType Directory -Path $collectedLogDir -Force -ErrorAction Stop
+    $script:LogFilePaths += $collectedLogFile
+}
+catch {
+    Log-Warning "Could not initialize VMRepair-collected log directory '$collectedLogDir': $($_.Exception.Message)"
+}
+
+function Write-PlainTextLog {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Level,
@@ -244,31 +274,38 @@ function Write-DesktopLog {
 
     $text = if ($null -eq $Message) { '' } else { ($Message | Out-String).TrimEnd() }
     $line = "$(Get-Date -Format o) [$Level] $text"
-    Add-Content -Path $logFile -Value $line
+    foreach ($path in $script:LogFilePaths) {
+        try {
+            Add-Content -Path $path -Value $line -Encoding UTF8 -ErrorAction Stop
+        }
+        catch {
+            Log-Warning "Could not append to plain-text log '$path': $($_.Exception.Message)"
+        }
+    }
 }
 
 function Write-InfoLog {
     param([string]$Message)
     Log-Info $Message
-    Write-DesktopLog -Level 'INFO' -Message $Message
+    Write-PlainTextLog -Level 'INFO' -Message $Message
 }
 
 function Write-WarningLog {
     param([string]$Message)
     Log-Warning $Message
-    Write-DesktopLog -Level 'WARN' -Message $Message
+    Write-PlainTextLog -Level 'WARN' -Message $Message
 }
 
 function Write-ErrorLog {
     param([string]$Message)
     Log-Error $Message
-    Write-DesktopLog -Level 'ERROR' -Message $Message
+    Write-PlainTextLog -Level 'ERROR' -Message $Message
 }
 
 function Write-OutputLog {
     param([AllowNull()]$Message)
     Log-Output $Message
-    Write-DesktopLog -Level 'OUTPUT' -Message $Message
+    Write-PlainTextLog -Level 'OUTPUT' -Message $Message
 }
 
 $script:RepairScriptVersion = '1.3'
@@ -529,6 +566,7 @@ $repairDiskIdentityRecord = $null
 try {
     Write-InfoLog "START: Running script win-update-registry.ps1"
     Write-InfoLog "Log file path: $logFile"
+    Write-InfoLog "Collected log file path: $collectedLogFile"
     Write-InfoLog "Parameters: rootKey=$rootKey, hive=$hive, controlSet=$controlSet, relativePath=$relativePath, propertyName=$propertyName, propertyValue=$propertyValue, propertyType=$propertyType, createPathIfMissing=$createPathIfMissing"
     Write-UpdateRegistryTelemetry -Event Start -Message 'Starting offline registry update' -Properties @{
         ScriptName = 'win-update-registry.ps1'
@@ -1040,6 +1078,7 @@ finally {
     }
     Write-InfoLog "Script ended at $(Get-Date)"
     Write-InfoLog "Log file path: $logFile"
+    Write-InfoLog "Collected log file path: $collectedLogFile"
 }
 
 return $script_final_status
