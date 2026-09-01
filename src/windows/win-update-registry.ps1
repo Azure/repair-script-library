@@ -8,11 +8,13 @@
     1. Stops any nested guest VM to ensure the attached disk is not in use.
     2. Identifies attached repair targets while excluding the repair VM's protected disks.
     3. Validates a Windows partition by requiring both an OS loader and the requested hive.
-    4. Creates a binary hive backup, then loads the requested hive (skips the partition if load fails).
-    5. Determines the active ControlSet (if using the SYSTEM hive) from the Select key.
-    6. Reads the current value of the specified registry property (if it exists).
-    7. Updates and verifies the specified property, creating a missing path only when explicitly requested.
-    8. Unloads the registry hive cleanly.
+    4. For Gen2 targets, validates the offline BCD loader mapping and repairs only
+         device/osdevice values that BCDEdit reports as unknown.
+    5. Creates a binary hive backup, then loads the requested hive (skips the partition if load fails).
+    6. Determines the active ControlSet (if using the SYSTEM hive) from the Select key.
+    7. Reads the current value of the specified registry property (if it exists).
+    8. Updates and verifies the specified property, creating a missing path only when explicitly requested.
+    9. Unloads the registry hive cleanly.
 
     This resolves non-boot issues caused by registry misconfiguration (e.g., enabling RDP,
     changing service startup type, disabling problematic drivers).
@@ -47,7 +49,7 @@
 
 .NOTES
     Name:    win-update-registry.ps1
-    Version: 1.3
+    Version: 1.3.1
     Author:  Tony Mocanu / Tony.Mocanu@Microsoft.com
     Platform: Windows Server 2016 and later; Windows PowerShell 5.1.
     Execution: Azure VMRepair repair VM with an attached Windows OS disk.
@@ -55,6 +57,12 @@
                No telemetry network requests are made by this script.
 
 .VERSION
+    v1.3.1: [September 2026] - Added the boot-safety preflight proven by
+                               win-sac-onLatest and win-chkdsk-fs-corruption.
+                               - Locates the generation-appropriate BCD store.
+                               - Repairs only unknown loader device/osdevice mappings.
+                               - Backs up, verifies, and automatically rolls back the BCD.
+                               - Verifies winload path and loader mapping before registry writes.
     v1.3: [August 2026] - Restricted offline hive mounts to HKLM and HKU.
                           - Added an explicit param block for VMRepair driver named-argument delivery.
                           - Dual-writes plain-text logs to the desktop and VMRepair collection path.
@@ -308,7 +316,7 @@ function Write-OutputLog {
     Write-PlainTextLog -Level 'OUTPUT' -Message $Message
 }
 
-$script:RepairScriptVersion = '1.3'
+$script:RepairScriptVersion = '1.3.1'
 $script:ExecutionStarted = Get-Date
 
 function Write-UpdateRegistryTelemetry {
@@ -461,6 +469,239 @@ function Invoke-UpdateRegistryDiskPart {
     }
 }
 
+function Invoke-UpdateRegistryBcdEdit {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Operation
+    )
+
+    $output = & bcdedit.exe @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in @($output)) {
+        if ($line) { Write-InfoLog "[bcdedit][$Operation] $line" }
+    }
+    Write-UpdateRegistryTelemetry -Event Operation -Message "bcdedit $Operation" -Properties @{
+        CoverageCategory = 'BootSafety'
+        Operation = $Operation
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
+    }
+
+    return [pscustomobject]@{
+        Output = @($output)
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
+    }
+}
+
+function Repair-UpdateRegistryUnknownBcdMapping {
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][object[]]$DiskPartitions,
+        [Parameter(Mandatory = $true)][string]$WindowsDrive
+    )
+
+    $efiGptType = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
+    $efiPartitions = @($DiskPartitions | Where-Object {
+        ([string]$_.GptType).Trim().Trim('{', '}') -ieq $efiGptType
+    })
+    $isGen2Disk = $efiPartitions.Count -gt 0
+    $bcdPath = $null
+
+    if ($isGen2Disk) {
+        foreach ($efiPartition in $efiPartitions) {
+            $efiLetter = [string]$efiPartition.DriveLetter
+            $letterAssignedByScript = $false
+            if (-not $efiLetter -or $efiLetter -eq [char]0) {
+                $efiLetter = Get-UpdateRegistryAvailableDriveLetter
+                if (-not $efiLetter) {
+                    throw "No temporary drive letter is available for the EFI partition on Disk $DiskNumber."
+                }
+                Invoke-UpdateRegistryDiskPart -Operation 'bcd-efi-assign' -Commands @(
+                    "select disk $DiskNumber"
+                    "select partition $($efiPartition.PartitionNumber)"
+                    "assign letter=$efiLetter"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+                if (-not (Test-Path -LiteralPath "${efiLetter}:\" -PathType Container)) {
+                    throw "EFI mount ${efiLetter}: failed for Disk $DiskNumber Partition $($efiPartition.PartitionNumber)."
+                }
+                $letterAssignedByScript = $true
+                $script:temporaryMounts += [pscustomobject]@{
+                    DiskNumber = $DiskNumber
+                    PartitionNumber = [int]$efiPartition.PartitionNumber
+                    DriveLetter = $efiLetter
+                }
+            }
+
+            $candidateBcdPath = "${efiLetter}:\EFI\Microsoft\Boot\BCD"
+            if (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf) {
+                $bcdPath = $candidateBcdPath
+                break
+            }
+
+            if ($letterAssignedByScript) {
+                Invoke-UpdateRegistryDiskPart -Operation 'bcd-efi-remove-unused' -Commands @(
+                    "select disk $DiskNumber"
+                    "select partition $($efiPartition.PartitionNumber)"
+                    "remove letter=$efiLetter noerr"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                $script:temporaryMounts = @($script:temporaryMounts | Where-Object {
+                    -not ($_.DiskNumber -eq $DiskNumber -and
+                        $_.PartitionNumber -eq [int]$efiPartition.PartitionNumber -and
+                        $_.DriveLetter -ieq $efiLetter)
+                })
+            }
+        }
+    }
+    else {
+        foreach ($partition in @($DiskPartitions | Where-Object {
+            $_.DriveLetter -and $_.DriveLetter -ne [char]0
+        })) {
+            $candidateBcdPath = "$($partition.DriveLetter):\Boot\BCD"
+            if (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf) {
+                $bcdPath = $candidateBcdPath
+                break
+            }
+        }
+        if (-not $bcdPath) {
+            $candidateBcdPath = "${WindowsDrive}:\Boot\BCD"
+            if (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf) {
+                $bcdPath = $candidateBcdPath
+            }
+        }
+    }
+
+    if (-not $bcdPath) {
+        throw "Disk $DiskNumber has no generation-appropriate BCD store."
+    }
+
+    $bootManagerQuery = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/enum', 'bootmgr', '/v') -Operation 'query-bootmgr'
+    if (-not $bootManagerQuery.Success) {
+        throw "Could not enumerate boot manager from $bcdPath."
+    }
+    $defaultLine = $bootManagerQuery.Output | Select-String -Pattern '^\s*default\s+' | Select-Object -First 1
+    if (-not $defaultLine -or $defaultLine -notmatch '\{([^}]+)\}') {
+        throw "Could not identify the default Windows loader in $bcdPath."
+    }
+    $defaultLoaderId = $matches[0]
+    if ($defaultLoaderId -notmatch '^(?i)\{[0-9a-f\-]{36}\}$') {
+        throw "Default BCD loader identifier '$defaultLoaderId' is invalid."
+    }
+
+    $loaderQuery = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'validate-loader'
+    $loaderText = $loaderQuery.Output -join "`n"
+    $loaderPathMatch = [regex]::Match($loaderText, '(?im)^\s*path\s+(.+?)\s*$')
+    $loaderDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*device\s+(.+?)\s*$')
+    $loaderOsDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+    $loaderSystemRootMatch = [regex]::Match($loaderText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+    if (-not $loaderQuery.Success -or -not $loaderPathMatch.Success -or
+        -not $loaderDeviceMatch.Success -or -not $loaderOsDeviceMatch.Success -or
+        -not $loaderSystemRootMatch.Success) {
+        throw "Default loader $defaultLoaderId is missing required mapping elements."
+    }
+
+    $originalLoaderPath = $loaderPathMatch.Groups[1].Value.Trim()
+    $originalSystemRoot = $loaderSystemRootMatch.Groups[1].Value.Trim()
+    if ($originalLoaderPath -notmatch '(?i)^\\Windows\\System32\\winload\.(exe|efi)$') {
+        throw "Default loader $defaultLoaderId references unsupported path '$originalLoaderPath'."
+    }
+    $resolvedLoaderFile = Join-Path -Path "${WindowsDrive}:\" -ChildPath $originalLoaderPath.TrimStart('\')
+    if (-not (Test-Path -LiteralPath $resolvedLoaderFile -PathType Leaf)) {
+        throw "Default loader references '$originalLoaderPath', but '$resolvedLoaderFile' does not exist."
+    }
+
+    $repairLoaderDevice = $loaderDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$'
+    $repairLoaderOsDevice = $loaderOsDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$'
+    if (-not $repairLoaderDevice -and -not $repairLoaderOsDevice) {
+        Write-UpdateRegistryTelemetry -Event Success -Message 'BCD loader mapping validated without changes' -Properties @{
+            CoverageCategory = 'BootSafety'
+            DiskNumber = [string]$DiskNumber
+            VMGeneration = if ($isGen2Disk) { 'V2' } else { 'V1' }
+            BcdPath = $bcdPath
+            LoaderGuid = $defaultLoaderId
+        }
+        return
+    }
+
+    $bcdBackup = $bcdPath + '.update-registry.bak.' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $bcdWriteStarted = $false
+    try {
+        $originalBcdItem = Get-Item -LiteralPath $bcdPath -Force -ErrorAction Stop
+        $originalBcdHash = Get-UpdateRegistryFileSha256 -LiteralPath $bcdPath
+        Copy-Item -LiteralPath $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+        $backupBcdItem = Get-Item -LiteralPath $bcdBackup -Force -ErrorAction Stop
+        $backupBcdHash = Get-UpdateRegistryFileSha256 -LiteralPath $bcdBackup
+        if ($backupBcdItem.Length -ne $originalBcdItem.Length -or
+            $backupBcdHash -ine $originalBcdHash) {
+            throw "BCD backup verification failed for '$bcdBackup'."
+        }
+
+        $validatedWindowsPartition = "partition=${WindowsDrive}:"
+        $bcdWriteStarted = $true
+        if ($repairLoaderDevice) {
+            $setDeviceResult = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'device', $validatedWindowsPartition) -Operation 'repair-loader-device'
+            if (-not $setDeviceResult.Success) {
+                throw "Could not repair device for loader $defaultLoaderId."
+            }
+        }
+        if ($repairLoaderOsDevice) {
+            $setOsDeviceResult = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'osdevice', $validatedWindowsPartition) -Operation 'repair-loader-osdevice'
+            if (-not $setOsDeviceResult.Success) {
+                throw "Could not repair osdevice for loader $defaultLoaderId."
+            }
+        }
+
+        $verifyLoader = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'verify-loader-mapping'
+        $verifyText = $verifyLoader.Output -join "`n"
+        $verifyPath = [regex]::Match($verifyText, '(?im)^\s*path\s+(.+?)\s*$')
+        $verifyDevice = [regex]::Match($verifyText, '(?im)^\s*device\s+(.+?)\s*$')
+        $verifyOsDevice = [regex]::Match($verifyText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+        $verifySystemRoot = [regex]::Match($verifyText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+        if (-not $verifyLoader.Success -or -not $verifyPath.Success -or
+            -not $verifyDevice.Success -or -not $verifyOsDevice.Success -or
+            -not $verifySystemRoot.Success -or
+            $verifyDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+            $verifyOsDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+            $verifyPath.Groups[1].Value.Trim() -ine $originalLoaderPath -or
+            $verifySystemRoot.Groups[1].Value.Trim() -ine $originalSystemRoot) {
+            throw "Loader mapping repair verification failed for $defaultLoaderId."
+        }
+
+        Write-UpdateRegistryTelemetry -Event Success -Message 'Unknown BCD loader mapping repaired and verified' -Properties @{
+            CoverageCategory = 'BootSafety'
+            DiskNumber = [string]$DiskNumber
+            VMGeneration = if ($isGen2Disk) { 'V2' } else { 'V1' }
+            BcdPath = $bcdPath
+            LoaderGuid = $defaultLoaderId
+            BackupPath = $bcdBackup
+            DeviceRepaired = $repairLoaderDevice
+            OsDeviceRepaired = $repairLoaderOsDevice
+        }
+    }
+    catch {
+        $repairError = $_.Exception.Message
+        Write-UpdateRegistryCatchTelemetry -CatchName 'BcdMappingPreflight' -Stage 'BootSafety' -RootCause 'BcdMappingFailure' -DiskNumber "$DiskNumber" -TargetDrive "${WindowsDrive}:" -ErrorRecord $_
+        if ($bcdWriteStarted -and (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+            Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+            $restoredBcdHash = Get-UpdateRegistryFileSha256 -LiteralPath $bcdPath
+            if ($restoredBcdHash -ine $backupBcdHash) {
+                throw "BCD repair failed and rollback hash verification failed. Original error: $repairError"
+            }
+            Write-UpdateRegistryTelemetry -Event Error -Message 'BCD loader mapping repair rolled back' -Properties @{
+                CoverageCategory = 'BootSafety'
+                DiskNumber = [string]$DiskNumber
+                BcdPath = $bcdPath
+                BackupPath = $bcdBackup
+                Error = $repairError
+            }
+        }
+        throw "BCD loader mapping preflight failed: $repairError"
+    }
+}
+
 function Get-UpdateRegistryDiskIdentity {
     param([Parameter(Mandatory = $true)][int]$DiskNumber)
 
@@ -558,7 +799,7 @@ function Restore-UpdateRegistryRepairIdentity {
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
-$temporaryMounts = @()
+$script:temporaryMounts = @()
 $collisionDiskRecords = @()
 $gptCollisionDiskNumbers = @()
 $repairDiskIdentityRecord = $null
@@ -704,6 +945,8 @@ try {
 
     $attachedDiskNumbers = @($attachedDisks | Select-Object -ExpandProperty Number)
     $partitionList = @(Get-Disk-Partitions)
+    $discoveredDiskNumbers = @($partitionList | Select-Object -ExpandProperty DiskNumber -Unique)
+    Write-InfoLog "Post-collision partition discovery returned disk numbers: $($discoveredDiskNumbers -join ', ')"
     $targetDiskGroups = @($partitionList |
         Where-Object {
             [int]$_.DiskNumber -in $attachedDiskNumbers -and
@@ -789,6 +1032,7 @@ try {
             DiskNumber = $diskNumber
             PartitionNumber = [int]$targetPartition.PartitionNumber
             DriveLetter = $targetDriveLetter
+            DiskPartitions = $diskPartitions
         }
         Write-InfoLog "Validated Windows target on Disk $diskNumber Partition $($targetPartition.PartitionNumber) at ${targetDriveLetter}:"
     }
@@ -804,6 +1048,20 @@ try {
 
             $drive = $partition.DriveLetter
             $processedCount++
+
+            # Windows Server 2022 Gen2 can expose the offline loader's device or
+            # osdevice as unknown after a clone collision is released. Repair the
+            # mapping while the source GPT identity is still unchanged, before
+            # touching the registry hive. This prevents winload.efi 0xc0000225.
+            try {
+                Repair-UpdateRegistryUnknownBcdMapping -DiskNumber $partition.DiskNumber `
+                    -DiskPartitions @($partition.DiskPartitions) -WindowsDrive $drive
+            }
+            catch {
+                Write-ErrorLog "Boot-safety preflight failed for Disk $($partition.DiskNumber): $($_.Exception.Message)"
+                $failedCount++
+                continue
+            }
 
             $regPath = $drive + ':\Windows\System32\config\'
             if (-not (Test-Path $regPath)) {
@@ -999,15 +1257,23 @@ catch {
 finally {
     foreach ($mount in @($temporaryMounts | Sort-Object DiskNumber, PartitionNumber -Unique)) {
         try {
-            Invoke-UpdateRegistryDiskPart -Operation 'mount-cleanup' -Commands @(
-                "select disk $($mount.DiskNumber)"
-                "select partition $($mount.PartitionNumber)"
-                "remove letter=$($mount.DriveLetter) noerr"
-            )
-            Update-HostStorageCache -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                Invoke-UpdateRegistryDiskPart -Operation "mount-cleanup-attempt-$attempt" -Commands @(
+                    "select disk $($mount.DiskNumber)"
+                    "select partition $($mount.PartitionNumber)"
+                    "remove letter=$($mount.DriveLetter) noerr"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+                if (-not (Test-Path -LiteralPath "$($mount.DriveLetter):\" -PathType Container)) {
+                    break
+                }
+                if ($attempt -lt 3) {
+                    Write-WarningLog "Temporary letter $($mount.DriveLetter): remains mounted after cleanup attempt $attempt; retrying."
+                }
+            }
             if (Test-Path -LiteralPath "$($mount.DriveLetter):\" -PathType Container) {
-                throw 'Temporary drive letter removal could not be verified.'
+                throw 'Temporary drive letter removal could not be verified after three attempts.'
             }
         }
         catch {
