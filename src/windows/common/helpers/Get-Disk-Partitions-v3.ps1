@@ -26,6 +26,11 @@
 #   pattern for every script in this repo. A no-op fallback is defined if it was not, so the helper can
 #   be dot-sourced standalone for testing.
 #
+#   Logger.ps1's Log-* functions write to the success stream. Both functions here return data, so a
+#   direct Log-* call would make every log line part of the returned collection - a caller iterating
+#   Get-Windows-OsDrives-v3 would treat '[Info ...]found Windows installation on F:' as a drive letter.
+#   All logging therefore goes through Write-V3Log, which sends the formatted line to the host instead.
+#
 # .EXAMPLE
 #   . .\src\windows\common\setup\init.ps1
 #   . .\src\windows\common\helpers\Get-Disk-Partitions-v3.ps1
@@ -51,6 +56,23 @@ if (-not (Get-Command -Name 'Log-Info' -ErrorAction SilentlyContinue)) {
 }
 if (-not (Get-Command -Name 'Log-Warning' -ErrorAction SilentlyContinue)) {
     Set-Item -Path 'function:global:Log-Warning' -Value { Param([PSObject[]]$message) Write-Warning "$message" }
+}
+
+function Write-V3Log {
+    <#
+      Log-* write to the success stream, so calling them directly from a function that returns data
+      would append the log lines to that return value. Emitting to the host keeps the pipeline clean
+      while preserving Logger.ps1's exact format. The standalone shims above return nothing, so under
+      Pester the line goes to the verbose or warning stream instead and nothing is printed here.
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true)][ValidateSet('Info', 'Warning')][string]$Level,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $formatted = if ($Level -eq 'Warning') { Log-Warning $Message } else { Log-Info $Message }
+    if ($formatted) { Write-Host ($formatted -join [Environment]::NewLine) }
 }
 
 function Get-Disk-Partitions-v3 {
@@ -81,12 +103,12 @@ function Get-Disk-Partitions-v3 {
     }
 
     if (-not $disks) {
-        Log-Warning "Get-Disk-Partitions-v3: no attached data disks found for BusType filter '$BusTypeFilter'. Run 'Get-Disk | Select Number,BusType,IsBoot,IsSystem' to confirm what this VM can see."
+        Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: no attached data disks found for BusType filter '$BusTypeFilter'. Run 'Get-Disk | Select Number,BusType,IsBoot,IsSystem' to confirm what this VM can see."
         return $partitionList
     }
 
     ForEach ($disk in $disks) {
-        Log-Info "Get-Disk-Partitions-v3: evaluating disk $($disk.Number) (BusType=$($disk.BusType), Model='$($disk.Model)', Offline=$($disk.IsOffline))"
+        Write-V3Log -Level Info -Message "Get-Disk-Partitions-v3: evaluating disk $($disk.Number) (BusType=$($disk.BusType), Model='$($disk.Model)', Offline=$($disk.IsOffline))"
 
         if ($disk.IsOffline) {
             $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
@@ -99,17 +121,17 @@ function Get-Disk-Partitions-v3 {
         # "exposes no partitions", which is the silent-success failure this helper exists to remove.
         $diskState = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
         if (-not $diskState) {
-            Log-Warning "Get-Disk-Partitions-v3: disk $($disk.Number) could not be re-read after being brought online, skipping."
+            Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be re-read after being brought online, skipping."
             continue
         }
         if ($diskState.IsOffline -or $diskState.IsReadOnly) {
-            Log-Warning "Get-Disk-Partitions-v3: disk $($disk.Number) is still Offline=$($diskState.IsOffline) ReadOnly=$($diskState.IsReadOnly) after Set-Disk, so it cannot be repaired. Skipping."
+            Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) is still Offline=$($diskState.IsOffline) ReadOnly=$($diskState.IsReadOnly) after Set-Disk, so it cannot be repaired. Skipping."
             continue
         }
 
         $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
         if (-not $partitions) {
-            Log-Info "Get-Disk-Partitions-v3: disk $($disk.Number) exposes no partitions, skipping."
+            Write-V3Log -Level Info -Message "Get-Disk-Partitions-v3: disk $($disk.Number) exposes no partitions, skipping."
             continue
         }
 
@@ -123,11 +145,11 @@ function Get-Disk-Partitions-v3 {
 
         if ($labelledTemp.Count -gt 0) {
             if ($diskState.BusType -eq 'SCSI' -and $partitions.Count -eq 1) {
-                Log-Info "Get-Disk-Partitions-v3: disk $($disk.Number) is the Azure resource disk, skipping."
+                Write-V3Log -Level Info -Message "Get-Disk-Partitions-v3: disk $($disk.Number) is the Azure resource disk, skipping."
                 continue
             }
 
-            Log-Warning "Get-Disk-Partitions-v3: disk $($disk.Number) has a volume labelled '$($global:AzureTempDiskLabel)' but is BusType=$($diskState.BusType) with $($partitions.Count) partition(s), so it is not the resource disk and is being treated as a repair target."
+            Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) has a volume labelled '$($global:AzureTempDiskLabel)' but is BusType=$($diskState.BusType) with $($partitions.Count) partition(s), so it is not the resource disk and is being treated as a repair target."
         }
 
         $partitionList += $partitions
@@ -164,7 +186,7 @@ function Get-Windows-OsDrives-v3 {
         $systemHive = "${driveLetter}:\Windows\System32\config\SYSTEM"
 
         if (Test-Path -LiteralPath $systemHive) {
-            Log-Info "Get-Windows-OsDrives-v3: found Windows installation on ${driveLetter}:"
+            Write-V3Log -Level Info -Message "Get-Windows-OsDrives-v3: found Windows installation on ${driveLetter}:"
             $osDrives += $driveLetter
         }
     }
