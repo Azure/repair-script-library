@@ -128,5 +128,10 @@
 		"id": "win-crowdstrike-fix-bootloop-cvm",
 		"path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
+	},
+	{
+		"id": "win-detect-nvme-readiness",
+		"path": "src/windows/win-detect-nvme-readiness.ps1",
+		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Makes no changes. NOTE: use option --run-on-repair."
 	}
 ]
