@@ -85,7 +85,11 @@ function Get-Disk-Partitions-v3 {
     Param(
         [Parameter(Mandatory = $false)]
         [ValidateSet('Any', 'SCSI', 'NVMe')]
-        [string]$BusTypeFilter = 'Any'
+        [string]$BusTypeFilter = 'Any',
+
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(0, 300)]
+        [int]$DriveLetterTimeoutSeconds = 60
     )
 
     $busTypes = switch ($BusTypeFilter) {
@@ -110,6 +114,8 @@ function Get-Disk-Partitions-v3 {
     ForEach ($disk in $disks) {
         Write-V3Log -Level Info -Message "Get-Disk-Partitions-v3: evaluating disk $($disk.Number) (BusType=$($disk.BusType), Model='$($disk.Model)', Offline=$($disk.IsOffline))"
 
+        $wasOffline = [bool]$disk.IsOffline
+
         if ($disk.IsOffline) {
             $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
         }
@@ -130,6 +136,22 @@ function Get-Disk-Partitions-v3 {
         }
 
         $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
+
+        # Windows assigns drive letters asynchronously after a disk is brought online, so a disk that
+        # was offline on entry returns partitions with no letters for the first few seconds. Callers key
+        # off DriveLetter, so returning too early looks identical to an empty disk - the silent success
+        # this helper exists to remove. Only wait when this call did the onlining.
+        if ($wasOffline) {
+            $deadline = (Get-Date).AddSeconds($DriveLetterTimeoutSeconds)
+            while ((Get-Date) -lt $deadline -and -not (@($partitions | Where-Object { $_.DriveLetter }).Count)) {
+                Start-Sleep -Seconds 2
+                $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
+            }
+            if (-not (@($partitions | Where-Object { $_.DriveLetter }).Count)) {
+                Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) came online but no partition was assigned a drive letter within $DriveLetterTimeoutSeconds seconds. Partitions are still returned, but callers that need a path will find none."
+            }
+        }
+
         if (-not $partitions) {
             Write-V3Log -Level Info -Message "Get-Disk-Partitions-v3: disk $($disk.Number) exposes no partitions, skipping."
             continue
@@ -170,12 +192,16 @@ function Get-Windows-OsDrives-v3 {
     Param(
         [Parameter(Mandatory = $false)]
         [ValidateSet('Any', 'SCSI', 'NVMe')]
-        [string]$BusTypeFilter = 'Any'
+        [string]$BusTypeFilter = 'Any',
+
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(0, 300)]
+        [int]$DriveLetterTimeoutSeconds = 60
     )
 
     $osDrives = @()
 
-    ForEach ($partition in (Get-Disk-Partitions-v3 -BusTypeFilter $BusTypeFilter)) {
+    ForEach ($partition in (Get-Disk-Partitions-v3 -BusTypeFilter $BusTypeFilter -DriveLetterTimeoutSeconds $DriveLetterTimeoutSeconds)) {
         if ([string]::IsNullOrWhiteSpace($partition.DriveLetter)) { continue }
         if ($partition.DriveLetter -eq "`0") { continue }
 
