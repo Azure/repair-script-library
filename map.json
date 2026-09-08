@@ -90,6 +90,11 @@
 		"description" : "Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account."
 	},
 	{
+		"id" : "win-add-temp-user",
+		"path" : "src/windows/win-add-temp-user.ps1",
+		"description" : "Creates a local administrator account on an attached OS disk by booting it in the nested Hyper-V guest and letting Windows itself create the account, so the SAM database is never edited by hand. Uses the SYSTEM\\Setup CmdLine hook rather than a Group Policy startup script, which is what makes it work on a domain-joined VM where local Group Policy may not apply. Confirms the account exists afterwards by reading the offline SAM and the result the payload left behind, and reports an error if neither confirms it. The file carrying the password deletes itself, and the setup hook is cleared, so nothing is left on the disk. Pass detectOnly=true to report only, or revert=true to undo a run that did not complete. Requires the rescue VM to be created with \"az vm repair create --enable-nested\". NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-get-patches",
 		"path" : "src/windows/win-get-patches.ps1",
 		"description" : "Get installed Windows patches for the nested Hyper-V server on a Rescue VM using DISM."
