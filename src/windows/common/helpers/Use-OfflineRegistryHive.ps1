@@ -45,9 +45,12 @@
           reused only when its backing file is verified. Test-OfflineHiveFile copies hives
           into a per-run directory locked to SYSTEM and Administrators and checks its own
           unload and cleanup.
+    v1.2: Test-OfflineHiveFile uses the shared read-only offreg reader, avoiding registry
+          mounts and scratch hive copies. An unavailable reader aborts validation rather
+          than misclassifying the hive as corrupt. Writable HKLM-based helpers are unchanged.
 #>
 
-if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command Open-OfflineRegistryReader -ErrorAction SilentlyContinue)) {
     try {
         . (Join-Path $PSScriptRoot 'OfflineRepairCommon.ps1')
     }
@@ -622,33 +625,21 @@ function Backup-OfflineHiveFile {
 function Test-OfflineHiveFile {
     <#
     .SYNOPSIS
-        Reports whether a registry hive file is structurally loadable by Windows.
+        Reports whether the Windows Offline Registry Library can open a hive file.
 
     .DESCRIPTION
         A size and 'regf' signature check only proves the file looks like a hive. The
-        authoritative test is to have Windows parse it, which is done by loading a scratch
-        copy with reg.exe. The copy means the file on the offline disk is never modified by
-        the check, while log replay still happens exactly as it would at boot, so a dirty
-        hive whose logs are present and applicable is correctly reported as healthy.
+        parsing test uses the shared offreg reader. Hive recovery happens in memory using
+        matching logs beside the file; no HKLM key, scratch copy or source write is needed.
 
-        This is a test of whether Windows will load the file as it stands, not a verdict on
-        whether the data is recoverable. A hive left unreconciled with no usable logs, which
-        is the normal state of a RegBack copy, is reported invalid here even though chkreg
-        can recover it. Callers that have a recovery path must try it before giving up.
+        IsValid means offreg can open the file, not that Windows will boot or that every
+        hive structure is healthy. An unreconciled hive without usable logs may fail even
+        though chkreg can recover it. Callers must retain their separate structural and
+        recovery checks.
 
-        It is also not a corruption check. reg.exe loads a hive with wrecked bins without
-        complaining, so structural damage needs chkreg on top of this.
-
-        RegLoadAppKey is deliberately not used. It rejects primary OS hives with
-        ERROR_BADDB (1009): measured on a healthy Windows Server 2022 disk, SAM and
-        COMPONENTS load through it but SYSTEM and SOFTWARE always fail, while reg.exe
-        loads the same SYSTEM file without error.
-
-        The scratch copy is made inside a per-run directory that is locked to SYSTEM and
-        Administrators with inheritance disabled BEFORE any hive bytes are written, because
-        SAM and SECURITY carry credential material that must not be left readable under a
-        default TEMP ACL. The validation unload is confirmed and the directory is deleted
-        afterwards; a copy that survives cleanup is reported as an error, not ignored.
+        Missing offreg.dll, type initialisation failures and a failed close throw: they are
+        environment/cleanup failures, not a reason to restore or repair a customer's hive.
+        This does not change Invoke-WithHive's writable HKLM-based contract.
 
     .OUTPUTS
         PSCustomObject with Path, Exists, Size, IsValid and Reason.
@@ -656,6 +647,8 @@ function Test-OfflineHiveFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path
     )
+
+    Initialize-OfflineRegistryReader
 
     $result = [PSCustomObject]@{
         Path    = $Path
@@ -665,9 +658,7 @@ function Test-OfflineHiveFile {
         Reason  = $null
     }
 
-    $scratchDir = $null
-    $mountKey = "RSLVALIDATE$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $mounted = $false
+    $reader = $null
     try {
         if (-not (Test-OfflinePath $Path)) { throw 'File does not exist.' }
 
@@ -684,57 +675,14 @@ function Test-OfflineHiveFile {
         try { [void]$stream.Read($header, 0, 4) } finally { $stream.Dispose() }
         if ([System.Text.Encoding]::ASCII.GetString($header) -ne 'regf') { throw "Hive header signature 'regf' is missing." }
 
-        # Create the scratch directory and lock it down BEFORE copying any hive bytes into it,
-        # so SAM/SECURITY credential material is never written out under an inheritable TEMP ACL.
-        $scratchDir = Join-Path ([System.IO.Path]::GetTempPath()) ("rsl-hive-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N'))
-        [void][System.IO.Directory]::CreateDirectory($scratchDir)
-        $acl = Get-Acl -LiteralPath $scratchDir
-        $acl.SetAccessRuleProtection($true, $false)
-        foreach ($existingRule in @($acl.Access)) { [void]$acl.RemoveAccessRule($existingRule) }
-        $inheritBoth = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-        $noPropagation = [System.Security.AccessControl.PropagationFlags]::None
-        $allow = [System.Security.AccessControl.AccessControlType]::Allow
-        $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
-        foreach ($wellKnownSid in @([System.Security.Principal.WellKnownSidType]::LocalSystemSid, [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid)) {
-            $sid = [System.Security.Principal.SecurityIdentifier]::new($wellKnownSid, $null)
-            $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $fullControl, $inheritBoth, $noPropagation, $allow))
-        }
-        Set-Acl -LiteralPath $scratchDir -AclObject $acl -ErrorAction Stop
-
-        $scratchHive = Join-Path $scratchDir ([System.IO.Path]::GetFileName($Path))
-        Copy-Item -LiteralPath $Path -Destination $scratchHive -Force -ErrorAction Stop
-
-        # The transaction logs travel with the hive so that a dirty hive is recovered the
-        # way Windows would recover it, instead of being reported as damaged.
-        foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
-            if (Test-OfflinePath "$Path$suffix") {
-                Copy-Item -LiteralPath "$Path$suffix" -Destination "$scratchHive$suffix" -Force -ErrorAction SilentlyContinue
-            }
-        }
-
-        $loadOutput = & reg.exe load "HKLM\$mountKey" $scratchHive 2>&1 | ForEach-Object { "$_" }
-        if ($LASTEXITCODE -ne 0) { throw "Windows could not load the hive: $((@($loadOutput) -join ' ').Trim())" }
-        $mounted = $true
-
+        $reader = [RslOffline.RegistryHiveReader]::Open($Path)
         $result.IsValid = $true
     }
     catch {
         $result.Reason = $_.Exception.Message
     }
     finally {
-        if ($mounted) {
-            # Confirm the validation mount is gone; a copy left loaded keeps the scratch file locked.
-            if (-not (Invoke-OfflineRegUnload -HiveKey "HKLM\$mountKey")) {
-                Add-OfflineRepairLog -Level Error -Message "Could not unload the validation hive HKLM\$mountKey; a scratch copy of '$Path' may remain loaded."
-            }
-        }
-        if ($scratchDir -and (Test-Path -LiteralPath $scratchDir)) {
-            Remove-Item -LiteralPath $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $scratchDir) {
-                # A surviving copy of SAM/SECURITY is a credential exposure, so it is surfaced, not swallowed.
-                Add-OfflineRepairLog -Level Error -Message "Could not remove the validation scratch directory '$scratchDir'; it may hold a copy of hive '$Path' (which can include SAM/SECURITY credential material). Remove it manually."
-            }
-        }
+        if ($reader) { $reader.Dispose() }
     }
 
     return $result
