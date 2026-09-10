@@ -916,16 +916,16 @@ try {
     $graceful = Stop-NestedRepairVmGraceful -Vm $vmState.Vm
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
+    if (-not $graceful.Stopped) {
+        Log-Error "The nested guest could not be confirmed stopped: $($graceful.Reason). Its disk is not taken back while it may still be in use." | Tee-Object -FilePath $logFile -Append
+        return $STATUS_ERROR
+    }
     if (-not $graceful.Graceful) {
         Log-Warning "The guest did not shut down cleanly: $($graceful.Reason). The Setup hook is re-checked below and repaired from here if the payload's own reset was lost." | Tee-Object -FilePath $logFile -Append
     }
 
-    $null = Stop-NestedRepairVm
-    $null = Set-OfflineDisksOnline
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
     # The drive letters are re-resolved because the disk went away and came back.
-    $offlineAfter = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
+    $offlineAfter = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive -DiskNumber $offline.DiskNumber
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
     if ($offlineAfter -and $offlineAfter.WindowsPath) {
