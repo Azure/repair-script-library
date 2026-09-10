@@ -30,11 +30,12 @@
 #     - The offline SAM hive, where a local account appears as a key under
 #       SAM\Domains\Account\Users\Names.
 #
-#   If neither confirms the account, the run reports failure. It never reports success for an account
-#   it did not observe.
+#   Success requires the complete guest result to confirm creation, administrator membership and
+#   enablement for the requested name. SAM presence alone is not proof of creation, and a readable
+#   SAM that contradicts the result causes failure.
 #
-#   The payload deletes itself and clears the hook it ran from, so the password is not left in a file
-#   on the disk and the VM does not re-enter setup mode on its next boot.
+#   The payload deletes itself and clears its hook. The rescue VM verifies cleanup and restores both
+#   recorded Setup values; incomplete cleanup returns failure and retains recovery metadata.
 #
 # .RESOLVES
 #   Lost or disabled local administrator on a VM that still boots. Not a no-boot repair: the disk has
@@ -44,10 +45,12 @@
 #   Account to create. Defaults to 'azrepairadmin'. Must not already exist on the disk.
 #
 # .PARAMETER password
-#   Password for the account. When omitted a compliant password is generated and printed once.
+#   Password for the account. When omitted a cryptographically generated password is printed once.
+#   Supplied values must use printable ASCII without double quotes for lossless batch transport.
 #
 # .PARAMETER detectOnly
-#   Report what is on the disk and change nothing.
+#   Inspect without creating an account or applying a Setup hook. Discovery can stop the unmanaged
+#   repair guest and prepare attached disks; writable hive reads may recover dirty hives.
 #
 # .PARAMETER revert
 #   Undo the Setup hook and remove the payload. The account itself is reported, not deleted, because
@@ -77,7 +80,8 @@
 #   that value to the next positional parameter.
 #
 #   The password is printed to the run output because that is the only way it reaches the engineer.
-#   It is not written to the log file, and the payload that carries it is deleted from the disk.
+#   It is not written to the desktop log, but the delivery service may retain the run output.
+#   The payload that carries it is deleted from the disk; failures require the reported recovery.
 #
 # .VERSION
 #   v1.0: Initial version.
@@ -168,19 +172,34 @@ function New-TempUserPassword {
     $digit = '23456789'
     $special = '!@#$%^&*()-_=+'
 
-    $chars = @(
-        $lower[(Get-Random -Maximum $lower.Length)]
-        $upper[(Get-Random -Maximum $upper.Length)]
-        $digit[(Get-Random -Maximum $digit.Length)]
-        $special[(Get-Random -Maximum $special.Length)]
-    )
-
-    $all = $lower + $upper + $digit + $special
-    for ($i = 0; $i -lt 12; $i++) {
-        $chars += $all[(Get-Random -Maximum $all.Length)]
+    $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $nextIndex = {
+            param([int]$UpperBound)
+            [byte[]]$byte = New-Object byte[] 1
+            $limit = 256 - (256 % $UpperBound)
+            do { $random.GetBytes($byte) } while ([int]$byte[0] -ge $limit)
+            return ([int]$byte[0] % $UpperBound)
+        }
+        $chars = @(
+            $lower[(& $nextIndex $lower.Length)]
+            $upper[(& $nextIndex $upper.Length)]
+            $digit[(& $nextIndex $digit.Length)]
+            $special[(& $nextIndex $special.Length)]
+        )
+        $all = $lower + $upper + $digit + $special
+        for ($i = 0; $i -lt 12; $i++) {
+            $chars += $all[(& $nextIndex $all.Length)]
+        }
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $other = & $nextIndex ($i + 1)
+            $saved = $chars[$i]
+            $chars[$i] = $chars[$other]
+            $chars[$other] = $saved
+        }
+        return -join $chars
     }
-
-    return -join ($chars | Sort-Object { Get-Random })
+    finally { $random.Dispose() }
 }
 
 function Test-TempUserName {
@@ -332,7 +351,7 @@ function Get-OfflineSetupState {
 
     $state.Available = $true
     if ($null -ne $props.SetupType) { $state.SetupType = [int]$props.SetupType }
-    if ($null -ne $props.CmdLine) { $state.CmdLine = "$($props.CmdLine)".Trim() }
+    if ($null -ne $props.CmdLine) { $state.CmdLine = "$($props.CmdLine)" }
 
     return $state
 }
@@ -343,7 +362,7 @@ function Set-OfflineSetupHook {
         Points SYSTEM\Setup\CmdLine at the payload and puts the disk into setup mode.
 
     .DESCRIPTION
-        The command is written as 'cmd.exe /c "<payload>"'. The program part is cmd.exe, which
+        The command is written as 'cmd.exe /d /c "<payload>"'. The program part is cmd.exe, which
         always exists in System32, so win-fix-logon-subsystem resolves it and classifies the entry
         as an active setup command rather than a dangling one it should clear.
 
@@ -374,7 +393,7 @@ function Set-OfflineSetupHook {
     $result.PreviousSetupType = $before.SetupType
     $result.PreviousCmdLine = $before.CmdLine
 
-    $command = 'cmd.exe /c "{0}"' -f $GuestPayloadPath
+    $command = 'cmd.exe /d /c "{0}"' -f $GuestPayloadPath
     $setupType = $script:SetupTypeRunCmdLine
 
     try {
@@ -440,7 +459,10 @@ function Restore-OfflineSetupHook {
             $key = 'HKLM:\BROKENSYSTEM\Setup'
             Set-ItemProperty -Path $key -Name 'SetupType' -Value $targetSetupType -Type DWord -Force -ErrorAction Stop
             if ([string]::IsNullOrWhiteSpace($targetCmdLine)) {
-                Remove-ItemProperty -Path $key -Name 'CmdLine' -Force -ErrorAction SilentlyContinue
+                $current = Get-ItemProperty -Path $key -ErrorAction Stop
+                if ($current.PSObject.Properties.Name -contains 'CmdLine') {
+                    Remove-ItemProperty -Path $key -Name 'CmdLine' -Force -ErrorAction Stop
+                }
             }
             else {
                 Set-ItemProperty -Path $key -Name 'CmdLine' -Value $targetCmdLine -Type String -Force -ErrorAction Stop
@@ -459,8 +481,27 @@ function Restore-OfflineSetupHook {
         return $result
     }
 
+    $expectedCmdLine = if ([string]::IsNullOrWhiteSpace($CmdLine)) { '' } else { $CmdLine }
+    if ([string]$readBack.CmdLine -cne $expectedCmdLine) {
+        $result.Reason = 'CmdLine did not read back as the recorded previous value after being restored'
+        return $result
+    }
+
     $result.Restored = $true
     return $result
+}
+
+function ConvertTo-TempUserBatchArgument {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    # Ignore-case matching folds some non-ASCII characters onto ASCII letters.
+    if ($Value -cmatch '["\x00-\x1f\x7f-\uffff]') {
+        throw "$Label must use printable ASCII characters without double quotes; the boot payload cannot transport other characters safely."
+    }
+    return $Value.Replace('%', '%%')
 }
 
 function Write-TempUserPayload {
@@ -487,8 +528,9 @@ function Write-TempUserPayload {
         password in it, on the disk permanently. It is also the signal that the payload ran to the
         end, since it is the last line: if the file is still there, the run stopped early.
 
-        The file is written as ASCII with CRLF because cmd.exe will not reliably parse a batch file
-        saved as UTF-8 with a byte order mark.
+        The file uses ASCII with CRLF. Unsupported characters are rejected, percent signs are
+        escaped and delayed expansion is disabled. Group/enable operations run only after creation
+        succeeds, so a name collision cannot promote an existing account.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '',
         Justification = 'The payload is a .cmd file that hands the password to net.exe, so it has to be plain text by the time it is written. The file deletes itself after it runs.')]
@@ -503,6 +545,17 @@ function Write-TempUserPayload {
 
     $result = [PSCustomObject]@{ Written = $false; Reason = $null }
 
+    try {
+        $batchUser = ConvertTo-TempUserBatchArgument -Value $UserName -Label 'username'
+        $batchPassword = ConvertTo-TempUserBatchArgument -Value $Password -Label 'password'
+        $batchResult = ConvertTo-TempUserBatchArgument -Value $GuestResultPath -Label 'result path'
+        $echoUser = $batchUser -replace '([&^<>|()])', '^$1'
+    }
+    catch {
+        $result.Reason = $_.Exception.Message
+        return $result
+    }
+
     $parent = Split-Path -Path $PayloadPath -Parent
     if (-not (Test-Path -LiteralPath $parent)) {
         try { New-Item -Path $parent -ItemType Directory -Force -ErrorAction Stop | Out-Null }
@@ -514,17 +567,22 @@ function Write-TempUserPayload {
 
     $lines = @(
         '@echo off'
-        'setlocal'
-        'set RESULT=' + $GuestResultPath
-        'net user "' + $UserName + '" "' + $Password + '" /add /y'
+        'setlocal DisableDelayedExpansion'
+        'set "RESULT=' + $batchResult + '"'
+        'net user "' + $batchUser + '" "' + $batchPassword + '" /add /y'
         'set RC_ADD=%ERRORLEVEL%'
-        'net localgroup Administrators "' + $UserName + '" /add'
+        'set RC_ADMIN=skipped'
+        'set RC_RDP=skipped'
+        'set RC_ACTIVE=skipped'
+        'if not "%RC_ADD%"=="0" goto write_result'
+        'net localgroup Administrators "' + $batchUser + '" /add'
         'set RC_ADMIN=%ERRORLEVEL%'
-        'net localgroup "Remote Desktop Users" "' + $UserName + '" /add'
+        'net localgroup "Remote Desktop Users" "' + $batchUser + '" /add'
         'set RC_RDP=%ERRORLEVEL%'
-        'net user "' + $UserName + '" /active:yes'
+        'net user "' + $batchUser + '" /active:yes'
         'set RC_ACTIVE=%ERRORLEVEL%'
-        '> "%RESULT%" echo user=' + $UserName
+        ':write_result'
+        '> "%RESULT%" echo user=' + $echoUser
         '>> "%RESULT%" echo add=%RC_ADD%'
         '>> "%RESULT%" echo admin=%RC_ADMIN%'
         '>> "%RESULT%" echo rdp=%RC_RDP%'
@@ -545,14 +603,14 @@ function Write-TempUserPayload {
         return $result
     }
 
-    if (-not (Test-Path -LiteralPath $PayloadPath)) {
-        $result.Reason = "the payload was written to '$PayloadPath' but the file is not there"
-        return $result
+    try {
+        if ([System.IO.File]::ReadAllText($PayloadPath, [System.Text.Encoding]::ASCII) -cne $text) {
+            $result.Reason = 'the payload did not read back exactly as written'
+            return $result
+        }
     }
-
-    $written = (Get-Item -LiteralPath $PayloadPath).Length
-    if ($written -le 0) {
-        $result.Reason = "the payload at '$PayloadPath' is empty"
+    catch {
+        $result.Reason = "the payload could not be read back: $($_.Exception.Message)"
         return $result
     }
 
@@ -566,9 +624,8 @@ function Read-TempUserResult {
         Reads the result file the payload wrote inside the guest.
 
     .OUTPUTS
-        PSCustomObject with Present, Complete, User, Codes and Reason. Complete is true only when
-        the payload reached its final line, which distinguishes a payload that failed part way
-        through from one that never ran.
+        PSCustomObject with Present, Complete, User, Codes and Reason. Complete requires the account
+        name, all command results and the completion marker. Setup cleanup is verified separately.
     #>
     param([Parameter(Mandatory = $true)][string]$ResultPath)
 
@@ -596,16 +653,19 @@ function Read-TempUserResult {
     }
 
     foreach ($line in $lines) {
-        $text = "$line".Trim()
+        $text = "$line"
         if ($text -notmatch '^([A-Za-z]+)=(.*)$') { continue }
         $name = $Matches[1].ToLowerInvariant()
-        $value = $Matches[2].Trim()
+        $value = $Matches[2]
 
         if ($name -eq 'user') { $result.User = $value }
-        else { $result.Codes[$name] = $value }
+        else { $result.Codes[$name] = $value.Trim() }
     }
 
-    $result.Complete = ($result.Codes.ContainsKey('done') -and $result.Codes['done'] -eq '1')
+    $required = @('add', 'admin', 'rdp', 'active', 'done')
+    $missing = @($required | Where-Object { -not $result.Codes.ContainsKey($_) })
+    $result.Complete = ($missing.Count -eq 0 -and $result.Codes['done'] -eq '1' -and
+        -not [string]::IsNullOrWhiteSpace($result.User))
     if (-not $result.Complete) {
         $result.Reason = 'the payload left a result file but did not reach its final line, so it failed part way through'
     }
@@ -628,38 +688,64 @@ function Write-RevertManifest {
         [Parameter(Mandatory = $true)][hashtable]$Entry
     )
 
-    $existing = $null
-    if (Test-Path -LiteralPath $ManifestPath) {
-        try { $existing = Get-Content -LiteralPath $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json }
-        catch { $existing = $null }
+    $existing = Read-RevertManifest -ManifestPath $ManifestPath
+    if ($null -ne $existing -and $existing.UserName -ine $Entry.UserName) {
+        throw 'A different account has a pending revert manifest. Revert that run before creating another account.'
     }
 
     $merged = @{}
     if ($null -ne $existing) {
         foreach ($property in $existing.PSObject.Properties) { $merged[$property.Name] = $property.Value }
     }
-    foreach ($key in $Entry.Keys) { $merged[$key] = $Entry[$key] }
-
-    $parent = Split-Path -Path $ManifestPath -Parent
-    if (-not (Test-Path -LiteralPath $parent)) {
-        New-Item -Path $parent -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+    foreach ($key in $Entry.Keys) {
+        if ($key -in @('PreviousSetupType', 'PreviousCmdLine') -and $merged.ContainsKey($key)) { continue }
+        $merged[$key] = $Entry[$key]
     }
 
-    ($merged | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $ManifestPath -Encoding UTF8 -Force
+    $parent = Split-Path -Path $ManifestPath -Parent
+    [void][IO.Directory]::CreateDirectory($parent)
+    $temporary = Join-Path $parent ('win-add-temp-user-manifest-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $json = $merged | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::ReadAllText($temporary) -cne $json) {
+            throw 'The revert manifest did not read back exactly as written.'
+        }
+        if ([IO.File]::Exists($ManifestPath)) {
+            [IO.File]::Replace($temporary, $ManifestPath, [NullString]::Value)
+        }
+        else {
+            [IO.File]::Move($temporary, $ManifestPath)
+        }
+    }
+    finally {
+        if ([IO.File]::Exists($temporary)) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }
+    }
 }
 
 function Read-RevertManifest {
     param([Parameter(Mandatory = $true)][string]$ManifestPath)
 
-    if (-not (Test-Path -LiteralPath $ManifestPath)) { return $null }
+    if (-not (Test-Path -LiteralPath $ManifestPath -ErrorAction Stop)) { return $null }
 
     try {
         $raw = Get-Content -LiteralPath $ManifestPath -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return ($raw | ConvertFrom-Json)
+        if ([string]::IsNullOrWhiteSpace($raw)) { throw 'the manifest is empty' }
+        $manifest = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $manifest -or
+            $manifest.PSObject.Properties.Name -notcontains 'PreviousSetupType' -or
+            $manifest.PSObject.Properties.Name -notcontains 'PreviousCmdLine' -or
+            [string]::IsNullOrWhiteSpace($manifest.UserName)) {
+            throw 'the manifest is missing the original Setup state or account name'
+        }
+        $value = 0
+        if (-not [int]::TryParse([string]$manifest.PreviousSetupType, [ref]$value) -or $value -lt 0) {
+            throw 'the recorded SetupType is invalid'
+        }
+        return $manifest
     }
     catch {
-        return $null
+        throw "The revert manifest could not be read safely: $($_.Exception.Message). It was retained for recovery."
     }
 }
 
@@ -667,364 +753,455 @@ function Read-RevertManifest {
 # Main
 #########################################################################################################
 
+$status = $STATUS_ERROR
+$hookNeedsRecovery = $false
+$guestMayBeRunning = $false
+$offlineAccessible = $false
+$payloadNeedsCleanup = $false
+
 try {
-    Log-Output "START: Running script $scriptName" | Tee-Object -FilePath $logFile -Append
-    $scriptStartTime | Out-File -FilePath $logFile -Append
+    :scenario do {
+        Log-Output "START: Running script $scriptName" | Tee-Object -FilePath $logFile -Append
+        $scriptStartTime | Out-File -FilePath $logFile -Append
 
-    Clear-OfflineRepairLog
+        Clear-OfflineRepairLog
 
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    if (-not $offline -or -not $offline.WindowsPath) {
-        Log-Error 'No offline Windows installation was found on the attached disk.' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    $windowsPath = $offline.WindowsPath
-    Log-Output "Offline Windows installation: $windowsPath" | Tee-Object -FilePath $logFile -Append
-
-    $payloadPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:PayloadRelativePath
-    $resultPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ResultRelativePath
-    $manifestPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ManifestRelativePath
-
-    # The guest sees its own Windows directory, which is not the drive letter it has on the rescue VM.
-    $guestWindows = 'C:\Windows'
-    $guestPayloadPath = "$guestWindows\$($script:PayloadRelativePath)"
-    $guestResultPath = "$guestWindows\$($script:ResultRelativePath)"
-
-    #####################################################################################################
-    # Revert
-    #####################################################################################################
-    if ($isRevert) {
-        Log-Output 'REVERT: undoing the Setup hook and removing the payload.' | Tee-Object -FilePath $logFile -Append
-
-        $manifest = Read-RevertManifest -ManifestPath $manifestPath
-        if ($null -eq $manifest) {
-            Log-Warning 'No revert manifest was found, so there is nothing recorded to undo.' | Tee-Object -FilePath $logFile -Append
+        if ($isDetectOnly -and $isRevert) {
+            Log-Error 'detectOnly=true and revert=true cannot be combined. Select detection or rollback.' | Tee-Object -FilePath $logFile -Append
+            break scenario
         }
 
-        $restoredCount = 0
+        $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-        if ($null -ne $manifest -and $null -ne $manifest.PreviousSetupType) {
-            $restore = Restore-OfflineSetupHook -WindowsPath $windowsPath `
-                -SetupType ([int]$manifest.PreviousSetupType) `
-                -CmdLine "$($manifest.PreviousCmdLine)"
-
-            if ($restore.Restored) {
-                Log-Output "Setup hook restored to SetupType=$([int]$manifest.PreviousSetupType)." | Tee-Object -FilePath $logFile -Append
-                $restoredCount++
-            }
-            else {
-                Log-Warning "The Setup hook could not be restored: $($restore.Reason)" | Tee-Object -FilePath $logFile -Append
-            }
+        if (-not $offline -or -not $offline.WindowsPath) {
+            Log-Error 'No offline Windows installation was found on the attached disk.' | Tee-Object -FilePath $logFile -Append
+            break scenario
         }
 
-        foreach ($stale in @($payloadPath, $resultPath)) {
-            if (Test-Path -LiteralPath $stale) {
-                Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
-                if (Test-Path -LiteralPath $stale) {
-                    Log-Warning "'$stale' could not be removed." | Tee-Object -FilePath $logFile -Append
+        $windowsPath = $offline.WindowsPath
+        $offlineAccessible = $true
+        Log-Output "Offline Windows installation: $windowsPath" | Tee-Object -FilePath $logFile -Append
+
+        $payloadPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:PayloadRelativePath
+        $resultPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ResultRelativePath
+        $manifestPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ManifestRelativePath
+
+        # The guest sees its own Windows directory, which is not the drive letter it has on the rescue VM.
+        $guestWindows = 'C:\Windows'
+        $guestPayloadPath = "$guestWindows\$($script:PayloadRelativePath)"
+        $guestResultPath = "$guestWindows\$($script:ResultRelativePath)"
+
+        #####################################################################################################
+        # Revert
+        #####################################################################################################
+        if ($isRevert) {
+            Log-Output 'REVERT: undoing the Setup hook and removing the payload.' | Tee-Object -FilePath $logFile -Append
+
+            $manifest = Read-RevertManifest -ManifestPath $manifestPath
+            if ($null -eq $manifest) {
+                $unrecordedState = Get-OfflineSetupState -WindowsPath $windowsPath
+                if (-not $unrecordedState.Available -or $unrecordedState.SetupType -ne 0 -or
+                    $unrecordedState.CmdLine -like "*$($script:PayloadRelativePath.Replace('\','*'))*") {
+                    Log-Error 'No revert manifest is available and the Setup state is unreadable or still active. Its original values cannot be inferred safely; diagnose this state before restoring the disk.' | Tee-Object -FilePath $logFile -Append
+                    break scenario
                 }
-                else {
-                    Log-Output "Removed '$stale'." | Tee-Object -FilePath $logFile -Append
+                Log-Warning 'No revert manifest was found and no active Setup hook was observed; only leftover payload/result files will be removed.' | Tee-Object -FilePath $logFile -Append
+            }
+
+            $restoredCount = 0
+            $revertFailed = $false
+
+            if ($null -ne $manifest -and $null -ne $manifest.PreviousSetupType) {
+                $restore = Restore-OfflineSetupHook -WindowsPath $windowsPath `
+                    -SetupType ([int]$manifest.PreviousSetupType) `
+                    -CmdLine "$($manifest.PreviousCmdLine)"
+
+                if ($restore.Restored) {
+                    Log-Output "Setup hook restored to SetupType=$([int]$manifest.PreviousSetupType)." | Tee-Object -FilePath $logFile -Append
                     $restoredCount++
                 }
+                else {
+                    Log-Warning "The Setup hook could not be restored: $($restore.Reason)" | Tee-Object -FilePath $logFile -Append
+                    $revertFailed = $true
+                }
             }
-        }
 
-        if ($null -ne $manifest -and $manifest.UserName) {
-            $check = Test-OfflineLocalUser -WindowsPath $windowsPath -Name "$($manifest.UserName)"
-            if ($check.Known -and $check.Exists) {
-                Log-Warning "The account '$($manifest.UserName)' still exists on this disk. It is not deleted here, because deleting an account means editing the SAM hive by hand. Remove it from inside the VM with: net user `"$($manifest.UserName)`" /delete" | Tee-Object -FilePath $logFile -Append
+            foreach ($stale in @($payloadPath, $resultPath)) {
+                if (Test-Path -LiteralPath $stale -ErrorAction Stop) {
+                    Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+                    if (Test-Path -LiteralPath $stale -ErrorAction Stop) {
+                        Log-Warning "'$stale' could not be removed." | Tee-Object -FilePath $logFile -Append
+                        $revertFailed = $true
+                    }
+                    else {
+                        Log-Output "Removed '$stale'." | Tee-Object -FilePath $logFile -Append
+                        $restoredCount++
+                    }
+                }
             }
+
+            if ($null -ne $manifest -and $manifest.UserName) {
+                $check = Test-OfflineLocalUser -WindowsPath $windowsPath -Name "$($manifest.UserName)"
+                if ($check.Known -and $check.Exists) {
+                    Log-Warning "The account '$($manifest.UserName)' still exists on this disk. It is not deleted here, because deleting an account means editing the SAM hive by hand. Remove it from inside the VM with: net user `"$($manifest.UserName)`" /delete" | Tee-Object -FilePath $logFile -Append
+                }
+            }
+
+            if ($revertFailed) {
+                Log-Error 'REVERT INCOMPLETE: the manifest was retained. Resolve the reported failure and retry -revert true.' | Tee-Object -FilePath $logFile -Append
+                break scenario
+            }
+            if (Test-Path -LiteralPath $manifestPath -ErrorAction Stop) {
+                Remove-Item -LiteralPath $manifestPath -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $manifestPath -ErrorAction Stop) {
+                    throw 'The completed revert manifest could not be removed.'
+                }
+            }
+            if ($null -ne $manifest -and [int]$manifest.PreviousSetupType -ne 0) {
+                Log-Warning "The recorded previous SetupType was $($manifest.PreviousSetupType) and has been preserved. Diagnose that pre-existing setup state before restoring the disk; repeating revert will not reset it to zero." | Tee-Object -FilePath $logFile -Append
+            }
+
+            Log-Output "REVERT COMPLETE: restored $restoredCount item(s)." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break scenario
         }
 
-        if (Test-Path -LiteralPath $manifestPath) {
-            Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+        #####################################################################################################
+        # Detect
+        #####################################################################################################
+        $findings = New-Object System.Collections.ArrayList
+
+        $nameCheck = Test-TempUserName -Name $username
+        if (-not $nameCheck.Valid) {
+            Log-Error "The requested user name cannot be used: $($nameCheck.Reason)." | Tee-Object -FilePath $logFile -Append
+            break scenario
         }
 
-        Log-Output "REVERT COMPLETE: restored $restoredCount item(s)." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
+        $setupState = Get-OfflineSetupState -WindowsPath $windowsPath
+        if (-not $setupState.Available) {
+            Log-Error "The Setup hook cannot be used on this disk: $($setupState.Reason)." | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
 
-    #####################################################################################################
-    # Detect
-    #####################################################################################################
-    $findings = New-Object System.Collections.ArrayList
+        Log-Output "SYSTEM\Setup\SetupType is $($setupState.SetupType)." | Tee-Object -FilePath $logFile -Append
+        if (-not [string]::IsNullOrWhiteSpace($setupState.CmdLine)) {
+            Log-Output "SYSTEM\Setup\CmdLine is '$($setupState.CmdLine)'." | Tee-Object -FilePath $logFile -Append
+        }
 
-    $nameCheck = Test-TempUserName -Name $username
-    if (-not $nameCheck.Valid) {
-        Log-Error "The requested user name cannot be used: $($nameCheck.Reason)." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    $setupState = Get-OfflineSetupState -WindowsPath $windowsPath
-    if (-not $setupState.Available) {
-        Log-Error "The Setup hook cannot be used on this disk: $($setupState.Reason)." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    Log-Output "SYSTEM\Setup\SetupType is $($setupState.SetupType)." | Tee-Object -FilePath $logFile -Append
-    if (-not [string]::IsNullOrWhiteSpace($setupState.CmdLine)) {
-        Log-Output "SYSTEM\Setup\CmdLine is '$($setupState.CmdLine)'." | Tee-Object -FilePath $logFile -Append
-    }
-
-    $userState = Test-OfflineLocalUser -WindowsPath $windowsPath -Name $username
-    if ($userState.Known) {
-        if ($userState.Exists) {
-            [void]$findings.Add((New-Finding -Cause 'AccountAlreadyExists' -Item $username -Repairable $false `
-                        -Message "A local account named '$username' already exists on this disk. Choose another name with -username, or reset that account's password instead of creating a new one."))
+        $userState = Test-OfflineLocalUser -WindowsPath $windowsPath -Name $username
+        if ($userState.Known) {
+            if ($userState.Exists) {
+                [void]$findings.Add((New-Finding -Cause 'AccountAlreadyExists' -Item $username -Repairable $false `
+                            -Message "A local account named '$username' already exists on this disk. Choose another name with -username, or reset that account's password instead of creating a new one."))
+            }
+            else {
+                Log-Output "No local account named '$username' exists on this disk." | Tee-Object -FilePath $logFile -Append
+            }
         }
         else {
-            Log-Output "No local account named '$username' exists on this disk." | Tee-Object -FilePath $logFile -Append
+            Log-Warning "The existing local accounts could not be listed: $($userState.Reason)" | Tee-Object -FilePath $logFile -Append
+            Log-Warning 'The run requires a complete successful account-creation result from the guest. Existing accounts will not be promoted or enabled if creation fails.' | Tee-Object -FilePath $logFile -Append
         }
-    }
-    else {
-        Log-Warning "The existing local accounts could not be listed: $($userState.Reason)" | Tee-Object -FilePath $logFile -Append
-        Log-Warning 'The run continues, but a name collision cannot be ruled out in advance and will surface as a failed payload.' | Tee-Object -FilePath $logFile -Append
-    }
 
-    # A setup command that is already present and points at something real is a genuine servicing or
-    # provisioning step. Overwriting it would destroy work the image is in the middle of.
-    if ($setupState.SetupType -ne 0 -and -not [string]::IsNullOrWhiteSpace($setupState.CmdLine) -and
-        $setupState.CmdLine -notlike "*$($script:PayloadRelativePath.Replace('\','*'))*") {
-        [void]$findings.Add((New-Finding -Cause 'SetupHookInUse' -Item 'CmdLine' -Repairable $false `
-                    -Message "SYSTEM\Setup is already in setup mode running '$($setupState.CmdLine)'. That is left alone, because overwriting it would discard a servicing or provisioning step this image is part way through. Let the VM finish that boot, or clear it with win-fix-logon-subsystem, then run this script again."))
-    }
-
-    $vmState = Get-NestedRepairVm
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    if (-not $vmState.Found) {
-        [void]$findings.Add((New-Finding -Cause 'NoNestedGuest' -Item 'ProblemVM' -Repairable $false `
-                    -Message "There is no nested Hyper-V guest to boot this disk in: $($vmState.Reason). This repair needs one, because the account is created by the running guest rather than by editing SAM offline. Re-create the rescue VM with 'az vm repair create --enable-nested'."))
-    }
-    else {
-        Log-Output "Nested guest '$($vmState.Name)' found, generation $($vmState.Generation), state $($vmState.State)." | Tee-Object -FilePath $logFile -Append
-    }
-
-    $blocking = @($findings | Where-Object { -not $_.Repairable })
-
-    if ($findings.Count -eq 0) {
-        Log-Output "DETECT: ready to create '$username' through the Setup hook." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        foreach ($finding in $findings) {
-            $prefix = if ($finding.Repairable) { 'REPAIRABLE' } else { 'BLOCKING  ' }
-            Log-Output "  [$prefix] $($finding.Cause): $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        # A setup command that is already present and points at something real is a genuine servicing or
+        # provisioning step. Overwriting it would destroy work the image is in the middle of.
+        if ($setupState.SetupType -ne 0) {
+            [void]$findings.Add((New-Finding -Cause 'SetupHookInUse' -Item 'CmdLine' -Repairable $false `
+                        -Message "SYSTEM\Setup already has SetupType=$($setupState.SetupType). This state is preserved even when CmdLine is empty. Revert a previous run of this script, or diagnose the pre-existing servicing/provisioning state before creating an account."))
         }
-        # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
-        # so a summary printed first is the first thing a long run loses.
-        Log-Output "DETECT: $($findings.Count) finding(s)." | Tee-Object -FilePath $logFile -Append
-    }
+        if (Test-Path -LiteralPath $manifestPath -ErrorAction Stop) {
+            [void]$findings.Add((New-Finding -Cause 'PendingRevertManifest' -Item $manifestPath -Repairable $false `
+                        -Message 'A previous run has recovery metadata on this disk. Use -revert true before starting a new account-creation run.'))
+        }
 
-    if ($isDetectOnly) {
-        Log-Output 'DETECT ONLY: nothing was changed.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
+        $vmState = Get-NestedRepairVm
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    if ($blocking.Count -gt 0) {
-        Log-Error 'Cannot continue while a blocking finding is present. Nothing was changed.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
+        if (-not $vmState.Found) {
+            [void]$findings.Add((New-Finding -Cause 'NoNestedGuest' -Item 'ProblemVM' -Repairable $false `
+                        -Message "There is no nested Hyper-V guest to boot this disk in: $($vmState.Reason). This repair needs one, because the account is created by the running guest rather than by editing SAM offline. Re-create the rescue VM with 'az vm repair create --enable-nested'."))
+        }
+        else {
+            Log-Output "Nested guest '$($vmState.Name)' found, generation $($vmState.Generation), state $($vmState.State)." | Tee-Object -FilePath $logFile -Append
+        }
 
-    #####################################################################################################
-    # Repair
-    #####################################################################################################
-    $effectivePassword = $password
-    $generated = $false
-    if ([string]::IsNullOrWhiteSpace($effectivePassword)) {
-        $effectivePassword = New-TempUserPassword
-        $generated = $true
-    }
+        $blocking = @($findings | Where-Object { -not $_.Repairable })
 
-    # A stale result file from an earlier run would be read as this run's outcome.
-    if (Test-Path -LiteralPath $resultPath) {
-        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
-    }
+        if ($findings.Count -eq 0) {
+            Log-Output "DETECT: ready to create '$username' through the Setup hook." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            foreach ($finding in $findings) {
+                $prefix = if ($finding.Repairable) { 'REPAIRABLE' } else { 'BLOCKING  ' }
+                Log-Output "  [$prefix] $($finding.Cause): $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            }
+            # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+            # so a summary printed first is the first thing a long run loses.
+            Log-Output "DETECT: $($findings.Count) finding(s)." | Tee-Object -FilePath $logFile -Append
+        }
 
-    Log-Output "REPAIR: writing the payload to '$payloadPath'." | Tee-Object -FilePath $logFile -Append
-    $payload = Write-TempUserPayload -PayloadPath $payloadPath -GuestResultPath $guestResultPath `
-        -UserName $username -Password $effectivePassword
+        if ($isDetectOnly) {
+            Log-Output 'DETECT ONLY: no account was created and no Setup hook was applied. Discovery may stop an unmanaged repair guest and prepare attached disks; hive reads may recover dirty hives.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break scenario
+        }
 
-    if (-not $payload.Written) {
-        Log-Error "The payload could not be written: $($payload.Reason)" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
+        if ($blocking.Count -gt 0) {
+            Log-Error 'Cannot continue while a blocking finding is present. No account was created and no Setup hook was applied.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
 
-    $hook = Set-OfflineSetupHook -WindowsPath $windowsPath -GuestPayloadPath $guestPayloadPath
-    if (-not $hook.Applied) {
-        Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
-        Log-Error "The Setup hook could not be applied: $($hook.Reason)" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
+        #####################################################################################################
+        # Repair
+        #####################################################################################################
+        if (Test-Path -LiteralPath $payloadPath -ErrorAction Stop) {
+            Log-Error 'A payload from an earlier run is still on this disk. Use -revert true before creating another account.' | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
+        $effectivePassword = $password
+        $generated = $false
+        if ([string]::IsNullOrWhiteSpace($effectivePassword)) {
+            $effectivePassword = New-TempUserPassword
+            $generated = $true
+        }
 
-    Log-Output "Setup hook applied: SetupType=$($script:SetupTypeRunCmdLine), CmdLine runs the payload." | Tee-Object -FilePath $logFile -Append
+        # A stale result file from an earlier run would be read as this run's outcome.
+        if (Test-Path -LiteralPath $resultPath -ErrorAction Stop) {
+            Remove-Item -LiteralPath $resultPath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $resultPath -ErrorAction Stop) {
+                throw 'The previous payload result could not be removed. The Setup hook was not applied.'
+            }
+        }
 
-    Write-RevertManifest -ManifestPath $manifestPath -Entry @{
-        UserName          = $username
-        PreviousSetupType = $hook.PreviousSetupType
-        PreviousCmdLine   = $hook.PreviousCmdLine
-        PayloadPath       = $payloadPath
-        AppliedUtc        = (Get-Date).ToUniversalTime().ToString('o')
-    }
+        Log-Output "REPAIR: writing the payload to '$payloadPath'." | Tee-Object -FilePath $logFile -Append
+        $payloadNeedsCleanup = $true
+        $payload = Write-TempUserPayload -PayloadPath $payloadPath -GuestResultPath $guestResultPath `
+            -UserName $username -Password $effectivePassword
 
-    #####################################################################################################
-    # Boot the guest so the payload runs
-    #####################################################################################################
-    Log-Output "BOOT: starting nested guest '$($vmState.Name)' so the payload runs." | Tee-Object -FilePath $logFile -Append
+        if (-not $payload.Written) {
+            Log-Error "The payload could not be written: $($payload.Reason)" | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
 
-    $diskNumbers = @()
-    if ($null -ne $offline.DiskNumber) { $diskNumbers = @([int]$offline.DiskNumber) }
+        Write-RevertManifest -ManifestPath $manifestPath -Entry @{
+            UserName          = $username
+            PreviousSetupType = $setupState.SetupType
+            PreviousCmdLine   = $setupState.CmdLine
+            PayloadPath       = $payloadPath
+            AppliedUtc        = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        $hookNeedsRecovery = $true
+        $hook = Set-OfflineSetupHook -WindowsPath $windowsPath -GuestPayloadPath $guestPayloadPath
+        if (-not $hook.Applied) {
+            Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+            Log-Error "The Setup hook could not be applied: $($hook.Reason)" | Tee-Object -FilePath $logFile -Append
+            Log-Error 'The recovery manifest was retained. Use -revert true to restore any partially written Setup values.' | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
 
-    $start = Start-NestedRepairVm -Vm $vmState.Vm -DiskNumber $diskNumbers
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Log-Output "Setup hook applied: SetupType=$($script:SetupTypeRunCmdLine), CmdLine runs the payload." | Tee-Object -FilePath $logFile -Append
 
-    if (-not $start.Started) {
-        Log-Error "The nested guest did not start: $($start.Reason)" | Tee-Object -FilePath $logFile -Append
-        Log-Error 'The Setup hook is still in place. Re-run with -revert true to undo it.' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
+        #####################################################################################################
+        # Boot the guest so the payload runs
+        #####################################################################################################
+        Log-Output "BOOT: starting nested guest '$($vmState.Name)' so the payload runs." | Tee-Object -FilePath $logFile -Append
 
-    $boot = Wait-NestedRepairVmBoot -Vm $vmState.Vm -TimeoutSeconds $bootTimeoutSeconds
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        $diskNumbers = @()
+        if ($null -ne $offline.DiskNumber) { $diskNumbers = @([int]$offline.DiskNumber) }
 
-    if ($boot.Booted) {
-        Log-Output "The guest booted after $($boot.WaitedSeconds) seconds. Allowing the payload to finish." | Tee-Object -FilePath $logFile -Append
-        # The heartbeat arrives when the OS is up. The payload runs before the logon UI, so it has
-        # usually already completed by this point, but a slow guest is given a little longer.
-        Start-Sleep -Seconds 30
-    }
-    else {
-        Log-Warning "The guest did not report a heartbeat: $($boot.Reason)" | Tee-Object -FilePath $logFile -Append
-        Log-Warning 'The result is read back anyway, because a guest can run the payload without Integration Services reporting.' | Tee-Object -FilePath $logFile -Append
-    }
+        $guestMayBeRunning = $true
+        $offlineAccessible = $false
+        $start = Start-NestedRepairVm -Vm $vmState.Vm -DiskNumber $diskNumbers
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    #####################################################################################################
-    # Verify
-    #####################################################################################################
-    Log-Output 'VERIFY: taking the disk back to read the result.' | Tee-Object -FilePath $logFile -Append
+        if (-not $start.Started) {
+            Log-Error "The nested guest did not start: $($start.Reason)" | Tee-Object -FilePath $logFile -Append
+            Log-Error 'The Setup hook is still in place. Confirm the nested guest is stopped, then use -revert true to undo it.' | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
 
-    # The guest is asked to shut down rather than switched off. The payload clears the Setup hook by
-    # writing to the registry, and that write lives in a loaded hive until Windows flushes it, which
-    # it always does on an orderly shutdown. Pulling the power instead throws that write away while
-    # keeping the files the payload wrote, so the run looks successful and the hook is still armed.
-    $graceful = Stop-NestedRepairVmGraceful -Vm $vmState.Vm
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        $boot = Wait-NestedRepairVmBoot -Vm $vmState.Vm -TimeoutSeconds $bootTimeoutSeconds
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    if (-not $graceful.Stopped) {
-        Log-Error "The nested guest could not be confirmed stopped: $($graceful.Reason). Its disk is not taken back while it may still be in use." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-    if (-not $graceful.Graceful) {
-        Log-Warning "The guest did not shut down cleanly: $($graceful.Reason). The Setup hook is re-checked below and repaired from here if the payload's own reset was lost." | Tee-Object -FilePath $logFile -Append
-    }
+        if ($boot.Booted) {
+            Log-Output "The guest booted after $($boot.WaitedSeconds) seconds. Allowing the payload to finish." | Tee-Object -FilePath $logFile -Append
+            # The heartbeat arrives when the OS is up. The payload runs before the logon UI, so it has
+            # usually already completed by this point, but a slow guest is given a little longer.
+            Start-Sleep -Seconds 30
+        }
+        else {
+            Log-Warning "The guest did not report a heartbeat: $($boot.Reason)" | Tee-Object -FilePath $logFile -Append
+            Log-Warning 'The result is read back anyway, because a guest can run the payload without Integration Services reporting.' | Tee-Object -FilePath $logFile -Append
+        }
 
-    # The drive letters are re-resolved because the disk went away and came back.
-    $offlineAfter = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive -DiskNumber $offline.DiskNumber
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        #####################################################################################################
+        # Verify
+        #####################################################################################################
+        Log-Output 'VERIFY: taking the disk back to read the result.' | Tee-Object -FilePath $logFile -Append
 
-    if ($offlineAfter -and $offlineAfter.WindowsPath) {
+        # The guest is asked to shut down rather than switched off. The payload clears the Setup hook by
+        # writing to the registry, and that write lives in a loaded hive until Windows flushes it, which
+        # it always does on an orderly shutdown. Pulling the power instead throws that write away while
+        # keeping the files the payload wrote, so the run looks successful and the hook is still armed.
+        $graceful = Stop-NestedRepairVmGraceful -Vm $vmState.Vm
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if (-not $graceful.Stopped) {
+            Log-Error "The nested guest could not be confirmed stopped: $($graceful.Reason). Its disk is not taken back while it may still be in use." | Tee-Object -FilePath $logFile -Append
+            Log-Error "Confirm nested guest '$($vmState.Name)' is stopped in Hyper-V before running -revert true. Do not bring its disk online while the guest is active." | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
+        $guestMayBeRunning = $false
+        if (-not $graceful.Graceful) {
+            Log-Warning "The guest did not shut down cleanly: $($graceful.Reason). The Setup hook is re-checked below and repaired from here if the payload's own reset was lost." | Tee-Object -FilePath $logFile -Append
+        }
+
+        # The drive letters are re-resolved because the disk went away and came back.
+        $offlineAfter = Get-OfflineWindowsDisk -WindowsDrive $offline.WindowsDrive -DiskNumber $offline.DiskNumber
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if (-not $offlineAfter -or -not $offlineAfter.WindowsPath) {
+            throw 'Rediscovery did not return the selected Windows installation. Do not use its previous drive letter until the disk is identified again.'
+        }
         $windowsPath = $offlineAfter.WindowsPath
+        $offlineAccessible = $true
         $resultPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ResultRelativePath
         $payloadPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:PayloadRelativePath
         $manifestPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ManifestRelativePath
-    }
 
-    $payloadResult = Read-TempUserResult -ResultPath $resultPath
-    $samCheck = Test-OfflineLocalUser -WindowsPath $windowsPath -Name $username
+        $payloadResult = Read-TempUserResult -ResultPath $resultPath
+        $samCheck = Test-OfflineLocalUser -WindowsPath $windowsPath -Name $username
 
-    $payloadSaysCreated = ($payloadResult.Complete -and $payloadResult.Codes['add'] -eq '0')
-    $samSaysCreated = ($samCheck.Known -and $samCheck.Exists)
+        $payloadSaysCreated = ($payloadResult.Complete -and $payloadResult.User -ieq $username -and
+            $payloadResult.Codes['add'] -eq '0' -and $payloadResult.Codes['admin'] -eq '0' -and
+            $payloadResult.Codes['active'] -eq '0')
+        $samContainsAccount = ($samCheck.Known -and $samCheck.Exists)
 
-    if ($payloadResult.Present) {
-        Log-Output "The payload reported: add=$($payloadResult.Codes['add']), admin=$($payloadResult.Codes['admin']), rdp=$($payloadResult.Codes['rdp']), active=$($payloadResult.Codes['active'])." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Warning $payloadResult.Reason | Tee-Object -FilePath $logFile -Append
-    }
-
-    if ($samCheck.Known) {
-        Log-Output "The offline SAM $(if ($samSaysCreated) { 'contains' } else { 'does not contain' }) an account named '$username'." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Warning "The offline SAM could not confirm the account: $($samCheck.Reason)" | Tee-Object -FilePath $logFile -Append
-    }
-
-    # The payload deletes itself, so it being gone is a signal that it ran to completion.
-    if (Test-Path -LiteralPath $payloadPath) {
-        Log-Warning 'The payload is still on the disk, which means it did not run to completion. Removing it now so the password is not left in a file.' | Tee-Object -FilePath $logFile -Append
-        Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
-    }
-
-    if (Test-Path -LiteralPath $resultPath) {
-        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
-    }
-
-    if (-not $payloadSaysCreated -and -not $samSaysCreated) {
-        Log-Error "FAILED: neither the payload result nor the offline SAM confirms that '$username' was created." | Tee-Object -FilePath $logFile -Append
-        Log-Error 'The Setup hook has been left in place so the guest can be booted again, or re-run with -revert true to undo it.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    # Windows owns SYSTEM\Setup\SetupType while it is in setup mode and keeps rewriting it until its
-    # setup pass completes. That pass cannot complete in a guest that is deliberately shut down part
-    # way through, so the value is normally still 2 here even though the payload did reset it. The
-    # payload keeps its own reset anyway, because it is what makes the disk self-heal if it is ever
-    # booted normally without this step. Clearing it from the rescue VM is the expected finish, not
-    # a sign that anything went wrong, so it is only reported as a problem when the write fails.
-    $setupAfter = Get-OfflineSetupState -WindowsPath $windowsPath
-    if ($setupAfter.Available -and $setupAfter.SetupType -ne 0) {
-        Log-Output 'FINALIZE: clearing the Setup hook from here, because Windows re-arms it until a setup pass it was not allowed to finish completes.' | Tee-Object -FilePath $logFile -Append
-        $restore = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType $hook.PreviousSetupType -CmdLine $hook.PreviousCmdLine
-
-        $setupFinal = Get-OfflineSetupState -WindowsPath $windowsPath
-        if ((-not $restore.Restored) -or ($setupFinal.Available -and $setupFinal.SetupType -ne 0)) {
-            Log-Warning "The Setup hook could not be cleared: $($restore.Reason)" | Tee-Object -FilePath $logFile -Append
-            Log-Warning "SetupType is still $($setupFinal.SetupType), so this VM would boot into setup mode. Re-run with -revert true before restoring the disk." | Tee-Object -FilePath $logFile -Append
+        if ($payloadResult.Present) {
+            Log-Output "The payload reported: add=$($payloadResult.Codes['add']), admin=$($payloadResult.Codes['admin']), rdp=$($payloadResult.Codes['rdp']), active=$($payloadResult.Codes['active'])." | Tee-Object -FilePath $logFile -Append
         }
         else {
-            Log-Output 'The Setup hook is cleared, so the VM will boot normally.' | Tee-Object -FilePath $logFile -Append
+            Log-Warning $payloadResult.Reason | Tee-Object -FilePath $logFile -Append
         }
-    }
-    else {
-        Log-Output 'The Setup hook is already clear, so the VM will boot normally.' | Tee-Object -FilePath $logFile -Append
-    }
 
-    if (Test-Path -LiteralPath $manifestPath) {
-        Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
-    }
+        if ($samCheck.Known) {
+            Log-Output "The offline SAM $(if ($samContainsAccount) { 'contains' } else { 'does not contain' }) an account named '$username'." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Warning "The offline SAM could not confirm the account: $($samCheck.Reason)" | Tee-Object -FilePath $logFile -Append
+        }
 
-    Log-Output '' | Tee-Object -FilePath $logFile -Append
-    Log-Output "SUCCESS: '$username' was created and confirmed$(if ($payloadSaysCreated -and $samSaysCreated) { ' by both the payload result and the offline SAM' } elseif ($samSaysCreated) { ' by the offline SAM' } else { ' by the payload result' })." | Tee-Object -FilePath $logFile -Append
+        # The payload deletes itself, so it being gone is a signal that it ran to completion.
+        if (Test-Path -LiteralPath $payloadPath -ErrorAction Stop) {
+            Log-Warning 'The payload is still on the disk, which means it did not run to completion. Removing it now so the password is not left in a file.' | Tee-Object -FilePath $logFile -Append
+            Remove-Item -LiteralPath $payloadPath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $payloadPath -ErrorAction Stop) {
+                throw 'The password payload could not be removed. The recovery manifest was retained.'
+            }
+        }
+        $payloadNeedsCleanup = $false
 
-    if ($payloadResult.Complete -and $payloadResult.Codes['admin'] -ne '0') {
-        Log-Warning "Adding '$username' to the local Administrators group returned $($payloadResult.Codes['admin']), so the account may not be an administrator." | Tee-Object -FilePath $logFile -Append
-    }
+        if (Test-Path -LiteralPath $resultPath -ErrorAction Stop) {
+            Remove-Item -LiteralPath $resultPath -Force -ErrorAction Stop
+        }
 
-    # Printed, never logged. This is the only route the password has to the engineer.
-    Log-Output '' | Tee-Object -FilePath $logFile -Append
-    Log-Output "  User name: $username"
-    if ($generated) {
-        Log-Output "  Password:  $effectivePassword"
-        Log-Output '  This password was generated for this run and is not written to the log file. Copy it now.'
-    }
-    else {
-        Log-Output '  Password:  the value passed to -password.'
-    }
-    Log-Output ''
+        if (-not $payloadSaysCreated -or ($samCheck.Known -and -not $samContainsAccount)) {
+            Log-Error "FAILED: a complete result for '$username' must confirm successful creation, administrator membership and enablement, without a contradictory SAM observation." | Tee-Object -FilePath $logFile -Append
+            Log-Error 'SAM presence alone cannot prove creation. The recovery manifest was retained; use -revert true before another attempt.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
 
-    Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM, then sign in with that account." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+        # Windows owns SYSTEM\Setup\SetupType while it is in setup mode and keeps rewriting it until its
+        # setup pass completes. That pass cannot complete in a guest that is deliberately shut down part
+        # way through, so the value is normally still 2 here even though the payload did reset it. The
+        # payload keeps its own reset anyway, because it is what makes the disk self-heal if it is ever
+        # booted normally without this step. Clearing it from the rescue VM is the expected finish, not
+        # a sign that anything went wrong, so it is only reported as a problem when the write fails.
+        Log-Output 'FINALIZE: restoring and verifying both recorded Setup values from the rescue VM.' | Tee-Object -FilePath $logFile -Append
+        $restore = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType $setupState.SetupType -CmdLine $setupState.CmdLine
+        if (-not $restore.Restored) {
+            Log-Error "The Setup hook could not be restored: $($restore.Reason). The recovery manifest was retained; use -revert true before restoring the disk." | Tee-Object -FilePath $logFile -Append
+            break scenario
+        }
+        $hookNeedsRecovery = $false
+
+        if (Test-Path -LiteralPath $manifestPath -ErrorAction Stop) {
+            Remove-Item -LiteralPath $manifestPath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $manifestPath -ErrorAction Stop) {
+                throw 'The completed recovery manifest could not be removed.'
+            }
+        }
+
+        Log-Output '' | Tee-Object -FilePath $logFile -Append
+        Log-Output "SUCCESS: '$username' was created, added to Administrators and enabled, confirmed by the payload result$(if ($samContainsAccount) { ' and the offline SAM' }). The recorded Setup state was restored." | Tee-Object -FilePath $logFile -Append
+
+        if ($payloadResult.Codes['rdp'] -ne '0') {
+            Log-Warning "Adding '$username' to Remote Desktop Users returned $($payloadResult.Codes['rdp']); administrator membership was confirmed, but verify the VM's remote-logon policy." | Tee-Object -FilePath $logFile -Append
+        }
+
+        # Kept out of the desktop log; the delivery service may retain the run output.
+        Log-Output '' | Tee-Object -FilePath $logFile -Append
+        Log-Output "  User name: $username"
+        if ($generated) {
+            Log-Output "  Password:  $effectivePassword"
+            Log-Output '  This password was generated for this run and is not written to the log file. Copy it now.'
+        }
+        else {
+            Log-Output '  Password:  the value passed to -password.'
+        }
+        Log-Output ''
+
+        Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM, then sign in with that account." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
+    if ($guestMayBeRunning) {
+        Log-Error 'Confirm the nested repair guest is stopped before taking its disk back or running -revert true.' | Tee-Object -FilePath $logFile -Append
+    }
+    if ($hookNeedsRecovery) {
+        Log-Error 'The Setup hook or password payload may still be on the disk. Keep the recovery manifest and use -revert true after the nested guest is stopped.' | Tee-Object -FilePath $logFile -Append
+    }
+    $status = $STATUS_ERROR
 }
+finally {
+    if ($payloadNeedsCleanup -and $offlineAccessible -and -not $guestMayBeRunning) {
+        try {
+            if (Test-Path -LiteralPath $payloadPath -ErrorAction Stop) {
+                Remove-Item -LiteralPath $payloadPath -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $payloadPath -ErrorAction Stop) {
+                    throw 'The incomplete password payload still exists.'
+                }
+            }
+        }
+        catch {
+            Log-Error "Password-payload cleanup failed: $($_.Exception.Message). Do not restore the disk until the payload has been removed." | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+        }
+    }
+    try {
+        if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) { Clear-OfflineDriveLetter }
+    }
+    catch {
+        Log-Error "Temporary drive-letter cleanup failed: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        $status = $STATUS_ERROR
+    }
+    try {
+        if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        }
+    }
+    catch {
+        Log-Error "Helper log flush failed: $($_.Exception.Message)"
+        $status = $STATUS_ERROR
+    }
+}
+return $status
