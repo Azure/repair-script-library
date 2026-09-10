@@ -8,14 +8,14 @@ Each helper script and description should be listed here.
 | `Get-Disk-Partitions.ps1` | Returns partitions of attached disks whose `Win32_diskdrive` model is `Microsoft Virtual Disk`, bringing them online with `diskpart`. **SCSI-attached disks only.** |
 | `Get-Disk-Partitions-v2.ps1` | As v1, with `$partitionlist` initialised to an array so a single result is not unrolled. **SCSI-attached disks only.** |
 | `Get-Disk-Partitions-v3.ps1` | `Get-Disk-Partitions-v3` selects attached disks by **BusType** (SCSI/SAS/RAID/NVMe) instead of the SCSI-only model string, so it also works when the repair VM uses the NVMe disk controller. Excludes the Azure resource disk. `Get-Windows-OsDrives-v3` narrows the result to drive letters that contain a Windows installation. |
-| `OfflineRepairCommon.ps1` | Shared primitives for offline repair: buffered logging, path joining and validation, Authenticode/catalog signature inspection, a read-only `offreg.dll` hive reader, and the offline-target gate (`Set-OfflineRepairRoot` / `Assert-OfflineTarget`) that binds every other offline helper to the attached disk. |
-| `Get-OfflineWindowsDisk.ps1` | Finds the offline Windows installation on the attached disk, verifies its disks are online and writable, and manages temporary drive letters for hidden EFI System and Recovery partitions. Selects by **BusType**, excludes resource disks by label or warning-file marker, and refuses the rescue VM's own boot/system disk. Reads hive metadata without registry mounts and binds the offline root for `Assert-OfflineTarget`. |
-| `Use-OfflineRegistryHive.ps1` | Mounts writable hives from the attached disk, runs a scriptblock, and verifies their unload even after a partial mount failure. Its separate `Test-OfflineHiveFile` validation uses the shared in-memory reader without mounting or copying hives. |
+| `OfflineRepairCommon.ps1` | Shared primitives for offline repair: buffered logging, drive-safe paths, signature inspection, a read-only `offreg.dll` reader, shared hive/default-drive state, the offline-target gate, and cross-process nested-VM lifecycle coordination. |
+| `Get-OfflineWindowsDisk.ps1` | Finds the offline Windows installation, verifies its disks are online and writable, and manages temporary drive letters. Selects by **BusType**, excludes resource disks and the rescue VM's own disks, reads hive metadata without mounts, and publishes the shared offline target. Active helper-managed or unrelated guests block discovery before disk preparation. |
+| `Use-OfflineRegistryHive.ps1` | Mounts writable hives, runs reentrant callbacks, and verifies unload with language-independent key-state checks. Provides strict control-set selection for writers. Its separate `Test-OfflineHiveFile` uses the shared in-memory reader without mounting or copying hives. |
 | `Use-OfflineProtectedResource.ps1` | Takes ownership of, reads and restores files and registry keys on the attached disk that `SYSTEM` cannot otherwise open, restoring every security descriptor it changed and verifying the restore rather than counting it. |
 | `Use-OfflinePrivilegedRegistry.ps1` | The privileged registry operations from `Use-OfflineProtectedResource.ps1`: enabling `SeTakeOwnershipPrivilege`/`SeRestorePrivilege` and removing or rewriting keys that deny access to `SYSTEM`. |
 | `Get-OfflineBcdStore.ps1` | Locates the BCD store on the attached disk and runs `bcdedit.exe` against it directly, without a shell. Distinguishes an empty boot inventory from a failed enumeration, and refuses to operate on the rescue VM's own store. |
-| `Use-OfflineFileRemoval.ps1` | Removes files from the attached disk with a backup, a verified rollback, and post-removal checks. Refuses to remove a registry hive or any of its side files, refuses to follow reparse points, and refuses any path outside the bound offline root. |
-| `Use-NestedRepairVm.ps1` | Boots the offline Windows installation as a nested Hyper-V guest on the rescue VM for repairs that only the running OS can perform. Restores the offline state of every disk it took, on every exit path. |
+| `Use-OfflineFileRemoval.ps1` | Removes approved files with hash-verified backups and rollback. Unknown or insufficient native volume capacity refuses removal. Retains original hashes and recorded metadata for later restores, refuses hive side files and reparse points, and enforces the bound offline target. |
+| `Use-NestedRepairVm.ps1` | Hands named disks to an existing nested guest and records ownership in Notes so discovery cannot interrupt it. A failed start restores only disks that call took offline. Reports whether an explicit shutdown actually completed before the caller takes the disk back. |
 
 **Which one to use:** new scripts that need the *Windows installation* — to mount its hives, edit its
 BCD, or repair files on it — should use `Get-OfflineWindowsDisk.ps1`, which also binds the offline root
@@ -78,3 +78,51 @@ not that the guest will boot or that a separate structural check is unnecessary.
 `Invoke-WithHive` and the protected-registry helpers still expose writable HKLM paths. The in-memory
 reader does not replace that contract; callers requiring those paths must keep using the guarded
 mount/unmount helpers.
+
+## Writable hives and control-set selection
+
+Mounted-key state is `Present`, `Absent`, or `Unknown`, determined through registry APIs rather
+than localized `reg.exe` messages. Access denial is not absence, and a file-sharing check is not
+used as proof of which registry key owns a hive.
+
+Writers must use `Get-OfflineSystemRootPath -Strict`, `Get-OfflineControlSetName -Strict`, or
+`Get-OfflineReferencedControlSetName -Strict`. Strict selection rejects an unreadable, wrongly typed,
+out-of-range or missing current control set instead of guessing `ControlSet001`. The non-strict
+fallback remains for tolerant reads, not for deriving a write target.
+
+`Invoke-WithHive` shares its depth and file bindings across dot-source scopes. An inner callback
+cannot unload an outer caller's hive or switch that active hive to another file. Discovery sets
+the default through `Set-OfflineWindowsDrive`; manual selection must use that setter too, rather
+than assigning a scope-private `$script:OfflineWindowsDrive`.
+
+## Removal and later rollback
+
+Persist `Invoke-OfflineRemovalPlan`'s `BackupRecord` with the backup location. Pass those records as
+`Restore-OfflineFileSet -FileRecord` on a later revert; reconstructing just names and attributes
+discards the verified original hashes and security descriptors.
+
+A restore checks the backup and restored contents against the recorded hash, reapplies the recorded
+security, then restores and verifies exact attributes. Attributes come last because an NTFS security
+change can set Archive. Treat `Succeeded = $false` as a failed or incomplete restore and retain the
+undo manifest, even when some files were restored.
+
+Legacy records without a Hash field remain supported with an explicit warning: the check proves the
+copy against the current backup, not against a recorded historical original. An explicitly empty
+Hash field is an unavailable verification result and is refused.
+
+## Nested-guest hand-offs
+
+Automatic discovery shutdown is limited to the unmanaged Azure-created `ProblemVM`, or an exact
+custom guest selected with `Get-OfflineWindowsDisk -NestedVmId`. Other active guests are never
+implicitly turned off.
+
+`Start-NestedRepairVm` marks a started or adopted guest with a separate
+`repair-script-library:nested-repair:v1` Notes line, preserving existing notes. A fresh discovery
+process recognizes it and refuses to proceed while it is active. Skipping the guest and onlining
+its disk would not be safe.
+
+Sequence offline editing, `Start-NestedRepairVm`, boot/result observation,
+`Stop-NestedRepairVmGraceful`, and rediscovery. **Confirm `Stopped` before taking the disk back.**
+A timeout power-off is reported as non-graceful and requires rechecking the disk. The shared host
+mutex serializes lifecycle transitions, not an entire repair session; it does not replace this
+caller sequencing.
