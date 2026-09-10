@@ -64,7 +64,7 @@ logging so it remains at the end of the output.
 
 ## Read-only hive access
 
-Discovery and `Test-OfflineHiveFile` share `Open-OfflineRegistryReader` in `OfflineRepairCommon.ps1`.
+Discovery and `Test-OfflineHiveFile` use the shared offreg reader in `OfflineRepairCommon.ps1`.
 It uses the Windows Offline Registry Library (`System32\offreg.dll`), keeps recovery in memory, and
 never invokes `reg.exe`, mounts an HKLM key, saves a hive, or copies credential-bearing hives to TEMP.
 Keep matching recovery logs beside dirty hives. Reader handles must be disposed in `finally`; close
