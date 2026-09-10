@@ -313,12 +313,13 @@ function Get-OfflineFolderHiveState {
         and still does not load after it says nothing about the removal; only a hive that loaded
         before and does not load after is evidence, and that is what the verification tests for.
 
-        Test-OfflineHiveFile parses a scratch copy, so this never modifies the offline disk and
-        never loads a hive in place. That matters: loading a hive in place creates KTM transaction
-        logs next to it, which would show up as unexplained new files in the verification.
+        Test-OfflineHiveFile parses with offreg in memory, so this never modifies the offline
+        disk or mounts a hive. That avoids the KTM transaction logs an in-place registry mount
+        can create next to a hive, which would look like unexplained new files in verification.
+        Loads records offreg's result for comparison, not a guarantee that Windows will boot.
 
         Hives above the size limit are recorded as skipped rather than tested, so a multi-gigabyte
-        COMPONENTS hive does not turn a small file deletion into a long copy. The file-level
+        COMPONENTS hive does not turn a small file deletion into a large in-memory parse. The file-level
         comparison still proves such a hive was not modified; only the parse is given up.
 
     .OUTPUTS
