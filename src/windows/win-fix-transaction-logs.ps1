@@ -149,7 +149,7 @@ $script:ProtectedExtension = @('.log', '.log1', '.log2', '.dat', '.sav', '.bak')
 # rolled back. Nothing here is ever selected for deletion - this list only observes.
 #
 # The list is longer than the six hives usually named because a measured Server 2022 config folder
-# holds ten: DRIVERS, ELAM, BBI and BCD-Template are hives too. Inclusion costs one scratch-copy
+# holds ten: DRIVERS, ELAM, BBI and BCD-Template are hives too. Inclusion costs one in-memory
 # parse each and can never remove a file, so the bar is "is it a hive in a folder we mutate", not
 # "is it needed at boot".
 #
@@ -158,24 +158,23 @@ $script:ProtectedExtension = @('.log', '.log1', '.log2', '.dat', '.sav', '.bak')
 # pristine disk it owns no transaction logs at all, so it contributes no deletion candidates. But
 # loading a hive in place creates them: on the test disk a single in-place reg.exe load produced
 # BCD-Template{guid}.TM.blf plus two .TMContainer files that were not there before. This script
-# never loads in place - Test-OfflineHiveFile copies to scratch first, so it cannot create them -
+# never mounts hives - Test-OfflineHiveFile uses offreg in memory, so it cannot create them -
 # but a machine that reaches this script has usually already been worked on, and a prior bcdboot or
 # repair attempt does load it in place. Once those logs exist a Config-scope run will delete them.
 # Damaging BCD-Template would not cause a no-boot; it would break the next bcdboot the operator
 # runs, which is a far more confusing failure.
 #
-# All ten loaded cleanly through Test-OfflineHiveFile on that disk, so the check is a real gate here
-# rather than something advisory - Test-OfflineHiveFile parses with reg.exe, which does not have the
-# ERROR_BADDB problem that makes RegLoadAppKey reject primary OS hives.
+# The before/after gate compares whether offreg can open each hive. It does not use RegLoadAppKey
+# or promise that a successful parse proves the guest will boot; structural validation is separate.
 $script:RegistryHive = @{
     'TxR'    = @()
     'Config' = @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'COMPONENTS', 'DRIVERS', 'ELAM', 'BBI', 'BCD-Template')
     'SMI'    = @('SCHEMA.DAT')
 }
 
-# Test-OfflineHiveFile copies a hive to a scratch location to have Windows parse it, and it runs
+# Test-OfflineHiveFile parses a hive in memory with offreg, and it runs
 # twice per repair - once for the baseline and once for the verification. Above this size the hive
-# is reported as skipped instead of copied. The file-level comparison in check 5 still proves the
+# is reported as skipped instead of parsed. The file-level comparison in check 5 still proves the
 # file was not modified, so nothing is given up except the parse.
 $script:HiveTestMaxBytes = 512MB
 
