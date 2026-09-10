@@ -576,7 +576,7 @@ try {
     $bcdState = Get-BcdSigningState -StorePath $offline.BcdStorePath
 
     $context = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
         $protection = Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState
         $drivers = @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
         $findings = @(Get-AllFinding -BlockEvidence $blockEvidence -Drivers $drivers)
@@ -670,7 +670,7 @@ try {
 
 
         $repairOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            $systemRoot = Get-OfflineSystemRootPath
+            $systemRoot = Get-OfflineSystemRootPath -Strict
             $done = 0
             $errors = [System.Collections.Generic.List[string]]::new()
             foreach ($finding in $repairable) {
@@ -702,7 +702,7 @@ try {
             Log-Info "SYSTEM hive backed up to $backupForProtection" | Tee-Object -FilePath $logFile -Append
         }
         $protectionChanges = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            $systemRoot = Get-OfflineSystemRootPath
+            $systemRoot = Get-OfflineSystemRootPath -Strict
             return (Disable-Protection -Protection (Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState))
         }
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -722,7 +722,7 @@ try {
 
     # Verify against freshly read state rather than trusting the writes above.
     $remaining = Invoke-WithHive -Hive 'SYSTEM', 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
+        $systemRoot = Get-OfflineSystemRootPath -Strict
         return @(Get-AllFinding -BlockEvidence $blockEvidence `
                 -Drivers @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive))
     }
