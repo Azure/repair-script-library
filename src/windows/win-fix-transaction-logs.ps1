@@ -492,20 +492,30 @@ try {
         }
 
         $restoredTotal = 0
-        $failedTotal = 0
+        $failedScopes = 0
         foreach ($entry in @($manifest.Scopes)) {
             Log-Output "Restoring scope $($entry.Scope) from $($entry.BackupPath)." | Tee-Object -FilePath $logFile -Append
             $restore = Restore-OfflineFileSet -BackupPath $entry.BackupPath -TargetPath $entry.TargetPath -FileRecord $entry.Files
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
             foreach ($line in @($restore.Detail)) { Log-Info "  $line" | Tee-Object -FilePath $logFile -Append }
             $restoredTotal += $restore.Restored
-            $failedTotal += $restore.Failed
+            if (-not $restore.Succeeded) {
+                $failedScopes++
+                Log-Error "Scope $($entry.Scope) was not fully restored and verified ($($restore.Restored) of $($restore.Expected) file(s))." | Tee-Object -FilePath $logFile -Append
+            }
         }
 
-        Log-Output "Restored $restoredTotal file(s); $failedTotal could not be restored." | Tee-Object -FilePath $logFile -Append
-        if ($failedTotal -gt 0) { return $STATUS_ERROR }
+        Log-Output "Restored $restoredTotal file(s); $failedScopes scope(s) were not fully restored." | Tee-Object -FilePath $logFile -Append
+        if ($failedScopes -gt 0) {
+            Log-Error "The revert manifest at $manifestPath was retained because not every scope was restored and verified." | Tee-Object -FilePath $logFile -Append
+            return $STATUS_ERROR
+        }
 
         try { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction Stop }
-        catch { Log-Warning "The manifest at $manifestPath could not be removed ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append }
+        catch {
+            Log-Error "The manifest at $manifestPath could not be removed ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append
+            return $STATUS_ERROR
+        }
 
         Log-Output 'Revert complete.' | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -647,7 +657,7 @@ try {
                 Scope      = $outcome.Label
                 TargetPath = $plan.ScopeInfo.Path
                 BackupPath = $outcome.BackupPath
-                Files      = @($plan.Snapshot.MatchedFile | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Attributes = $_.Attributes } })
+                Files      = @($outcome.BackupRecord)
             })
         Log-Output "Scope $($outcome.Label): $(@($outcome.Removed).Count) file(s) removed and verified." | Tee-Object -FilePath $logFile -Append
     }
@@ -657,11 +667,19 @@ try {
     }
 
     foreach ($outcome in $failed) {
-        Log-Error "Scope $($outcome.Label) failed and was rolled back: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+        if ($outcome.RollbackAttempted -and $outcome.RollbackSucceeded) {
+            Log-Error "Scope $($outcome.Label) failed; its removed files were rolled back and verified: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+        }
+        elseif ($outcome.RollbackAttempted) {
+            Log-Error "FATAL: Scope $($outcome.Label) failed and its automatic rollback did not restore and verify every file: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Error "Scope $($outcome.Label) failed without an automatic rollback: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+        }
     }
 
     if ($failed.Count -gt 0) {
-        Log-Error "$($failed.Count) of $($results.Count) scope(s) failed. The disk is in the state it was in before this run." | Tee-Object -FilePath $logFile -Append
+        Log-Error "$($failed.Count) of $($results.Count) scope(s) failed. Review the per-scope rollback results and keep the backups and revert manifest; successful scopes remain cleared." | Tee-Object -FilePath $logFile -Append
         return $STATUS_ERROR
     }
 
