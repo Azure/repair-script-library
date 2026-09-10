@@ -27,6 +27,7 @@
       Test-NestedRepairVmSupported   Is the Hyper-V role, its PowerShell module and vmms usable here.
       Get-NestedRepairVm             Resolve exactly one nested guest, or explain why it cannot.
       Connect-NestedRepairVmDisk     Attach the offline disk to the guest and point its boot order at it.
+      Set-NestedRepairVmManaged      Persist the ownership marker that prevents automatic discovery shutdown.
       Start-NestedRepairVm           Take the disk offline on the host, attach it and start the guest.
       Wait-NestedRepairVmBoot        Block until the guest reports a heartbeat, or time out.
       Stop-NestedRepairVmGraceful    Ask the guest to shut down cleanly, pulling the power only if needed.
@@ -42,8 +43,14 @@
       ... edit the offline disk ...
       Start-NestedRepairVm           # host releases the disk, guest boots and applies the change
       Wait-NestedRepairVmBoot        # observe that it really booted
-      Stop-NestedRepairVm            # guest releases the disk again
+      Stop-NestedRepairVmGraceful    # confirm Stopped before taking the disk back
       Set-OfflineDisksOnline         # host takes it back to verify the result
+
+    Starting or adopting a running guest records a marker in its Notes without replacing existing
+    notes. Discovery refuses while any marked guest is active; it must not just skip the guest and
+    online its disks. The marker survives a new PowerShell process. A shared host mutex serializes
+    the short ownership/disk transitions, not an entire repair session. Callers must still sequence
+    their offline edits, guest execution and verified shutdown.
 
 .NOTES
     Name:   Use-NestedRepairVm.ps1
@@ -72,11 +79,15 @@
             - An all-skipped disk set (every requested disk unreadable or the rescue VM's own) is reported
               as a failure at both ends instead of starting a diskless guest that only burns the timeout.
             - Guests are resolved by Id, not by a name Get-VM treats as a wildcard; vmms must be running.
+    v1.2: Mark helper-managed guests persistently and serialize lifecycle transitions with discovery.
+          Report an unconfirmed or failed forced shutdown as failure, never as a completed hand-off.
 #>
 
 # Resolve the offline-repair core against this file's own folder, so a scenario loads the same
 # helper wherever it dot-sources this from, and fail loudly here rather than at the first log call.
-if (-not (Get-Command -Name Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command -Name Add-OfflineRepairLog -ErrorAction SilentlyContinue) -or
+    -not (Get-Command -Name Enter-OfflineNestedVmLifecycle -ErrorAction SilentlyContinue) -or
+    -not (Get-Command -Name Test-OfflineNestedVmManaged -ErrorAction SilentlyContinue)) {
     $dependencyPath = Join-Path -Path $PSScriptRoot -ChildPath 'OfflineRepairCommon.ps1'
     try {
         . $dependencyPath
@@ -85,8 +96,11 @@ if (-not (Get-Command -Name Add-OfflineRepairLog -ErrorAction SilentlyContinue))
         throw "Use-NestedRepairVm.ps1 could not load its dependency OfflineRepairCommon.ps1 from '$dependencyPath': $($_.Exception.Message)"
     }
 }
-if (-not (Get-Command -Name Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
-    throw "Use-NestedRepairVm.ps1 requires 'Add-OfflineRepairLog', which OfflineRepairCommon.ps1 did not define."
+foreach ($required in @('Add-OfflineRepairLog', 'Get-OfflineNestedVmOwnershipTag',
+        'Test-OfflineNestedVmManaged', 'Enter-OfflineNestedVmLifecycle', 'Exit-OfflineNestedVmLifecycle')) {
+    if (-not (Get-Command -Name $required -ErrorAction SilentlyContinue)) {
+        throw "Use-NestedRepairVm.ps1 requires '$required', which OfflineRepairCommon.ps1 did not define."
+    }
 }
 
 # The name 'az vm repair create --enable-nested' gives the guest it builds.
@@ -378,6 +392,44 @@ function Connect-NestedRepairVmDisk {
     return $result
 }
 
+function Set-NestedRepairVmManaged {
+    <#
+    .SYNOPSIS
+        Protects an explicitly selected guest from automatic discovery shutdown.
+
+    .DESCRIPTION
+        Appends the shared ownership tag to Notes, preserving existing text, and verifies the
+        stored value by Id. An already tagged guest produces no write. This marker is persistent;
+        the caller must use the explicit graceful-stop helper for later disk hand-offs.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([bool])]
+    param([Parameter(Mandatory = $true)][ValidateNotNull()]$Vm)
+
+    $lease = Enter-OfflineNestedVmLifecycle
+    try {
+        $current = Get-VM -Id $Vm.Id -ErrorAction Stop
+        if (-not $current) { throw "Nested guest '$($Vm.Id)' could not be resolved before recording repair ownership." }
+        if (Test-OfflineNestedVmManaged -Vm $current) { return $true }
+        if (-not $PSCmdlet.ShouldProcess($current.Name, 'Record repair ownership in the guest Notes')) { return $false }
+
+        $notesProperty = $current.PSObject.Properties['Notes']
+        $notes = if ($notesProperty) { [string]$notesProperty.Value } else { '' }
+        $separator = if ([string]::IsNullOrEmpty($notes) -or $notes.EndsWith("`n")) { '' } else { [Environment]::NewLine }
+        $updatedNotes = $notes + $separator + (Get-OfflineNestedVmOwnershipTag)
+        Set-VM -VM $current -Notes $updatedNotes -ErrorAction Stop
+        $after = Get-VM -Id $current.Id -ErrorAction Stop
+        if (-not $after -or -not (Test-OfflineNestedVmManaged -Vm $after)) {
+            throw "Repair ownership of nested guest '$($current.Name)' could not be confirmed; the guest must not be started."
+        }
+        Add-OfflineRepairLog -Level Info -Message "Nested guest '$($current.Name)' is marked as helper-managed; automatic discovery will not interrupt it."
+        return $true
+    }
+    finally {
+        Exit-OfflineNestedVmLifecycle -Lease $lease
+    }
+}
+
 function Start-NestedRepairVm {
     <#
     .SYNOPSIS
@@ -393,6 +445,8 @@ function Start-NestedRepairVm {
         Already running is treated as success only when the guest genuinely has the requested disk
         attached. A guest that is up but was never given the disk is reported as a failure, because
         "running" would otherwise be mistaken for "attached and repairing the right disk".
+        Before success or a new start, ownership is recorded in Notes so a later discovery pass
+        cannot power the guest off. Failure to record ownership refuses the start.
 
         If the guest does not end up running, every disk this call took offline is brought back online
         before returning, so a failed start leaves the rescue VM no worse than it was found. Disks that
@@ -435,230 +489,259 @@ function Start-NestedRepairVm {
         return $result
     }
 
-    # Resolve the guest by its Id, not its name. Get-VM -Name treats its argument as a wildcard, so a
-    # name containing [ ] * or ? would match the wrong guest, or several. The Id is a GUID and exact.
-    $current = Get-VM -Id $Vm.Id -ErrorAction SilentlyContinue
-    if ($null -eq $current) {
-        $result.Reason = "the nested guest '$($Vm.Name)' no longer exists"
-        return $result
-    }
-
-    if ($current.State -eq 'Running') {
-        $result.AlreadyRunning = $true
-        $result.State = "$($current.State)"
-
-        # Running is not the same as attached. If the guest is already up but the requested disk was
-        # never handed to it, reporting success would tell the caller a disk is present that is not.
-        $requested = @($DiskNumber | Sort-Object -Unique)
-        if ($requested.Count -gt 0) {
-            try {
-                $attachedNow = @(Get-VMHardDiskDrive -VM $current -ErrorAction Stop |
-                        ForEach-Object { $_.DiskNumber } | Where-Object { $null -ne $_ })
-            }
-            catch {
-                $result.Reason = "the nested guest '$($current.Name)' is already running but the disks attached to it could not be read: $($_.Exception.Message)"
-                return $result
-            }
-
-            $missing = @($requested | Where-Object { $attachedNow -notcontains $_ })
-            if ($missing.Count -gt 0) {
-                $result.Reason = "the nested guest '$($current.Name)' is already running but does not have disk(s) $($missing -join ', ') attached, so it is not running on the disk this repair targets. Stop it and start it again so the disk is attached"
-                return $result
-            }
-        }
-
-        $result.Started = $true
-        Add-OfflineRepairLog -Level Info -Message "Nested guest '$($current.Name)' is already running with the requested disk(s) attached."
-        return $result
-    }
-
-    # Everything from here takes disks offline on the host, so this is where -WhatIf has to stop.
-    # It returns the same shape every other exit path returns, with Started left $false, so a preview
-    # run can never be mistaken by the caller for a guest that is actually up on the repaired disk.
-    $requestedDisks = @($DiskNumber | Sort-Object -Unique)
-    $whatIfTarget = if ($requestedDisks.Count -gt 0) {
-        "nested guest '$($current.Name)' with host disk(s) $($requestedDisks -join ', ')"
-    }
-    else {
-        "nested guest '$($current.Name)'"
-    }
-    if (-not $PSCmdlet.ShouldProcess($whatIfTarget, 'Take the disk(s) offline on the host, attach them and start the guest')) {
-        $result.State = "$($current.State)"
-        $result.Reason = 'the guest was not started because -WhatIf was specified'
-        return $result
-    }
-
-    # Everything from here takes disks offline on the host. If the guest does not end up running, the
-    # finally hands those disks back, so a failed start never leaves the rescue VM without volumes it
-    # had at entry. Only disks THIS call took offline are restored: disks already offline at entry were
-    # offline for a reason this function does not own, and disks the guest is now running on stay with
-    # the guest.
-    $offlined = @()      # every requested disk that is now offline, so the guest can claim and boot it
-    $weOfflined = @()    # only the disks this call took offline; these are the ones the finally restores
-    $skipped = @()       # why each requested disk never reached offline, so an all-skipped run can say so
+    $lease = Enter-OfflineNestedVmLifecycle
     try {
-        foreach ($number in ($DiskNumber | Sort-Object -Unique)) {
-            try {
-                $disk = Get-Disk -Number $number -ErrorAction Stop
-            }
-            catch {
-                $skipped += "disk $number could not be read"
-                Add-OfflineRepairLog -Level Warning -Message "Disk $number could not be read, so it was not taken offline: $($_.Exception.Message)"
-                continue
-            }
-
-            if ($disk.IsBoot -or $disk.IsSystem) {
-                $skipped += "disk $number is the rescue VM's own system disk"
-                Add-OfflineRepairLog -Level Warning -Message "Disk $number is the rescue VM's own system disk and was left online."
-                continue
-            }
-
-            if ($disk.IsOffline) {
-                # Already offline at entry: usable by the guest, but not ours to bring back afterwards.
-                $offlined += $number
-                continue
-            }
-
-            try {
-                Set-Disk -Number $number -IsOffline $true -ErrorAction Stop
-            }
-            catch {
-                $result.Reason = "disk $number could not be taken offline, so the guest cannot claim it: $($_.Exception.Message)"
-                return $result
-            }
-
-            # Read it back. A disk that is still online here means the guest will fail to start for a
-            # reason that would otherwise be reported as an unrelated Hyper-V error.
-            $after = Get-Disk -Number $number -ErrorAction SilentlyContinue
-            if ($null -eq $after -or -not $after.IsOffline) {
-                $result.Reason = "disk $number still reports as online after being taken offline, so the guest cannot claim it"
-                return $result
-            }
-
-            Add-OfflineRepairLog -Level Info -Message "Disk $number taken offline so the nested guest can claim it."
-            $offlined += $number
-            $weOfflined += $number
-        }
-        $result.DisksOffline = $offlined
-
-        # If nothing reached the offline state there is no disk for the guest to boot, and a Hyper-V VM
-        # starts perfectly well with no disk attached. Going on would set Started = $true for a guest that
-        # cannot run the repair and leave the caller waiting out its full heartbeat timeout. Stop here, and
-        # say whether each disk was unreadable or was the rescue VM's own, so the reason is actionable on
-        # its own without having to read the log.
-        if ($offlined.Count -eq 0) {
-            $detail = if ($skipped.Count -gt 0) { $skipped -join '; ' } else { 'no disks were requested' }
-            $result.Reason = "no disk could be taken offline for the nested guest, so it has nothing to boot: $detail"
-            Add-OfflineRepairLog -Level Error -Message $result.Reason
+        # Resolve the guest by its Id, not its name. Get-VM -Name treats its argument as a wildcard, so a
+        # name containing [ ] * or ? would match the wrong guest, or several. The Id is a GUID and exact.
+        $current = Get-VM -Id $Vm.Id -ErrorAction SilentlyContinue
+        if ($null -eq $current) {
+            $result.Reason = "the nested guest '$($Vm.Name)' no longer exists"
             return $result
         }
 
-        # The disk has to be attached before the guest is started, and it has to be offline before it
-        # can be attached, so this sits between the two. Attach the disks that are actually offline now,
-        # not the raw request, which may include a disk that could not be offlined. See
-        # Connect-NestedRepairVmDisk for why the guest may otherwise arrive with no disk at all.
-        $attach = Connect-NestedRepairVmDisk -Vm $current -DiskNumber $offlined
-        if ($attach.Reason) {
-            $result.Reason = $attach.Reason
-            return $result
-        }
-        $result.DisksAttached = $attach.Attached
+        if ($current.State -eq 'Running') {
+            $result.AlreadyRunning = $true
+            $result.State = "$($current.State)"
 
-        # A rescue VM is often small. Work out a startup-memory size that fits its free physical memory,
-        # so the guest can boot even when it was configured for more than the host can spare.
-        $startBytes = 0
-        try { $startBytes = [int64]$current.MemoryStartup } catch { $startBytes = 0 }
+            # Running is not the same as attached. If the guest is already up but the requested disk was
+            # never handed to it, reporting success would tell the caller a disk is present that is not.
+            $requested = @($DiskNumber | Sort-Object -Unique)
+            if ($requested.Count -gt 0) {
+                try {
+                    $attachedNow = @(Get-VMHardDiskDrive -VM $current -ErrorAction Stop |
+                            ForEach-Object { $_.DiskNumber } | Where-Object { $null -ne $_ })
+                }
+                catch {
+                    $result.Reason = "the nested guest '$($current.Name)' is already running but the disks attached to it could not be read: $($_.Exception.Message)"
+                    return $result
+                }
 
-        $freeBytes = 0
-        try { $freeBytes = [int64]((Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).FreePhysicalMemory) * 1024 }
-        catch { $freeBytes = 0 }
+                $missing = @($requested | Where-Object { $attachedNow -notcontains $_ })
+                if ($missing.Count -gt 0) {
+                    $result.Reason = "the nested guest '$($current.Name)' is already running but does not have disk(s) $($missing -join ', ') attached, so it is not running on the disk this repair targets. Stop it and start it again so the disk is attached"
+                    return $result
+                }
+            }
 
-        $memoryFloor = 512MB    # Windows will not boot in less; also the dynamic-memory minimum used here.
-        $hostHeadroom = 512MB   # Leave the host room; Hyper-V cannot hand a guest every free byte.
-
-        $fitStartup = 0
-        if ($startBytes -gt $memoryFloor) {
-            if ($freeBytes -gt 0) { $fitStartup = [int64]($freeBytes - $hostHeadroom) }
-            else { $fitStartup = [int64]1GB }   # free memory unreadable: a size the guest can grow from
-            if ($fitStartup -gt $startBytes) { $fitStartup = $startBytes }
-            if ($fitStartup -lt $memoryFloor) { $fitStartup = $memoryFloor }
-            $fitStartup = [int64]([math]::Floor($fitStartup / 2MB) * 2MB)   # dynamic memory aligns to 2 MB
-        }
-
-        $startupFits = ($freeBytes -le 0) -or ($startBytes -le ($freeBytes - $hostHeadroom))
-
-        $memoryReduced = $false
-        if (-not $startupFits -and $fitStartup -gt 0 -and $fitStartup -lt $startBytes) {
-            # The configured startup size will not fit free memory. Shrink it and let dynamic memory grow
-            # it back if the host frees up, rather than failing before Windows even loads.
             try {
-                Set-VMMemory -VM $current -DynamicMemoryEnabled $true -MinimumBytes $memoryFloor -StartupBytes $fitStartup -MaximumBytes $startBytes -ErrorAction Stop
-                $memoryReduced = $true
-                Add-OfflineRepairLog -Level Warning -Message "Nested guest '$($current.Name)' asks for $([math]::Round($startBytes / 1GB, 2)) GB at start but only about $([math]::Round($freeBytes / 1GB, 2)) GB is free, so its startup memory was reduced to $([math]::Round($fitStartup / 1GB, 2)) GB with dynamic memory enabled."
+                if (-not (Set-NestedRepairVmManaged -Vm $current)) {
+                    $result.Reason = 'the running guest was not adopted because recording repair ownership was declined'
+                    return $result
+                }
             }
             catch {
-                Add-OfflineRepairLog -Level Warning -Message "The startup memory of '$($current.Name)' could not be reduced before starting: $($_.Exception.Message)"
+                $result.Reason = "the running guest could not be protected from automatic discovery: $($_.Exception.Message)"
+                Add-OfflineRepairLog -Level Error -Message $result.Reason
+                return $result
             }
+            $result.Started = $true
+            Add-OfflineRepairLog -Level Info -Message "Nested guest '$($current.Name)' is already running with the requested disk(s) attached."
+            return $result
         }
 
+        # Everything from here takes disks offline on the host, so this is where -WhatIf has to stop.
+        # It returns the same shape every other exit path returns, with Started left $false, so a preview
+        # run can never be mistaken by the caller for a guest that is actually up on the repaired disk.
+        $requestedDisks = @($DiskNumber | Sort-Object -Unique)
+        $whatIfTarget = if ($requestedDisks.Count -gt 0) {
+            "nested guest '$($current.Name)' with host disk(s) $($requestedDisks -join ', ')"
+        }
+        else {
+            "nested guest '$($current.Name)'"
+        }
+        if (-not $PSCmdlet.ShouldProcess($whatIfTarget, 'Take the disk(s) offline on the host, attach them and start the guest')) {
+            $result.State = "$($current.State)"
+            $result.Reason = 'the guest was not started because -WhatIf was specified'
+            return $result
+        }
+
+        # Everything from here takes disks offline on the host. If the guest does not end up running, the
+        # finally hands those disks back, so a failed start never leaves the rescue VM without volumes it
+        # had at entry. Only disks THIS call took offline are restored: disks already offline at entry were
+        # offline for a reason this function does not own, and disks the guest is now running on stay with
+        # the guest.
+        $offlined = @()      # every requested disk that is now offline, so the guest can claim and boot it
+        $weOfflined = @()    # only the disks this call took offline; these are the ones the finally restores
+        $skipped = @()       # why each requested disk never reached offline, so an all-skipped run can say so
         try {
-            Start-VM -VM $current -ErrorAction Stop | Out-Null
-        }
-        catch {
-            $startError = $_.Exception.Message
+            foreach ($number in ($DiskNumber | Sort-Object -Unique)) {
+                try {
+                    $disk = Get-Disk -Number $number -ErrorAction Stop
+                }
+                catch {
+                    $skipped += "disk $number could not be read"
+                    Add-OfflineRepairLog -Level Warning -Message "Disk $number could not be read, so it was not taken offline: $($_.Exception.Message)"
+                    continue
+                }
 
-            if ($startError -notmatch 'memory') {
-                $result.Reason = "the nested guest '$($current.Name)' failed to start: $startError"
+                if ($disk.IsBoot -or $disk.IsSystem) {
+                    $skipped += "disk $number is the rescue VM's own system disk"
+                    Add-OfflineRepairLog -Level Warning -Message "Disk $number is the rescue VM's own system disk and was left online."
+                    continue
+                }
+
+                if ($disk.IsOffline) {
+                    # Already offline at entry: usable by the guest, but not ours to bring back afterwards.
+                    $offlined += $number
+                    continue
+                }
+
+                try {
+                    Set-Disk -Number $number -IsOffline $true -ErrorAction Stop
+                }
+                catch {
+                    $result.Reason = "disk $number could not be taken offline, so the guest cannot claim it: $($_.Exception.Message)"
+                    return $result
+                }
+
+                # Read it back. A disk that is still online here means the guest will fail to start for a
+                # reason that would otherwise be reported as an unrelated Hyper-V error.
+                $after = Get-Disk -Number $number -ErrorAction SilentlyContinue
+                if ($null -eq $after -or -not $after.IsOffline) {
+                    $result.Reason = "disk $number still reports as online after being taken offline, so the guest cannot claim it"
+                    return $result
+                }
+
+                Add-OfflineRepairLog -Level Info -Message "Disk $number taken offline so the nested guest can claim it."
+                $offlined += $number
+                $weOfflined += $number
+            }
+            $result.DisksOffline = $offlined
+
+            # If nothing reached the offline state there is no disk for the guest to boot, and a Hyper-V VM
+            # starts perfectly well with no disk attached. Going on would set Started = $true for a guest that
+            # cannot run the repair and leave the caller waiting out its full heartbeat timeout. Stop here, and
+            # say whether each disk was unreadable or was the rescue VM's own, so the reason is actionable on
+            # its own without having to read the log.
+            if ($offlined.Count -eq 0) {
+                $detail = if ($skipped.Count -gt 0) { $skipped -join '; ' } else { 'no disks were requested' }
+                $result.Reason = "no disk could be taken offline for the nested guest, so it has nothing to boot: $detail"
+                Add-OfflineRepairLog -Level Error -Message $result.Reason
                 return $result
             }
 
-            # The start failed for a memory reason. If a smaller footprint has not been applied yet, apply
-            # it now and retry once; otherwise report the real reason, not a generic start failure.
-            if ($memoryReduced -or $fitStartup -le 0 -or $fitStartup -ge $startBytes) {
-                $result.Reason = "the nested guest '$($current.Name)' could not start because the rescue VM does not have enough free memory for it: $startError"
+            # The disk has to be attached before the guest is started, and it has to be offline before it
+            # can be attached, so this sits between the two. Attach the disks that are actually offline now,
+            # not the raw request, which may include a disk that could not be offlined. See
+            # Connect-NestedRepairVmDisk for why the guest may otherwise arrive with no disk at all.
+            $attach = Connect-NestedRepairVmDisk -Vm $current -DiskNumber $offlined
+            if ($attach.Reason) {
+                $result.Reason = $attach.Reason
                 return $result
+            }
+            $result.DisksAttached = $attach.Attached
+
+            try {
+                if (-not (Set-NestedRepairVmManaged -Vm $current)) {
+                    $result.Reason = 'the guest was not started because recording repair ownership was declined'
+                    return $result
+                }
+            }
+            catch {
+                $result.Reason = "the guest could not be protected from automatic discovery and was not started: $($_.Exception.Message)"
+                Add-OfflineRepairLog -Level Error -Message $result.Reason
+                return $result
+            }
+
+            # A rescue VM is often small. Work out a startup-memory size that fits its free physical memory,
+            # so the guest can boot even when it was configured for more than the host can spare.
+            $startBytes = 0
+            try { $startBytes = [int64]$current.MemoryStartup } catch { $startBytes = 0 }
+
+            $freeBytes = 0
+            try { $freeBytes = [int64]((Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).FreePhysicalMemory) * 1024 }
+            catch { $freeBytes = 0 }
+
+            $memoryFloor = 512MB    # Windows will not boot in less; also the dynamic-memory minimum used here.
+            $hostHeadroom = 512MB   # Leave the host room; Hyper-V cannot hand a guest every free byte.
+
+            $fitStartup = 0
+            if ($startBytes -gt $memoryFloor) {
+                if ($freeBytes -gt 0) { $fitStartup = [int64]($freeBytes - $hostHeadroom) }
+                else { $fitStartup = [int64]1GB }   # free memory unreadable: a size the guest can grow from
+                if ($fitStartup -gt $startBytes) { $fitStartup = $startBytes }
+                if ($fitStartup -lt $memoryFloor) { $fitStartup = $memoryFloor }
+                $fitStartup = [int64]([math]::Floor($fitStartup / 2MB) * 2MB)   # dynamic memory aligns to 2 MB
+            }
+
+            $startupFits = ($freeBytes -le 0) -or ($startBytes -le ($freeBytes - $hostHeadroom))
+
+            $memoryReduced = $false
+            if (-not $startupFits -and $fitStartup -gt 0 -and $fitStartup -lt $startBytes) {
+                # The configured startup size will not fit free memory. Shrink it and let dynamic memory grow
+                # it back if the host frees up, rather than failing before Windows even loads.
+                try {
+                    Set-VMMemory -VM $current -DynamicMemoryEnabled $true -MinimumBytes $memoryFloor -StartupBytes $fitStartup -MaximumBytes $startBytes -ErrorAction Stop
+                    $memoryReduced = $true
+                    Add-OfflineRepairLog -Level Warning -Message "Nested guest '$($current.Name)' asks for $([math]::Round($startBytes / 1GB, 2)) GB at start but only about $([math]::Round($freeBytes / 1GB, 2)) GB is free, so its startup memory was reduced to $([math]::Round($fitStartup / 1GB, 2)) GB with dynamic memory enabled."
+                }
+                catch {
+                    Add-OfflineRepairLog -Level Warning -Message "The startup memory of '$($current.Name)' could not be reduced before starting: $($_.Exception.Message)"
+                }
             }
 
             try {
-                Set-VMMemory -VM $current -DynamicMemoryEnabled $true -MinimumBytes $memoryFloor -StartupBytes $fitStartup -MaximumBytes $startBytes -ErrorAction Stop
-                $memoryReduced = $true
-                Add-OfflineRepairLog -Level Warning -Message "Nested guest '$($current.Name)' could not start with its configured memory, so it was reduced to $([math]::Round($fitStartup / 1GB, 2)) GB with dynamic memory enabled and retried."
                 Start-VM -VM $current -ErrorAction Stop | Out-Null
             }
             catch {
-                $result.Reason = "the nested guest '$($current.Name)' could not start even after its memory was reduced to fit the rescue VM: $($_.Exception.Message)"
-                return $result
-            }
-        }
+                $startError = $_.Exception.Message
 
-        $state = (Get-VM -Id $current.Id -ErrorAction SilentlyContinue).State
-        $result.State = "$state"
-        $result.Started = ($state -eq 'Running')
+                if ($startError -notmatch 'memory') {
+                    $result.Reason = "the nested guest '$($current.Name)' failed to start: $startError"
+                    return $result
+                }
 
-        if ($result.Started) {
-            Add-OfflineRepairLog -Level Info -Message "Nested guest '$($current.Name)' started."
-        }
-        else {
-            $result.Reason = "the nested guest '$($current.Name)' was asked to start but reports state '$state'"
-        }
-    }
-    finally {
-        # Restore only the disks this call took offline, and only when the guest is not running on them.
-        # A guest that started owns its disks; disks already offline at entry are left as they were found.
-        if (-not $result.Started) {
-            foreach ($number in $weOfflined) {
+                # The start failed for a memory reason. If a smaller footprint has not been applied yet, apply
+                # it now and retry once; otherwise report the real reason, not a generic start failure.
+                if ($memoryReduced -or $fitStartup -le 0 -or $fitStartup -ge $startBytes) {
+                    $result.Reason = "the nested guest '$($current.Name)' could not start because the rescue VM does not have enough free memory for it: $startError"
+                    return $result
+                }
+
                 try {
-                    Set-Disk -Number $number -IsOffline $false -ErrorAction Stop
-                    Add-OfflineRepairLog -Level Info -Message "Disk $number was returned online after the nested guest did not start, so the rescue VM keeps the access it had at entry."
+                    Set-VMMemory -VM $current -DynamicMemoryEnabled $true -MinimumBytes $memoryFloor -StartupBytes $fitStartup -MaximumBytes $startBytes -ErrorAction Stop
+                    $memoryReduced = $true
+                    Add-OfflineRepairLog -Level Warning -Message "Nested guest '$($current.Name)' could not start with its configured memory, so it was reduced to $([math]::Round($fitStartup / 1GB, 2)) GB with dynamic memory enabled and retried."
+                    Start-VM -VM $current -ErrorAction Stop | Out-Null
                 }
                 catch {
-                    Add-OfflineRepairLog -Level Warning -Message "Disk $number could not be returned online after the nested guest did not start: $($_.Exception.Message)"
+                    $result.Reason = "the nested guest '$($current.Name)' could not start even after its memory was reduced to fit the rescue VM: $($_.Exception.Message)"
+                    return $result
+                }
+            }
+
+            $state = (Get-VM -Id $current.Id -ErrorAction SilentlyContinue).State
+            $result.State = "$state"
+            $result.Started = ($state -eq 'Running')
+
+            if ($result.Started) {
+                Add-OfflineRepairLog -Level Info -Message "Nested guest '$($current.Name)' started."
+            }
+            else {
+                $result.Reason = "the nested guest '$($current.Name)' was asked to start but reports state '$state'"
+            }
+        }
+        finally {
+            # Restore only the disks this call took offline, and only when the guest is not running on them.
+            # A guest that started owns its disks; disks already offline at entry are left as they were found.
+            if (-not $result.Started) {
+                foreach ($number in $weOfflined) {
+                    try {
+                        Set-Disk -Number $number -IsOffline $false -ErrorAction Stop
+                        Add-OfflineRepairLog -Level Info -Message "Disk $number was returned online after the nested guest did not start, so the rescue VM keeps the access it had at entry."
+                    }
+                    catch {
+                        Add-OfflineRepairLog -Level Warning -Message "Disk $number could not be returned online after the nested guest did not start: $($_.Exception.Message)"
+                    }
                 }
             }
         }
-    }
 
-    return $result
+        return $result
+    }
+    finally {
+        Exit-OfflineNestedVmLifecycle -Lease $lease
+    }
 }
 
 function Wait-NestedRepairVmBoot {
@@ -819,84 +902,104 @@ function Stop-NestedRepairVmGraceful {
         return $result
     }
 
-    $name = $Vm.Name
-    # Resolve and act on the guest by its Id. Get-VM (and Stop-VM -Name) treat the name as a wildcard,
-    # so a name containing [ ] * or ? could match the wrong guest, or several.
-    $id = $Vm.Id
-
-    $current = Get-VM -Id $id -ErrorAction SilentlyContinue
-    if (-not $current) {
-        $result.Reason = "the nested guest '$name' no longer exists"
-        return $result
-    }
-
-    if ($current.State -eq 'Off') {
-        # Deliberately not reported as graceful. Reaching here means the guest powered off on its
-        # own before it was asked to, and there is no way from the host to tell an orderly shutdown
-        # apart from a crash, so the caller is told to re-check the disk rather than trust it.
-        $result.Stopped = $true
-        $result.State = 'Off'
-        $result.Reason = "the nested guest '$name' was already off, so it is not known whether it shut down cleanly"
-        Add-OfflineRepairLog -Level Info -Message $result.Reason
-        return $result
-    }
-
-    # The shutdown request is the first thing that changes state, so -WhatIf stops here. Stopped stays
-    # $false, which is what the caller already treats as "the guest is still running".
-    if (-not $PSCmdlet.ShouldProcess("nested guest '$name'", 'Request a clean shutdown, turning it off only if it does not comply')) {
-        $result.State = [string]$current.State
-        $result.Reason = 'the guest was not stopped because -WhatIf was specified'
-        return $result
-    }
-
-    Add-OfflineRepairLog -Level Info -Message "Asking the nested guest '$name' to shut down cleanly so anything it wrote to the registry is flushed to its disk."
-
+    $lease = Enter-OfflineNestedVmLifecycle
     try {
-        Stop-VM -VM $current -Force -AsJob -ErrorAction Stop | Out-Null
-    }
-    catch {
-        # Return here. Falling through to the wait loop and the power-off path would overwrite this with
-        # the generic "had to be turned off" reason and lose the real cause of the failed request.
-        $result.State = [string]$current.State
-        $result.Reason = "the shutdown request to '$name' failed: $($_.Exception.Message)"
-        Add-OfflineRepairLog -Level Warning -Message $result.Reason
-        return $result
-    }
+        $name = $Vm.Name
+        # Resolve and act on the guest by its Id. Get-VM (and Stop-VM -Name) treat the name as a wildcard,
+        # so a name containing [ ] * or ? could match the wrong guest, or several.
+        $id = $Vm.Id
 
-    $started = Get-Date
-    while (((Get-Date) - $started).TotalSeconds -lt $TimeoutSeconds) {
         $current = Get-VM -Id $id -ErrorAction SilentlyContinue
-
         if (-not $current) {
-            $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
-            $result.Reason = "the nested guest '$name' disappeared while it was shutting down"
-            Add-OfflineRepairLog -Level Warning -Message $result.Reason
+            $result.Reason = "the nested guest '$name' no longer exists"
             return $result
         }
 
         if ($current.State -eq 'Off') {
+            # Deliberately not reported as graceful. Reaching here means the guest powered off on its
+            # own before it was asked to, and there is no way from the host to tell an orderly shutdown
+            # apart from a crash, so the caller is told to re-check the disk rather than trust it.
             $result.Stopped = $true
-            $result.Graceful = $true
             $result.State = 'Off'
-            $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
-            Add-OfflineRepairLog -Level Info -Message "The nested guest '$name' shut down cleanly after $($result.WaitedSeconds) seconds."
+            $result.Reason = "the nested guest '$name' was already off, so it is not known whether it shut down cleanly"
+            Add-OfflineRepairLog -Level Info -Message $result.Reason
             return $result
         }
 
-        Start-Sleep -Seconds $PollSeconds
+        # The shutdown request is the first thing that changes state, so -WhatIf stops here. Stopped stays
+        # $false, which is what the caller already treats as "the guest is still running".
+        if (-not $PSCmdlet.ShouldProcess("nested guest '$name'", 'Request a clean shutdown, turning it off only if it does not comply')) {
+            $result.State = [string]$current.State
+            $result.Reason = 'the guest was not stopped because -WhatIf was specified'
+            return $result
+        }
+
+        Add-OfflineRepairLog -Level Info -Message "Asking the nested guest '$name' to shut down cleanly so anything it wrote to the registry is flushed to its disk."
+
+        try {
+            Stop-VM -VM $current -Force -AsJob -ErrorAction Stop | Out-Null
+        }
+        catch {
+            # Return here. Falling through to the wait loop and the power-off path would overwrite this with
+            # the generic "had to be turned off" reason and lose the real cause of the failed request.
+            $result.State = [string]$current.State
+            $result.Reason = "the shutdown request to '$name' failed: $($_.Exception.Message)"
+            Add-OfflineRepairLog -Level Warning -Message $result.Reason
+            return $result
+        }
+
+        $started = Get-Date
+        while (((Get-Date) - $started).TotalSeconds -lt $TimeoutSeconds) {
+            $current = Get-VM -Id $id -ErrorAction SilentlyContinue
+
+            if (-not $current) {
+                $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
+                $result.Reason = "the nested guest '$name' disappeared while it was shutting down"
+                Add-OfflineRepairLog -Level Warning -Message $result.Reason
+                return $result
+            }
+
+            if ($current.State -eq 'Off') {
+                $result.Stopped = $true
+                $result.Graceful = $true
+                $result.State = 'Off'
+                $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
+                Add-OfflineRepairLog -Level Info -Message "The nested guest '$name' shut down cleanly after $($result.WaitedSeconds) seconds."
+                return $result
+            }
+
+            Start-Sleep -Seconds $PollSeconds
+        }
+
+        $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
+        Add-OfflineRepairLog -Level Warning -Message "The nested guest '$name' did not shut down within $($result.WaitedSeconds) seconds, so its power is being turned off. Anything it wrote to the registry and that Windows had not flushed yet is lost, so the disk has to be re-checked rather than trusted."
+
+        try {
+            Stop-VM -VM $current -TurnOff -Force -ErrorAction Stop
+            Start-Sleep -Seconds 3
+            $current = Get-VM -Id $id -ErrorAction Stop
+        }
+        catch {
+            $result.State = [string]$current.State
+            $result.Reason = "the nested guest '$name' could not be confirmed stopped after the shutdown timeout: $($_.Exception.Message)"
+            Add-OfflineRepairLog -Level Error -Message $result.Reason
+            return $result
+        }
+
+        $result.State = if ($current) { [string]$current.State } else { $null }
+        $result.Stopped = ($null -ne $current -and $current.State -eq 'Off')
+        $result.Graceful = $false
+        if ($result.Stopped) {
+            $result.Reason = "the nested guest '$name' had to be turned off at the power button after $($result.WaitedSeconds) seconds"
+        }
+        else {
+            $result.Reason = "the nested guest '$name' could not be confirmed Off after a forced shutdown; its disk must not be taken back"
+            Add-OfflineRepairLog -Level Error -Message $result.Reason
+        }
+
+        return $result
     }
-
-    $result.WaitedSeconds = [int]((Get-Date) - $started).TotalSeconds
-    Add-OfflineRepairLog -Level Warning -Message "The nested guest '$name' did not shut down within $($result.WaitedSeconds) seconds, so its power is being turned off. Anything it wrote to the registry and that Windows had not flushed yet is lost, so the disk has to be re-checked rather than trusted."
-
-    Stop-VM -VM $current -TurnOff -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-
-    $current = Get-VM -Id $id -ErrorAction SilentlyContinue
-    $result.State = if ($current) { [string]$current.State } else { $null }
-    $result.Stopped = (-not $current) -or ($current.State -eq 'Off')
-    $result.Graceful = $false
-    $result.Reason = "the nested guest '$name' had to be turned off at the power button after $($result.WaitedSeconds) seconds"
-
-    return $result
+    finally {
+        Exit-OfflineNestedVmLifecycle -Lease $lease
+    }
 }

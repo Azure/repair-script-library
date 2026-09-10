@@ -34,7 +34,9 @@
       3. A hash-verified backup taken before anything is deleted, into a folder unique to the run,
          so one run can never overwrite an earlier run's only copy of the originals. Each file's
          owner and DACL are recorded in binary form alongside its bytes, so a rollback restores the
-         security it had and not merely its contents.
+         security it had and not merely its contents. Backup capacity must be known and sufficient
+         before any file is copied or removed. The verified SHA256 is retained so a rollback checks
+         both the backup and the restored bytes against the same original baseline.
 
       4. Independent checks afterwards, and a rollback of the whole set if any fails. The registry
          check reports INCONCLUSIVE, not PASS, when no hive was loadable beforehand, so a run that
@@ -70,6 +72,10 @@
     Enable-OfflineOwnershipPrivilege, Save-OfflinePathSecurity).
 
 .VERSION
+    v1.2: Query backup capacity natively on the actual directory's volume, without PowerShell drive
+          registration, and refuse unknown, invalid or insufficient capacity. Retain the verified
+          backup hash and verify rollback contents before counting a file as restored. Report hash
+          read failures without making optional snapshot hashes mandatory.
     v1.1: Added the hive base-name veto so a hive's own transaction and recovery logs
           (SYSTEM.LOG1, SOFTWARE.LOG2, SECURITY.blf, SYSTEM.regtrans-ms) can no longer be removed;
           the guard is now genuinely two independent layers. Bound every delete to the offline root
@@ -113,26 +119,90 @@ function Get-OfflineFileHashValue {
     <#
     .SYNOPSIS
         SHA256 of a file, or $null when it cannot be read.
+
+    .DESCRIPTION
+        An unavailable hash is logged and returned as $null, never as a verified match. Snapshot
+        hashing is optional; backup and restore callers must require readable comparison hashes.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
-    try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash }
-    catch { return $null }
+    try {
+        $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ([string]::IsNullOrWhiteSpace($hash)) { throw 'SHA256 was not returned.' }
+        return $hash
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "The SHA256 hash of $Path could not be read: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 function Get-OfflineFreeSpace {
     <#
     .SYNOPSIS
-        Free bytes on the volume holding a path, or $null when it cannot be determined.
+        Available bytes on an existing directory's volume, or $null when unknown.
+
+    .DESCRIPTION
+        Queries GetDiskFreeSpaceExW from System32, loaded lazily, without PowerShell drive
+        registration or a Storage module dependency. Uses the directory itself, not its drive
+        letter's root, so a mounted volume below that root is measured correctly. Absolute drive,
+        UNC, extended UNC and volume-GUID directory paths are supported.
+
+        Returns an Int64, including a genuine zero. An invalid path, native failure or byte-count
+        overflow is logged and returns $null. The caller must refuse removal when capacity is
+        unknown. The directory must already exist; falling back to an ancestor could measure a
+        different volume from the intended backup location.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
     try {
-        $root = [System.IO.Path]::GetPathRoot($Path)
-        if ([string]::IsNullOrWhiteSpace($root)) { return $null }
-        $drive = Get-PSDrive -Name $root.Substring(0, 1) -ErrorAction Stop
-        return [int64]$drive.Free
+        $drivePath = $Path -match '^(?:\\\\\?\\)?[A-Za-z]:\\'
+        $volumePath = $Path -match '^\\\\\?\\Volume\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}\\'
+        $uncPath = $Path -match '^\\\\(?:\?\\UNC\\|(?![?.]\\))[^\\]+\\[^\\]+(?:\\|$)'
+        if ($Path.IndexOf([char]0) -ge 0 -or -not ($drivePath -or $volumePath -or $uncPath)) {
+            throw 'An absolute drive, UNC or volume-GUID directory path is required.'
+        }
+
+        if (-not ('RslOffline.FileRemovalDiskSpace' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+
+namespace RslOffline
+{
+    public static class FileRemovalDiskSpace
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetDiskFreeSpaceExW(string directory,
+            out ulong available, out ulong total, out ulong free);
+
+        public static long GetAvailableBytes(string directory)
+        {
+            ulong available, total, free;
+            if (!GetDiskFreeSpaceExW(directory, out available, out total, out free))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error, "GetDiskFreeSpaceExW failed (Win32 error " +
+                    error + "): " + new Win32Exception(error).Message);
+            }
+            if (available > total || available > free)
+                throw new InvalidDataException("GetDiskFreeSpaceExW returned inconsistent byte counts.");
+            return checked((long)available);
+        }
     }
-    catch { return $null }
+}
+'@ -ErrorAction Stop
+        }
+
+        return [RslOffline.FileRemovalDiskSpace]::GetAvailableBytes($Path.TrimEnd('\') + '\')
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "Free space for $Path could not be determined: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 function Test-OfflineRemovableFile {
@@ -441,8 +511,9 @@ function Backup-OfflineFile {
         log could return owned by the wrong authority.
 
     .OUTPUTS
-        PSCustomObject with Name, Source, Backup, Attributes, Security, Success and Reason.
+        PSCustomObject with Name, Source, Backup, Attributes, Security, Hash, Success and Reason.
         Security is a byte[] security descriptor, or $null when it could not be read.
+        Hash is the verified original SHA256, retained for rollback independently of IncludeHash.
     #>
     param(
         [Parameter(Mandatory = $true)]$File,
@@ -455,6 +526,7 @@ function Backup-OfflineFile {
         Backup     = (Join-Path $BackupPath $File.Name)
         Attributes = $File.Attributes
         Security   = $null
+        Hash       = $null
         Success    = $false
         Reason     = $null
     }
@@ -479,6 +551,7 @@ function Backup-OfflineFile {
         $result.Reason = 'the backup copy does not match the original'
         return $result
     }
+    $result.Hash = $sourceHash
 
     # Record the live source's owner and DACL, so a rollback restores the security the file had and
     # not merely its bytes. Best-effort: a file whose descriptor cannot be read is still backed up
@@ -560,6 +633,15 @@ function Restore-OfflineFileSet {
         and DACL are then reapplied, so a restored file is the one that was there before and not a
         look-alike carrying the rescue VM's idea of permissions.
 
+        When a backup record carries Hash, both the backup before copying and the restored bytes
+        must match that captured, verified original SHA256. An absent or unreadable comparison
+        hash is a failure, never a match. Files not in a supplied record set are refused.
+
+        For a recordless restore, or a legacy metadata-only record with no Hash field, the backup
+        is hashed before copying and the destination must match that baseline. A warning makes
+        this narrower guarantee explicit: it proves the copy, not that the backup still matches
+        the historical original. An explicitly empty Hash field is not a legacy record and fails.
+
         The rollback is deliberately loud. The backup folder is enumerated with -ErrorAction Stop,
         and the run is reported as failed unless the number of files recovered equals the number
         expected. A backup folder that has gone missing or unreadable, or a restore that quietly put
@@ -568,7 +650,9 @@ function Restore-OfflineFileSet {
 
     .OUTPUTS
         PSCustomObject with Restored, Failed, Expected, Succeeded and Detail[]. Succeeded is $true
-        only when nothing failed and every expected file came back.
+        only when nothing failed, every expected file's restored contents were hash-verified,
+        and its recorded metadata was reapplied.
+        Restored counts verified files, not merely successful copy operations.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$BackupPath,
@@ -586,18 +670,23 @@ function Restore-OfflineFileSet {
     }
     $detail = [System.Collections.Generic.List[string]]::new()
 
+    function Add-RestoreFailure {
+        param([string]$Message)
+        $summary.Failed++
+        $detail.Add($Message)
+        Add-OfflineRepairLog -Level Error -Message $Message
+    }
+
     # Restoring goes through the protected-copy path, so the helper that provides it has to be
     # loaded. Saying so once beats failing per file with an obscure "command not found".
     if (-not (Get-Command -Name 'Copy-OfflineProtectedFile' -ErrorAction SilentlyContinue)) {
-        $detail.Add('Use-OfflineProtectedResource.ps1 is not loaded, so files cannot be restored through the protected-copy path.')
-        $summary.Failed = 1
+        Add-RestoreFailure 'Use-OfflineProtectedResource.ps1 is not loaded, so files cannot be restored through the protected-copy path.'
         $summary.Detail = @($detail)
         return $summary
     }
 
     if (-not (Test-Path -LiteralPath $BackupPath)) {
-        $detail.Add("The backup folder $BackupPath is not present, so nothing could be restored.")
-        $summary.Failed = 1
+        Add-RestoreFailure "The backup folder $BackupPath is not present, so nothing could be restored."
         $summary.Detail = @($detail)
         return $summary
     }
@@ -608,8 +697,7 @@ function Restore-OfflineFileSet {
         $backedUp = @(Get-ChildItem -LiteralPath $BackupPath -File -Force -ErrorAction Stop)
     }
     catch {
-        $detail.Add("The backup folder $BackupPath could not be read ($($_.Exception.Message)), so the rollback cannot proceed.")
-        $summary.Failed = 1
+        Add-RestoreFailure "The backup folder $BackupPath could not be read ($($_.Exception.Message)), so the rollback cannot proceed."
         $summary.Detail = @($detail)
         return $summary
     }
@@ -621,31 +709,92 @@ function Restore-OfflineFileSet {
         $destination = Join-Path $TargetPath $item.Name
         $recorded = @($FileRecord) | Where-Object { $_ -and $_.Name -eq $item.Name } | Select-Object -First 1
 
-        $copy = Copy-OfflineProtectedFile -Source $item.FullName -Destination $destination
-        if (-not $copy.Copied) {
-            $summary.Failed++
-            $detail.Add("Could not restore $($item.Name): $($copy.Reason)")
+        if ($recordCount -gt 0 -and -not $recorded) {
+            Add-RestoreFailure "Could not restore $($item.Name): it is not in the expected file record set."
             continue
         }
 
-        if ($recorded -and $recorded.Attributes) {
-            try { (Get-Item -LiteralPath $destination -Force -ErrorAction Stop).Attributes = [System.IO.FileAttributes]$recorded.Attributes }
-            catch { $detail.Add("Restored $($item.Name) but could not reapply its attributes ($($_.Exception.Message)).") }
+        $hasRecordedHash = $false
+        if ($recorded) {
+            $hasRecordedHash = $null -ne $recorded.PSObject.Properties['Hash']
+            if ($recorded -is [System.Collections.IDictionary]) { $hasRecordedHash = $recorded.Contains('Hash') }
         }
+        if ($hasRecordedHash -and [string]::IsNullOrWhiteSpace($recorded.Hash)) {
+            Add-RestoreFailure "Could not restore $($item.Name): the recorded original hash is unavailable."
+            continue
+        }
+
+        $backupHash = Get-OfflineFileHashValue -Path $item.FullName
+        if ([string]::IsNullOrWhiteSpace($backupHash)) {
+            Add-RestoreFailure "Could not restore $($item.Name): the backup hash is unavailable."
+            continue
+        }
+        $expectedHash = $backupHash
+        if ($hasRecordedHash) {
+            $expectedHash = $recorded.Hash
+            if ($backupHash -ne $expectedHash) {
+                Add-RestoreFailure "Could not restore $($item.Name): the backup hash does not match the recorded original."
+                continue
+            }
+        }
+        else {
+            $warning = "No original-file hash was recorded for $($item.Name); verification is only against the backup hash captured before this restore."
+            $detail.Add($warning)
+            Add-OfflineRepairLog -Level Warning -Message $warning
+        }
+
+        try { $copy = Copy-OfflineProtectedFile -Source $item.FullName -Destination $destination }
+        catch {
+            Add-RestoreFailure "Could not restore $($item.Name): $($_.Exception.Message)"
+            continue
+        }
+        if (-not $copy.Copied) {
+            Add-RestoreFailure "Could not restore $($item.Name): $($copy.Reason)"
+            continue
+        }
+
+        # Read before replaying a restrictive descriptor, but replay metadata even if hashing fails.
+        $restoredHash = Get-OfflineFileHashValue -Path $destination
+        $restoreProblems = [System.Collections.Generic.List[string]]::new()
 
         if ($recorded -and $recorded.Security) {
             if (-not (Restore-OfflineFileSecurity -Path $destination -BinaryDescriptor $recorded.Security)) {
-                $detail.Add("Restored $($item.Name) but could not reapply its original owner and DACL.")
+                $restoreProblems.Add('could not reapply its original owner and DACL')
             }
         }
 
+        # NTFS sets Archive when security changes, so exact attributes must be replayed last.
+        if ($recorded -and $recorded.Attributes) {
+            try {
+                $expectedAttributes = [System.IO.FileAttributes]$recorded.Attributes
+                [System.IO.File]::SetAttributes($destination, $expectedAttributes)
+                if ([System.IO.File]::GetAttributes($destination) -ne $expectedAttributes) {
+                    throw 'the attributes read back do not match the recorded original'
+                }
+            }
+            catch {
+                $restoreProblems.Add("could not reapply its attributes ($($_.Exception.Message))")
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($restoredHash)) {
+            $restoreProblems.Add('the restored file hash is unavailable')
+        }
+        elseif ($restoredHash -ne $expectedHash) {
+            $restoreProblems.Add('its hash does not match the captured baseline')
+        }
+        if ($restoreProblems.Count -gt 0) {
+            Add-RestoreFailure "Could not fully restore $($item.Name): $($restoreProblems -join '; ')."
+            continue
+        }
+
         $summary.Restored++
-        $detail.Add("Restored $($item.Name).")
+        $detail.Add("Restored and hash-verified $($item.Name).")
     }
 
     $summary.Succeeded = ($summary.Failed -eq 0 -and $summary.Restored -eq $summary.Expected)
     if (-not $summary.Succeeded -and $summary.Failed -eq 0) {
-        $detail.Add("Rollback recovered $($summary.Restored) of $($summary.Expected) expected file(s).")
+        Add-RestoreFailure "Rollback recovered $($summary.Restored) of $($summary.Expected) expected file(s)."
     }
 
     $summary.Detail = @($detail)
@@ -661,7 +810,8 @@ function Test-OfflineRemovalResult {
         Six checks. Check 5 is the one that matters most: comparing every other file in the folder
         by size, last write time and attributes is the direct evidence that the registry hives and
         their .LOG1/.LOG2 recovery logs were neither removed nor modified. Check 6 then has Windows
-        confirm the hives still parse.
+        confirm the hives still parse. Check 5 compares metadata, not content hashes; IncludeHash
+        captures removable-file hashes for the backup baseline, not every other file's contents.
 
         Check 4 re-reads the filesystem directly rather than trusting the list of files the delete
         loop reported it removed, so it can actually catch a delete that did not take. Check 6
@@ -669,9 +819,9 @@ function Test-OfflineRemovalResult {
         proved nothing about the hives is never mistaken for one that proved them intact; an
         inconclusive check is not a failure and does not roll the run back.
 
-        A folder ACL that could not be read before and cannot be read now is passed rather than
-        failed, because there is nothing to compare and refusing on that basis would roll back a
-        correct repair on a build that simply restricts the folder.
+        A folder timestamp or ACL that could not be read on either side is INCONCLUSIVE rather
+        than PASS or FAIL. There is no comparable evidence, and refusing on that basis would roll
+        back a correct repair on a build that simply restricts the folder.
 
     .OUTPUTS
         PSCustomObject with Passed, Inconclusive, Check[] and Failure[]. Each Check carries Name,
@@ -738,7 +888,7 @@ function Test-OfflineRemovalResult {
         elseif ($stillOnDisk.Count -gt 0) { "still on disk: $($stillOnDisk -join ', ')" }
         else { "removed without being planned: $($unexpectedlyGone -join ', ')" })
 
-    # 5. Everything else in the folder is byte-for-byte and flag-for-flag as it was.
+    # 5. Everything else in the folder retains its size, last-write timestamp and attributes.
     $otherProblems = [System.Collections.Generic.List[string]]::new()
     foreach ($original in @($before.OtherFile)) {
         $current = @($after.OtherFile) | Where-Object { $_.Name -eq $original.Name } | Select-Object -First 1
@@ -803,6 +953,12 @@ function Invoke-OfflineRemovalPlan {
         touched - the folder once, and each file again as it is deleted - so a degraded or unrooted
         path is refused rather than allowed to delete from the rescue VM's own volume. The backup
         goes into a folder unique to this run, so one run cannot overwrite an earlier run's backups.
+        Capacity on that directory's actual volume must be known and sufficient before any file is
+        copied or deleted; a failed query, invalid byte count or headroom overflow refuses the run.
+
+        BackupRecord retains each verified copy's Hash, Attributes and Security. Callers persisting
+        revert metadata should retain these records and pass them as FileRecord to
+        Restore-OfflineFileSet, so a later revert can verify against the same original baseline.
 
         A failure at any point rolls the whole plan back. A partially cleared CLFS log set is worse
         than a full one: the .blf refers to containers that would no longer exist. A rollback that
@@ -815,10 +971,10 @@ function Invoke-OfflineRemovalPlan {
         each call instead.
 
     .OUTPUTS
-        PSCustomObject with Label, BackupPath, Removed[], Verification, Success, Reason,
+        PSCustomObject with Label, BackupPath, BackupRecord[], Removed[], Verification, Success, Reason,
         RollbackAttempted, RollbackSucceeded and RollbackDetail[]. A run where Success is false,
         RollbackAttempted is true and RollbackSucceeded is false is the fatal case: the offline
-        image is missing files the rollback could not put back.
+        image has missing or unverified files, not a proven restoration of the original contents.
     #>
     param(
         [Parameter(Mandatory = $true)]$Plan,
@@ -829,6 +985,7 @@ function Invoke-OfflineRemovalPlan {
     $result = [PSCustomObject]@{
         Label             = $Plan.Label
         BackupPath        = $null
+        BackupRecord      = @()
         Removed           = @()
         Verification      = $null
         Success           = $false
@@ -885,23 +1042,36 @@ function Invoke-OfflineRemovalPlan {
     $result.BackupPath = $backupPath
 
     # Room for the backup, with the same again as headroom.
-    $required = ($Plan.TotalBytes * 2)
-    $free = Get-OfflineFreeSpace -Path $backupPath
-    if ($null -eq $free) {
-        Add-OfflineRepairLog -Level Warning -Message 'Free space on the backup volume could not be confirmed; continuing.'
+    try {
+        if (($Plan.TotalBytes -isnot [int64] -and $Plan.TotalBytes -isnot [int32]) -or $Plan.TotalBytes -lt 0) {
+            throw 'The plan total must be a nonnegative Int64 byte count.'
+        }
+        $required = [int64]([decimal]$Plan.TotalBytes * 2)
+        $free = Get-OfflineFreeSpace -Path $backupPath
+        if ($null -eq $free) { throw 'Free space on the backup volume could not be determined.' }
+        if (($free -isnot [int64] -and $free -isnot [int32]) -or $free -lt 0) {
+            throw 'The free-space query did not return a nonnegative Int64 byte count.'
+        }
     }
-    elseif ($free -lt $required) {
-        $result.Reason = "not enough free space for the backup: $([math]::Round($free / 1MB)) MB free, $([math]::Round($required / 1MB)) MB needed"
+    catch {
+        $result.Reason = "backup capacity could not be confirmed; refusing removal: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Error -Message $result.Reason
+        return $result
+    }
+    if ($free -lt $required) {
+        $result.Reason = "not enough free space for the backup: $free bytes free, $required bytes needed including headroom"
+        Add-OfflineRepairLog -Level Error -Message $result.Reason
         return $result
     }
 
     # Back everything up first. Nothing is deleted until every file has a verified copy. The backup
-    # records - each carrying the file's recorded attributes and its owner and DACL - are what a
+    # records - each carrying the verified hash, recorded attributes and owner and DACL - are what a
     # rollback restores from, so they are kept for the rollback calls below.
     $backups = [System.Collections.Generic.List[object]]::new()
     foreach ($file in @($Plan.Snapshot.MatchedFile)) {
         $backup = Backup-OfflineFile -File $file -BackupPath $backupPath
         if (-not $backup.Success) {
+            $result.BackupRecord = @($backups)
             $result.Reason = "$($file.Name) could not be backed up - $($backup.Reason)"
             Add-OfflineRepairLog -Level Error -Message $result.Reason
             return $result
@@ -909,6 +1079,7 @@ function Invoke-OfflineRemovalPlan {
         $backups.Add($backup)
         Add-OfflineRepairLog -Message "Backed up $($file.Name) ($([math]::Round($file.Length / 1KB)) KB)."
     }
+    $result.BackupRecord = @($backups)
 
     # Delete, working from the same list.
     #
@@ -960,7 +1131,7 @@ function Invoke-OfflineRemovalPlan {
 
     if ($deleteFailed) {
         Add-OfflineRepairLog -Level Error -Message "$deleteFailed Rolling this set back."
-        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord @($backups)
+        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord $result.BackupRecord
         foreach ($line in @($rollback.Detail)) { Add-OfflineRepairLog -Message "  $line" }
         $result.RollbackAttempted = $true
         $result.RollbackSucceeded = [bool]$rollback.Succeeded
@@ -971,7 +1142,7 @@ function Invoke-OfflineRemovalPlan {
             Add-OfflineRepairLog -Level Warning -Message "Removal of '$($Plan.Label)' failed and was rolled back cleanly; the offline image is unchanged."
         }
         else {
-            $result.Reason = "FATAL: $deleteFailed The rollback then failed ($($rollback.Restored) of $($rollback.Expected) restored); the offline image is missing files with no restored backup. Recover by hand from $backupPath."
+            $result.Reason = "FATAL: $deleteFailed The rollback then failed ($($rollback.Restored) of $($rollback.Expected) restored and hash-verified); the offline image has missing or unverified files. Recover by hand from $backupPath."
             Add-OfflineRepairLog -Level Error -Message $result.Reason
         }
         return $result
@@ -992,7 +1163,7 @@ function Invoke-OfflineRemovalPlan {
 
     if (-not $verification.Passed) {
         Add-OfflineRepairLog -Level Error -Message "Verification failed for $($Plan.Label). Rolling it back."
-        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord @($backups)
+        $rollback = Restore-OfflineFileSet -BackupPath $backupPath -TargetPath $Plan.Path -FileRecord $result.BackupRecord
         foreach ($line in @($rollback.Detail)) { Add-OfflineRepairLog -Message "  $line" }
         $result.RollbackAttempted = $true
         $result.RollbackSucceeded = [bool]$rollback.Succeeded
@@ -1003,7 +1174,7 @@ function Invoke-OfflineRemovalPlan {
             Add-OfflineRepairLog -Level Warning -Message "Verification of '$($Plan.Label)' failed and was rolled back cleanly; the offline image is unchanged."
         }
         else {
-            $result.Reason = "FATAL: verification failed and the rollback then failed ($($rollback.Restored) of $($rollback.Expected) restored): $($verification.Failure -join '; '). The offline image is missing files with no restored backup. Recover by hand from $backupPath."
+            $result.Reason = "FATAL: verification failed and the rollback then failed ($($rollback.Restored) of $($rollback.Expected) restored and hash-verified): $($verification.Failure -join '; '). The offline image has missing or unverified files. Recover by hand from $backupPath."
             Add-OfflineRepairLog -Level Error -Message $result.Reason
         }
         return $result
