@@ -58,9 +58,12 @@
           Clear() that would also drop the failures, the letters still stuck are named in a
           single Warning, and the function never throws. It declares SupportsShouldProcess so
           -WhatIf flows into the delegated calls and its behaviour matches Remove-OfflineDriveLetter.
+    v1.4: Verify disk state after diskpart, skip writes to already-ready disks, and recognise
+          the resource disk by its language-independent warning file as well as its label.
+          Probe hive metadata in memory through offreg, without registry mounts.
 #>
 
-if (-not (Get-Command Add-OfflineRepairLog -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command Open-OfflineRegistryReader -ErrorAction SilentlyContinue)) {
     try {
         . (Join-Path $PSScriptRoot 'OfflineRepairCommon.ps1')
     }
@@ -313,26 +316,38 @@ function Test-TemporaryStorageDisk {
         The temporary/resource disk is local scratch space that is wiped on deallocation.
         It sits on the same bus as the disks being repaired and carries no attribute the
         bus-type filter would exclude, so without an explicit check it would be brought
-        online and made writable like a broken OS disk. Azure labels its volume
-        'Temporary Storage', which is the only reliable signal, so it is matched on that.
+        online and made writable like a broken OS disk. Match either the English
+        'Temporary Storage' label or the language-independent DATALOSS_WARNING_README.txt
+        at a volume root. Inspect existing access paths only; this check never mounts a disk.
 
     .OUTPUTS
-        $true when any volume on the disk is labelled 'Temporary Storage'.
+        $true when any volume on the disk has either resource-disk marker.
     #>
     param(
         [Parameter(Mandatory = $true)]$Disk
     )
 
     try {
-        $labels = @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue |
-                Get-Volume -ErrorAction SilentlyContinue |
-                ForEach-Object { "$($_.FileSystemLabel)" })
+        foreach ($partition in @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue)) {
+            $volumes = @($partition | Get-Volume -ErrorAction SilentlyContinue)
+            $labels = @($volumes | ForEach-Object { $_.FileSystemLabel })
+            if ($labels -contains 'Temporary Storage') { return $true }
+
+            $roots = @($partition.AccessPaths) + @($volumes | ForEach-Object {
+                    $_.Path
+                    if ($_.DriveLetter) { "$($_.DriveLetter):\" }
+                })
+            foreach ($root in @($roots | Where-Object { $_ } | Select-Object -Unique)) {
+                $marker = Join-OfflinePath -Root $root -ChildPath 'DATALOSS_WARNING_README.txt'
+                if ($marker -and (Test-OfflinePath $marker)) { return $true }
+            }
+        }
     }
     catch {
-        return $false
+        Add-OfflineRepairLog -Level Warning -Message "Could not inspect resource-disk markers on disk $($Disk.Number): $($_.Exception.Message)"
     }
 
-    return [bool]($labels -contains 'Temporary Storage')
+    return $false
 }
 
 function Set-OfflineDisksOnline {
@@ -342,7 +357,9 @@ function Set-OfflineDisksOnline {
 
     .DESCRIPTION
         The rescue VM's own boot/system disk and the Azure temporary/resource disk are
-        never touched. Returns the disk numbers that were successfully brought online.
+        never touched. Returns disk numbers confirmed online and writable. A disk that is
+        already ready requires no writes; a changed disk is re-read rather than trusting
+        diskpart's exit code, because 'noerr' can suppress an online/attribute failure.
 
         SupportsShouldProcess is declared so -WhatIf reports each disk it would online.
         ConfirmImpact is left at the default (Medium), below the default $ConfirmPreference
@@ -366,29 +383,42 @@ function Set-OfflineDisksOnline {
         })
 
     foreach ($disk in $disks) {
+        if (-not $disk.IsOffline -and -not $disk.IsReadOnly) {
+            $processed += $disk.Number
+            continue
+        }
         if (-not $PSCmdlet.ShouldProcess("disk $($disk.Number)", 'Bring online and clear the read-only flag')) { continue }
 
         # diskpart is used rather than Set-Disk because it succeeds on disks whose
         # partition table is damaged, which is common on the disks we are repairing.
-        $script = @"
-select disk $($disk.Number)
-attributes disk clear readonly noerr
-online disk noerr
-"@
-        $output = $script | diskpart.exe 2>&1
-        # diskpart exits non-zero when it could not process the script, which is the
-        # difference between a real online and a silent no-op, so a disk is counted only
-        # when the exit code confirms it. Its output is logged on failure, not discarded.
-        if ($LASTEXITCODE -eq 0) {
+        $commands = @("select disk $($disk.Number)")
+        if ($disk.IsReadOnly) { $commands += 'attributes disk clear readonly noerr' }
+        if ($disk.IsOffline) { $commands += 'online disk noerr' }
+        $output = ($commands -join "`r`n") | diskpart.exe 2>&1
+        $diskpartExit = $LASTEXITCODE
+        $diskState = $null
+        $stateError = ''
+        try {
+            $diskState = Get-Disk -Number $disk.Number -ErrorAction Stop
+        }
+        catch {
+            $stateError = $_.Exception.Message
+        }
+
+        if ($diskState -and -not $diskState.IsOffline -and -not $diskState.IsReadOnly) {
             $processed += $disk.Number
+            if ($diskpartExit -ne 0) {
+                Add-OfflineRepairLog -Level Warning -Message "Disk $($disk.Number) is confirmed online and writable, but diskpart reported exit $diskpartExit`: $(($output | Out-String).Trim())"
+            }
         }
         else {
-            Add-OfflineRepairLog -Level Warning -Message "diskpart could not bring disk $($disk.Number) online (exit code $LASTEXITCODE): $(($output | Out-String).Trim())"
+            $stateText = if ($diskState) { "IsOffline=$($diskState.IsOffline), IsReadOnly=$($diskState.IsReadOnly)" } else { "state unavailable: $stateError" }
+            Add-OfflineRepairLog -Level Warning -Message "Disk $($disk.Number) was not confirmed online and writable ($stateText; diskpart exit $diskpartExit): $(($output | Out-String).Trim())"
         }
     }
 
     if ($processed.Count -gt 0) {
-        Add-OfflineRepairLog -Level Info -Message "Brought attached virtual disk(s) online: $($processed -join ', ')"
+        Add-OfflineRepairLog -Level Info -Message "Attached virtual disk(s) confirmed online and writable: $($processed -join ', ')"
     }
     else {
         Add-OfflineRepairLog -Level Warning -Message 'No attached virtual data disk was brought online on the rescue VM.'
@@ -713,66 +743,49 @@ function Get-OfflineWindowsInstallCandidate {
     }
 
     if ($candidate.SystemHivePresent -and $candidate.SoftwareHivePresent) {
-        # Load under a unique temporary key so this probe never collides with the
-        # BROKEN<HIVE> mounts used by the repair itself.
-        $tempBase = 'RSLPROBE_{0}' -f ([guid]::NewGuid().ToString('N'))
-        $softwareKey = "${tempBase}_SOFTWARE"
-        $systemKey = "${tempBase}_SYSTEM"
-        $loadedKeys = [System.Collections.Generic.List[string]]::new()
-
-        # The probe is best-effort by design: a SOFTWARE hive that cannot be read is a
-        # fault this library exists to repair, so failing to read it must not abort
-        # discovery. But it must not be silent either - an unreadable hive costs this
-        # candidate up to 40 of its score, which is enough to change which installation
-        # is selected on a disk carrying more than one. Every failure below is recorded
-        # on the candidate and surfaced as a Warning.
+        # Unreadable metadata lowers a candidate's score but must not hide the disk that
+        # needs repairing. A close failure, unlike a read failure, aborts discovery.
         $probeNotes = [System.Collections.Generic.List[string]]::new()
 
-        try {
-            $regOut = (reg.exe load "HKLM\$softwareKey" "$softwareHivePath" 2>&1 | Out-String).Trim()
-            if ($LASTEXITCODE -eq 0) {
-                [void]$loadedKeys.Add($softwareKey)
-                $cvError = $null
-                $cv = Get-ItemProperty "HKLM:\$softwareKey\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue -ErrorVariable cvError
-                if ($cv) {
-                    $candidate.ProductName = [string]$cv.ProductName
-                    $candidate.CurrentBuildNumber = [string]$cv.CurrentBuildNumber
+        foreach ($hiveName in @('SOFTWARE', 'SYSTEM')) {
+            $hivePath = if ($hiveName -eq 'SOFTWARE') { $softwareHivePath } else { $systemHivePath }
+            $reader = $null
+            try {
+                $reader = Open-OfflineRegistryReader -Path $hivePath
+                if ($hiveName -eq 'SOFTWARE') {
+                    $cvKey = 'Microsoft\Windows NT\CurrentVersion'
+                    $candidate.ProductName = [string]$reader.ReadString($cvKey, 'ProductName')
+                    $candidate.CurrentBuildNumber = [string]$reader.ReadString($cvKey, 'CurrentBuildNumber')
+                    if (-not $candidate.ProductName -or -not $candidate.CurrentBuildNumber) {
+                        [void]$probeNotes.Add('SOFTWARE product name or build number is absent.')
+                    }
                 }
                 else {
-                    [void]$probeNotes.Add("SOFTWARE\Microsoft\Windows NT\CurrentVersion could not be read: $(if ($cvError) { $cvError[0].Exception.Message } else { 'key not present' })")
-                }
-            }
-            else {
-                [void]$probeNotes.Add("reg load of $softwareHivePath failed (exit $LASTEXITCODE): $regOut")
-            }
+                    $currentSet = $reader.ReadDword('Select', 'Current')
+                    if ($null -eq $currentSet -or $currentSet -lt 1 -or $currentSet -gt 999) {
+                        [void]$probeNotes.Add('SYSTEM\Select\Current is absent or invalid; the active control set cannot be identified.')
+                    }
+                    else {
+                        $controlSetName = 'ControlSet{0:d3}' -f $currentSet
+                        $candidate.GuestComputerName = [string]$reader.ReadString("$controlSetName\Control\ComputerName\ComputerName", 'ComputerName')
+                        if (-not $candidate.GuestComputerName) {
+                            [void]$probeNotes.Add("SYSTEM\$controlSetName guest computer name is absent.")
+                        }
+                    }
 
-            $regOut = (reg.exe load "HKLM\$systemKey" "$systemHivePath" 2>&1 | Out-String).Trim()
-            if ($LASTEXITCODE -eq 0) {
-                [void]$loadedKeys.Add($systemKey)
-                $currentSet = (Get-ItemProperty "HKLM:\$systemKey\Select" -ErrorAction SilentlyContinue).Current
-                $controlSetName = if ($currentSet) { 'ControlSet{0:d3}' -f $currentSet } else { 'ControlSet001' }
-                $candidate.GuestComputerName = [string]((Get-ItemProperty "HKLM:\$systemKey\$controlSetName\Control\ComputerName\ComputerName" -ErrorAction SilentlyContinue).ComputerName)
-
-                $setup = Get-ItemProperty "HKLM:\$systemKey\Setup" -ErrorAction SilentlyContinue
-                if ($setup -and (($null -ne $setup.SetupType -and "$($setup.SetupType)" -ne '0') -or -not [string]::IsNullOrWhiteSpace($setup.CmdLine))) {
-                    $candidate.SetupInProgress = $true
+                    $setupType = $reader.ReadDword('Setup', 'SetupType')
+                    $cmdLine = $reader.ReadString('Setup', 'CmdLine')
+                    if ($null -eq $setupType) { [void]$probeNotes.Add('SYSTEM\Setup\SetupType is absent.') }
+                    if (($null -ne $setupType -and $setupType -ne 0) -or -not [string]::IsNullOrWhiteSpace($cmdLine)) {
+                        $candidate.SetupInProgress = $true
+                    }
                 }
             }
-            else {
-                [void]$probeNotes.Add("reg load of $systemHivePath failed (exit $LASTEXITCODE): $regOut")
+            catch {
+                [void]$probeNotes.Add("$hiveName read failed: $($_.Exception.Message)")
             }
-        }
-        finally {
-            [GC]::Collect()
-            [GC]::WaitForPendingFinalizers()
-            for ($i = $loadedKeys.Count - 1; $i -ge 0; $i--) {
-                # A probe hive that will not unload keeps the offline hive file open for the
-                # rest of the run, which is worse than the missing score: the repair that
-                # follows cannot mount it. Never pass that off as clean.
-                $unloadOut = (reg.exe unload "HKLM\$($loadedKeys[$i])" 2>&1 | Out-String).Trim()
-                if ($LASTEXITCODE -ne 0) {
-                    [void]$probeNotes.Add("reg unload of HKLM\$($loadedKeys[$i]) failed (exit $LASTEXITCODE): $unloadOut. The offline hive file may stay locked for this run.")
-                }
+            finally {
+                if ($reader) { $reader.Dispose() }
             }
         }
 
@@ -781,7 +794,7 @@ function Get-OfflineWindowsInstallCandidate {
         }
         else {
             $candidate.ProbeStatus = $probeNotes -join '; '
-            Add-OfflineRepairLog -Level Warning -Message "Offline hive probe of $normalizedPath degraded, so this installation is scored without its product name and build number: $($candidate.ProbeStatus)"
+            Add-OfflineRepairLog -Level Warning -Message "Offline hive probe of $normalizedPath has incomplete metadata, which may lower this installation's score: $($candidate.ProbeStatus)"
         }
     }
     else {
@@ -852,7 +865,7 @@ function Get-OfflineWindowsDisk {
     }
 
     $null = Stop-NestedRepairVm
-    $null = Set-OfflineDisksOnline -ExcludeDiskNumber @($systemDiskNumber | Where-Object { $_ -ge 0 })
+    $onlineDiskNumbers = @(Set-OfflineDisksOnline -ExcludeDiskNumber @($systemDiskNumber | Where-Object { $_ -ge 0 }))
 
     # Select by bus type, not model name: Azure NVMe disks report 'Microsoft NVMe Direct
     # Disk', which the old '*Virtual Disk*' match missed. The rescue VM's own system disk,
@@ -861,6 +874,8 @@ function Get-OfflineWindowsDisk {
     $disks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
             $_.BusType -in @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual') -and
             $_.Number -ne $systemDiskNumber -and
+            $_.Number -in $onlineDiskNumbers -and
+            -not ($_.IsOffline -or $_.IsReadOnly) -and
             -not ($_.IsBoot -or $_.IsSystem) -and
             -not (Test-TemporaryStorageDisk -Disk $_) -and
             ($DiskNumber -lt 0 -or $_.Number -eq $DiskNumber)

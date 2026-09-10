@@ -56,6 +56,8 @@
     v1.1: Added the offline target binding gate. Moved shared state to $global:. Trust
           reporting no longer infers a Microsoft signature from an unsigned version
           resource.
+    v1.2: Added a read-only offreg reader for discovery and hive validation, without
+          mounting hives in the rescue VM's registry or replaying logs onto the source.
 #>
 
 function Get-OfflineRepairState {
@@ -149,6 +151,155 @@ function Clear-OfflineRepairLog {
         Discards the buffered messages.
     #>
     (Get-OfflineRepairState).LogBuffer.Clear()
+}
+
+function Initialize-OfflineRegistryReader {
+    <#
+    .SYNOPSIS
+        Initialises read-only access to hive files through the Windows Offline Registry Library.
+
+    .DESCRIPTION
+        Uses the offreg.dll in System32. Reads and log recovery happen in memory; there
+        is no HKLM mount, registry provider handle, save operation or reg.exe fallback.
+        An unavailable library is an environment failure, not evidence of hive damage.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not ('RslOffline.RegistryHiveReader' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace RslOffline
+{
+    public sealed class RegistryHiveReader : IDisposable
+    {
+        private IntPtr handle;
+        private const uint MaxValueBytes = 1024 * 1024;
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int OROpenHive(string path, out IntPtr result);
+
+        [DllImport("offreg.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORCreateHive(out IntPtr result);
+
+        [DllImport("offreg.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORCloseHive(IntPtr hive);
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORGetValue(IntPtr hive, string key, string name,
+            out uint type, byte[] data, ref uint size);
+
+        private RegistryHiveReader(IntPtr value) { handle = value; }
+
+        public bool IsOpen { get { return handle != IntPtr.Zero; } }
+
+        private static void Check(int result, string operation)
+        {
+            if (result != 0)
+                throw new Win32Exception(result, operation + " failed (Win32 error " +
+                    result + "): " + new Win32Exception(result).Message);
+        }
+
+        public static void EnsureSupported()
+        {
+            IntPtr value;
+            Check(ORCreateHive(out value), "Initialising offreg.dll");
+            using (RegistryHiveReader reader = new RegistryHiveReader(value)) { }
+        }
+
+        public static RegistryHiveReader Open(string path)
+        {
+            IntPtr value;
+            Check(OROpenHive(path, out value), "Opening offline hive '" + path + "'");
+            return new RegistryHiveReader(value);
+        }
+
+        private byte[] ReadValue(string key, string name, out uint type)
+        {
+            if (!IsOpen) throw new ObjectDisposedException("RegistryHiveReader");
+            uint size = 0;
+            int result = ORGetValue(handle, key, name, out type, null, ref size);
+            if (result == 2 || result == 3) return null;
+            if (result != 234) Check(result, "Reading '" + key + "\\" + name + "'");
+            if (size > MaxValueBytes)
+                throw new InvalidDataException("Registry metadata value exceeds the 1 MiB read limit.");
+
+            byte[] data = new byte[size];
+            Check(ORGetValue(handle, key, name, out type, data, ref size),
+                "Reading '" + key + "\\" + name + "'");
+            if (size > data.Length)
+                throw new InvalidDataException("Registry value grew beyond its reported size.");
+            if (size != data.Length) Array.Resize(ref data, (int)size);
+            return data;
+        }
+
+        public string ReadString(string key, string name)
+        {
+            uint type;
+            byte[] data = ReadValue(key, name, out type);
+            if (data == null) return null;
+            if ((type != 1 && type != 2) || data.Length % 2 != 0)
+                throw new InvalidDataException("'" + key + "\\" + name + "' is not a registry string.");
+            return Encoding.Unicode.GetString(data).TrimEnd('\0');
+        }
+
+        public uint? ReadDword(string key, string name)
+        {
+            uint type;
+            byte[] data = ReadValue(key, name, out type);
+            if (data == null) return null;
+            if (type != 4 || data.Length != 4)
+                throw new InvalidDataException("'" + key + "\\" + name + "' is not a registry DWORD.");
+            return BitConverter.ToUInt32(data, 0);
+        }
+
+        public void Dispose()
+        {
+            if (IsOpen)
+            {
+                Check(ORCloseHive(handle), "Closing offline hive");
+                handle = IntPtr.Zero;
+            }
+            GC.SuppressFinalize(this);
+        }
+
+        ~RegistryHiveReader()
+        {
+            if (IsOpen) ORCloseHive(handle);
+        }
+    }
+}
+'@ -ErrorAction Stop
+    }
+
+    [RslOffline.RegistryHiveReader]::EnsureSupported()
+}
+
+function Open-OfflineRegistryReader {
+    <#
+    .SYNOPSIS
+        Opens an offline hive for scalar metadata reads without mounting or modifying it.
+
+    .DESCRIPTION
+        ReadString and ReadDword take hive-relative key paths and return $null only for
+        an absent key/value. Other read failures throw. Dirty hives may require their
+        matching recovery logs alongside them. Always Dispose the reader in a finally;
+        a failed close throws rather than reporting a successful cleanup.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    Initialize-OfflineRegistryReader
+    return [RslOffline.RegistryHiveReader]::Open($Path)
 }
 
 #region Offline target binding
