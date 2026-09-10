@@ -48,20 +48,17 @@
     v1.2: Test-OfflineHiveFile uses the shared read-only offreg reader, avoiding registry
           mounts and scratch hive copies. An unavailable reader aborts validation rather
           than misclassifying the hive as corrupt. Writable HKLM-based helpers are unchanged.
+    v1.3: Removed localised-output decisions, distinguished file sharing from other failures,
+          added strict control-set selection for writers and shared lifecycle/default state.
 #>
 
-if (-not (Get-Command Open-OfflineRegistryReader -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command Get-OfflineRegistryKeyOpenResult -ErrorAction SilentlyContinue)) {
     try {
         . (Join-Path $PSScriptRoot 'OfflineRepairCommon.ps1')
     }
     catch {
         throw "Use-OfflineRegistryHive.ps1 could not load its dependency OfflineRepairCommon.ps1 from '$PSScriptRoot': $($_.Exception.Message)"
     }
-}
-
-# Drive letter of the offline Windows installation, normally set by Get-OfflineWindowsDisk.ps1.
-if (-not (Get-Variable -Name OfflineWindowsDrive -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:OfflineWindowsDrive = $null
 }
 
 function Get-OfflineHiveFilePath {
@@ -82,24 +79,28 @@ function Get-OfflineHiveFilePath {
 function Get-OfflineHiveKeyState {
     <#
     .SYNOPSIS
-        Reports whether a mount key is loaded, using reg.exe so no in-process handle opens.
+        Reports whether a key exists using a numeric native open result.
 
     .DESCRIPTION
-        Returns 'Present' when the key is loaded, 'Absent' when reg.exe reports the key does
-        not exist, and 'Unknown' when the state could not be read (for example access is
-        denied). The distinction is the point: treating 'Unknown' as 'Absent' is exactly how
-        an access-denied result was previously mistaken for a clean unload.
+        Returns 'Present' for ERROR_SUCCESS, 'Absent' only for ERROR_FILE_NOT_FOUND or
+        ERROR_PATH_NOT_FOUND, and 'Unknown' for access denial or any indeterminate result.
+        The query tests the key, not its default value or its backing file's lock state.
+        The native handle is disposed before this function returns.
 
     .OUTPUTS
         [string] one of 'Present', 'Absent' or 'Unknown'.
     #>
     param([Parameter(Mandatory = $true)][string]$HiveKey)
 
-    $out = reg.exe query $HiveKey /ve 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) { return 'Present' }
-    # reg.exe reports "The system was unable to find the specified registry key or value"
-    # only when the key genuinely is not loaded. Any other failure is an undetermined state.
-    if ($out -match 'unable to find|cannot find|specified registry key') { return 'Absent' }
+    try {
+        $result = Get-OfflineRegistryKeyOpenResult -Key $HiveKey
+        if ($result -eq 0) { return 'Present' }
+        if ($result -eq 2 -or $result -eq 3) { return 'Absent' }
+        Add-OfflineRepairLog -Level Warning -Message "Could not determine whether $HiveKey exists (Win32 error $result)."
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "Could not determine whether $HiveKey exists: $($_.Exception.Message)"
+    }
     return 'Unknown'
 }
 
@@ -113,20 +114,29 @@ function Test-OfflineFileInUse {
         so an exclusive open fails with a sharing violation, while a file nothing has mounted
         opens cleanly. The handle is closed at once and nothing is written, so the hive on
         the offline disk is never changed by the check. Any other failure (for example access
-        denied) is raised to the caller, which must treat it as 'cannot verify'.
+        denied, missing file or unrelated I/O failure) is raised to the caller, which must
+        treat it as 'cannot verify'. A sharing violation alone does not identify a mount.
 
     .OUTPUTS
         [bool] $true when the file is in use, $false when it can be opened exclusively.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
+    $stream = $null
     try {
         $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
-        $stream.Dispose()
         return $false
     }
+    catch [System.UnauthorizedAccessException] {
+        throw [System.UnauthorizedAccessException]::new("File access to '$Path' could not be verified: access was denied.", $_.Exception)
+    }
     catch [System.IO.IOException] {
-        return $true
+        # HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION).
+        if ($_.Exception.HResult -in @(-2147024864, -2147024863)) { return $true }
+        throw
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
     }
 }
 
@@ -138,7 +148,7 @@ function Invoke-OfflineRegUnload {
     .DESCRIPTION
         Releases cached registry handles with a garbage collection pass, then retries
         'reg unload' while PowerShell's registry provider lets go. After the loop it
-        re-queries the key with reg.exe and reports success only when the key is actually
+        checks the key with a numeric native query and reports success only when it is actually
         gone - a zero exit code is not trusted on its own, so a hive left mounted is never
         mistaken for unloaded. Callers decide how loudly to report a failure.
 
@@ -157,9 +167,13 @@ function Invoke-OfflineRegUnload {
     Add-OfflineRepairLog -Level Info -Message "Unloading offline hive: reg unload $HiveKey"
     $maxAttempts = 6
     $out = ''
+    $keyState = 'Unknown'
     for ($i = 1; $i -le $maxAttempts; $i++) {
         $out = reg.exe unload $HiveKey 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0 -or $out -match 'unable to find|parameter is incorrect') { break }
+        $exitCode = $LASTEXITCODE
+        $keyState = Get-OfflineHiveKeyState -HiveKey $HiveKey
+        if ($keyState -eq 'Absent') { return $true }
+        if ($exitCode -eq 0) { break }
         if ($i -lt $maxAttempts) {
             [GC]::Collect()
             [GC]::WaitForPendingFinalizers()
@@ -168,11 +182,7 @@ function Invoke-OfflineRegUnload {
         }
     }
 
-    # A zero exit code is necessary but not sufficient. Confirm the key is really gone before
-    # reporting success, so a hive that is still mounted is never reported as unloaded.
-    if ((Get-OfflineHiveKeyState -HiveKey $HiveKey) -eq 'Absent') { return $true }
-
-    Add-OfflineRepairLog -Level Warning -Message "reg unload $HiveKey did not confirm removal (last message: $($out.Trim()))."
+    Add-OfflineRepairLog -Level Warning -Message "reg unload $HiveKey did not confirm removal (exit code $exitCode; key state $keyState; last message: $($out.Trim()))."
     return $false
 }
 
@@ -182,13 +192,11 @@ function Mount-OfflineHive {
         Loads an offline hive as HKLM\BROKEN<HIVE> and registers it with the offline gate.
 
     .DESCRIPTION
-        A pre-existing HKLM\BROKEN<HIVE> key is reused only when it is proven to be backed by
-        THIS disk's hive file: a loaded hive holds its primary file open, so the target file
-        being in use is the signal that the mount is ours. If that file is free - which is
-        what a stale key from a crashed run, or a concurrent run against a different disk,
-        looks like - the mount is refused rather than silently retargeting every read and
-        write to the wrong hive. On a successful load or a verified reuse the key is
-        registered with Register-OfflineHiveKey so Assert-OfflineTarget will allow writes.
+        A pre-existing key is reused only when shared lifecycle state records a successful
+        load of THIS file and the file remains in use. A file lock alone proves neither
+        mount existence nor ownership. An untracked mount is not adopted, even if the
+        target file is locked by some other process. Successful loads and verified reuse
+        are registered with Register-OfflineHiveKey so Assert-OfflineTarget allows writes.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WindowsPath,
@@ -198,55 +206,67 @@ function Mount-OfflineHive {
     )
 
     $offHive = Get-OfflineHiveFilePath -WindowsPath $WindowsPath -Hive $Hive
-    if (-not (Test-OfflinePath $offHive)) {
-        throw "$Hive hive not found: $offHive"
+    $hiveKey = "HKLM\BROKEN$Hive"
+    $state = Get-OfflineRepairState
+    $keyState = Get-OfflineHiveKeyState -HiveKey $hiveKey
+    if ($keyState -eq 'Unknown') {
+        throw "Cannot load $hiveKey because its existing key state could not be verified. Resolve the registry query failure before retrying."
+    }
+    if ($keyState -eq 'Absent') {
+        $null = Unregister-OfflineHiveKey -Key $hiveKey
+        [void]$state.HiveFilePaths.Remove($hiveKey)
     }
 
-    $hiveKey = "HKLM\BROKEN$Hive"
+    try { $targetInUse = Test-OfflineFileInUse -Path $offHive }
+    catch [System.IO.FileNotFoundException] { throw "$Hive hive not found: $offHive" }
+    catch [System.IO.DirectoryNotFoundException] { throw "$Hive hive not found: $offHive" }
+    catch [System.UnauthorizedAccessException] {
+        throw "File access to '$offHive' could not be verified: access was denied. Check file permissions before retrying; no mount ownership was inferred."
+    }
+    catch {
+        throw "File access to '$offHive' could not be verified: $($_.Exception.Message). No mount ownership was inferred."
+    }
 
-    # A previous failed unload, or another run, can leave the key mounted. Reuse it only after
-    # proving it is backed by our file; otherwise refuse, because reusing a foreign or stale
-    # mount would point every read and write at the wrong hive.
-    if ((Get-OfflineHiveKeyState -HiveKey $hiveKey) -eq 'Present') {
-        try { $targetInUse = Test-OfflineFileInUse -Path $offHive }
-        catch {
-            throw "Refusing to reuse the existing $hiveKey mount: the state of '$offHive' could not be verified ($($_.Exception.Message)). Unload the key with 'reg unload $hiveKey' and retry."
-        }
-
-        if ($targetInUse) {
+    if ($keyState -eq 'Present') {
+        $knownFile = $state.HiveFilePaths[$hiveKey]
+        if ($knownFile -and $knownFile -eq (ConvertTo-OfflineComparablePath $offHive) -and $targetInUse) {
             Add-OfflineRepairLog -Level Info -Message "$hiveKey is already loaded from '$offHive' - reusing the existing mount."
             $null = Register-OfflineHiveKey -Key $hiveKey
             return
         }
 
-        throw "Refusing to reuse the existing $hiveKey mount: it is not backed by '$offHive' (that file is not open), so it belongs to a different disk or a crashed run. Unload it first with 'reg unload $hiveKey'."
+        throw "Refusing to reuse ${hiveKey}: its backing file could not be verified as '$offHive' from this process's mount records. A file lock alone does not identify a hive mount. Identify the existing key's owner before taking action."
     }
 
     Add-OfflineRepairLog -Level Info -Message "Loading offline hive: reg load $hiveKey `"$offHive`""
     $out = reg.exe load $hiveKey "$offHive" 2>&1 | Out-String
 
     if ($LASTEXITCODE -ne 0) {
-        if ($out -match 'being used by another process|locked') {
-            # The hive file is loaded under a different key name. Help the caller find it.
-            $stdKeys = @('BCD00000000', 'HARDWARE', 'SAM', 'SECURITY', 'SOFTWARE', 'SYSTEM',
-                'BROKENSYSTEM', 'BROKENSOFTWARE', 'BROKENCOMPONENTS', 'BROKENSAM',
-                'BROKENSECURITY', 'BROKENDEFAULT')
-            $foreign = reg.exe query HKLM 2>&1 | ForEach-Object {
-                if ($_ -match '^HKEY_LOCAL_MACHINE\\(.+)$') { $Matches[1] }
-            } | Where-Object { $_ -notin $stdKeys }
-
-            $hint = if ($foreign) {
-                "Non-standard HKLM keys that may hold this hive: $($foreign -join ', '). Unload them first with: reg unload HKLM\<keyname>"
-            }
-            else {
-                'Check for a hive loaded under a different key name (reg query HKLM) and unload it first.'
-            }
-            throw "Cannot load the $Hive hive - the file is already in use by another process. $hint"
+        $exitCode = $LASTEXITCODE
+        try { $targetInUse = Test-OfflineFileInUse -Path $offHive }
+        catch {
+            throw "Failed to load the offline $Hive hive (exit code $exitCode): $($out.Trim()). File access to '$offHive' could not be verified: $($_.Exception.Message). No mount ownership was inferred."
         }
-        throw "Failed to load the offline $Hive hive: $($out.Trim())"
+        if ($targetInUse) {
+            throw "Cannot load the $Hive hive: '$offHive' has a sharing or lock violation. Identify the process or mount holding the file before taking action; a lock does not prove a foreign mount. reg load exit code ${exitCode}: $($out.Trim())"
+        }
+        throw "Failed to load the offline $Hive hive (exit code $exitCode): $($out.Trim())"
     }
 
-    $null = Register-OfflineHiveKey -Key $hiveKey
+    $state.HiveFilePaths[$hiveKey] = ConvertTo-OfflineComparablePath $offHive
+    try { $null = Register-OfflineHiveKey -Key $hiveKey }
+    catch {
+        $registrationError = $_
+        try {
+            if (-not (Dismount-OfflineHive -Hive $Hive)) {
+                Add-OfflineRepairLog -Level Error -Message "Registration failed and cleanup of $hiveKey could not be confirmed."
+            }
+        }
+        catch {
+            Add-OfflineRepairLog -Level Error -Message "Registration failed and cleanup of $hiveKey threw: $($_.Exception.Message)"
+        }
+        throw $registrationError
+    }
 }
 
 function Dismount-OfflineHive {
@@ -259,7 +279,7 @@ function Dismount-OfflineHive {
         loaded is a success; a state that cannot be read (for example access is denied) is
         NOT, so it is never mistaken for a clean unload. On a confirmed unload the mount key
         is unregistered from the offline-target gate; on failure it is left registered and
-        $false is returned, because the file is still locked.
+        $false is returned, because the mount may still exist.
 
     .OUTPUTS
         [bool] $true when the hive is confirmed unloaded, $false otherwise.
@@ -273,10 +293,17 @@ function Dismount-OfflineHive {
     $hiveKey = "HKLM\BROKEN$Hive"
     $Error.Clear()
 
+    $sharedState = Get-OfflineRepairState
+    if ([int]$sharedState.HiveLoadDepth[$Hive] -gt 0) {
+        Add-OfflineRepairLog -Level Error -Message "Refusing to unload $hiveKey while an Invoke-WithHive caller still owns a reference."
+        return $false
+    }
+
     $state = Get-OfflineHiveKeyState -HiveKey $hiveKey
     if ($state -eq 'Absent') {
         Add-OfflineRepairLog -Level Info -Message "$hiveKey is not currently loaded - nothing to unload."
         $null = Unregister-OfflineHiveKey -Key $hiveKey
+        [void]$sharedState.HiveFilePaths.Remove($hiveKey)
         return $true
     }
     if ($state -eq 'Unknown') {
@@ -287,6 +314,7 @@ function Dismount-OfflineHive {
 
     if (Invoke-OfflineRegUnload -HiveKey $hiveKey) {
         $null = Unregister-OfflineHiveKey -Key $hiveKey
+        [void]$sharedState.HiveFilePaths.Remove($hiveKey)
         return $true
     }
 
@@ -428,8 +456,9 @@ function Invoke-WithHive {
         Mounts one or more offline hives, runs a script block, and always unmounts them.
 
     .DESCRIPTION
-        Nested calls are reference counted, so an inner call can reuse an outer mount
-        without unloading it from under the caller. Hives are unmounted in reverse order.
+        Nested calls share reference counts across dot-source scopes, so an inner call
+        can reuse an outer mount without unloading it from under the caller. Reusing a
+        hive name for a different Windows path is refused. Hives unload in reverse order.
 
         The block's output is materialised before the hive is unloaded. PowerShell's registry
         provider keeps a key open behind every live object it returns - a
@@ -448,8 +477,10 @@ function Invoke-WithHive {
 
         The mount loop runs inside the try, so a hive that fails to load part-way through a
         multi-hive mount does not strand the ones already mounted. If a hive cannot be
-        confirmed unloaded, its depth entry is kept (the mount is still real) and the call
-        throws rather than reporting a success that left the file locked.
+        confirmed unloaded, its mount record is kept and the call throws. Reference counts
+        track active callers only and are always balanced, including on cleanup failure;
+        a later call can retry cleanup of the recorded mount instead of inheriting a
+        phantom active caller.
 
     .OUTPUTS
         The script block's output, with any live registry handle replaced by an inert
@@ -462,20 +493,22 @@ function Invoke-WithHive {
         Invoke-WithHive 'SYSTEM','SOFTWARE' { ... }
     #>
     param(
-        [Parameter(Mandatory = $true)][string[]]$Hive,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('SYSTEM', 'SOFTWARE', 'COMPONENTS', 'SAM', 'SECURITY', 'DEFAULT')]
+        [string[]]$Hive,
         [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
         [Parameter(Mandatory = $false)][string]$WindowsPath
     )
 
-    if (-not (Get-Variable -Name OfflineHiveLoadDepth -Scope Script -ErrorAction SilentlyContinue)) {
-        $script:OfflineHiveLoadDepth = @{}
-    }
+    $offlineHiveLifecycle = Get-OfflineRepairState
+    $offlineHiveDepths = $offlineHiveLifecycle.HiveLoadDepth
 
     if ([string]::IsNullOrWhiteSpace($WindowsPath)) {
-        if ([string]::IsNullOrWhiteSpace($script:OfflineWindowsDrive)) {
+        $offlineDefaultWindowsDrive = Get-OfflineWindowsDrive
+        if ([string]::IsNullOrWhiteSpace($offlineDefaultWindowsDrive)) {
             throw 'The offline Windows drive is unknown. Run Get-OfflineWindowsDisk first, or pass -WindowsPath.'
         }
-        $WindowsPath = Join-OfflinePath -Root $script:OfflineWindowsDrive -ChildPath 'Windows'
+        $WindowsPath = Join-OfflinePath -Root $offlineDefaultWindowsDrive -ChildPath 'Windows'
     }
 
     $mountedHere = [System.Collections.Generic.List[string]]::new()
@@ -491,12 +524,18 @@ function Invoke-WithHive {
         # by the finally: without this, a first hive stays mounted when a second fails to load.
         foreach ($h in $Hive) {
             $hiveName = $h.ToUpperInvariant()
-            $depth = if ($script:OfflineHiveLoadDepth.ContainsKey($hiveName)) { [int]$script:OfflineHiveLoadDepth[$hiveName] } else { 0 }
+            $offlineHiveKey = "HKLM\BROKEN$hiveName"
+            $offlineHiveFile = ConvertTo-OfflineComparablePath (Get-OfflineHiveFilePath -WindowsPath $WindowsPath -Hive $hiveName)
+            $depth = if ($offlineHiveDepths.ContainsKey($hiveName)) { [int]$offlineHiveDepths[$hiveName] } else { 0 }
             if ($depth -eq 0) {
                 Mount-OfflineHive -WindowsPath $WindowsPath -Hive $hiveName
                 [void]$mountedHere.Add($hiveName)
+                $offlineHiveLifecycle.HiveFilePaths[$offlineHiveKey] = $offlineHiveFile
             }
-            $script:OfflineHiveLoadDepth[$hiveName] = $depth + 1
+            elseif ($offlineHiveLifecycle.HiveFilePaths[$offlineHiveKey] -ne $offlineHiveFile) {
+                throw "Cannot reuse $offlineHiveKey for '$offlineHiveFile': an outer caller owns '$($offlineHiveLifecycle.HiveFilePaths[$offlineHiveKey])'."
+            }
+            $offlineHiveDepths[$hiveName] = $depth + 1
             [void]$acquired.Add($hiveName)
         }
 
@@ -517,28 +556,23 @@ function Invoke-WithHive {
 
         for ($i = $acquired.Count - 1; $i -ge 0; $i--) {
             $hiveName = $acquired[$i]
-            $depth = if ($script:OfflineHiveLoadDepth.ContainsKey($hiveName)) { [int]$script:OfflineHiveLoadDepth[$hiveName] } else { 0 }
-            if ($depth -le 1) {
-                if ($mountedHere.Contains($hiveName)) {
-                    $unloaded = $false
-                    try { $unloaded = Dismount-OfflineHive -Hive $hiveName }
-                    catch { $unloaded = $false; Add-OfflineRepairLog -Level Error -Message "Unloading BROKEN$hiveName threw: $($_.Exception.Message)" }
-                    if ($unloaded) {
-                        # Only now is the hive really gone, so only now does the counter drop.
-                        [void]$script:OfflineHiveLoadDepth.Remove($hiveName)
-                    }
-                    else {
-                        # Keep the counter: the hive is still mounted and its file still locked.
-                        [void]$failedUnloads.Add($hiveName)
-                    }
-                }
-                else {
-                    # An outer scope owns this mount; just release our reference to it.
-                    [void]$script:OfflineHiveLoadDepth.Remove($hiveName)
-                }
+            $depth = [int]$offlineHiveDepths[$hiveName]
+            if ($depth -lt 1) {
+                Add-OfflineRepairLog -Level Error -Message "The shared reference count for BROKEN$hiveName was lost; refusing an unowned unload."
+                [void]$failedUnloads.Add($hiveName)
+                continue
             }
-            else {
-                $script:OfflineHiveLoadDepth[$hiveName] = $depth - 1
+            if ($depth -gt 1) {
+                $offlineHiveDepths[$hiveName] = $depth - 1
+                continue
+            }
+
+            [void]$offlineHiveDepths.Remove($hiveName)
+            if ($mountedHere.Contains($hiveName)) {
+                $unloaded = $false
+                try { $unloaded = Dismount-OfflineHive -Hive $hiveName }
+                catch { Add-OfflineRepairLog -Level Error -Message "Unloading BROKEN$hiveName threw: $($_.Exception.Message)" }
+                if (-not $unloaded) { [void]$failedUnloads.Add($hiveName) }
             }
         }
     }
@@ -547,10 +581,55 @@ function Invoke-WithHive {
     if ($scriptError) { throw $scriptError }
 
     if ($failedUnloads.Count -gt 0) {
-        throw "Failed to unload offline hive(s) $($failedUnloads -join ', '): the hive file(s) remain locked, so a later repair run against the same disk would fail. Unload them with 'reg unload HKLM\BROKEN<HIVE>' before retrying."
+        throw "Failed to confirm unload of offline hive(s) $($failedUnloads -join ', '). Mount records are retained for retry; inspect the logged errors before attempting manual cleanup."
     }
 
     return $snapshot
+}
+
+function Get-OfflineSelectedControlSetName {
+    <#
+    .SYNOPSIS
+        Resolves one Select reference to an existing control set without provider handles.
+
+    .DESCRIPTION
+        Current is required. Default and LastKnownGood may be absent, zero or point at a
+        missing optional set, which is skipped. A non-DWORD, out-of-range reference or
+        indeterminate target key is not a missing optional set. Strict callers throw for
+        those failures; tolerant readers log the reason and receive no selection.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('Current', 'Default', 'LastKnownGood')][string]$Name,
+        [switch]$Strict
+    )
+
+    try {
+        $number = Get-OfflineRegistryDword -Key 'HKLM\BROKENSYSTEM\Select' -Name $Name
+        if ($null -eq $number -or ($Name -ne 'Current' -and $number -eq 0)) {
+            if ($Name -eq 'Current') { throw 'Select\Current is missing.' }
+            return $null
+        }
+        if ($number -isnot [uint32] -or $number -lt 1 -or $number -gt 999) {
+            throw "Select\$Name must be a DWORD in the range 1..999."
+        }
+
+        $controlSet = 'ControlSet{0:d3}' -f $number
+        $keyState = Get-OfflineHiveKeyState -HiveKey "HKLM\BROKENSYSTEM\$controlSet"
+        if ($keyState -eq 'Absent' -and $Name -ne 'Current') {
+            Add-OfflineRepairLog -Level Warning -Message "Select\$Name references missing optional $controlSet; skipping it."
+            return $null
+        }
+        if ($keyState -ne 'Present') {
+            throw "Select\$Name references $controlSet, whose key state is $keyState."
+        }
+        return $controlSet
+    }
+    catch {
+        $message = "Cannot resolve SYSTEM\Select\$Name to an existing control set: $($_.Exception.Message)"
+        if ($Strict) { throw $message }
+        Add-OfflineRepairLog -Level Warning -Message $message
+        return $null
+    }
 }
 
 function Get-OfflineSystemRootPath {
@@ -559,10 +638,16 @@ function Get-OfflineSystemRootPath {
         Returns the active ControlSet path inside the mounted BROKENSYSTEM hive.
 
     .DESCRIPTION
-        Falls back to ControlSet001 when the Select key is absent (e.g. offline WinPE disks).
+        Tolerant readers fall back to ControlSet001 with a warning when Current cannot
+        be resolved (for example offline WinPE disks). Writers must pass -Strict: it
+        requires a DWORD Current in 1..999 and a verifiably existing target control set.
+        Access denial and indeterminate reads never become a successful strict selection.
     #>
-    $current = (Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue).Current
-    if ($current) { return 'HKLM:\BROKENSYSTEM\ControlSet{0:d3}' -f $current }
+    param([switch]$Strict)
+
+    $name = Get-OfflineSelectedControlSetName -Name Current -Strict:$Strict
+    if ($name) { return "HKLM:\BROKENSYSTEM\$name" }
+    Add-OfflineRepairLog -Level Warning -Message 'Using ControlSet001 only as a tolerant read fallback; this path is not a verified write target.'
     return 'HKLM:\BROKENSYSTEM\ControlSet001'
 }
 
@@ -570,27 +655,40 @@ function Get-OfflineControlSetName {
     <#
     .SYNOPSIS
         Returns the active ControlSet name, for example 'ControlSet001'.
+
+    .DESCRIPTION
+        Pass -Strict for a write target; it has the same contract as Get-OfflineSystemRootPath.
     #>
-    return (Split-Path -Path (Get-OfflineSystemRootPath) -Leaf)
+    param([switch]$Strict)
+
+    return (Split-Path -Path (Get-OfflineSystemRootPath -Strict:$Strict) -Leaf)
 }
 
 function Get-OfflineReferencedControlSetName {
     <#
     .SYNOPSIS
         Returns every ControlSet referenced by Select (Current, Default, LastKnownGood).
-    #>
-    $names = [System.Collections.Generic.List[string]]::new()
-    $select = Get-ItemProperty 'HKLM:\BROKENSYSTEM\Select' -ErrorAction SilentlyContinue
 
-    foreach ($value in @($select.Current, $select.Default, $select.LastKnownGood)) {
-        if ($null -eq $value) { continue }
-        $name = 'ControlSet{0:d3}' -f [int]$value
-        if (-not $names.Contains($name) -and (Test-Path "HKLM:\BROKENSYSTEM\$name")) {
+    .DESCRIPTION
+        Strict writers require a valid Current even when other references are usable.
+        Missing optional references/sets are skipped; malformed or unreadable references
+        throw in strict mode. Tolerant readers retain the ControlSet001 fallback when no
+        usable references exist and that fallback key is present.
+    #>
+    param([switch]$Strict)
+
+    $names = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($reference in @('Current', 'Default', 'LastKnownGood')) {
+        $name = Get-OfflineSelectedControlSetName -Name $reference -Strict:$Strict
+        if ($name -and -not $names.Contains($name)) {
             [void]$names.Add($name)
         }
     }
 
-    if ($names.Count -eq 0 -and (Test-Path 'HKLM:\BROKENSYSTEM\ControlSet001')) {
+    if (-not $Strict -and $names.Count -eq 0 -and
+        (Get-OfflineHiveKeyState -HiveKey 'HKLM\BROKENSYSTEM\ControlSet001') -eq 'Present') {
+        Add-OfflineRepairLog -Level Warning -Message 'Using ControlSet001 only as a tolerant read fallback; no usable Select references were found.'
         [void]$names.Add('ControlSet001')
     }
 
@@ -701,7 +799,7 @@ function Resolve-OfflineImagePath {
         [Parameter(Mandatory = $false)][string]$WindowsDrive
     )
 
-    if ([string]::IsNullOrWhiteSpace($WindowsDrive)) { $WindowsDrive = $script:OfflineWindowsDrive }
+    if ([string]::IsNullOrWhiteSpace($WindowsDrive)) { $WindowsDrive = Get-OfflineWindowsDrive }
     if ([string]::IsNullOrWhiteSpace($WindowsDrive)) {
         throw 'The offline Windows drive is unknown. Run Get-OfflineWindowsDisk first, or pass -WindowsDrive.'
     }
