@@ -22,8 +22,8 @@
       Clear-OfflineDriveLetter      Release every drive letter this run assigned (finally).
       Stop-NestedRepairVm           Stop a nested Hyper-V repair VM holding the disk.
 
-    Get-OfflineWindowsDisk sets $script:OfflineWindowsDrive, which the offline registry
-    hive helper (Use-OfflineRegistryHive.ps1) uses as its default Windows path.
+    Get-OfflineWindowsDisk publishes the selected Windows drive through the shared repair
+    state, which the offline registry hive helper uses as its default Windows path.
 
 .NOTES
     Name:   Get-OfflineWindowsDisk.ps1
@@ -61,9 +61,14 @@
     v1.4: Verify disk state after diskpart, skip writes to already-ready disks, and recognise
           the resource disk by its language-independent warning file as well as its label.
           Probe hive metadata in memory through offreg, without registry mounts.
+    v1.5: Refuse discovery while a helper-managed guest owns its disks. Limit automatic
+          shutdown to ProblemVM or an explicit Id, and serialize guest/disk hand-offs.
 #>
 
-if (-not (Get-Command Open-OfflineRegistryReader -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command Open-OfflineRegistryReader -ErrorAction SilentlyContinue) -or
+    -not (Get-Command Set-OfflineWindowsDrive -ErrorAction SilentlyContinue) -or
+    -not (Get-Command Enter-OfflineNestedVmLifecycle -ErrorAction SilentlyContinue) -or
+    -not (Get-Command Test-OfflineNestedVmManaged -ErrorAction SilentlyContinue)) {
     try {
         . (Join-Path $PSScriptRoot 'OfflineRepairCommon.ps1')
     }
@@ -269,42 +274,91 @@ function Get-PartitionExistingRoot {
 function Stop-NestedRepairVm {
     <#
     .SYNOPSIS
-        Stops a running nested Hyper-V VM so its VHD can be mounted offline.
+        Releases the Azure-created nested guest before an offline repair.
 
     .DESCRIPTION
         Only relevant when the repair VM was created with 'az vm repair create --enable-nested'.
-        Returns the names of the VMs that were stopped. Silently does nothing when the
-        Hyper-V role is not installed.
+        The default target is exactly one guest named ProblemVM; a custom guest requires its
+        explicit Id. Other active guests block discovery rather than being turned off.
 
-        SupportsShouldProcess is declared so -WhatIf reports each VM it would turn off.
-        ConfirmImpact is left at the default (Medium), below the default $ConfirmPreference
-        (High), so the non-interactive SYSTEM run under az vm repair proceeds without a prompt.
+        A guest claimed by Start-NestedRepairVm is never stopped here. The owning flow must
+        call Stop-NestedRepairVmGraceful and confirm Stopped before rediscovering the disk.
+        Refusing, rather than merely skipping that guest, prevents disk preparation from
+        proceeding while the guest still owns it. The Notes marker persists across processes.
+
+        Returns the name only after the selected guest is confirmed Off. Does nothing when
+        Hyper-V is absent. Enumeration or shutdown failures abort the hand-off.
+
+    .PARAMETER VmId
+        Exact Id of a custom, unmanaged repair guest. Omit for the Azure-created ProblemVM.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([System.Object[]])]
-    param()
+    param([guid]$VmId = [guid]::Empty)
 
     $stopped = @()
-
     if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { return $stopped }
 
+    $lease = Enter-OfflineNestedVmLifecycle
     try {
-        $running = @(Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Running' })
-    }
-    catch {
-        Add-OfflineRepairLog -Level Info -Message "Hyper-V is present but VMs could not be enumerated: $($_.Exception.Message)"
+        $guests = @(Get-VM -ErrorAction Stop)
+        $active = @($guests | Where-Object { $_.State -ne 'Off' })
+        $managed = @($active | Where-Object { Test-OfflineNestedVmManaged -Vm $_ })
+        if ($managed.Count -gt 0) {
+            $names = ($managed | ForEach-Object { "'$($_.Name)' ($($_.Id))" }) -join ', '
+            throw "Offline discovery refused: helper-managed guest(s) $names are still active. The owning flow must use Stop-NestedRepairVmGraceful and confirm Stopped before taking the disk back."
+        }
+
+        $target = @(if ($VmId -ne [guid]::Empty) {
+                $guests | Where-Object { $_.Id -eq $VmId }
+            }
+            else {
+                $guests | Where-Object { $_.Name -eq 'ProblemVM' }
+            })
+
+        if ($VmId -ne [guid]::Empty -and $target.Count -ne 1) {
+            throw "The explicitly selected nested repair guest '$VmId' could not be resolved uniquely."
+        }
+        if ($active.Count -eq 0) { return $stopped }
+        if ($target.Count -ne 1) {
+            throw 'Active Hyper-V guests exist but there is not exactly one ProblemVM. Nothing was stopped. Select the intended unmanaged repair guest explicitly with -NestedVmId on Get-OfflineWindowsDisk.'
+        }
+
+        $other = @($active | Where-Object { $_.Id -ne $target[0].Id })
+        if ($other.Count -gt 0) {
+            $names = ($other | ForEach-Object { "'$($_.Name)' ($($_.Id))" }) -join ', '
+            throw "Offline discovery refused: other Hyper-V guest(s) $names are active. Nothing was stopped; complete their disk hand-off explicitly first."
+        }
+
+        $vm = Get-VM -Id $target[0].Id -ErrorAction Stop
+        if (-not $vm) { throw 'The selected nested repair guest disappeared before shutdown.' }
+        if ($vm.State -eq 'Off') { return $stopped }
+        if (Test-OfflineNestedVmManaged -Vm $vm) {
+            throw "Nested guest '$($vm.Name)' was claimed by a repair flow; automatic shutdown was refused."
+        }
+        if ($vm.State -ne 'Running') {
+            throw "Nested guest '$($vm.Name)' is '$($vm.State)', not Running or Off. Resolve that state explicitly before offline discovery."
+        }
+        if (-not $PSCmdlet.ShouldProcess($vm.Name, 'Turn off the selected unmanaged repair VM so its disk can be mounted offline')) {
+            return $stopped
+        }
+
+        Add-OfflineRepairLog -Level Info -Message "Stopping unmanaged nested repair guest '$($vm.Name)' ($($vm.Id)) so its disk can be mounted offline."
+        Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop
+        $after = Get-VM -Id $vm.Id -ErrorAction Stop
+        if (-not $after -or $after.State -ne 'Off') {
+            throw "Nested guest '$($vm.Name)' could not be confirmed Off after shutdown; disk preparation was refused."
+        }
+        $stopped += $vm.Name
         return $stopped
     }
-
-    foreach ($vm in $running) {
-        if (-not $PSCmdlet.ShouldProcess($vm.Name, 'Turn off nested Hyper-V VM so its disk can be mounted offline')) { continue }
-        Add-OfflineRepairLog -Level Info -Message "Stopping nested Hyper-V VM '$($vm.Name)' so its disk can be mounted offline."
-        Stop-VM -Name $vm.Name -TurnOff -Force -ErrorAction SilentlyContinue
-        $stopped += $vm.Name
+    catch {
+        Add-OfflineRepairLog -Level Error -Message $_.Exception.Message
+        throw
     }
-
-    if ($stopped.Count -gt 0) { Start-Sleep -Seconds 3 }
-    return $stopped
+    finally {
+        Exit-OfflineNestedVmLifecycle -Lease $lease
+    }
 }
 
 function Test-TemporaryStorageDisk {
@@ -825,17 +879,21 @@ function Get-OfflineWindowsDisk {
         Locates the offline Windows installation on the attached broken OS disk.
 
     .DESCRIPTION
-        Stops a nested repair VM if one is running, brings the attached virtual disks
+        Releases an unmanaged Azure-created nested repair VM, brings the attached virtual disks
         online, assigns drive letters to partitions that have none, then selects the
-        best Windows installation and its matching boot partition.
+        best Windows installation and its matching boot partition. Active helper-managed
+        or unrelated guests block discovery before disks or drive letters are changed.
 
-        Sets $script:OfflineWindowsDrive for the offline registry hive helper.
+        Publishes the selected Windows drive through the shared repair state.
 
     .PARAMETER DiskNumber
         Restrict the search to a specific disk number.
 
     .PARAMETER WindowsDrive
         Skip discovery and use this drive letter as the offline Windows volume.
+
+    .PARAMETER NestedVmId
+        Exact Id of a custom unmanaged repair guest. Omit for the Azure-created ProblemVM.
 
     .OUTPUTS
         PSCustomObject with DiskNumber, PartitionStyle, Generation, WindowsDrive,
@@ -850,7 +908,8 @@ function Get-OfflineWindowsDisk {
     #>
     param(
         [Parameter(Mandatory = $false)][int]$DiskNumber = -1,
-        [Parameter(Mandatory = $false)][string]$WindowsDrive
+        [Parameter(Mandatory = $false)][string]$WindowsDrive,
+        [Parameter(Mandatory = $false)][guid]$NestedVmId = [guid]::Empty
     )
 
     # The rescue VM's own OS disk must be known before anything is brought online, because
@@ -864,8 +923,14 @@ function Get-OfflineWindowsDisk {
         throw "Could not determine the rescue VM's own system disk number, so the broken disk cannot be told apart from it: $($_.Exception.Message)"
     }
 
-    $null = Stop-NestedRepairVm
-    $onlineDiskNumbers = @(Set-OfflineDisksOnline -ExcludeDiskNumber @($systemDiskNumber | Where-Object { $_ -ge 0 }))
+    $lease = Enter-OfflineNestedVmLifecycle
+    try {
+        $null = Stop-NestedRepairVm -VmId $NestedVmId
+        $onlineDiskNumbers = @(Set-OfflineDisksOnline -ExcludeDiskNumber @($systemDiskNumber | Where-Object { $_ -ge 0 }))
+    }
+    finally {
+        Exit-OfflineNestedVmLifecycle -Lease $lease
+    }
 
     # Select by bus type, not model name: Azure NVMe disks report 'Microsoft NVMe Direct
     # Disk', which the old '*Virtual Disk*' match missed. The rescue VM's own system disk,
@@ -1007,15 +1072,13 @@ function Get-OfflineWindowsDisk {
     # VM's own system drive, which is the fail-closed behaviour we want. The boot/EFI
     # partition is a separate volume on the same disk that BCD repairs write to, so it is
     # bound too or the gate would refuse them.
-    $null = Set-OfflineRepairRoot -Path $selected.Drive
+    $null = Set-OfflineWindowsDrive -WindowsDrive $selected.Drive
     if ($bootDrive) {
         $bootRoot = "$bootDrive".TrimEnd('\')
         if ($bootRoot -match '^[A-Za-z]:$' -and $bootRoot -ne $selected.Drive) {
             $null = Set-OfflineRepairRoot -Path $bootRoot
         }
     }
-
-    $script:OfflineWindowsDrive = $selected.Drive
 
     $result = [PSCustomObject]@{
         DiskNumber           = $selected.DiskNumber
