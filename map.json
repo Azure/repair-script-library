@@ -138,5 +138,10 @@
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
 		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Makes no changes. NOTE: use option --run-on-repair."
+	},
+	{
+		"id": "linux-detect-nvme-readiness",
+		"path": "src/linux/linux-detect-nvme-readiness.sh",
+		"description": "Read-only check of whether a Linux OS disk can boot from an NVMe disk controller. Reports unstable /dev/sd* references in /etc/fstab, whether the initramfs contains an NVMe driver, and the dracut hostonly setting. Makes no changes. NOTE: use option --run-on-repair."
 	}
 ]
