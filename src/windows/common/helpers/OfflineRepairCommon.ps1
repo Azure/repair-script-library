@@ -58,6 +58,8 @@
           resource.
     v1.2: Added a read-only offreg reader for discovery and hive validation, without
           mounting hives in the rescue VM's registry or replaying logs onto the source.
+    v1.3: Shared writable-hive lifecycle and default-drive state across dot-source scopes.
+          Added numeric, read-only native queries for mounted keys and DWORD metadata.
 #>
 
 function Get-OfflineRepairState {
@@ -66,8 +68,8 @@ function Get-OfflineRepairState {
         Returns the shared helper state, creating it on first use.
 
     .DESCRIPTION
-        One hashtable in $global: holds the log buffer, the bound offline roots and the
-        registered hive mount keys. See the file header for why this is not $script:.
+        One hashtable in $global: holds the log buffer, target bindings, default Windows
+        drive and hive lifecycle. See the file header for why this is not $script:.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
         Justification = 'Deliberate, and confined to this one function. These helpers are dot-sourced, and a $script: variable binds to the scope that did the dot-sourcing: a helper sourced from inside a function would get its own private copy of the root list, so Assert-OfflineTarget would check a set the caller never populated and the gate would fail open. Each az vm repair run is a fresh process, so there is nothing to leak into; Clear-OfflineRepairRoot resets it for tests.')]
@@ -76,12 +78,67 @@ function Get-OfflineRepairState {
 
     if (-not $global:OfflineRepairState) {
         $global:OfflineRepairState = @{
-            LogBuffer = [System.Collections.Generic.List[object]]::new()
-            Roots     = [System.Collections.Generic.List[string]]::new()
-            HiveKeys  = [System.Collections.Generic.List[string]]::new()
+            LogBuffer     = [System.Collections.Generic.List[object]]::new()
+            Roots         = [System.Collections.Generic.List[string]]::new()
+            HiveKeys      = [System.Collections.Generic.List[string]]::new()
+            WindowsDrive  = $null
+            HiveLoadDepth = @{}
+            HiveFilePaths = @{}
         }
     }
+    # Upgrade an existing state without resetting another dot-source scope's acquisitions.
+    foreach ($name in @('HiveLoadDepth', 'HiveFilePaths')) {
+        if (-not $global:OfflineRepairState.ContainsKey($name)) {
+            $global:OfflineRepairState[$name] = @{}
+        }
+    }
+    if (-not $global:OfflineRepairState.ContainsKey('WindowsDrive')) {
+        $global:OfflineRepairState.WindowsDrive = $null
+    }
     return $global:OfflineRepairState
+}
+
+function Set-OfflineWindowsDrive {
+    <#
+    .SYNOPSIS
+        Binds the default offline Windows drive for every dot-source scope.
+
+    .DESCRIPTION
+        Call after discovery selects the Windows volume. Returns the bound root, like
+        Set-OfflineRepairRoot. An active hive caller must not have its default retargeted.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Only updates the in-process offline target binding; skipping it for WhatIf would leave subsequent helpers bound to the wrong default.')]
+    param([Parameter(Mandatory = $true)][string]$WindowsDrive)
+
+    $state = Get-OfflineRepairState
+    $normalised = ConvertTo-OfflineComparablePath $WindowsDrive
+    if ($state.WindowsDrive -and $normalised -ne $state.WindowsDrive -and $state.HiveLoadDepth.Count -gt 0) {
+        throw "Cannot change the offline Windows drive from '$($state.WindowsDrive)' to '$WindowsDrive' while hives are in use."
+    }
+    $state.WindowsDrive = Set-OfflineRepairRoot -Path $WindowsDrive
+    return $state.WindowsDrive
+}
+
+function Get-OfflineWindowsDrive {
+    <#
+    .SYNOPSIS
+        Returns the shared default offline Windows drive.
+
+    .DESCRIPTION
+        Imports a legacy $script:OfflineWindowsDrive only when no shared default is set.
+        Once imported, shared state is authoritative; callers changing disks must use
+        Set-OfflineWindowsDrive rather than updating a scope-private variable.
+    #>
+    $state = Get-OfflineRepairState
+    if ([string]::IsNullOrWhiteSpace($state.WindowsDrive)) {
+        $legacy = Get-Variable -Name OfflineWindowsDrive -Scope Script -ErrorAction SilentlyContinue
+        if ($legacy -and -not [string]::IsNullOrWhiteSpace($legacy.Value)) {
+            $null = Set-OfflineWindowsDrive -WindowsDrive $legacy.Value
+            Add-OfflineRepairLog -Level Warning -Message 'Imported the legacy OfflineWindowsDrive default. Use Set-OfflineWindowsDrive when selecting another disk.'
+        }
+    }
+    return $state.WindowsDrive
 }
 
 function Add-OfflineRepairLog {
@@ -302,6 +359,122 @@ function Open-OfflineRegistryReader {
     return [RslOffline.RegistryHiveReader]::Open($Path)
 }
 
+function Initialize-OfflineMountedRegistry {
+    <#
+    .SYNOPSIS
+        Initialises read-only native queries of already mounted HKLM keys.
+
+    .DESCRIPTION
+        RegOpenKeyEx returns numeric errors for the key itself, independently of its
+        default value or the OS language. Every handle is disposed before returning.
+        No privileges, registry provider handles, mounts or writes are involved.
+        Offline file discovery and validation continue to use the separate offreg reader.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('RslOffline.MountedRegistry' -as [type]) { return }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace RslOffline
+{
+    public static class MountedRegistry
+    {
+        private static readonly IntPtr HKLM = new IntPtr(unchecked((int)0x80000002));
+        private const int KeyQueryValue = 1;
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int RegOpenKeyExW(IntPtr key, string subKey, int options,
+            int access, out SafeRegistryHandle result);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int RegQueryValueExW(SafeRegistryHandle key, string name,
+            IntPtr reserved, out uint type, byte[] data, ref uint size);
+
+        private static void Check(int result, string operation)
+        {
+            if (result != 0)
+                throw new Win32Exception(result, operation + " failed (Win32 error " +
+                    result + "): " + new Win32Exception(result).Message);
+        }
+
+        public static int OpenKeyResult(string subKey)
+        {
+            SafeRegistryHandle key;
+            int result = RegOpenKeyExW(HKLM, subKey, 0, KeyQueryValue, out key);
+            using (key) { return result; }
+        }
+
+        public static uint? ReadDword(string subKey, string name)
+        {
+            SafeRegistryHandle key;
+            int result = RegOpenKeyExW(HKLM, subKey, 0, KeyQueryValue, out key);
+            using (key)
+            {
+                if (result == 2 || result == 3) return null;
+                Check(result, "Opening HKLM\\" + subKey);
+                uint type;
+                uint size = 4;
+                byte[] data = new byte[size];
+                result = RegQueryValueExW(key, name, IntPtr.Zero, out type, data, ref size);
+                if (result == 2) return null;
+                if (result != 234) Check(result, "Reading HKLM\\" + subKey + "\\" + name);
+                if (result == 234 || type != 4 || size != 4)
+                    throw new InvalidDataException("HKLM\\" + subKey + "\\" + name +
+                        " is not a four-byte registry DWORD.");
+                return BitConverter.ToUInt32(data, 0);
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+
+function Get-OfflineRegistryKeyOpenResult {
+    <#
+    .SYNOPSIS
+        Returns the native result of opening an existing HKLM key for query access.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Key)
+
+    $normalised = ConvertTo-OfflineComparableRegistryPath $Key
+    if (-not $normalised -or $normalised -eq 'HKLM') {
+        throw "'$Key' is not an HKLM subkey."
+    }
+    Initialize-OfflineMountedRegistry
+    return [RslOffline.MountedRegistry]::OpenKeyResult($normalised.Substring(5))
+}
+
+function Get-OfflineRegistryDword {
+    <#
+    .SYNOPSIS
+        Reads a mounted HKLM DWORD without retaining a registry handle.
+
+    .DESCRIPTION
+        Returns null only for an absent key/value. A wrong type, access denial or any
+        other native read failure throws instead of converting it into a missing value.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name
+    )
+
+    $normalised = ConvertTo-OfflineComparableRegistryPath $Key
+    if (-not $normalised -or $normalised -eq 'HKLM') {
+        throw "'$Key' is not an HKLM subkey."
+    }
+    Initialize-OfflineMountedRegistry
+    return [RslOffline.MountedRegistry]::ReadDword($normalised.Substring(5), $Name)
+}
+
 #region Offline target binding
 
 $script:OfflineRootPattern = '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)$'
@@ -477,6 +650,7 @@ function Clear-OfflineRepairRoot {
     $state = Get-OfflineRepairState
     $state.Roots.Clear()
     $state.HiveKeys.Clear()
+    $state.WindowsDrive = $null
 }
 
 function Register-OfflineHiveKey {
@@ -876,4 +1050,85 @@ function Get-OfflineSecureBootState {
 
     $result.Source = 'the SecureBoot variable was not present in the most recent Measured Boot logs'
     return $result
+}
+
+function Get-OfflineNestedVmOwnershipTag {
+    <#
+    .SYNOPSIS
+        Returns the persistent Notes marker shared by discovery and nested-guest helpers.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    return 'repair-script-library:nested-repair:v1'
+}
+
+function Test-OfflineNestedVmManaged {
+    <#
+    .SYNOPSIS
+        Reports whether a guest has the exact ownership marker on a separate Notes line.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory = $true)][AllowNull()]$Vm)
+
+    if ($null -eq $Vm) { return $false }
+    $notes = $Vm.PSObject.Properties['Notes']
+    if (-not $notes) { return $false }
+    $tag = Get-OfflineNestedVmOwnershipTag
+    foreach ($line in ([string]$notes.Value -split '\r\n|\n|\r')) {
+        if ([string]::Equals($line, $tag, [StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
+function Enter-OfflineNestedVmLifecycle {
+    <#
+    .SYNOPSIS
+        Serializes nested-guest ownership and disk hand-offs across host processes.
+
+    .DESCRIPTION
+        The lease is reentrant on the current thread, so discovery can call the guarded
+        stopper while holding its own disk-preparation lease. Another thread or process
+        is refused immediately. Release each acquired lease in finally; this is not a
+        lease for an entire repair session or the lifetime of a running guest.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Threading.Mutex])]
+    param()
+
+    $lease = $null
+    $acquired = $false
+    try {
+        $lease = [System.Threading.Mutex]::new($false, 'Global\RslOfflineNestedVmLifecycleV1')
+        try { $acquired = $lease.WaitOne(0) }
+        catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+            Add-OfflineRepairLog -Level Warning -Message 'The previous nested-VM lifecycle owner exited unexpectedly. Guest ownership and disk state will be checked again before proceeding.'
+        }
+        if (-not $acquired) {
+            throw 'Another nested-VM lifecycle operation is in progress on this host; the disk hand-off was refused.'
+        }
+        return $lease
+    }
+    catch {
+        if ($lease) {
+            try { if ($acquired) { $lease.ReleaseMutex() } }
+            finally { $lease.Dispose() }
+        }
+        Add-OfflineRepairLog -Level Error -Message "Could not acquire the nested-VM lifecycle lease: $($_.Exception.Message)"
+        throw
+    }
+}
+
+function Exit-OfflineNestedVmLifecycle {
+    <#
+    .SYNOPSIS
+        Releases and disposes a lifecycle lease acquired by the current thread.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][System.Threading.Mutex]$Lease)
+
+    try { $Lease.ReleaseMutex() }
+    finally { $Lease.Dispose() }
 }
