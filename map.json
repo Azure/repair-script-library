@@ -70,6 +70,11 @@
 		"description" : "Enables nested hyperV using attached data disk as OS disk."
 	},
 	{
+		"id" : "win-fix-firewall-service",
+		"path" : "src/windows/win-fix-firewall-service.ps1",
+		"description" : "Restores the Windows Defender Firewall service on a VM that boots, reports Ready and listens on 3389, yet answers nothing from the virtual network - ICMP included - because mpssvc is not running and the boot-time filters Windows installs before it starts are still blocking everything. Repairs two causes read from the offline SYSTEM hive: a DebugedLoopbackApps value under Services\\mpssvc\\Parameters\\AppCs whose registry type is not the REG_SZ that CheckNetIsolation writes, and MpsSvc or the Base Filtering Engine under it left Disabled. Measured on a live build 20348 VM one reboot at a time, a value of any other type stopped the service on every boot, an empty REG_MULTI_SZ as reliably as one holding 700 SIDs. A correctly typed REG_SZ value is always preserved: these offline checks do not validate its content, so a suspected content fault is reported for manual investigation rather than repaired, and a clean result does not prove the firewall service starts. A healthy VM produces no findings and nothing is written. Only Start=4 is treated as evidence, so a deliberately demand-started service is never corrected. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-toggle-safe-mode",
 		"path" : "src/windows/win-toggle-safe-mode.ps1",
 		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
