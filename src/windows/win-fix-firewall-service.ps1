@@ -13,7 +13,8 @@
 #   because the Windows Defender Firewall service is not running and the boot-time filters that
 #   Windows installs before it starts are still in force, blocking everything.
 #
-#   Two causes are repaired, both read from the offline SYSTEM hive.
+#   Two causes are repaired automatically, both read from the offline SYSTEM hive. REG_SZ
+#   content failures are left for manual investigation, as described below.
 #
 #   1. A loopback exemption value mpssvc cannot read.
 #
@@ -35,13 +36,15 @@
 #        REG_MULTI_SZ, 330 SIDs / 55,692 bytes               dead, "The data is invalid."
 #        REG_MULTI_SZ, 700 SIDs / 133,196 bytes              dead, "The data is invalid."
 #
-#      Two things follow, and this script is built on both. The registry type decides on its own:
-#      the supported tool writes REG_SZ, and every value of another type killed the service however
-#      much or little it held - an empty REG_MULTI_SZ is as fatal as a full one. Content matters
-#      too, but only within the right type, and there is no size threshold to find: an empty REG_SZ
-#      and a one-SID REG_SZ are both healthy, while a REG_SZ holding a list mpssvc cannot parse is
-#      not. The monolithic script this replaces treated the fault as an oversized list and carried
-#      entry-count thresholds of 683 and 600. No such threshold exists.
+#      The registry type is an independent repair trigger: the supported tool writes REG_SZ,
+#      and every value of another type killed the service on the boots measured, however much or
+#      little it held - an empty REG_MULTI_SZ is as fatal as a full one. REG_SZ content can also
+#      be invalid, but a service failure record does not prove that the value caused the failure.
+#      This script therefore preserves every REG_SZ value and reports any recorded failures as
+#      diagnostic context for manual investigation. This intentionally limits automatic repair
+#      to wrong-type values; it does not establish that a preserved REG_SZ value is healthy.
+#      The monolithic script carried entry-count thresholds of 683 and 600. Neither those counts
+#      nor the size of the measured failing sample is a validated repair threshold.
 #
 #      The two failure modes look different from the firewall API as well. A wrong-type value gives
 #      "There are no more endpoints available from the endpoint mapper"; unreadable REG_SZ content
@@ -51,8 +54,6 @@
 #
 #      Windows never recovers from this on its own. The value is durable across reboots, the restart
 #      loop never converges, and the machine stays unreachable until the value is removed.
-
-
 #
 #   2. The firewall service, or the platform underneath it, set to Disabled.
 #
@@ -75,17 +76,18 @@
 #
 #   The trigger and the target are deliberately not the same thing:
 #
-#     - The TRIGGER is evidence that mpssvc is actually failing on this value. The offline System
-#       event log is read for Service Control Manager records showing the firewall service
-#       terminating, and the value's size is compared against the smallest size measured to break a
-#       live VM. Either is enough; neither fires on a machine whose firewall service starts.
+#     - The automatic loopback TRIGGER is a registry type other than REG_SZ, the type the
+#       supported tool writes. Recorded Service Control Manager failures are diagnostic only:
+#       they may be historical or caused by a disabled service or another fault. Neither an
+#       event count nor the value's size authorizes deleting a correctly typed REG_SZ value.
 #     - The TARGET is the state measured on healthy images: the value ABSENT, not present and empty.
 #       The monolithic script renamed the value to DebugedLoopbackApps_ and recreated an empty
 #       DebugedLoopbackApps in its place, which leaves two artefacts on a machine that shipped with
 #       neither.
 #
-#   Everything removed is written to the log first - every SID in the list, in order - so an
-#   exemption somebody actually wanted can be put back with CheckNetIsolation once the VM is up.
+#   Every readable entry is buffered for logging before removal, in order, and the buffer is
+#   flushed on normal and exception paths. An exemption somebody actually wanted can be put back
+#   with CheckNetIsolation once the VM is up.
 #
 #   "Prepare a Windows VHD or VHDX to upload to Azure"
 #   (https://learn.microsoft.com/azure/virtual-machines/windows/prepare-for-upload-vhd-image) requires
@@ -101,6 +103,8 @@
 #   "The Windows Defender Firewall service terminated with the following service-specific error: The
 #   data is invalid."; Get-NetFirewallRule failing with an endpoint mapper error; and RDP lost after
 #   CheckNetIsolation LoopbackExempt was used in bulk, often by a test harness or a packaging script.
+#   These symptoms are not proof of a repairable loopback fault: REG_SZ content failures require
+#   manual investigation and are not repaired automatically, even when failure events are present.
 #
 # .PARAMETER detectOnly
 #   "true" to report what is wrong with the firewall service and change nothing at all.
@@ -122,6 +126,11 @@
 #   different fault with a different fix, and is not repaired here. This script is about a service
 #   that cannot start at all. Nothing in the firewall's rule set or profile configuration is read or
 #   written.
+#
+#   REG_SZ values are always preserved. Event history cannot distinguish invalid REG_SZ content
+#   from an unrelated or already-resolved service failure. Missing, unreadable or unrecognized
+#   localized event records also cannot establish service health. If startup still fails after
+#   the supported registry faults are repaired, investigate the remaining cause manually.
 #
 #   The crash loop is noisy: thousands of Service Control Manager records in minutes. On a machine
 #   that has been failing for a while the System log will have wrapped, and evidence of whatever
@@ -165,13 +174,13 @@ $script:LoopbackValueName = 'DebugedLoopbackApps'
 $script:LegacyArchiveValueName = 'DebugedLoopbackApps_'
 
 # The type CheckNetIsolation writes, measured on build 20348: REG_SZ, one 164-byte value holding a
-# single app container SID. A value of this type is left alone however large it is, because it is
-# what a correctly configured machine looks like. Anything else at this value name is the fault.
+# single app container SID. This type is preserved however large its value is: these offline
+# checks do not validate REG_SZ content. Other types remain independent repair findings.
 $script:ExpectedLoopbackValueKind = [Microsoft.Win32.RegistryValueKind]::String
 
 # Service Control Manager. 7024 is "terminated with the following service-specific error", which is
 # what the crash loop logs; the others cover a service that failed to start or terminated
-# unexpectedly, so a differently shaped failure of the same service still counts as evidence.
+# unexpectedly. All are diagnostic history, not authorization to delete REG_SZ content.
 $script:ScmProvider = 'Service Control Manager'
 $script:ScmFailureEventId = @(7000, 7001, 7023, 7024, 7031, 7034)
 
@@ -179,8 +188,8 @@ $script:ScmFailureEventId = @(7000, 7001, 7023, 7024, 7031, 7034)
 $script:MaxEventsRead = 400
 
 # Matched against the rendered message and against the event data. The display name is stored in the
-# log in the language of the machine that wrote it, so a non-English installation may not match; that
-# is why size alone is also sufficient evidence.
+# log in the language of the machine that wrote it, so a non-English installation may not match.
+# An absent match is not proof of health and does not enable a size-based fallback.
 $script:FirewallEventPattern = 'MpsSvc|Windows Defender Firewall|Windows Firewall'
 
 # MpsSvc is the firewall service. BFE is the Base Filtering Engine it depends on: with BFE disabled
@@ -216,13 +225,13 @@ function New-Finding {
 function Get-FirewallCrashEvidence {
     <#
     .SYNOPSIS
-        Reading the offline System log for the firewall service failing to start.
+        Reading recorded firewall service failures from the offline System log.
 
     .DESCRIPTION
-        Direct evidence that this machine's firewall service is actually broken, rather than an
-        inference from the size of a registry value. Best effort by design: a log that is missing,
-        corrupt or written in another language returns no evidence, and the caller falls back to the
-        measured size instead of refusing to act.
+        Historical diagnostic context, not proof of a current failure or invalid REG_SZ content.
+        Best effort by design: a missing, corrupt or unrecognized localized log may supply no
+        matching records. There is no size fallback. Automatic repairs depend only on wrong-type
+        loopback values and disabled service start settings.
 
         The messages are rendered using the rescue VM's own copy of the Service Control Manager
         resources, so the text comes back in this machine's language regardless of the language of
@@ -235,11 +244,11 @@ function Get-FirewallCrashEvidence {
         Readable = $false; Count = 0; Sample = ''; LastTime = $null; LogPath = ''
     }
 
-    $logPath = Join-Path $VolumeRoot 'Windows\System32\winevt\Logs\System.evtx'
+    $logPath = Join-OfflinePath $VolumeRoot 'Windows\System32\winevt\Logs\System.evtx'
     $result.LogPath = $logPath
 
-    if (-not (Test-Path -LiteralPath $logPath)) {
-        Add-OfflineRepairLog -Level Info -Message "No System event log at $logPath, so the size of the value is the only evidence available."
+    if (-not (Test-OfflinePath $logPath)) {
+        Add-OfflineRepairLog -Level Warning -Message "No System event log at $logPath. Event evidence is unavailable; this does not establish firewall service health or validate REG_SZ content."
         return $result
     }
 
@@ -252,8 +261,14 @@ function Get-FirewallCrashEvidence {
         $result.Readable = $true
     }
     catch {
-        # No matching records at all also lands here, which is a perfectly normal answer.
-        Add-OfflineRepairLog -Level Info -Message "The offline System log produced no Service Control Manager failure records ($($_.Exception.Message))."
+        $eventErrorId = ($_.FullyQualifiedErrorId -split ',', 2)[0]
+        if ($eventErrorId -eq 'NoMatchingEventsFound') {
+            $result.Readable = $true
+            Add-OfflineRepairLog -Level Info -Message 'The offline System log contains no matching Service Control Manager failure records.'
+        }
+        else {
+            Add-OfflineRepairLog -Level Warning -Message "The offline System log could not be read ($($_.Exception.Message)). Event evidence is unavailable; this does not establish firewall service health."
+        }
         return $result
     }
 
@@ -368,15 +383,12 @@ function Get-AllFinding {
         Everything wrong that this script is prepared to act on.
 
     .DESCRIPTION
-        Two independent triggers, because the fault has two measured shapes.
-
         The registry type is conclusive on its own: CheckNetIsolation writes REG_SZ, and a value of
         any other type stopped mpssvc on every reboot tested, even when it was empty.
 
-        A REG_SZ value is judged on the offline log instead, because REG_SZ is what a correctly
-        configured machine has and there is no size or entry count that separates a good one from a
-        bad one - an empty REG_SZ and a one-SID REG_SZ are both healthy. So a REG_SZ value is only
-        a fault when this machine's own System log shows the firewall service failing to start.
+        REG_SZ is always preserved. Neither its size nor recorded service failures proves that
+        its content caused a failure. Suspicion is logged for manual investigation, not returned
+        as a repairable loopback finding. Disabled service settings are independent findings.
     #>
     [CmdletBinding()]
     param(
@@ -389,27 +401,21 @@ function Get-AllFinding {
 
     if ($Loopback.Present) {
         $wrongType = ($Loopback.Kind -ne $script:ExpectedLoopbackValueKind)
-        $serviceFailing = ($Evidence.Count -gt 0)
-
-        if ($wrongType -or $serviceFailing) {
-            $why = if ($wrongType -and $serviceFailing) {
-                "it is $($Loopback.Kind) rather than the $($script:ExpectedLoopbackValueKind) CheckNetIsolation writes, and the offline System log holds $($Evidence.Count) firewall service failure record(s)"
-            }
-            elseif ($wrongType) {
-                "it is $($Loopback.Kind) rather than the $($script:ExpectedLoopbackValueKind) CheckNetIsolation writes, which stopped the service on every reboot measured, whatever the value held. The offline System log holds no failure records, which only means the machine was captured before they were written"
-            }
-            else {
-                "the offline System log holds $($Evidence.Count) firewall service failure record(s), so this machine's mpssvc is not accepting the value even though its type is right"
-            }
-
+        if ($wrongType) {
             [void]$findings.Add((New-Finding `
                         -Cause 'LoopbackValueUnreadable' `
                         -Item $script:LoopbackValueName `
-                        -Message "$($script:LoopbackValueName) is $($Loopback.Kind) holding $($Loopback.ByteLength) bytes, and the Windows Defender Firewall service cannot start with it: $why. Any readable content is written to the log before the value is removed." `
+                        -Message "$($script:LoopbackValueName) is $($Loopback.Kind) holding $($Loopback.ByteLength) bytes, rather than the $($script:ExpectedLoopbackValueKind) CheckNetIsolation writes. This wrong-type value stopped the service on every reboot measured, regardless of its size. Any readable content is buffered for logging before removal." `
                         -Data $Loopback))
         }
         else {
-            Add-OfflineRepairLog -Level Info -Message "$($script:LoopbackValueName) is $($Loopback.Kind), the type CheckNetIsolation writes, holding $(@($Loopback.Entries).Count) entry(s) in $($Loopback.ByteLength) bytes, and nothing in the offline log shows the firewall service failing. That is a supported configuration and is left alone."
+            Add-OfflineRepairLog -Level Info -Message "$($script:LoopbackValueName) is REG_SZ holding $(@($Loopback.Entries).Count) entry(s) in $($Loopback.ByteLength) bytes and is preserved. These offline checks do not validate or automatically repair REG_SZ content."
+            if ($Evidence.Count -gt 0) {
+                Add-OfflineRepairLog -Level Warning -Message "The offline System log holds $($Evidence.Count) recorded firewall service failure(s), but they do not prove that REG_SZ content caused the failure. The records may be historical or explained by a disabled service or another cause. If firewall startup still fails, investigate the preserved value and remaining causes manually."
+            }
+            elseif (-not $Evidence.Readable) {
+                Add-OfflineRepairLog -Level Warning -Message 'Event evidence is unavailable. REG_SZ content and firewall service health remain unverified; investigate manually if startup still fails.'
+            }
         }
     }
 
@@ -492,162 +498,195 @@ function Repair-Finding {
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly)" | Tee-Object -FilePath $logFile -Append
 
+$status = $STATUS_ERROR
 try {
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    :Main do {
+        $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $volumeRoot = Split-Path -Path $offline.WindowsPath -Parent
+        $volumeRoot = Split-Path -Path $offline.WindowsPath -Parent
 
-    Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
-    Log-Info "$($script:DocUrl) requires that the firewall allows inbound Remote Desktop, but does not describe the loopback exemption list; the target below was measured on healthy images." | Tee-Object -FilePath $logFile -Append
+        Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
+        Log-Info "$($script:DocUrl) requires that the firewall allows inbound Remote Desktop, but does not describe the loopback exemption list; the target below was measured on healthy images." | Tee-Object -FilePath $logFile -Append
 
-    # Read outside the hive: the event log is a file, and reading it does not need the hive mounted.
-    $evidence = Get-FirewallCrashEvidence -VolumeRoot $volumeRoot
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        # Read outside the hive: the event log is a file, and reading it does not need the hive mounted.
+        $evidence = Get-FirewallCrashEvidence -VolumeRoot $volumeRoot
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $context = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
-        $loopback = Get-LoopbackListState -SystemRoot $systemRoot
-        $services = Get-FirewallServiceState -SystemRoot $systemRoot
+        $context = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
+            $loopback = Get-LoopbackListState -SystemRoot $systemRoot
+            $services = Get-FirewallServiceState -SystemRoot $systemRoot
 
-        return [PSCustomObject]@{
-            ControlSet = (Split-Path -Path $systemRoot -Leaf)
-            Loopback   = $loopback
-            Services   = @($services)
-            Findings   = @(Get-AllFinding -Loopback $loopback -Evidence $evidence -Services $services)
+            return [PSCustomObject]@{
+                ControlSet = (Split-Path -Path $systemRoot -Leaf)
+                Loopback   = $loopback
+                Services   = @($services)
+                Findings   = @(Get-AllFinding -Loopback $loopback -Evidence $evidence -Services $services)
+            }
         }
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    # Context. None of this is a fault by itself, so none of it appears in the findings list.
-    $loopback = $context.Loopback
-    Log-Info "Control set $($context.ControlSet)." | Tee-Object -FilePath $logFile -Append
+        # Context. None of this is a fault by itself, so none of it appears in the findings list.
+        $loopback = $context.Loopback
+        Log-Info "Control set $($context.ControlSet)." | Tee-Object -FilePath $logFile -Append
 
-    if ($evidence.Readable) {
-        Log-Info "Offline System log: $($evidence.Count) Service Control Manager record(s) show the firewall service failing$(if ($evidence.LastTime) { ", most recently at $($evidence.LastTime)" })." | Tee-Object -FilePath $logFile -Append
-        if ($evidence.Sample) {
-            Log-Info "  $($evidence.Sample)" | Tee-Object -FilePath $logFile -Append
+        if ($evidence.Readable) {
+            Log-Info "Offline System log: $($evidence.Count) recorded firewall service failure(s)$(if ($evidence.LastTime) { ", most recently at $($evidence.LastTime)" }). This history does not prove a current failure or invalid REG_SZ content." | Tee-Object -FilePath $logFile -Append
+            if ($evidence.Sample) {
+                Log-Info "  $($evidence.Sample)" | Tee-Object -FilePath $logFile -Append
+            }
         }
-    }
-    else {
-        Log-Info 'Offline System log: no firewall service failure records could be read. That does not clear the machine, because the type of the loopback value decides on its own.' | Tee-Object -FilePath $logFile -Append
-    }
+        else {
+            Log-Warning 'Offline System log: event evidence is unavailable. Automatic repair is limited to wrong-type loopback values and disabled services; REG_SZ content and service health are not established by this check.' | Tee-Object -FilePath $logFile -Append
+        }
 
-    if (-not $loopback.Readable) {
-        Log-Warning "The firewall's AppCs key could not be read, so a loopback list fault cannot be ruled out. $($loopback.Error)" | Tee-Object -FilePath $logFile -Append
-    }
-    elseif (-not $loopback.KeyExists) {
-        Log-Info 'No AppCs key is present. That is not a fault: it is created the first time a loopback exemption is added.' | Tee-Object -FilePath $logFile -Append
-    }
-    elseif (-not $loopback.Present) {
-        Log-Info "AppCs is present and holds no $($script:LoopbackValueName) value, which is the state measured on healthy images." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Info "$($script:LoopbackValueName): $($loopback.Kind), $($loopback.ByteLength) bytes, $(@($loopback.Entries).Count) readable entry(s). Expected type is $($script:ExpectedLoopbackValueKind)." | Tee-Object -FilePath $logFile -Append
-    }
+        if (-not $loopback.Readable) {
+            Log-Warning "The firewall's AppCs key could not be read, so a loopback list fault cannot be ruled out. $($loopback.Error)" | Tee-Object -FilePath $logFile -Append
+        }
+        elseif (-not $loopback.KeyExists) {
+            Log-Info 'No AppCs key is present. That is not a fault: it is created the first time a loopback exemption is added.' | Tee-Object -FilePath $logFile -Append
+        }
+        elseif (-not $loopback.Present) {
+            Log-Info "AppCs is present and holds no $($script:LoopbackValueName) value, which is the state measured on healthy images." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Info "$($script:LoopbackValueName): $($loopback.Kind), $($loopback.ByteLength) bytes, $(@($loopback.Entries).Count) readable entry(s). Expected type is $($script:ExpectedLoopbackValueKind)." | Tee-Object -FilePath $logFile -Append
+        }
 
-    if ($loopback.LegacyArchive) {
-        Log-Info "AppCs also holds $($script:LegacyArchiveValueName). That is not a Windows value: it is what the monolithic repair script renamed a faulty list to, so this machine has been repaired that way before. It is reported rather than removed, because mpssvc does not read it." | Tee-Object -FilePath $logFile -Append
-    }
+        if ($loopback.LegacyArchive) {
+            Log-Info "AppCs also holds $($script:LegacyArchiveValueName). That is not a Windows value: it is what the monolithic repair script renamed a faulty list to, so this machine has been repaired that way before. It is reported rather than removed, because mpssvc does not read it." | Tee-Object -FilePath $logFile -Append
+        }
 
-    foreach ($service in @($context.Services)) {
-        $shown = if (-not $service.Exists) { 'no service key' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
-        Log-Info "  $($service.Name): $shown - $($service.Spec.Purpose)." | Tee-Object -FilePath $logFile -Append
-    }
+        foreach ($service in @($context.Services)) {
+            $shown = if (-not $service.Exists) { 'no service key' } elseif ($null -eq $service.Start) { '(Start not set)' } else { "Start=$($service.Start)" }
+            Log-Info "  $($service.Name): $shown - $($service.Spec.Purpose)." | Tee-Object -FilePath $logFile -Append
+        }
 
-    $findings = @($context.Findings)
-    foreach ($finding in $findings) {
-        Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
-
-    $repairable = @($findings | Where-Object { $_.Repairable })
-    $unrepairable = @($findings | Where-Object { -not $_.Repairable })
-
-    if ($isDetectOnly) {
+        $findings = @($context.Findings)
         foreach ($finding in $findings) {
-            Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
-        # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
-        # so a summary printed first is the first thing a long run loses.
-        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
 
-    if ($findings.Count -eq 0) {
-        Log-Output 'No firewall service fault was found. The service and the filtering engine under it are not disabled, and no loopback exemption list is stopping the service from starting. No changes were made.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
+        $repairable = @($findings | Where-Object { $_.Repairable })
+        $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
-    $repairedCount = 0
-    $failed = [System.Collections.Generic.List[string]]::new()
-
-    $backup = Backup-OfflineHiveFile -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-    Log-Info "SYSTEM hive backed up to $backup" | Tee-Object -FilePath $logFile -Append
-
-    $repairOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        if ((Get-OfflineControlSetName -Strict) -ne $context.ControlSet) {
-            throw 'Select\Current changed since detection; refusing to write the previously captured registry paths.'
+        if ($isDetectOnly) {
+            foreach ($finding in $findings) {
+                Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            }
+            # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+            # so a summary printed first is the first thing a long run loses.
+            Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
         }
-        $done = 0
-        $errors = [System.Collections.Generic.List[string]]::new()
-        foreach ($finding in $repairable) {
-            try {
-                if (Repair-Finding -Finding $finding) {
-                    $finding.Repaired = $true
-                    $done++
+
+        if ($findings.Count -eq 0) {
+            Log-Output 'No supported firewall registry fault was found. No registry values were changed. These offline checks do not establish that the firewall service starts or that REG_SZ loopback content is valid; investigate manually if startup still fails.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        $repairedCount = 0
+        $failed = [System.Collections.Generic.List[string]]::new()
+
+        $backup = Backup-OfflineHiveFile -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Log-Info "SYSTEM hive backed up to $backup. This copy stays on the customer's disk after 'az vm repair restore' and is not removed by this script; delete it once the VM is confirmed healthy." | Tee-Object -FilePath $logFile -Append
+
+        $repairOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            if ((Get-OfflineControlSetName -Strict) -ne $context.ControlSet) {
+                throw 'Select\Current changed since detection; refusing to write the previously captured registry paths.'
+            }
+            $done = 0
+            $errors = [System.Collections.Generic.List[string]]::new()
+            foreach ($finding in $repairable) {
+                try {
+                    if (Repair-Finding -Finding $finding) {
+                        $finding.Repaired = $true
+                        $done++
+                    }
+                }
+                catch {
+                    [void]$errors.Add("$($finding.Item): $($_.Exception.Message)")
+                    Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair failed ($($_.Exception.Message))."
                 }
             }
-            catch {
-                [void]$errors.Add("$($finding.Item): $($_.Exception.Message)")
-                Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair failed ($($_.Exception.Message))."
-            }
+            return [PSCustomObject]@{ Repaired = $done; Errors = @($errors) }
         }
-        return [PSCustomObject]@{ Repaired = $done; Errors = @($errors) }
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $repairedCount += $repairOutcome.Repaired
-    foreach ($failure in @($repairOutcome.Errors)) { [void]$failed.Add($failure) }
+        $repairedCount += $repairOutcome.Repaired
+        foreach ($failure in @($repairOutcome.Errors)) { [void]$failed.Add($failure) }
 
-    # Verify against freshly read state rather than trusting the writes above.
-    $remaining = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath -Strict
-        return @(Get-AllFinding `
-                -Loopback (Get-LoopbackListState -SystemRoot $systemRoot) `
-                -Evidence $evidence `
-                -Services (Get-FirewallServiceState -SystemRoot $systemRoot))
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        # Verify against freshly read state rather than trusting the writes above.
+        $remaining = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            $systemRoot = Get-OfflineSystemRootPath -Strict
+            return @(Get-AllFinding `
+                    -Loopback (Get-LoopbackListState -SystemRoot $systemRoot) `
+                    -Evidence $evidence `
+                    -Services (Get-FirewallServiceState -SystemRoot $systemRoot))
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $stillRepairable = @($remaining | Where-Object { $_.Repairable })
-    foreach ($finding in $stillRepairable) {
-        Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
+        $stillRepairable = @($remaining | Where-Object { $_.Repairable })
+        foreach ($finding in $stillRepairable) {
+            Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        }
 
-    $summary = "Repaired $repairedCount of $($repairable.Count) issue(s) that could be repaired."
-    if ($unrepairable.Count -gt 0) { $summary += " $($unrepairable.Count) issue(s) need a decision and were only reported." }
+        $summary = "Repaired $repairedCount of $($repairable.Count) issue(s) that could be repaired."
+        if ($unrepairable.Count -gt 0) { $summary += " $($unrepairable.Count) issue(s) need a decision and were only reported." }
 
-    if ($failed.Count -gt 0 -or $stillRepairable.Count -gt 0) {
-        Log-Error "$summary $($failed.Count) repair(s) failed and $($stillRepairable.Count) issue(s) are still present." | Tee-Object -FilePath $logFile -Append
+        if ($failed.Count -gt 0 -or $stillRepairable.Count -gt 0) {
+            Log-Error "$summary $($failed.Count) repair(s) failed and $($stillRepairable.Count) issue(s) are still present." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        Log-Output $summary | Tee-Object -FilePath $logFile -Append
+        foreach ($finding in $unrepairable) {
+            Log-Output "  [MANUAL] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+        if ($repairedCount -gt 0) {
+            Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM, then verify firewall startup and inbound connectivity. REG_SZ content was not validated or repaired, so recovery is not guaranteed if another cause remains. Any removed loopback exemption is listed in the log and can be added back with CheckNetIsolation LoopbackExempt. The SYSTEM hive backup at $backup travels back with the disk and can be deleted once the VM is confirmed healthy." | Tee-Object -FilePath $logFile -Append
+        }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    Log-Output $summary | Tee-Object -FilePath $logFile -Append
-    foreach ($finding in $unrepairable) {
-        Log-Output "  [MANUAL] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
-    if ($repairedCount -gt 0) {
-        Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM. The firewall service starts on the next boot and the machine answers inbound traffic again; any loopback exemption that was removed is listed in the log above and can be added back with CheckNetIsolation LoopbackExempt." | Tee-Object -FilePath $logFile -Append
-    }
-    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
+    $status = $STATUS_ERROR
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
 }
+finally {
+    # A dependency may have failed to load before these functions became available.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        try {
+            Clear-OfflineDriveLetter
+            if (@(Get-OfflineAssignedDriveLetter).Count -gt 0) {
+                $status = $STATUS_ERROR
+                Add-OfflineRepairLog -Level Error -Message 'Temporary drive letters remain assigned. Registry repair may have completed, but cleanup is incomplete; inspect the cleanup diagnostics before proceeding.'
+            }
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Add-OfflineRepairLog -Level Error -Message "Drive-letter cleanup failed: $($_.Exception.Message)"
+        }
+    }
+
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        try {
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append -ErrorAction Stop
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Log-Error "Final helper diagnostics could not be written to the detail log: $($_.Exception.Message)"
+        }
+    }
+}
+return $status
