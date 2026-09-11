@@ -130,6 +130,11 @@
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
 	},
 	{
+		"id": "win-fix-transaction-logs",
+		"path": "src/windows/win-fix-transaction-logs.ps1",
+		"description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again. Clears the transactional registry logs only by default; pass scope=Config, scope=SMI or scope=All to widen that, force=true to clear without local ERROR_LOG_FULL evidence, detectOnly=true to report only, or revert=true to restore the files. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
 		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Makes no changes. NOTE: use option --run-on-repair."
