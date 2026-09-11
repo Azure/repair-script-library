@@ -59,6 +59,7 @@
 #
 # .PARAMETER detectOnly
 #   "true" reports what was found and what would be removed, and writes nothing. Default "false".
+#   Cannot be combined with revert=true.
 #
 # .PARAMETER scope
 #   Which log set to clear: TxR, Config, SMI or All. Default "TxR".
@@ -94,12 +95,17 @@
 #   cleared: a new file appearing there would be indistinguishable from one this script failed to
 #   account for, and check 4 above would not be able to tell the difference.
 #
+#   The revert manifest remains at the root of that volume, for example
+#   F:\win-fix-transaction-logs-revert.json. Keep both it and the Windows\Temp backups until the
+#   original VM is confirmed healthy. A later run preserves earlier scopes in that same manifest.
+#
 #   Switch parameters are declared as ValidateSet strings on purpose. The extension turns
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
 #   that value to the next positional parameter.
 #
 # .VERSION
 #   v1.0: Initial version.
+#   v1.1: Preserve undo state on manifest failures, reject conflicting modes, and always clean up.
 #
 #########################################################################################################
 
@@ -387,7 +393,7 @@ function Get-PendingServicingMarker {
 
 function Get-RevertManifestPath {
     param([Parameter(Mandatory = $true)][string]$Drive)
-    return (Join-Path $Drive "$scriptName-revert.json")
+    return (Join-OfflinePath $Drive "$scriptName-revert.json")
 }
 
 function Read-RevertManifest {
@@ -402,15 +408,26 @@ function Read-RevertManifest {
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    if (-not (Test-OfflinePath $Path)) { return $null }
 
-    $content = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
-    if ([string]::IsNullOrWhiteSpace($content)) { return $null }
-
-    try { $parsed = $content | ConvertFrom-Json }
+    try {
+        $content = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($content)) { throw 'The existing manifest is empty.' }
+        $parsed = $content | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $parsed -or $null -eq $parsed.PSObject.Properties['Scopes']) {
+            throw 'The existing manifest does not contain a Scopes collection.'
+        }
+        foreach ($entry in @($parsed.Scopes)) {
+            if ($null -eq $entry -or $entry.Scope -notin @('TxR', 'Config', 'SMI') -or
+                [string]::IsNullOrWhiteSpace($entry.TargetPath) -or
+                [string]::IsNullOrWhiteSpace($entry.BackupPath) -or
+                $null -eq $entry.PSObject.Properties['Files']) {
+                throw 'The existing manifest contains an invalid scope entry.'
+            }
+        }
+    }
     catch {
-        Add-OfflineRepairLog -Level Warning -Message "The revert manifest at $Path could not be read ($($_.Exception.Message))."
-        return $null
+        throw "The revert manifest at $Path could not be read; it must be preserved for recovery ($($_.Exception.Message))."
     }
 
     return $parsed
@@ -428,272 +445,333 @@ function Write-RevertManifest {
 
         Entries are keyed by scope. A scope cleared twice keeps the most recent backup, because that
         is the one holding the files that were actually there last.
+
+        A unique sibling file is read back before atomic publication. A failed write, read-back or
+        publication therefore leaves the previous manifest intact.
+
+    .OUTPUTS
+        Boolean success. Diagnostics are buffered for the caller to flush.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)]$Entry
     )
 
-    $entries = [System.Collections.Generic.List[object]]::new()
-    foreach ($item in @($Entry)) { $entries.Add($item) }
+    $stagedPath = $null
+    try {
+        $entries = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in @($Entry)) { $entries.Add($item) }
 
-    $existing = Read-RevertManifest -Path $Path
-    if ($existing -and $existing.Scopes) {
-        $known = @($entries | ForEach-Object { $_.Scope })
-        foreach ($old in @($existing.Scopes)) {
-            if ($known -notcontains $old.Scope) { $entries.Add($old) }
+        $existing = Read-RevertManifest -Path $Path
+        if ($existing -and $existing.Scopes) {
+            $known = @($entries | ForEach-Object { $_.Scope })
+            foreach ($old in @($existing.Scopes)) {
+                if ($known -notcontains $old.Scope) { $entries.Add($old) }
+            }
+        }
+
+        $manifest = [PSCustomObject]@{
+            Script    = $scriptName
+            Timestamp = $scriptStartTime
+            Scopes    = @($entries)
+        }
+
+        $json = $manifest | ConvertTo-Json -Depth 6 -ErrorAction Stop
+        $stagedPath = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+        $json | Set-Content -LiteralPath $stagedPath -Encoding UTF8 -NoNewline -ErrorAction Stop
+        $readback = Get-Content -LiteralPath $stagedPath -Raw -ErrorAction Stop
+        if ($readback -cne $json) { throw 'The staged manifest did not read back exactly as written.' }
+        $null = $readback | ConvertFrom-Json -ErrorAction Stop
+
+        if ($null -ne $existing) {
+            [System.IO.File]::Replace($stagedPath, $Path, [NullString]::Value)
+        }
+        else {
+            [System.IO.File]::Move($stagedPath, $Path)
         }
     }
-
-    $manifest = [PSCustomObject]@{
-        Script    = $scriptName
-        Timestamp = $scriptStartTime
-        Scopes    = @($entries)
-    }
-
-    try {
-        $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
-        Log-Info "Recorded the revert manifest at $Path." | Tee-Object -FilePath $logFile -Append
-    }
     catch {
-        Log-Warning "The revert manifest could not be written to $Path ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append
+        Add-OfflineRepairLog -Level Error -Message "The revert manifest could not be published at $Path ($($_.Exception.Message)). Keep the existing manifest and all backups."
+        foreach ($item in @($Entry)) {
+            Add-OfflineRepairLog -Level Error -Message "Scope $($item.Scope): recovery backups remain at $($item.BackupPath)."
+        }
+        return $false
     }
+    finally {
+        if ($stagedPath -and (Test-OfflinePath $stagedPath)) {
+            try { Remove-Item -LiteralPath $stagedPath -Force -ErrorAction Stop }
+            catch {
+                Add-OfflineRepairLog -Level Warning -Message "The temporary manifest at $stagedPath could not be removed ($($_.Exception.Message))."
+            }
+        }
+    }
+    Add-OfflineRepairLog -Message "Recorded the revert manifest at $Path."
+    return $true
 }
 
 #########################################################################################################
 # Main
 #########################################################################################################
 
+$status = $STATUS_ERROR
+if ($isDetectOnly -and $isRevert) {
+    Log-Error 'detectOnly=true cannot be combined with revert=true. No disk discovery or changes were attempted.'
+    return $status
+}
+
 try {
-    Log-Output "=== $scriptName started at $scriptStartTime ===" | Tee-Object -FilePath $logFile -Append
+    :Main do {
+        Log-Output "=== $scriptName started at $scriptStartTime ===" | Tee-Object -FilePath $logFile -Append
 
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
-
-    $systemRoot = $offline.WindowsPath
-    $manifestPath = Get-RevertManifestPath -Drive $offline.WindowsDrive
-
-    $selectedScopes = if ($scope -eq 'All') { @('TxR', 'Config', 'SMI') } else { @($scope) }
-
-    #####################################################################################################
-    # Revert
-    #####################################################################################################
-    if ($isRevert) {
-        Log-Output '--- Revert ---' | Tee-Object -FilePath $logFile -Append
-
-        $manifest = Read-RevertManifest -Path $manifestPath
+        $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-        if (-not $manifest -or -not $manifest.Scopes) {
-            Log-Output "No revert manifest was found at $manifestPath, so there is nothing this script has to put back." | Tee-Object -FilePath $logFile -Append
-            return $STATUS_SUCCESS
+        Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
+
+        $systemRoot = $offline.WindowsPath
+        $manifestPath = Get-RevertManifestPath -Drive $offline.WindowsDrive
+
+        $selectedScopes = if ($scope -eq 'All') { @('TxR', 'Config', 'SMI') } else { @($scope) }
+
+        #####################################################################################################
+        # Revert
+        #####################################################################################################
+        if ($isRevert) {
+            Log-Output '--- Revert ---' | Tee-Object -FilePath $logFile -Append
+
+            $manifest = Read-RevertManifest -Path $manifestPath
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+            if (-not $manifest -or -not $manifest.Scopes) {
+                Log-Output "No revert manifest was found at $manifestPath, so there is nothing this script has to put back." | Tee-Object -FilePath $logFile -Append
+                $status = $STATUS_SUCCESS
+                break Main
+            }
+
+            $restoredTotal = 0
+            $failedScopes = 0
+            foreach ($entry in @($manifest.Scopes)) {
+                Log-Output "Restoring scope $($entry.Scope) from $($entry.BackupPath)." | Tee-Object -FilePath $logFile -Append
+                $restore = Restore-OfflineFileSet -BackupPath $entry.BackupPath -TargetPath $entry.TargetPath -FileRecord $entry.Files
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                foreach ($line in @($restore.Detail)) { Log-Info "  $line" | Tee-Object -FilePath $logFile -Append }
+                $restoredTotal += $restore.Restored
+                if (-not $restore.Succeeded) {
+                    $failedScopes++
+                    Log-Error "Scope $($entry.Scope) was not fully restored and verified ($($restore.Restored) of $($restore.Expected) file(s))." | Tee-Object -FilePath $logFile -Append
+                }
+            }
+
+            Log-Output "Restored $restoredTotal file(s); $failedScopes scope(s) were not fully restored." | Tee-Object -FilePath $logFile -Append
+            if ($failedScopes -gt 0) {
+                Log-Error "The revert manifest at $manifestPath was retained because not every scope was restored and verified." | Tee-Object -FilePath $logFile -Append
+                break Main
+            }
+
+            try { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction Stop }
+            catch {
+                Log-Error "The manifest at $manifestPath could not be removed ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append
+                break Main
+            }
+
+            Log-Output 'Revert complete.' | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
         }
 
-        $restoredTotal = 0
-        $failedScopes = 0
-        foreach ($entry in @($manifest.Scopes)) {
-            Log-Output "Restoring scope $($entry.Scope) from $($entry.BackupPath)." | Tee-Object -FilePath $logFile -Append
-            $restore = Restore-OfflineFileSet -BackupPath $entry.BackupPath -TargetPath $entry.TargetPath -FileRecord $entry.Files
+        #####################################################################################################
+        # Detect
+        #####################################################################################################
+        Log-Output '--- Detection ---' | Tee-Object -FilePath $logFile -Append
+
+        $findings = [System.Collections.Generic.List[object]]::new()
+
+        $evidence = Get-LogExhaustionEvidence -SystemRoot $systemRoot
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if ($evidence.Found) {
+            $findings.Add((New-Finding -Category 'Log exhaustion' -Severity 'Critical' -Priority 10 `
+                        -Detail "ERROR_LOG_FULL was reported in $($evidence.Source): $($evidence.SampleLine)"))
+            Log-Output "Log exhaustion evidence found in $($evidence.Source)." | Tee-Object -FilePath $logFile -Append
+            Log-Output "  $($evidence.SampleLine)" | Tee-Object -FilePath $logFile -Append
+        }
+        elseif (@($evidence.LogsRead).Count -eq 0) {
+            Log-Output 'No CBS log was available to read, so there is no evidence either way.' | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Output "No ERROR_LOG_FULL entry was found in the last $($script:CbsTailLine) lines of $(@($evidence.LogsRead).Count) CBS log(s)." | Tee-Object -FilePath $logFile -Append
+        }
+
+        $plans = [System.Collections.Generic.List[object]]::new()
+        foreach ($name in $selectedScopes) {
+            $scopeInfo = Get-TransactionLogScope -Name $name -SystemRoot $systemRoot
+            $plan = Get-TransactionLogPlan -ScopeInfo $scopeInfo
             Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-            foreach ($line in @($restore.Detail)) { Log-Info "  $line" | Tee-Object -FilePath $logFile -Append }
-            $restoredTotal += $restore.Restored
-            if (-not $restore.Succeeded) {
-                $failedScopes++
-                Log-Error "Scope $($entry.Scope) was not fully restored and verified ($($restore.Restored) of $($restore.Expected) file(s))." | Tee-Object -FilePath $logFile -Append
+            $plans.Add($plan)
+
+            if (-not $plan.Snapshot.Present) {
+                Log-Output "Scope $name ($($scopeInfo.Label)): the folder $($scopeInfo.Path) is not present." | Tee-Object -FilePath $logFile -Append
+                continue
+            }
+            if (-not $plan.Snapshot.Accessible) {
+                Log-Warning "Scope ${name}: $($scopeInfo.Path) could not be enumerated ($($plan.Snapshot.AccessError))." | Tee-Object -FilePath $logFile -Append
+                $findings.Add((New-Finding -Category 'Folder unreadable' -Severity 'Warning' -Priority 30 -Actionable $false `
+                            -Detail "$($scopeInfo.Path) could not be enumerated: $($plan.Snapshot.AccessError)"))
+                continue
+            }
+
+            Log-Output "Scope $name ($($scopeInfo.Label)): $($plan.FileCount) log file(s), $([math]::Round($plan.TotalBytes / 1KB)) KB, alongside $(@($plan.Snapshot.OtherFile).Count) other file(s)." | Tee-Object -FilePath $logFile -Append
+            foreach ($file in @($plan.Snapshot.MatchedFile)) {
+                Log-Info "    $($file.Name)  $([math]::Round($file.Length / 1KB)) KB" | Tee-Object -FilePath $logFile -Append
+            }
+            foreach ($hive in @($plan.HiveState | Where-Object { $_.Present })) {
+                $state = if ($hive.Tested) { if ($hive.Loads) { 'loads' } else { "does not load ($($hive.Reason))" } } else { $hive.Reason }
+                Log-Info "    hive $($hive.Name): $state" | Tee-Object -FilePath $logFile -Append
             }
         }
 
-        Log-Output "Restored $restoredTotal file(s); $failedScopes scope(s) were not fully restored." | Tee-Object -FilePath $logFile -Append
-        if ($failedScopes -gt 0) {
-            Log-Error "The revert manifest at $manifestPath was retained because not every scope was restored and verified." | Tee-Object -FilePath $logFile -Append
-            return $STATUS_ERROR
+        $markers = Get-PendingServicingMarker -SystemRoot $systemRoot
+        foreach ($marker in $markers) {
+            $findings.Add((New-Finding -Category 'Pending servicing' -Severity 'Warning' -Priority 40 -Actionable $false `
+                        -Detail "$marker - an interrupted update is a different problem; win-fix-pending-servicing is the script for it"))
+            Log-Warning "$marker. This script does not act on that; win-fix-pending-servicing does." | Tee-Object -FilePath $logFile -Append
         }
 
-        try { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction Stop }
+        $actionable = @($plans | Where-Object { $_.Actionable })
+
+        Log-Output '--- Findings ---' | Tee-Object -FilePath $logFile -Append
+        if ($findings.Count -eq 0) {
+            Log-Output 'No issues found.' | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            foreach ($finding in @($findings | Sort-Object Priority)) {
+                Log-Output "[$($finding.Severity)] $($finding.Category): $($finding.Detail)" | Tee-Object -FilePath $logFile -Append
+            }
+        }
+
+        #####################################################################################################
+        # Decide
+        #####################################################################################################
+        if ($isDetectOnly) {
+            if ($actionable.Count -gt 0) {
+                $total = ($actionable | Measure-Object -Property FileCount -Sum).Sum
+                Log-Output "detectOnly: $total transaction log file(s) across $($actionable.Count) scope(s) would be removed." | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                Log-Output 'detectOnly: there are no transaction log files to remove.' | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output 'detectOnly was requested, so nothing was changed.' | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        if ($actionable.Count -eq 0) {
+            Log-Output 'There are no transaction log files in the selected scope(s), so there is nothing to remove.' | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        if (-not $evidence.Found -and -not $isForce) {
+            Log-Output 'Transaction logs are present, but they are present on every healthy Windows installation and no evidence of log exhaustion was found.' | Tee-Object -FilePath $logFile -Append
+            Log-Output 'Nothing was changed. If the symptom was identified another way - CBS.log can roll over into a .cab and take the evidence with it - re-run with "force true".' | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        if (-not $evidence.Found -and $isForce) {
+            Log-Warning 'No log exhaustion evidence was found, but force was requested, so the logs will be cleared.' | Tee-Object -FilePath $logFile -Append
+        }
+
+        #####################################################################################################
+        # Repair
+        #####################################################################################################
+        $null = Read-RevertManifest -Path $manifestPath
+        Log-Output '--- Repair ---' | Tee-Object -FilePath $logFile -Append
+
+        $backupRoot = Join-OfflinePath $systemRoot "Temp\$scriptName\$scriptStartTime"
+        try { New-Item -Path $backupRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null }
         catch {
-            Log-Error "The manifest at $manifestPath could not be removed ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append
-            return $STATUS_ERROR
+            Log-Error "The backup folder $backupRoot could not be created ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append
+            break Main
+        }
+        Log-Output "Backups for this run are in $backupRoot." | Tee-Object -FilePath $logFile -Append
+
+        $results = [System.Collections.Generic.List[object]]::new()
+        foreach ($plan in $actionable) {
+            Log-Output "Clearing scope $($plan.Scope) - $($plan.FileCount) file(s) in $($plan.ScopeInfo.Path)." | Tee-Object -FilePath $logFile -Append
+            $outcome = Invoke-OfflineRemovalPlan -Plan $plan -BackupRoot $backupRoot
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            $results.Add($outcome)
         }
 
-        Log-Output 'Revert complete.' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
+        #####################################################################################################
+        # Verify
+        #####################################################################################################
+        Log-Output '--- Verification ---' | Tee-Object -FilePath $logFile -Append
 
-    #####################################################################################################
-    # Detect
-    #####################################################################################################
-    Log-Output '--- Detection ---' | Tee-Object -FilePath $logFile -Append
+        $succeeded = @($results | Where-Object { $_.Success })
+        $failed = @($results | Where-Object { -not $_.Success })
 
-    $findings = [System.Collections.Generic.List[object]]::new()
-
-    $evidence = Get-LogExhaustionEvidence -SystemRoot $systemRoot
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    if ($evidence.Found) {
-        $findings.Add((New-Finding -Category 'Log exhaustion' -Severity 'Critical' -Priority 10 `
-                    -Detail "ERROR_LOG_FULL was reported in $($evidence.Source): $($evidence.SampleLine)"))
-        Log-Output "Log exhaustion evidence found in $($evidence.Source)." | Tee-Object -FilePath $logFile -Append
-        Log-Output "  $($evidence.SampleLine)" | Tee-Object -FilePath $logFile -Append
-    }
-    elseif (@($evidence.LogsRead).Count -eq 0) {
-        Log-Output 'No CBS log was available to read, so there is no evidence either way.' | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Output "No ERROR_LOG_FULL entry was found in the last $($script:CbsTailLine) lines of $(@($evidence.LogsRead).Count) CBS log(s)." | Tee-Object -FilePath $logFile -Append
-    }
-
-    $plans = [System.Collections.Generic.List[object]]::new()
-    foreach ($name in $selectedScopes) {
-        $scopeInfo = Get-TransactionLogScope -Name $name -SystemRoot $systemRoot
-        $plan = Get-TransactionLogPlan -ScopeInfo $scopeInfo
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-        $plans.Add($plan)
-
-        if (-not $plan.Snapshot.Present) {
-            Log-Output "Scope $name ($($scopeInfo.Label)): the folder $($scopeInfo.Path) is not present." | Tee-Object -FilePath $logFile -Append
-            continue
-        }
-        if (-not $plan.Snapshot.Accessible) {
-            Log-Warning "Scope ${name}: $($scopeInfo.Path) could not be enumerated ($($plan.Snapshot.AccessError))." | Tee-Object -FilePath $logFile -Append
-            $findings.Add((New-Finding -Category 'Folder unreadable' -Severity 'Warning' -Priority 30 -Actionable $false `
-                        -Detail "$($scopeInfo.Path) could not be enumerated: $($plan.Snapshot.AccessError)"))
-            continue
+        $manifestEntries = [System.Collections.Generic.List[object]]::new()
+        foreach ($outcome in $succeeded) {
+            $plan = @($actionable | Where-Object { $_.Scope -eq $outcome.Label } | Select-Object -First 1)[0]
+            $manifestEntries.Add([PSCustomObject]@{
+                    Scope      = $outcome.Label
+                    TargetPath = $plan.ScopeInfo.Path
+                    BackupPath = $outcome.BackupPath
+                    Files      = @($outcome.BackupRecord)
+                })
+            Log-Output "Scope $($outcome.Label): $(@($outcome.Removed).Count) file(s) removed and verified." | Tee-Object -FilePath $logFile -Append
         }
 
-        Log-Output "Scope $name ($($scopeInfo.Label)): $($plan.FileCount) log file(s), $([math]::Round($plan.TotalBytes / 1KB)) KB, alongside $(@($plan.Snapshot.OtherFile).Count) other file(s)." | Tee-Object -FilePath $logFile -Append
-        foreach ($file in @($plan.Snapshot.MatchedFile)) {
-            Log-Info "    $($file.Name)  $([math]::Round($file.Length / 1KB)) KB" | Tee-Object -FilePath $logFile -Append
+        $manifestWritten = $true
+        if ($manifestEntries.Count -gt 0) {
+            $manifestWritten = Write-RevertManifest -Path $manifestPath -Entry @($manifestEntries)
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            if (-not $manifestWritten) {
+                Log-Error "Revert information could not be published. Backups for this run remain at $backupRoot; keep them and the existing manifest at $manifestPath." | Tee-Object -FilePath $logFile -Append
+            }
         }
-        foreach ($hive in @($plan.HiveState | Where-Object { $_.Present })) {
-            $state = if ($hive.Tested) { if ($hive.Loads) { 'loads' } else { "does not load ($($hive.Reason))" } } else { $hive.Reason }
-            Log-Info "    hive $($hive.Name): $state" | Tee-Object -FilePath $logFile -Append
+
+        foreach ($outcome in $failed) {
+            if ($outcome.RollbackAttempted -and $outcome.RollbackSucceeded) {
+                Log-Error "Scope $($outcome.Label) failed; its removed files were rolled back and verified: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+            }
+            elseif ($outcome.RollbackAttempted) {
+                Log-Error "FATAL: Scope $($outcome.Label) failed and its automatic rollback did not restore and verify every file: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                Log-Error "Scope $($outcome.Label) failed without an automatic rollback: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+            }
         }
-    }
 
-    $markers = Get-PendingServicingMarker -SystemRoot $systemRoot
-    foreach ($marker in $markers) {
-        $findings.Add((New-Finding -Category 'Pending servicing' -Severity 'Warning' -Priority 40 -Actionable $false `
-                    -Detail "$marker - an interrupted update is a different problem; win-fix-pending-servicing is the script for it"))
-        Log-Warning "$marker. This script does not act on that; win-fix-pending-servicing does." | Tee-Object -FilePath $logFile -Append
-    }
-
-    $actionable = @($plans | Where-Object { $_.Actionable })
-
-    Log-Output '--- Findings ---' | Tee-Object -FilePath $logFile -Append
-    if ($findings.Count -eq 0) {
-        Log-Output 'No issues found.' | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        foreach ($finding in @($findings | Sort-Object Priority)) {
-            Log-Output "[$($finding.Severity)] $($finding.Category): $($finding.Detail)" | Tee-Object -FilePath $logFile -Append
+        if ($failed.Count -gt 0) {
+            Log-Error "$($failed.Count) of $($results.Count) scope(s) failed. Review the per-scope rollback results and keep the backups and revert manifest; successful scopes remain cleared." | Tee-Object -FilePath $logFile -Append
+            break Main
         }
-    }
+        if (-not $manifestWritten) { break Main }
 
-    #####################################################################################################
-    # Decide
-    #####################################################################################################
-    if ($isDetectOnly) {
-        if ($actionable.Count -gt 0) {
-            $total = ($actionable | Measure-Object -Property FileCount -Sum).Sum
-            Log-Output "detectOnly: $total transaction log file(s) across $($actionable.Count) scope(s) would be removed." | Tee-Object -FilePath $logFile -Append
+        Log-Output 'The transaction logs were cleared. Windows recreates them on the next boot.' | Tee-Object -FilePath $logFile -Append
+        if (@($markers).Count -gt 0) {
+            Log-Warning 'Pending servicing markers are still present, so the VM may need win-fix-pending-servicing as well.' | Tee-Object -FilePath $logFile -Append
         }
-        else {
-            Log-Output 'detectOnly: there are no transaction log files to remove.' | Tee-Object -FilePath $logFile -Append
-        }
-        Log-Output 'detectOnly was requested, so nothing was changed.' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
+        Log-Output "Detach the disk and reattach it to the original VM with 'az vm repair restore'." | Tee-Object -FilePath $logFile -Append
+        Log-Output "The backups and the revert manifest travel back with the disk. Once the VM is confirmed healthy they can be deleted from $backupRoot and $manifestPath. Reverting needs both, so keep them until then." | Tee-Object -FilePath $logFile -Append
 
-    if ($actionable.Count -eq 0) {
-        Log-Output 'There are no transaction log files in the selected scope(s), so there is nothing to remove.' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if (-not $evidence.Found -and -not $isForce) {
-        Log-Output 'Transaction logs are present, but they are present on every healthy Windows installation and no evidence of log exhaustion was found.' | Tee-Object -FilePath $logFile -Append
-        Log-Output 'Nothing was changed. If the symptom was identified another way - CBS.log can roll over into a .cab and take the evidence with it - re-run with "force true".' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if (-not $evidence.Found -and $isForce) {
-        Log-Warning 'No log exhaustion evidence was found, but force was requested, so the logs will be cleared.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    #####################################################################################################
-    # Repair
-    #####################################################################################################
-    Log-Output '--- Repair ---' | Tee-Object -FilePath $logFile -Append
-
-    $backupRoot = Join-OfflinePath $systemRoot "Temp\$scriptName\$scriptStartTime"
-    try { New-Item -Path $backupRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null }
-    catch {
-        Log-Error "The backup folder $backupRoot could not be created ($($_.Exception.Message))." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-    Log-Output "Backups for this run are in $backupRoot." | Tee-Object -FilePath $logFile -Append
-
-    $results = [System.Collections.Generic.List[object]]::new()
-    foreach ($plan in $actionable) {
-        Log-Output "Clearing scope $($plan.Scope) - $($plan.FileCount) file(s) in $($plan.ScopeInfo.Path)." | Tee-Object -FilePath $logFile -Append
-        $outcome = Invoke-OfflineRemovalPlan -Plan $plan -BackupRoot $backupRoot
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-        $results.Add($outcome)
-    }
-
-    #####################################################################################################
-    # Verify
-    #####################################################################################################
-    Log-Output '--- Verification ---' | Tee-Object -FilePath $logFile -Append
-
-    $succeeded = @($results | Where-Object { $_.Success })
-    $failed = @($results | Where-Object { -not $_.Success })
-
-    $manifestEntries = [System.Collections.Generic.List[object]]::new()
-    foreach ($outcome in $succeeded) {
-        $plan = @($actionable | Where-Object { $_.Scope -eq $outcome.Label } | Select-Object -First 1)[0]
-        $manifestEntries.Add([PSCustomObject]@{
-                Scope      = $outcome.Label
-                TargetPath = $plan.ScopeInfo.Path
-                BackupPath = $outcome.BackupPath
-                Files      = @($outcome.BackupRecord)
-            })
-        Log-Output "Scope $($outcome.Label): $(@($outcome.Removed).Count) file(s) removed and verified." | Tee-Object -FilePath $logFile -Append
-    }
-
-    if ($manifestEntries.Count -gt 0) {
-        Write-RevertManifest -Path $manifestPath -Entry @($manifestEntries)
-    }
-
-    foreach ($outcome in $failed) {
-        if ($outcome.RollbackAttempted -and $outcome.RollbackSucceeded) {
-            Log-Error "Scope $($outcome.Label) failed; its removed files were rolled back and verified: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
-        }
-        elseif ($outcome.RollbackAttempted) {
-            Log-Error "FATAL: Scope $($outcome.Label) failed and its automatic rollback did not restore and verify every file: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
-        }
-        else {
-            Log-Error "Scope $($outcome.Label) failed without an automatic rollback: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
-        }
-    }
-
-    if ($failed.Count -gt 0) {
-        Log-Error "$($failed.Count) of $($results.Count) scope(s) failed. Review the per-scope rollback results and keep the backups and revert manifest; successful scopes remain cleared." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    Log-Output 'The transaction logs were cleared. Windows recreates them on the next boot.' | Tee-Object -FilePath $logFile -Append
-    if (@($markers).Count -gt 0) {
-        Log-Warning 'Pending servicing markers are still present, so the VM may need win-fix-pending-servicing as well.' | Tee-Object -FilePath $logFile -Append
-    }
-    Log-Output "Detach the disk and reattach it to the original VM with 'az vm repair restore'." | Tee-Object -FilePath $logFile -Append
-    Log-Output "The backups and the revert manifest travel back with the disk. Once the VM is confirmed healthy they can be deleted from $backupRoot and $manifestPath. Reverting needs both, so keep them until then." | Tee-Object -FilePath $logFile -Append
-
-    return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
+    $status = $STATUS_ERROR
     Log-Error "$scriptName failed: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error $_.ScriptStackTrace | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
 }
+finally {
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        Clear-OfflineDriveLetter
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    }
+}
+return $status
