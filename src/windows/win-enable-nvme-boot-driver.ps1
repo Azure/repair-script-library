@@ -69,17 +69,22 @@ try {
         $root = Get-OfflineSystemRootPath -Strict
         $servicePath = "$root\Services\stornvme"
         $nativeServicePath = $servicePath -replace '^HKLM:\\', 'HKLM\'
-        if ((Get-OfflineHiveKeyState -HiveKey $servicePath) -ne 'Present') {
+        $serviceKeyState = Get-OfflineHiveKeyState -HiveKey $servicePath
+        if ($Mode -ne 'Rollback' -and $serviceKeyState -ne 'Present') {
             throw "The offline stornvme service key '$servicePath' is not present. No changes were made."
         }
 
-        $current = Get-ItemProperty -LiteralPath $servicePath -ErrorAction Stop
         $changes = @()
-        foreach ($name in $desiredValues.Keys) {
-            $desired = $desiredValues[$name].Value
-            $actual = $current.$name
-            if ($actual -ne $desired) {
-                $changes += [PSCustomObject]@{ Name = $name; Before = $actual; After = $desired }
+        if ($Mode -ne 'Rollback') {
+            $current = Get-ItemProperty -LiteralPath $servicePath -ErrorAction Stop
+            $currentKey = Get-Item -LiteralPath $servicePath -ErrorAction Stop
+            foreach ($name in $desiredValues.Keys) {
+                $desired = $desiredValues[$name]
+                $actual = $current.$name
+                $actualKind = if ($current.PSObject.Properties.Name -contains $name) { $currentKey.GetValueKind($name).ToString() } else { $null }
+                if ($actual -ne $desired.Value -or $actualKind -ne $desired.Kind) {
+                    $changes += [PSCustomObject]@{ Name = $name; Before = $actual; BeforeKind = $actualKind; After = $desired.Value; AfterKind = $desired.Kind }
+                }
             }
         }
 
@@ -100,7 +105,10 @@ try {
                 throw "BackupFile '$BackupFile' contains no registry section."
             }
             foreach ($section in $sections) {
-                $sectionKey = $section.Groups[1].Value.TrimStart('-')
+                $sectionKey = $section.Groups[1].Value
+                if ($sectionKey.StartsWith('-', [System.StringComparison]::Ordinal)) {
+                    throw "BackupFile '$BackupFile' contains a deletion section '$sectionKey'."
+                }
                 if (-not $sectionKey.Equals($expectedKey, [System.StringComparison]::OrdinalIgnoreCase) -and
                     -not $sectionKey.StartsWith($expectedKey + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
                     throw "BackupFile '$BackupFile' contains an out-of-scope registry section '$sectionKey'."
@@ -113,10 +121,16 @@ try {
                 throw "Registry rollback import failed with exit code $LASTEXITCODE`: $(($importOutput | Out-String).Trim())"
             }
 
-            $backedUpValueNames = @([regex]::Matches($backupText, '(?m)^\s*"([^"]+)"=') |
+            $escapedExpectedKey = [regex]::Escape($expectedKey)
+            $rootSection = [regex]::Match($backupText, "(?ms)^\s*\[$escapedExpectedKey\]\s*\r?\n(?<Body>.*?)(?=^\s*\[|\z)")
+            if (-not $rootSection.Success) {
+                throw "BackupFile '$BackupFile' contains no exact '$expectedKey' section."
+            }
+            $backedUpValueNames = @([regex]::Matches($rootSection.Groups['Body'].Value, '(?m)^\s*"([^"]+)"=') |
                 ForEach-Object { $_.Groups[1].Value })
+            $restored = Get-ItemProperty -LiteralPath $servicePath -ErrorAction Stop
             foreach ($name in $desiredValues.Keys) {
-                if ($backedUpValueNames -contains $name) { continue }
+                if ($backedUpValueNames -contains $name -or -not ($restored.PSObject.Properties.Name -contains $name)) { continue }
                 [void](Assert-OfflineTarget -Path $servicePath -Action "remove the offline stornvme $name value during rollback")
                 Remove-ItemProperty -LiteralPath $servicePath -Name $name -Force -ErrorAction Stop
             }
@@ -143,8 +157,8 @@ try {
             return [PSCustomObject]@{ Outcome = 'NoChangeNeeded'; ServicePath = $servicePath; Changes = @(); BackupFile = $null }
         }
 
-        $evidenceRoot = Join-Path $env:PUBLIC "Desktop\nvme-repair-$(Get-Date -Format yyyyMMddHHmmss)"
-        New-Item -Path $evidenceRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        $evidenceRoot = Join-Path $env:PUBLIC "Desktop\nvme-repair-$(Get-Date -Format yyyyMMddHHmmss)-$([guid]::NewGuid().ToString('N'))"
+        New-Item -Path $evidenceRoot -ItemType Directory -ErrorAction Stop | Out-Null
         $backupPath = Join-Path $evidenceRoot "$($offline.WindowsDrive.TrimEnd(':'))-stornvme-before.reg"
         $exportOutput = & reg.exe export $nativeServicePath $backupPath /y 2>&1
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or
@@ -159,9 +173,11 @@ try {
         }
 
         $verified = Get-ItemProperty -LiteralPath $servicePath -ErrorAction Stop
+        $verifiedKey = Get-Item -LiteralPath $servicePath -ErrorAction Stop
         foreach ($name in $desiredValues.Keys) {
-            if ($verified.$name -ne $desiredValues[$name].Value) {
-                throw "Verification failed for $servicePath\$name. Expected '$($desiredValues[$name].Value)', read '$($verified.$name)'. Roll back with Mode=Rollback BackupFile='$backupPath'."
+            $verifiedKind = if ($verified.PSObject.Properties.Name -contains $name) { $verifiedKey.GetValueKind($name).ToString() } else { $null }
+            if ($verified.$name -ne $desiredValues[$name].Value -or $verifiedKind -ne $desiredValues[$name].Kind) {
+                throw "Verification failed for $servicePath\$name. Expected '$($desiredValues[$name].Value)' ($($desiredValues[$name].Kind)), read '$($verified.$name)' ($verifiedKind). Roll back with Mode=Rollback BackupFile='$backupPath'."
             }
         }
 

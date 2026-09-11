@@ -26,25 +26,43 @@ function Copy-FixtureState {
     return $copy
 }
 
+function Get-HealthyKinds {
+    return [ordered]@{
+        Start = 'DWord'
+        Type = 'DWord'
+        ErrorControl = 'DWord'
+        Group = 'String'
+        ImagePath = 'ExpandString'
+        Sentinel = 'String'
+    }
+}
+
 function Set-NvmeFixture {
     Param(
         [hashtable]$State,
+        [hashtable]$Kinds = (Get-HealthyKinds),
         [bool]$DriverPresent = $true,
         [int]$CandidateCount = 1,
-        [bool]$HiveReadable = $true
+        [bool]$HiveReadable = $true,
+        [bool]$KeyPresent = $true,
+        [bool]$WriteWrongKind = $false
     )
 
     $global:NvmeFixture = @{
         State = Copy-FixtureState $State
+        Kinds = Copy-FixtureState $Kinds
         DriverPresent = $DriverPresent
         CandidateCount = $CandidateCount
         HiveReadable = $HiveReadable
         HiveActive = $false
         StrictCalls = 0
         ImportFails = $false
+        KeyPresent = $KeyPresent
+        WriteWrongKind = $WriteWrongKind
         Operations = [System.Collections.Generic.List[string]]::new()
         Backups = @{}
         LastBackup = $null
+        ImportedSuffix = ''
     }
     $global:LASTEXITCODE = 0
 }
@@ -106,7 +124,12 @@ function Assert-OfflineTarget {
     return $Path
 }
 function Write-OfflineRepairLog { }
-function Get-OfflineHiveKeyState { Param([string]$HiveKey) return 'Present' }
+function Get-OfflineHiveKeyState {
+    Param([string]$HiveKey)
+    Assert-FixtureServicePath $HiveKey
+    if ($global:NvmeFixture.KeyPresent) { return 'Present' }
+    return 'Missing'
+}
 '@ | Set-Content -LiteralPath (Join-Path $helperRoot 'OfflineRepairCommon.ps1') -Encoding Utf8
 
     @'
@@ -141,9 +164,27 @@ function Get-OfflineSystemRootPath {
     $global:NvmeFixture.StrictCalls++
     return 'HKLM:\BROKENSYSTEM\ControlSet001'
 }
+function Get-Item {
+    Param([string]$LiteralPath, $ErrorAction)
+    if (-not $LiteralPath.StartsWith('HKLM:\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($null -ne $ErrorAction) {
+            return Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath -ErrorAction $ErrorAction
+        }
+        return Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath
+    }
+    Assert-FixtureServicePath $LiteralPath
+    if (-not $global:NvmeFixture.KeyPresent) { throw "Fixture service key '$LiteralPath' is missing." }
+    $key = [PSCustomObject]@{}
+    $key | Add-Member -MemberType ScriptMethod -Name GetValueKind -Value {
+        Param([string]$Name)
+        return [System.Enum]::Parse([Microsoft.Win32.RegistryValueKind], $global:NvmeFixture.Kinds[$Name])
+    }
+    return $key
+}
 function Get-ItemProperty {
     Param([string]$LiteralPath, $ErrorAction)
     Assert-FixtureServicePath $LiteralPath
+    if (-not $global:NvmeFixture.KeyPresent) { throw "Fixture service key '$LiteralPath' is missing." }
     return [PSCustomObject](Copy-FixtureState $global:NvmeFixture.State)
 }
 function New-ItemProperty {
@@ -154,7 +195,9 @@ function New-ItemProperty {
         throw "Fixture observed an unguarded registry write to $Name."
     }
     [void]$operations.Add("Write:$Name")
+    $global:NvmeFixture.KeyPresent = $true
     $global:NvmeFixture.State[$Name] = $Value
+    $global:NvmeFixture.Kinds[$Name] = if ($global:NvmeFixture.WriteWrongKind) { 'String' } else { $PropertyType }
 }
 function Remove-ItemProperty {
     Param([string]$LiteralPath, [string]$Name, [switch]$Force, $ErrorAction)
@@ -165,6 +208,7 @@ function Remove-ItemProperty {
     }
     [void]$operations.Add("Remove:$Name")
     [void]$global:NvmeFixture.State.Remove($Name)
+    [void]$global:NvmeFixture.Kinds.Remove($Name)
 }
 function global:reg.exe {
     $verb = "$($args[0])".ToLowerInvariant()
@@ -174,16 +218,26 @@ function global:reg.exe {
         if (-not "$($args[1])".Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Fixture observed registry export outside the strict stornvme target: '$($args[1])'."
         }
-        $global:NvmeFixture.Backups[$path] = Copy-FixtureState $global:NvmeFixture.State
+        $global:NvmeFixture.Backups[$path] = @{
+            State = Copy-FixtureState $global:NvmeFixture.State
+            Kinds = Copy-FixtureState $global:NvmeFixture.Kinds
+            Suffix = $global:NvmeFixture.ImportedSuffix
+        }
         $global:NvmeFixture.LastBackup = $path
         $key = "$($args[1])" -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\'
         $valueLines = @($global:NvmeFixture.State.Keys | Sort-Object | ForEach-Object {
                 $name = $_
                 $value = $global:NvmeFixture.State[$name]
-                if ($value -is [int]) { '"{0}"=dword:{1:x8}' -f $name, $value }
+                $kind = $global:NvmeFixture.Kinds[$name]
+                if ($kind -eq 'DWord') { '"{0}"=dword:{1:x8}' -f $name, $value }
+                elseif ($kind -eq 'ExpandString') {
+                    $bytes = [System.Text.Encoding]::Unicode.GetBytes("$value`0")
+                    '"{0}"=hex(2):{1}' -f $name, (($bytes | ForEach-Object { $_.ToString('x2') }) -join ',')
+                }
                 else { '"{0}"="{1}"' -f $name, "$value".Replace('\', '\\').Replace('"', '\"') }
             })
-        "Windows Registry Editor Version 5.00`r`n`r`n[$key]`r`n$($valueLines -join "`r`n")`r`n" | Set-Content -LiteralPath $path -Encoding Unicode
+        "Windows Registry Editor Version 5.00`r`n`r`n[$key]`r`n$($valueLines -join "`r`n")`r`n$($global:NvmeFixture.ImportedSuffix)" |
+            Set-Content -LiteralPath $path -Encoding Unicode
         $global:LASTEXITCODE = 0
         return
     }
@@ -198,7 +252,14 @@ function global:reg.exe {
             $global:LASTEXITCODE = 5
             return 'fixture import failure'
         }
-        $global:NvmeFixture.State = Copy-FixtureState $global:NvmeFixture.Backups[$path]
+        $backup = $global:NvmeFixture.Backups[$path]
+        if ($null -eq $backup) { throw "Fixture has no parsed state for '$path'." }
+        $global:NvmeFixture.KeyPresent = $true
+        $global:NvmeFixture.ImportedSuffix = $backup.Suffix
+        foreach ($name in $backup.State.Keys) {
+            $global:NvmeFixture.State[$name] = $backup.State[$name]
+            $global:NvmeFixture.Kinds[$name] = $backup.Kinds[$name]
+        }
         $global:LASTEXITCODE = 0
         return
     }
@@ -227,7 +288,7 @@ function global:reg.exe {
 
     Set-NvmeFixture -State $broken
     $repair = Invoke-NvmeFixture -Parameters @{ Mode = 'Repair' }
-    Assert-Equal 0 $repair.Status 'Repair mode should succeed.'
+    Assert-Equal 0 $repair.Status "Repair mode should succeed. Output: $($repair.Output)"
     Assert-True ($repair.Output -match 'VERIFIED') 'Repair mode should report verification.'
     foreach ($name in @('Start', 'Type', 'ErrorControl', 'Group', 'ImagePath')) {
         Assert-True ($global:NvmeFixture.Operations -contains "Write:$name") "Repair mode should write $name."
@@ -236,6 +297,7 @@ function global:reg.exe {
     Assert-True (-not $global:NvmeFixture.State.Contains('CriticalDeviceDatabase')) 'Repair must not write CriticalDeviceDatabase.'
     $backupPath = $global:NvmeFixture.LastBackup
     Assert-True (Test-Path -LiteralPath $backupPath -PathType Leaf) 'Repair should create a verified rollback backup.'
+    Assert-True ((Get-Content -LiteralPath $backupPath -Raw) -match '(?m)^"ImagePath"=hex\(2\):') 'The fixture backup must preserve ImagePath as REG_EXPAND_SZ.'
 
     $global:NvmeFixture.Operations.Clear()
     $secondRepair = Invoke-NvmeFixture -Parameters @{ Mode = 'Repair' }
@@ -265,6 +327,43 @@ function global:reg.exe {
     Assert-True ($global:NvmeFixture.Operations -contains 'Remove:ImagePath') 'Rollback should explicitly remove the value that Repair introduced.'
     Assert-Equal 'unchanged' $global:NvmeFixture.State.Sentinel 'Absent-value rollback must preserve unrelated values.'
 
+    $global:NvmeFixture.Operations.Clear()
+    $secondRollbackMissingValue = Invoke-NvmeFixture -Parameters @{ Mode = 'Rollback'; BackupFile = $missingValueBackup }
+    Assert-Equal 0 $secondRollbackMissingValue.Status 'Repeating an absent-value rollback should succeed.'
+    Assert-True (-not ($global:NvmeFixture.Operations -contains 'Remove:ImagePath')) 'Repeated rollback must not remove an already absent value.'
+
+    $global:NvmeFixture.State = [ordered]@{}
+    $global:NvmeFixture.Kinds = [ordered]@{}
+    $global:NvmeFixture.KeyPresent = $false
+    $global:NvmeFixture.Operations.Clear()
+    $rollbackMissingKey = Invoke-NvmeFixture -Parameters @{ Mode = 'Rollback'; BackupFile = $missingValueBackup }
+    Assert-Equal 0 $rollbackMissingKey.Status "Rollback should recreate a missing stornvme key. Output: $($rollbackMissingKey.Output)"
+    Assert-True $global:NvmeFixture.KeyPresent 'Rollback should recreate the missing service key.'
+    Assert-Equal 4 $global:NvmeFixture.State.Start 'A recreated service key should contain the backed-up values.'
+
+    $childSuffix = "[HKEY_LOCAL_MACHINE\BROKENSYSTEM\ControlSet001\Services\stornvme\Parameters]`r`n`"ImagePath`"=`"child-only`"`r`n"
+    $global:NvmeFixture.Backups[$missingValueBackup].Suffix = $childSuffix
+    [System.IO.File]::WriteAllText(
+        $missingValueBackup,
+        [System.IO.File]::ReadAllText($missingValueBackup).TrimEnd() + "`r`n" + $childSuffix,
+        [System.Text.Encoding]::Unicode)
+    $global:NvmeFixture.State.ImagePath = 'current-root-value'
+    $global:NvmeFixture.Kinds.ImagePath = 'String'
+    $global:NvmeFixture.Operations.Clear()
+    $rollbackWithChildValue = Invoke-NvmeFixture -Parameters @{ Mode = 'Rollback'; BackupFile = $missingValueBackup }
+    Assert-Equal 0 $rollbackWithChildValue.Status "Rollback should isolate root values from child sections. Output: $($rollbackWithChildValue.Output)"
+    Assert-True ($global:NvmeFixture.Operations -contains 'Remove:ImagePath') 'A child-section ImagePath must not count as a root service value.'
+    Assert-True (-not $global:NvmeFixture.State.Contains('ImagePath')) 'Rollback should remove a root value absent from the root backup section.'
+
+    $deletionBackup = Join-Path $fixtureRoot 'deletion.reg'
+    "Windows Registry Editor Version 5.00`r`n`r`n[-HKEY_LOCAL_MACHINE\BROKENSYSTEM\ControlSet001\Services\stornvme]`r`n" |
+        Set-Content -LiteralPath $deletionBackup -Encoding Unicode
+    Set-NvmeFixture -State $healthy
+    $deletion = Invoke-NvmeFixture -Parameters @{ Mode = 'Rollback'; BackupFile = $deletionBackup }
+    Assert-Equal 1 $deletion.Status 'Rollback should reject a registry deletion section.'
+    Assert-True ($deletion.Output -match 'contains a deletion section') 'Deletion-section refusal should identify the unsafe section.'
+    Assert-Equal 0 $global:NvmeFixture.Operations.Count 'A deletion-section backup must be rejected before import.'
+
     $outOfScopeBackup = Join-Path $fixtureRoot 'out-of-scope.reg'
     "Windows Registry Editor Version 5.00`r`n`r`n[HKEY_LOCAL_MACHINE\BROKENSYSTEM\ControlSet001\Services\stornvme]`r`n`r`n[HKEY_CURRENT_USER\Software\Unexpected]`r`n" |
         Set-Content -LiteralPath $outOfScopeBackup -Encoding Unicode
@@ -283,6 +382,29 @@ function global:reg.exe {
     Assert-True (-not $global:NvmeFixture.HiveActive) 'A failed registry import must unload the hive.'
     Assert-Equal $beforeFailedImport.Start $global:NvmeFixture.State.Start 'A failed import must leave current service values intact.'
     Assert-True (-not ($global:NvmeFixture.Operations -match '^Remove:')) 'A failed import must not remove any current service value.'
+
+    $wrongKinds = Get-HealthyKinds
+    $wrongKinds.ImagePath = 'String'
+    Set-NvmeFixture -State $healthy -Kinds $wrongKinds
+    $repairWrongKind = Invoke-NvmeFixture -Parameters @{ Mode = 'Repair' }
+    Assert-Equal 0 $repairWrongKind.Status "Repair should correct a kind-only mismatch. Output: $($repairWrongKind.Output)"
+    Assert-True ($global:NvmeFixture.Operations -contains 'Write:ImagePath') 'Repair should rewrite ImagePath when only its registry kind is wrong.'
+    Assert-Equal 'ExpandString' $global:NvmeFixture.Kinds.ImagePath 'Repair should restore ImagePath to REG_EXPAND_SZ.'
+
+    Set-NvmeFixture -State $broken -WriteWrongKind $true
+    $repairWrongWriteKind = Invoke-NvmeFixture -Parameters @{ Mode = 'Repair' }
+    Assert-Equal 1 $repairWrongWriteKind.Status 'Repair should fail if a write rereads with the wrong registry kind.'
+    Assert-True ($repairWrongWriteKind.Output -match 'Verification failed') 'Wrong-kind verification failure should be explicit.'
+
+    Set-NvmeFixture -State $broken
+    $firstCollisionRepair = Invoke-NvmeFixture -Parameters @{ Mode = 'Repair' }
+    Assert-Equal 0 $firstCollisionRepair.Status 'The first collision fixture repair should succeed.'
+    $firstCollisionBackup = $global:NvmeFixture.LastBackup
+    $global:NvmeFixture.State.Start = 4
+    $global:NvmeFixture.Operations.Clear()
+    $secondCollisionRepair = Invoke-NvmeFixture -Parameters @{ Mode = 'Repair' }
+    Assert-Equal 0 $secondCollisionRepair.Status 'The immediate second collision fixture repair should succeed.'
+    Assert-True ($firstCollisionBackup -ne $global:NvmeFixture.LastBackup) 'Immediate repairs must create distinct backup paths.'
 
     Set-NvmeFixture -State $broken -DriverPresent $false
     $missingDriver = Invoke-NvmeFixture -Parameters @{ Mode = 'Repair' }
