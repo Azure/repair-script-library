@@ -45,7 +45,8 @@ function Set-NvmeFixture {
         [int]$CandidateCount = 1,
         [bool]$HiveReadable = $true,
         [bool]$KeyPresent = $true,
-        [bool]$WriteWrongKind = $false
+        [bool]$WriteWrongKind = $false,
+        [string[]]$SubKeys = @()
     )
 
     $global:NvmeFixture = @{
@@ -59,6 +60,7 @@ function Set-NvmeFixture {
         ImportFails = $false
         KeyPresent = $KeyPresent
         WriteWrongKind = $WriteWrongKind
+        SubKeys = @($SubKeys)
         Operations = [System.Collections.Generic.List[string]]::new()
         Backups = @{}
         LastBackup = $null
@@ -174,12 +176,26 @@ function Get-Item {
     }
     Assert-FixtureServicePath $LiteralPath
     if (-not $global:NvmeFixture.KeyPresent) { throw "Fixture service key '$LiteralPath' is missing." }
-    $key = [PSCustomObject]@{}
+    $key = [PSCustomObject]@{ Name = 'HKEY_LOCAL_MACHINE\BROKENSYSTEM\ControlSet001\Services\stornvme' }
     $key | Add-Member -MemberType ScriptMethod -Name GetValueKind -Value {
         Param([string]$Name)
         return [System.Enum]::Parse([Microsoft.Win32.RegistryValueKind], $global:NvmeFixture.Kinds[$Name])
     }
+    $key | Add-Member -MemberType ScriptMethod -Name GetValueNames -Value {
+        return @($global:NvmeFixture.State.Keys)
+    }
     return $key
+}
+function Get-ChildItem {
+    Param([string]$LiteralPath, [switch]$Recurse, $ErrorAction)
+    if (-not $LiteralPath.StartsWith('HKLM:\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
+    }
+    Assert-FixtureServicePath $LiteralPath
+    return @($global:NvmeFixture.SubKeys | ForEach-Object {
+            $subKey = [PSCustomObject]@{ Name = $_ }
+            $subKey | Add-Member -MemberType ScriptMethod -Name GetValueNames -Value { return @() } -PassThru
+        })
 }
 function Get-ItemProperty {
     Param([string]$LiteralPath, $ErrorAction)
@@ -363,6 +379,54 @@ function global:reg.exe {
     Assert-Equal 1 $deletion.Status 'Rollback should reject a registry deletion section.'
     Assert-True ($deletion.Output -match 'contains a deletion section') 'Deletion-section refusal should identify the unsafe section.'
     Assert-Equal 0 $global:NvmeFixture.Operations.Count 'A deletion-section backup must be rejected before import.'
+
+    # A child-only backup passes the section-scope loop, so the missing root section has to be
+    # detected before the import rather than after it.
+    $childOnlyBackup = Join-Path $fixtureRoot 'child-only.reg'
+    "Windows Registry Editor Version 5.00`r`n`r`n[HKEY_LOCAL_MACHINE\BROKENSYSTEM\ControlSet001\Services\stornvme\Parameters]`r`n`"Example`"=`"value`"`r`n" |
+        Set-Content -LiteralPath $childOnlyBackup -Encoding Unicode
+    Set-NvmeFixture -State $healthy
+    # Registered so a premature import would succeed, leaving the mutation the assertions look for.
+    $global:NvmeFixture.Backups[$childOnlyBackup] = @{
+        State = Copy-FixtureState $broken
+        Kinds = Get-HealthyKinds
+        Suffix = ''
+    }
+    $childOnly = Invoke-NvmeFixture -Parameters @{ Mode = 'Rollback'; BackupFile = $childOnlyBackup }
+    Assert-Equal 1 $childOnly.Status 'Rollback should reject a backup with no exact root section.'
+    Assert-True (-not ($global:NvmeFixture.Operations -contains 'Import:stornvme')) 'A backup without a root section must be rejected before import.'
+    Assert-Equal 0 $global:NvmeFixture.Operations.Count 'A backup without a root section must not write.'
+    Assert-Equal 0 $global:NvmeFixture.State.Start 'A backup without a root section must leave current values intact.'
+
+    # reg.exe import merges, so a subkey the backup does not restore would survive the rollback.
+    Set-NvmeFixture -State $healthy -SubKeys @('HKEY_LOCAL_MACHINE\BROKENSYSTEM\ControlSet001\Services\stornvme\Unexpected')
+    $global:NvmeFixture.Backups[$backupPath] = @{
+        State = Copy-FixtureState $broken
+        Kinds = Get-HealthyKinds
+        Suffix = ''
+    }
+    $residualSubKey = Invoke-NvmeFixture -Parameters @{ Mode = 'Rollback'; BackupFile = $backupPath }
+    Assert-Equal 1 $residualSubKey.Status 'Rollback should refuse when the offline subtree has a subkey the backup omits.'
+    Assert-True ($residualSubKey.Output -match 'Rollback would leave it behind') 'The residue refusal should explain why it stopped.'
+    Assert-Equal 0 $global:NvmeFixture.Operations.Count 'A subtree with unrestorable residue must not be imported.'
+    Assert-Equal 0 $global:NvmeFixture.State.Start 'A refused rollback must leave current values intact.'
+
+    # Same for a value the backup does not declare and this script never writes.
+    $residualState = Copy-FixtureState $healthy
+    $residualState.Unrelated = 'keep-me'
+    $residualKinds = Get-HealthyKinds
+    $residualKinds.Unrelated = 'String'
+    Set-NvmeFixture -State $residualState -Kinds $residualKinds
+    $global:NvmeFixture.Backups[$backupPath] = @{
+        State = Copy-FixtureState $broken
+        Kinds = Get-HealthyKinds
+        Suffix = ''
+    }
+    $residualValue = Invoke-NvmeFixture -Parameters @{ Mode = 'Rollback'; BackupFile = $backupPath }
+    Assert-Equal 1 $residualValue.Status 'Rollback should refuse when the root key has a value the backup omits.'
+    Assert-True ($residualValue.Output -match "'Unrelated' value") 'The residue refusal should name the offending value.'
+    Assert-Equal 0 $global:NvmeFixture.Operations.Count 'A root key with unrestorable residue must not be imported.'
+    Assert-Equal 'keep-me' $global:NvmeFixture.State.Unrelated 'A refused rollback must not remove the unrestorable value.'
 
     $outOfScopeBackup = Join-Path $fixtureRoot 'out-of-scope.reg'
     "Windows Registry Editor Version 5.00`r`n`r`n[HKEY_LOCAL_MACHINE\BROKENSYSTEM\ControlSet001\Services\stornvme]`r`n`r`n[HKEY_CURRENT_USER\Software\Unexpected]`r`n" |

@@ -104,6 +104,10 @@ try {
             if ($sections.Count -eq 0) {
                 throw "BackupFile '$BackupFile' contains no registry section."
             }
+
+            # Record what each section declares so the offline subtree can be checked against the
+            # backup before anything is written.
+            $backupValueNames = @{}
             foreach ($section in $sections) {
                 $sectionKey = $section.Groups[1].Value
                 if ($sectionKey.StartsWith('-', [System.StringComparison]::Ordinal)) {
@@ -113,6 +117,42 @@ try {
                     -not $sectionKey.StartsWith($expectedKey + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
                     throw "BackupFile '$BackupFile' contains an out-of-scope registry section '$sectionKey'."
                 }
+                $sectionBody = [regex]::Match(
+                    $backupText,
+                    "(?ms)^\s*\[$([regex]::Escape($sectionKey))\]\s*\r?\n(?<Body>.*?)(?=^\s*\[|\z)")
+                $declared = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+                if ($sectionBody.Success) {
+                    foreach ($value in [regex]::Matches($sectionBody.Groups['Body'].Value, '(?m)^\s*(?:"(?<Name>[^"]+)"|(?<Default>@))=')) {
+                        [void]$declared.Add($(if ($value.Groups['Default'].Success) { '(default)' } else { $value.Groups['Name'].Value }))
+                    }
+                }
+                $backupValueNames[$sectionKey] = $declared
+            }
+
+            if (-not $backupValueNames.ContainsKey($expectedKey)) {
+                throw "BackupFile '$BackupFile' contains no exact '$expectedKey' section."
+            }
+            $backedUpValueNames = $backupValueNames[$expectedKey]
+
+            # reg.exe import only adds and overwrites, so anything present offline but absent from the
+            # backup would survive the rollback. Refuse before writing rather than fail verification
+            # once the hive has already been changed.
+            if ($serviceKeyState -eq 'Present') {
+                $liveKeys = @(Get-Item -LiteralPath $servicePath -ErrorAction Stop) +
+                            @(Get-ChildItem -LiteralPath $servicePath -Recurse -ErrorAction Stop)
+                foreach ($liveKey in $liveKeys) {
+                    if (-not $backupValueNames.ContainsKey($liveKey.Name)) {
+                        throw "The offline subtree contains the key '$($liveKey.Name)', which '$BackupFile' does not restore. Rollback would leave it behind; no changes were made."
+                    }
+                    $isRootKey = $liveKey.Name.Equals($expectedKey, [System.StringComparison]::OrdinalIgnoreCase)
+                    foreach ($liveValueName in @($liveKey.GetValueNames())) {
+                        $reportedName = if ([string]::IsNullOrEmpty($liveValueName)) { '(default)' } else { $liveValueName }
+                        if ($backupValueNames[$liveKey.Name].Contains($reportedName)) { continue }
+                        # Values this script writes are removed after the import when the backup omits them.
+                        if ($isRootKey -and $desiredValues.Contains($reportedName)) { continue }
+                        throw "The offline key '$($liveKey.Name)' has a '$reportedName' value that '$BackupFile' does not restore. Rollback would leave it behind; no changes were made."
+                    }
+                }
             }
 
             [void](Assert-OfflineTarget -Path $servicePath -Action 'import the offline stornvme rollback backup')
@@ -121,16 +161,9 @@ try {
                 throw "Registry rollback import failed with exit code $LASTEXITCODE`: $(($importOutput | Out-String).Trim())"
             }
 
-            $escapedExpectedKey = [regex]::Escape($expectedKey)
-            $rootSection = [regex]::Match($backupText, "(?ms)^\s*\[$escapedExpectedKey\]\s*\r?\n(?<Body>.*?)(?=^\s*\[|\z)")
-            if (-not $rootSection.Success) {
-                throw "BackupFile '$BackupFile' contains no exact '$expectedKey' section."
-            }
-            $backedUpValueNames = @([regex]::Matches($rootSection.Groups['Body'].Value, '(?m)^\s*"([^"]+)"=') |
-                ForEach-Object { $_.Groups[1].Value })
             $restored = Get-ItemProperty -LiteralPath $servicePath -ErrorAction Stop
             foreach ($name in $desiredValues.Keys) {
-                if ($backedUpValueNames -contains $name -or -not ($restored.PSObject.Properties.Name -contains $name)) { continue }
+                if ($backedUpValueNames.Contains($name) -or -not ($restored.PSObject.Properties.Name -contains $name)) { continue }
                 [void](Assert-OfflineTarget -Path $servicePath -Action "remove the offline stornvme $name value during rollback")
                 Remove-ItemProperty -LiteralPath $servicePath -Name $name -Force -ErrorAction Stop
             }
