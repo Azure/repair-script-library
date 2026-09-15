@@ -22,6 +22,9 @@
 #
 #########################################################################################################
 
+# Mode and BackupFile are read inside the Invoke-WithHive script block, which PSScriptAnalyzer
+# cannot see through, so PSReviewUnusedParameter reports them as unused on every CI run.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '')]
 Param(
     [Parameter(Mandatory = $false)][ValidateSet('Report', 'Repair', 'Rollback')][string]$Mode = 'Report',
     [Parameter(Mandatory = $false)][ValidatePattern('^[A-Za-z]:?$')][string]$OsDriveLetter = '',
