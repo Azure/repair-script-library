@@ -8,8 +8,8 @@
 # .DESCRIPTION
 #   Runs against the broken OS disk attached to a rescue VM by "az vm repair create". It answers the
 #   question "can the firmware reach a boot partition on this disk at all", which is the layer below
-#   win-fix-bcd. If there is no system partition, or its boot sectors are damaged, no amount of BCD
-#   repair helps, because the firmware never gets far enough to read the store.
+#   boot configuration repair. If there is no system partition, or its boot sectors are damaged, no
+#   amount of BCD repair helps, because the firmware never gets far enough to read the store.
 #
 #   The script repairs in two tiers, and which tier runs is decided by the evidence:
 #
@@ -45,7 +45,7 @@
 #   Reported but never repaired here:
 #     - BPB TotalSectors is larger than the partition that contains it. The filesystem believes it
 #       is bigger than its container, which follows a bad resize. Correcting the boot sector would
-#       hide a filesystem fault rather than fix it. Use win-fix-file-system.
+#       hide a filesystem fault rather than fix it. Use win-chkdsk-fs-corruption.
 #     - The boot partition holds no NTFS filesystem on Gen1. That is a filesystem fault, not a boot
 #       sector fault.
 #     - There is not enough unallocated space to create a system partition. Nothing is moved or
@@ -54,7 +54,8 @@
 #       copy a known good bootstrap from. Attach the disk to a Gen1 rescue VM and run this again.
 #
 #   Once the firmware can reach the partition again, the boot configuration inside it is a separate
-#   question. Run win-fix-bcd after this script if the VM still does not boot.
+#   question. If the VM still does not boot, repairing the boot configuration is the next step; run
+#   'az vm repair list-scripts' to see which boot configuration script the library offers.
 #
 # .RESOLVES
 #   "A disk read error occurred. Press Ctrl+Alt+Del to restart" - the classic stale HiddenSectors
@@ -105,19 +106,20 @@
 #   Gen2 EFI System Partition, because a GPT partition table is not carried in the sectors that are
 #   backed up; the created partition is reported so it can be removed by hand if that is wanted.
 #
-#   The Active flag is also corrected by win-fix-bcd, which sets it on the partition holding the BCD
+#   The Active flag is also corrected by boot configuration repair, which sets it on the partition holding the BCD
 #   store. The two agree: this script additionally clears the flag from any other partition, which
-#   matters only in the "more than one Active" case that win-fix-bcd does not look for.
+#   matters only in the "more than one Active" case that boot configuration repair does not look for.
 #
 #   bootsect.exe is not used. It is not in-box on Windows Server, so it is never present on a rescue
 #   VM, and it does not correct BPB HiddenSectors, which is the highest value repair here. The
 #   bootstrap is instead restored from the NTFS backup boot sector kept at the end of the volume, or
 #   copied from a healthy Windows volume attached to the rescue VM.
 #
-#   Related scenarios, deliberately not folded in because they are different problems:
-#     win-fix-bcd                       the boot configuration inside the system partition
-#     win-fix-file-system               chkdsk and filesystem level damage
-#     win-sfc-sf-corruption             damaged Windows binaries
+#   Related scenarios, deliberately not folded in because they are different problems. Run
+#   'az vm repair list-scripts' to see which of these the library you have offers:
+#     boot configuration repair          the BCD store inside the system partition
+#     win-chkdsk-fs-corruption           chkdsk and filesystem level damage
+#     win-sfc-sf-corruption              damaged Windows binaries
 #
 # .VERSION
 #   v1.0: Initial version.
@@ -714,6 +716,20 @@ function Get-PartitionFilesystemFinding {
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
     if ($Offline.Generation -ne 2 -or -not $Resolved.Partition) { return @($findings) }
 
+    # 'Unknown' means two very different things: the sector was read and holds no recognised
+    # filesystem, or the sector could never be read at all. Only the first justifies a format.
+    # Treating a failed read as an unformatted partition would reformat a perfectly good EFI
+    # System Partition because of a transient I/O or sharing error.
+    if ($null -eq $State.VbrRaw) {
+        $detail = 'No further detail was recorded.'
+        if ($State.Errors) { $detail = "Read error: $($State.Errors -join '; ')" }
+        [void]$findings.Add((New-Finding -Cause 'EspUnreadable' -Item "partition $($Resolved.Partition.PartitionNumber)" -Tier 'None' -Repairable $false -Data $Resolved.Partition.PartitionNumber -Message (
+            "The boot sector of the EFI System Partition (partition $($Resolved.Partition.PartitionNumber)) could not be read, " +
+            'so whether it holds a FAT filesystem is unknown. Nothing is changed: formatting it on the strength of a failed ' +
+            "read would destroy a healthy partition. $detail")))
+        return @($findings)
+    }
+
     if ($State.FileSystem -in @('FAT32', 'FAT16', 'FAT12', 'FAT')) { return @($findings) }
 
     [void]$findings.Add((New-Finding -Cause 'EspNotFormatted' -Item "partition $($Resolved.Partition.PartitionNumber)" -Tier 'Partition' -Data $Resolved.Partition.PartitionNumber -Message (
@@ -806,7 +822,7 @@ function Get-VbrFinding {
         [void]$findings.Add((New-Finding -Cause 'BootVolumeNotNtfs' -Item $label -Repairable $false -Tier 'None' -Message (
             "The system partition ($label) does not hold an NTFS filesystem: its boot sector reads as " +
             "'$($State.FileSystem)' (OEM id '$($State.Vbr.OemId)'). That is filesystem damage rather than a boot " +
-            'sector fault, and rewriting the boot sector would hide it. Use win-fix-file-system.')))
+            'sector fault, and rewriting the boot sector would hide it. Use win-chkdsk-fs-corruption.')))
         return @($findings)
     }
 
@@ -859,7 +875,7 @@ function Get-VbrFinding {
                 "The BPB says the volume holds $($State.Vbr.TotalSectors) sectors but $label only has room for " +
                 "$partitionSectors. The filesystem believes it is larger than its container, which follows a bad " +
                 'resize and also makes the NTFS backup boot sector unreachable. Repair the filesystem first with ' +
-                'win-fix-file-system, then run this script again.')))
+                'win-chkdsk-fs-corruption, then run this script again.')))
         }
     }
 
@@ -1062,7 +1078,22 @@ function Invoke-SectorRepair {
 
     # Build the two candidate sectors in memory. Nothing is written until every finding has been
     # applied to the buffer, so a failure part way through leaves the disk untouched.
-    $newMbr = if ($State.MbrRaw) { $State.MbrRaw.Clone() } else { $null }
+    #
+    # Sector 0 is re-read here rather than cloned from $State.MbrRaw. $State was captured by the
+    # detect pass, before the Set-Partition calls above rewrote the partition table at offset 446
+    # to move the Active flag. Write-RawDiskSector writes the whole 512 bytes, so a stale buffer
+    # would carry the old partition table back onto the disk and silently undo the flag repair
+    # that was just reported as successful.
+    $newMbr = $null
+    if ($State.MbrRaw) {
+        try {
+            $newMbr = Read-RawDiskSector -DiskNumber $Offline.DiskNumber -ByteOffset 0 -Length 512
+        }
+        catch {
+            Add-OfflineRepairLog -Level Error -Message "Sector 0 could not be re-read before repair, so no sector was written: $($_.Exception.Message)"
+            return $false
+        }
+    }
     $newVbr = if ($State.VbrRaw) { $State.VbrRaw.Clone() } else { $null }
     $mbrDirty = $false
     $vbrDirty = $false
@@ -1712,14 +1743,18 @@ function Get-UnreadablePartitionTable {
         is reported only when those entries are still plausible, so a genuinely blank disk that is
         RAW because nobody ever partitioned it is left alone.
 
-        A disk that is RAW cannot be hosting the running rescue Windows, so there is nothing to
-        exclude here.
+        A disk that is RAW is not hosting the running rescue Windows, but the rescue VM's own system,
+        boot and resource disks are excluded explicitly anyway: this runs before the offline Windows
+        installation has been identified, so it is the one write in the script that is not yet bound
+        to a known target, and a wrong guess here writes to the wrong disk.
 
     .OUTPUTS
         One object per candidate disk, or nothing.
     #>
 
     foreach ($disk in @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.PartitionStyle -eq 'RAW' } | Sort-Object Number)) {
+        if ($disk.IsSystem -or $disk.IsBoot -or $disk.IsClustered) { continue }
+
         $sector = $null
         try { $sector = Read-RawDiskSector -DiskNumber $disk.Number -ByteOffset 0 -Length 512 } catch { continue }
         if (-not $sector) { continue }
@@ -1915,7 +1950,19 @@ try {
     # Sector 0 is checked before anything else looks for Windows: a disk whose partition table
     # signature is gone is reported by Windows as RAW with no partitions at all, so the offline
     # installation cannot be found and the run would end with a misleading "no Windows here".
-    foreach ($unreadable in @(Get-UnreadablePartitionTable)) {
+    #
+    # This is the one write that happens before the offline disk has been identified, so it refuses
+    # to act when the target is ambiguous rather than writing to every candidate in turn.
+    $unreadableDisks = @(Get-UnreadablePartitionTable)
+    if ($unreadableDisks.Count -gt 1 -and -not $isDetectOnly -and -not $isRevert) {
+        Log-Error ("$($unreadableDisks.Count) attached disks ($(($unreadableDisks.DiskNumber | Sort-Object) -join ', ')) have an unreadable partition table. " +
+            'Which one holds the Windows installation under repair cannot be established before the partition table is readable, ' +
+            'so nothing is written. Detach the disks that are not under repair and run this again.') | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_ERROR
+    }
+
+    foreach ($unreadable in $unreadableDisks) {
         Log-Output "  [FIXABLE] Disk $($unreadable.DiskNumber) has a partition table Windows cannot read, because sector 0 has lost its 0x55AA signature. The firmware stops at `"Missing operating system`" and no tool can see the volumes, although the $($unreadable.Entries) partition entries behind the signature are still intact. The two signature bytes will be written back." | Tee-Object -FilePath $logFile -Append
 
         if ($isDetectOnly) {
@@ -1990,7 +2037,7 @@ try {
     }
 
     if ($findings.Count -eq 0) {
-        Log-Output 'No system partition fault was found. The firmware can reach a boot partition on this disk. If the VM still does not boot, the fault is in the boot configuration inside it: use run id win-fix-bcd.' | Tee-Object -FilePath $logFile -Append
+        Log-Output "No system partition fault was found. The firmware can reach a boot partition on this disk. If the VM still does not boot, the fault is in the boot configuration inside it; run 'az vm repair list-scripts' to see what the library offers." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
     }
@@ -2008,6 +2055,12 @@ try {
     # Back up before the first write. The Windows volume has to be mounted for this, so it happens
     # while the disk is still online and before anything is changed.
     $backup = Save-BootSectorBackup -Offline $offline -State $detected.State
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+    # Written before the first write, not after the last one. Every repair path below can fail or
+    # return early, and a disk that has been modified with no manifest beside it cannot be reverted
+    # at all. CreatedPartition is filled in again at the end once its number is known.
+    Save-RevertManifest -Offline $offline -Backup $backup -CreatedPartition 0
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
     $createdPartition = 0
@@ -2094,7 +2147,7 @@ try {
     }
     if ($backup.MbrPath) { Log-Output "The original sector 0 was kept at $($backup.MbrPath)." | Tee-Object -FilePath $logFile -Append }
     if ($backup.VbrPath) { Log-Output "The original volume boot record was kept at $($backup.VbrPath)." | Tee-Object -FilePath $logFile -Append }
-    Log-Output "If the VM still does not boot, the boot configuration inside the partition is the next layer: use run id win-fix-bcd." | Tee-Object -FilePath $logFile -Append
+    Log-Output "If the VM still does not boot, the boot configuration inside the partition is the next layer. Run 'az vm repair list-scripts' to see what else the library offers." | Tee-Object -FilePath $logFile -Append
     Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
     return $STATUS_SUCCESS
@@ -2103,4 +2156,11 @@ catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
     return $STATUS_ERROR
+}
+finally {
+    # Get-OfflineWindowsDisk assigns temporary drive letters to the partitions it inspects and
+    # requires the caller to release them here, and the log buffer has to be flushed on the failure
+    # paths too - otherwise the helper warnings that explain a thrown exception are discarded with it.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) { Clear-OfflineDriveLetter }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) { Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append }
 }
