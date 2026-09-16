@@ -456,6 +456,12 @@ function Test-RegBackMaintained {
 
         Anything that stops the value being read counts as not maintained: with no way to
         confirm the backup was being refreshed, the conservative answer is to leave RegBack be.
+
+        The scratch copy is loaded with reg.exe directly because Mount-OfflineHive derives the
+        hive path from the offline Windows directory and cannot be pointed at a copy. The
+        unload goes through Invoke-OfflineRegUnload, which retries while handles release and
+        then confirms the key is actually gone, because a zero exit code from 'reg unload' does
+        not mean the hive left the registry.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath
@@ -466,6 +472,7 @@ function Test-RegBackMaintained {
 
     $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("rsl-regback-{0}" -f [guid]::NewGuid().ToString('N'))
     $mountKey = "RSLREGBACK$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $hiveKey = "HKLM\$mountKey"
     $mounted = $false
     try {
         Copy-Item -LiteralPath $systemHive -Destination $scratch -Force -ErrorAction Stop
@@ -475,8 +482,16 @@ function Test-RegBackMaintained {
             }
         }
 
-        $null = & reg.exe load "HKLM\$mountKey" $scratch 2>&1
-        if ($LASTEXITCODE -ne 0) { return $false }
+        $loadOutput = & reg.exe load $hiveKey $scratch 2>&1 | Out-String
+        $loadExit = $LASTEXITCODE
+
+        # The key state decides, not the exit code: a load that reported success but produced no
+        # key would otherwise be unloaded as though it were mounted, and a load that reported
+        # failure after mounting would be leaked.
+        if ((Get-OfflineHiveKeyState -HiveKey $hiveKey) -ne 'Present') {
+            Add-OfflineRepairLog -Message "The SYSTEM scratch copy did not mount (exit $loadExit`: $($loadOutput.Trim())), so RegBack is treated as not maintained."
+            return $false
+        }
         $mounted = $true
 
         $current = (Get-ItemProperty -Path "HKLM:\$mountKey\Select" -ErrorAction SilentlyContinue).Current
@@ -491,12 +506,18 @@ function Test-RegBackMaintained {
     }
     finally {
         if ($mounted) {
-            [gc]::Collect()
-            [gc]::WaitForPendingFinalizers()
-            & reg.exe unload "HKLM\$mountKey" 2>&1 | Out-Null
+            if (Invoke-OfflineRegUnload -HiveKey $hiveKey) {
+                $mounted = $false
+            }
+            else {
+                Add-OfflineRepairLog -Level Warning -Message "$hiveKey could not be confirmed unloaded. It holds only a temporary copy of SYSTEM and nothing on the offline disk, but $scratch cannot be deleted while it is mounted."
+            }
         }
-        foreach ($suffix in @('', '.LOG', '.LOG1', '.LOG2')) {
-            if (Test-Path -LiteralPath "$scratch$suffix") { Remove-Item -LiteralPath "$scratch$suffix" -Force -ErrorAction SilentlyContinue }
+
+        if (-not $mounted) {
+            foreach ($suffix in @('', '.LOG', '.LOG1', '.LOG2')) {
+                if (Test-Path -LiteralPath "$scratch$suffix") { Remove-Item -LiteralPath "$scratch$suffix" -Force -ErrorAction SilentlyContinue }
+            }
         }
     }
 }
@@ -576,15 +597,16 @@ function Get-AllFinding {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
-        [Parameter(Mandatory = $false)][string]$HiveFilter = $null,
+        [Parameter(Mandatory = $false)][AllowNull()][AllowEmptyCollection()][string[]]$HiveFilter = @(),
         [Parameter(Mandatory = $false)][string]$ChkRegPath = '',
         [Parameter(Mandatory = $true)][string]$ScratchDir
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $scope = @($HiveFilter | Where-Object { $_ })
 
     foreach ($spec in (Get-OfflineHiveSpec)) {
-        if ($HiveFilter -and $spec.Name -ne $HiveFilter) { continue }
+        if ($scope.Count -gt 0 -and $spec.Name -notin $scope) { continue }
 
         $path = Join-OfflinePath -Root $ConfigPath -ChildPath $spec.Name
         $validation = Test-OfflineHiveFile -Path $path
@@ -691,22 +713,39 @@ function Repair-HiveInPlace {
         return $true
     }
 
-    $backup = "$path.bak-$(Get-Date -Format yyyyMMddHHmmss)"
+    $stamp = Get-Date -Format yyyyMMddHHmmss
+    $backup = "$path.bak-$stamp"
+    [void](Assert-OfflineTarget -Path $path -Action 'replace a registry hive on the offline disk')
     Copy-Item -LiteralPath $path -Destination $backup -Force -ErrorAction Stop
     Copy-Item -LiteralPath $repair.RepairedPath -Destination $path -Force -ErrorAction Stop
+
+    # The logs describe the file that was just replaced and would be replayed over the repair, so
+    # they are moved aside before the installed file is validated rather than after. Validating
+    # first would load the repaired hive with the stale logs still beside it, which is not the
+    # state the VM boots into, so a pass there would say nothing about the state being shipped.
+    $movedLogs = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
+        $logPath = "$path$suffix"
+        if (-not (Test-OfflinePath $logPath)) { continue }
+
+        $logBackup = "$logPath.bak-$stamp"
+        try {
+            Move-Item -LiteralPath $logPath -Destination $logBackup -Force -ErrorAction Stop
+            [void]$movedLogs.Add([PSCustomObject]@{ From = $logPath; To = $logBackup })
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): could not move $logPath aside ($($_.Exception.Message)), so the stale log may be replayed over the repair."
+        }
+    }
 
     $after = Test-OfflineHiveFile -Path $path
     if (-not $after.IsValid) {
         Copy-Item -LiteralPath $backup -Destination $path -Force -ErrorAction SilentlyContinue
-        Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): the replaced file did not validate on disk, so the original was put back from $backup."
-        return $false
-    }
-
-    # The logs describe the file that was just replaced and would be replayed over the repair.
-    foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
-        if (Test-OfflinePath "$path$suffix") {
-            Move-Item -LiteralPath "$path$suffix" -Destination "$path$suffix.bak-$(Get-Date -Format yyyyMMddHHmmss)" -Force -ErrorAction SilentlyContinue
+        foreach ($moved in $movedLogs) {
+            Move-Item -LiteralPath $moved.To -Destination $moved.From -Force -ErrorAction SilentlyContinue
         }
+        Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): the replaced file did not validate on disk, so the original was put back from $backup and its transaction logs were restored."
+        return $false
     }
 
     Add-OfflineRepairLog -Message "$($Finding.Item): repaired with chkreg and verified. Original saved as $backup."
@@ -754,12 +793,15 @@ function Restore-HiveFromRegBack {
 
     try {
         foreach ($item in $targets) {
+            [void](Assert-OfflineTarget -Path $item.LivePath -Action 'restore a registry hive from RegBack')
+
             $backup = $null
             if (Test-OfflinePath $item.LivePath) {
                 $backup = "$($item.LivePath).bak-$stamp"
                 Copy-Item -LiteralPath $item.LivePath -Destination $backup -Force -ErrorAction Stop
             }
-            [void]$touched.Add([PSCustomObject]@{ LivePath = $item.LivePath; Backup = $backup })
+            [void]$touched.Add([PSCustomObject]@{ LivePath = $item.LivePath; Backup = $backup; MovedLogs = [System.Collections.Generic.List[PSCustomObject]]::new() })
+            $entry = $touched[$touched.Count - 1]
 
             Copy-Item -LiteralPath $item.SourcePath -Destination $item.LivePath -Force -ErrorAction Stop
 
@@ -767,10 +809,20 @@ function Restore-HiveFromRegBack {
             $liveHash = (Get-FileHash -LiteralPath $item.LivePath -Algorithm SHA256 -ErrorAction Stop).Hash
             if ($sourceHash -ne $liveHash) { throw "the restored $($item.Name) hive does not match its RegBack source." }
 
-            # Stale logs describe the hive that was just replaced and would undo the restore.
+            # Stale logs describe the hive that was just replaced and would undo the restore. Each
+            # move is recorded so that a failure on a later hive can put them back: a rolled back
+            # hive whose transaction logs are still renamed is not the state the VM started in.
             foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
-                if (Test-OfflinePath "$($item.LivePath)$suffix") {
-                    Move-Item -LiteralPath "$($item.LivePath)$suffix" -Destination "$($item.LivePath)$suffix.bak-$stamp" -Force -ErrorAction SilentlyContinue
+                $logPath = "$($item.LivePath)$suffix"
+                if (-not (Test-OfflinePath $logPath)) { continue }
+
+                $logBackup = "$logPath.bak-$stamp"
+                try {
+                    Move-Item -LiteralPath $logPath -Destination $logBackup -Force -ErrorAction Stop
+                    [void]$entry.MovedLogs.Add([PSCustomObject]@{ From = $logPath; To = $logBackup })
+                }
+                catch {
+                    Add-OfflineRepairLog -Level Warning -Message "Could not move $logPath aside ($($_.Exception.Message)), so the stale log may be replayed over the restored hive."
                 }
             }
 
@@ -788,6 +840,11 @@ function Restore-HiveFromRegBack {
                 }
                 elseif (Test-OfflinePath $entry.LivePath) {
                     Remove-Item -LiteralPath $entry.LivePath -Force -ErrorAction Stop
+                }
+
+                # The hive is only back as it was if its transaction logs come back with it.
+                foreach ($moved in $entry.MovedLogs) {
+                    Move-Item -LiteralPath $moved.To -Destination $moved.From -Force -ErrorAction SilentlyContinue
                 }
             }
             catch {
@@ -939,8 +996,16 @@ try {
         }
     }
 
-    # Verify against freshly read files rather than trusting the writes above.
-    $remaining = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
+    # Verify against freshly read files rather than trusting the writes above. The scan covers
+    # every hive that was actually written, not just the one named by the hive parameter: the
+    # identity pair rule can restore SAM alongside SECURITY, and a hive written but never
+    # re-validated would be reported as a clean run.
+    $verifyScope = @($hiveFilter | Where-Object { $_ })
+    if ($verifyScope.Count -gt 0) {
+        $verifyScope = @($verifyScope + @($restored) + @($repairedInPlace) | Where-Object { $_ } | Sort-Object -Unique)
+    }
+
+    $remaining = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $verifyScope -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
     Write-OperatorLog
 
     foreach ($finding in $remaining) {
@@ -975,6 +1040,9 @@ catch {
 }
 finally {
     Write-OperatorLog
+    # Get-OfflineWindowsDisk assigns temporary drive letters to the partitions it inspects and
+    # requires the caller to release them here, including on the failure paths.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) { Clear-OfflineDriveLetter }
     if ($scratchDir -and (Test-Path -LiteralPath $scratchDir)) {
         Remove-Item -LiteralPath $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
     }
