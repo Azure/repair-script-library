@@ -130,6 +130,11 @@
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
 	},
 	{
+		"id": "win-fix-bcd",
+		"path": "src/windows/win-fix-bcd.ps1",
+		"description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC000000F, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot. Pass detectOnly=true to report only, revert=true to restore the previous store, or rebuild=true to force a full bcdboot rebuild instead of a targeted repair. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
 		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Makes no changes. NOTE: use option --run-on-repair."
