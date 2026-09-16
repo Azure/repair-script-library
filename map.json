@@ -70,6 +70,11 @@
 		"description" : "Enables nested hyperV using attached data disk as OS disk."
 	},
 	{
+		"id" : "win-fix-registry-corruption",
+		"path" : "src/windows/win-fix-registry-corruption.ps1",
+		"description" : "Repairs corrupted, empty or unloadable registry hives behind stop error 0xC0000218 STATUS_CANNOT_LOAD_REGISTRY_FILE and stop error 0x74 BAD_SYSTEM_CONFIG_INFO. Validates every hive by loading a scratch copy, repairs structural damage in place with chkreg.exe, and for a hive it cannot repair prints the command to opt into a validated RegBack restore, which is performed only when allowRegBack=true - because RegBack is usually empty or stale on Windows 10 1803 and later, and restoring it rolls local account passwords, and a domain-joined machine account password, back to the time of the backup. Backs up every file it replaces. Pass detectOnly=true to report only, or hive to scope the run to a single hive. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-toggle-safe-mode",
 		"path" : "src/windows/win-toggle-safe-mode.ps1",
 		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
