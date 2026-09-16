@@ -130,6 +130,11 @@
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
 	},
 	{
+		"id": "win-fix-boot-partition",
+		"path": "src/windows/win-fix-boot-partition.ps1",
+		"description": "Repairs the system partition itself, the layer below the BCD store - a deleted EFI System Partition or System Reserved partition, an unformatted ESP, a missing 0x55AA boot signature, zeroed or NTLDR era bootstrap code, no Active partition or more than one, and a stale BPB HiddenSectors field that gives 'A disk read error occurred' after a partition move or restore while chkdsk and sfc report nothing. Pass detectOnly=true to report only, or revert=true to restore the sectors a previous run backed up; an EFI System Partition created for a Generation 2 VM is not removed by a revert. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
 		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Makes no changes. NOTE: use option --run-on-repair."
