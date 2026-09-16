@@ -21,8 +21,10 @@
 #     4. UpperFilters and LowerFilters on boot-critical PCI and VMBus device instances, which break
 #        boot bus enumeration before any storage driver runs.
 #     5. Missing Hyper-V ACPI enumeration keys (VMBus and Hyper_V_Gen_Counter_V1 not mapped to the
-#        newer MSFT1000 and MSFT1002 device IDs), which stops synthetic device detection on images
-#        migrated from another hypervisor.
+#        newer MSFT1000 and MSFT1002 device IDs), which can stop synthetic device detection on
+#        images migrated from another hypervisor. Reported only, never rewritten: the same state is
+#        normal on a build that enumerates under the older ID, so there is no evidence here that
+#        distinguishes a healthy image from a broken one.
 #     6. A SAN policy that keeps newly discovered disks offline after a disk migration.
 #
 #   The script never rewrites a value that is already correct, so it is safe to run repeatedly and
@@ -58,9 +60,11 @@
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
 #   that value to the next positional parameter.
 #
-#   Only registry causes are handled here. A 0x7B whose cause is an unloadable hive belongs to
-#   win-fix-registry-corruption. A 0x7B whose cause is a damaged BCD store is out of scope for this
-#   script, and no run id in this library owns BCD repair yet.
+#   Only registry causes are handled here. A 0x7B whose cause is an unloadable or corrupt SYSTEM
+#   hive is not repaired here: that needs hive validation and a RegBack restore, which this script
+#   deliberately does not attempt. A 0x7B whose cause is a damaged BCD store is likewise out of
+#   scope. Check 'az vm repair list-scripts' for a run id covering either area before referring to
+#   one, because the set of published scenarios varies by library version.
 #
 #   The SYSTEM hive file is backed up next to itself before the first write.
 #
@@ -93,6 +97,9 @@ $isStrict = ($strictFilters -eq 'true')
 #   the binary alone. The others carry image-specific state and are reported instead.
 #   ExpectedStartOverride is only checked for the drivers where a single value is correct on every
 #   supported image, which is why storport and the class drivers are excluded from that check.
+#   It always matches the boot-start requirement in AllowedStarts: StartOverride is what PnP writes
+#   to override Start, so a row that demands Start=0 and expects a non-zero override would ask for
+#   a driver that is enabled and overridden back off at the same time.
 # fvevol is deliberately absent: whether its key is required depends on the OS volume being
 # BitLocker encrypted, which cannot be determined reliably from the offline hive.
 function Get-BootStorageDriverSpec {
@@ -100,10 +107,10 @@ function Get-BootStorageDriverSpec {
         [PSCustomObject]@{ Name = 'acpi'; Binary = 'acpi.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $true; CanRecreate = $false; ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $false; ExpectedStartOverride = $null; Description = 'ACPI platform bus' }
         [PSCustomObject]@{ Name = 'pci'; Binary = 'pci.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $true; CanRecreate = $true; ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $false; ExpectedStartOverride = $null; Description = 'PCI boot bus' }
         [PSCustomObject]@{ Name = 'vdrvroot'; Binary = 'vdrvroot.sys'; Start = 0; AllowedStarts = [int[]]@(0, 1, 3); Required = $true; CanRecreate = $false; ErrorControl = 1; Group = 'System Bus Extender'; CheckStartOverride = $false; ExpectedStartOverride = $null; Description = 'virtual drive root enumerator' }
-        [PSCustomObject]@{ Name = 'intelide'; Binary = 'intelide.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $true; ExpectedStartOverride = 3; Description = 'legacy IDE controller' }
-        [PSCustomObject]@{ Name = 'pciide'; Binary = 'pciide.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $true; ExpectedStartOverride = 3; Description = 'PCI IDE controller' }
-        [PSCustomObject]@{ Name = 'atapi'; Binary = 'atapi.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport'; CheckStartOverride = $true; ExpectedStartOverride = 3; Description = 'IDE channel driver' }
-        [PSCustomObject]@{ Name = 'storahci'; Binary = 'storahci.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport'; CheckStartOverride = $true; ExpectedStartOverride = 3; Description = 'AHCI storage miniport' }
+        [PSCustomObject]@{ Name = 'intelide'; Binary = 'intelide.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $true; ExpectedStartOverride = 0; Description = 'legacy IDE controller' }
+        [PSCustomObject]@{ Name = 'pciide'; Binary = 'pciide.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'System Bus Extender'; CheckStartOverride = $true; ExpectedStartOverride = 0; Description = 'PCI IDE controller' }
+        [PSCustomObject]@{ Name = 'atapi'; Binary = 'atapi.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport'; CheckStartOverride = $true; ExpectedStartOverride = 0; Description = 'IDE channel driver' }
+        [PSCustomObject]@{ Name = 'storahci'; Binary = 'storahci.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport'; CheckStartOverride = $true; ExpectedStartOverride = 0; Description = 'AHCI storage miniport' }
         [PSCustomObject]@{ Name = 'vmbus'; Binary = 'vmbus.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $true; CanRecreate = $false; ErrorControl = 3; Group = 'Boot Bus Extender'; CheckStartOverride = $true; ExpectedStartOverride = 0; Description = 'Hyper-V VMBus' }
         [PSCustomObject]@{ Name = 'storvsc'; Binary = 'storvsc.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $true; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport'; CheckStartOverride = $true; ExpectedStartOverride = 0; Description = 'Hyper-V synthetic storage' }
         [PSCustomObject]@{ Name = 'storport'; Binary = 'storport.sys'; Start = 0; AllowedStarts = [int[]]@(0); Required = $false; CanRecreate = $false; ErrorControl = 3; Group = 'SCSI Miniport'; CheckStartOverride = $false; ExpectedStartOverride = $null; Description = 'storage port driver' }
@@ -234,24 +241,39 @@ function Get-ClassFilterFinding {
             $drop = [System.Collections.Generic.List[object]]::new()
 
             foreach ($filter in $current) {
-                $imagePathRaw = (Get-ItemProperty -Path "$SystemRoot\Services\$filter" -ErrorAction SilentlyContinue).ImagePath
-                $resolved = if ($imagePathRaw) { Resolve-OfflineImagePath -ImagePath $imagePathRaw -WindowsDrive $WindowsDrive } else { $null }
-                $item = if ($resolved) { Get-Item -LiteralPath $resolved -Force -ErrorAction SilentlyContinue } else { $null }
+                # The inbox filters for this class are tested first and never removed. An unreadable
+                # service key or an absent ImagePath must not be able to drop a driver the boot path
+                # depends on, which is what ordering this check after the dangling tests allowed.
+                if ($classSpec.SafeFilters -icontains $filter) { [void]$keep.Add($filter); continue }
 
-                if (-not $imagePathRaw) {
-                    [void]$drop.Add([PSCustomObject]@{ Filter = $filter; Reason = 'the service key has no ImagePath, so the filter is dangling' })
+                $servicePath = "$SystemRoot\Services\$filter"
+                if (-not (Test-Path -LiteralPath $servicePath)) {
+                    [void]$drop.Add([PSCustomObject]@{ Filter = $filter; Reason = 'there is no service key for it, so the filter is dangling' })
                     continue
                 }
+
+                # ImagePath is optional for a kernel driver: the kernel falls back to
+                # System32\drivers\<ServiceName>.sys. Treating its absence as proof of a dangling
+                # filter would remove drivers that load perfectly well.
+                $imagePathRaw = (Get-ItemProperty -LiteralPath $servicePath -ErrorAction SilentlyContinue).ImagePath
+                $effectiveImagePath = if ($imagePathRaw) { $imagePathRaw } else { "system32\drivers\$filter.sys" }
+                $resolved = Resolve-OfflineImagePath -ImagePath $effectiveImagePath -WindowsDrive $WindowsDrive
+                $item = if ($resolved) { Get-Item -LiteralPath $resolved -Force -ErrorAction SilentlyContinue } else { $null }
+
                 if (-not $item) {
-                    [void]$drop.Add([PSCustomObject]@{ Filter = $filter; Reason = "the driver binary is missing at $resolved, so the filter is dangling" })
+                    $missingReason = if ($imagePathRaw) {
+                        "the driver binary is missing at $resolved, so the filter is dangling"
+                    }
+                    else {
+                        "the service key has no ImagePath and no driver binary at $resolved, so the filter is dangling"
+                    }
+                    [void]$drop.Add([PSCustomObject]@{ Filter = $filter; Reason = $missingReason })
                     continue
                 }
                 if ($item.Length -eq 0) {
                     [void]$drop.Add([PSCustomObject]@{ Filter = $filter; Reason = "the driver binary at $resolved is zero bytes" })
                     continue
                 }
-
-                if ($classSpec.SafeFilters -icontains $filter) { [void]$keep.Add($filter); continue }
 
                 $company = "$($item.VersionInfo.CompanyName)"
                 if (-not $Strict -and $company -match 'Microsoft') { [void]$keep.Add($filter); continue }
@@ -282,9 +304,31 @@ function Get-DeviceInstanceFilterFinding {
     $enumRoot = "$SystemRoot\Enum\ACPI"
     if (-not (Test-Path $enumRoot)) { return @($findings) }
 
-    foreach ($device in @(Get-ChildItem -Path $enumRoot -ErrorAction SilentlyContinue)) {
-        foreach ($instance in @(Get-ChildItem -Path $device.PSPath -ErrorAction SilentlyContinue)) {
-            $props = Get-ItemProperty -Path $instance.PSPath -ErrorAction SilentlyContinue
+    # Enumeration failures are surfaced rather than swallowed. Enum carries a restrictive DACL, so
+    # "the subtree could not be read" and "the subtree is clean" are easy to confuse, and reporting
+    # the second when the first happened would hand the operator a clean bill of health for a check
+    # that never ran.
+    $devices = @()
+    try { $devices = @(Get-ChildItem -LiteralPath $enumRoot -ErrorAction Stop) }
+    catch {
+        [void]$findings.Add((New-Finding -Cause 'EnumUnreadable' -Item $enumRoot `
+                    -Message "the ACPI device enumeration subtree could not be read ($($_.Exception.Message)), so boot bus device filters could not be checked" `
+                    -Repairable $false))
+        return @($findings)
+    }
+
+    foreach ($device in $devices) {
+        $instances = @()
+        try { $instances = @(Get-ChildItem -LiteralPath $device.PSPath -ErrorAction Stop) }
+        catch {
+            [void]$findings.Add((New-Finding -Cause 'EnumUnreadable' -Item "$($device.PSChildName)" `
+                        -Message "the ACPI device key $($device.PSChildName) could not be enumerated ($($_.Exception.Message)), so its device filters could not be checked" `
+                        -Repairable $false))
+            continue
+        }
+
+        foreach ($instance in $instances) {
+            $props = Get-ItemProperty -LiteralPath $instance.PSPath -ErrorAction SilentlyContinue
             if ($null -eq $props -or $bootBusServices -inotcontains $props.Service) { continue }
 
             foreach ($filterType in @('UpperFilters', 'LowerFilters')) {
@@ -319,8 +363,16 @@ function Get-AcpiEnumMappingFinding {
         if (-not (Test-Path $sourcePath)) { continue }
         if (Test-Path $targetPath) { continue }
 
+        # Reported, never repaired. "Source present, target absent" is not on its own evidence of
+        # damage: an image whose build enumerates the device under the older ID legitimately has no
+        # key for the newer one, and is indistinguishable here from one that needs it. Copying the
+        # device instance subtree would also duplicate instance-specific values (Driver,
+        # ParentIdPrefix, LocationInformation) under a second device ID, which is not a state PnP
+        # produces. Until there is positive evidence of what the image's PnP looks for, this stays a
+        # report so that a healthy disk still produces no writes.
         [void]$findings.Add((New-Finding -Cause 'AcpiEnumMapping' -Item "$($pair.Source) -> $($pair.Target)" `
-                    -Message "the $($pair.Description) is enumerated only as $($pair.Source), so Windows builds that look for $($pair.Target) cannot detect it" `
+                    -Message "the $($pair.Description) is enumerated only as $($pair.Source) and there is no $($pair.Target) key. On a guest whose build looks for $($pair.Target) this stops synthetic device detection; on a build that uses $($pair.Source) it is normal. Confirm against a healthy VM of the same build before changing it by hand." `
+                    -Repairable $false `
                     -Data ([PSCustomObject]@{ SourcePath = $sourcePath; TargetPath = $targetPath; Source = $pair.Source; Target = $pair.Target })))
     }
 
@@ -371,8 +423,7 @@ function Get-AllFinding {
 
 function Repair-Finding {
     param(
-        [Parameter(Mandatory = $true)]$Finding,
-        [Parameter(Mandatory = $true)][string]$SystemRoot
+        [Parameter(Mandatory = $true)]$Finding
     )
 
     $data = $Finding.Data
@@ -380,6 +431,7 @@ function Repair-Finding {
     switch ($Finding.Cause) {
         'DriverServiceKey' {
             $spec = $data.Spec
+            [void](Assert-OfflineTarget -Path $data.ServicePath -Action "recreate the offline $($spec.Name) service key")
             New-Item -Path $data.ServicePath -Force | Out-Null
             Set-ItemProperty -Path $data.ServicePath -Name Type -Value 1 -Type DWord -Force
             Set-ItemProperty -Path $data.ServicePath -Name Start -Value $spec.Start -Type DWord -Force
@@ -390,14 +442,17 @@ function Repair-Finding {
         }
         'DriverStart' {
             $spec = $data.Spec
+            [void](Assert-OfflineTarget -Path $data.ServicePath -Action "set the offline $($spec.Name) Start value")
             Set-ItemProperty -Path $data.ServicePath -Name Start -Value $spec.Start -Type DWord -Force
             Add-OfflineRepairLog -Message "$($spec.Name) Start: $($data.Current) -> $($spec.Start)"
         }
         'DriverStartOverride' {
+            [void](Assert-OfflineTarget -Path $data.OverridePath -Action "set the offline $($Finding.Item) StartOverride value")
             Set-ItemProperty -Path $data.OverridePath -Name $data.ValueName -Value $data.Expected -Type DWord -Force
             Add-OfflineRepairLog -Message "$($Finding.Item) StartOverride: $($data.Current) -> $($data.Expected)"
         }
         'ClassFilter' {
+            [void](Assert-OfflineTarget -Path $data.ClassPath -Action "rewrite the offline $($data.FilterType) list on $($Finding.Item)")
             if (@($data.Keep).Count -gt 0) {
                 Set-ItemProperty -Path $data.ClassPath -Name $data.FilterType -Value ([string[]]@($data.Keep)) -Type MultiString -Force
             }
@@ -408,20 +463,21 @@ function Repair-Finding {
             Add-OfflineRepairLog -Message "$($Finding.Item): removed $((@($data.Drop) | ForEach-Object { $_.Filter }) -join ', '), kept $(if (@($data.Keep).Count) { @($data.Keep) -join ', ' } else { '(none)' })"
         }
         'DeviceInstanceFilter' {
+            [void](Assert-OfflineTarget -Path $data.RegistryPath -Action "remove the offline $($data.FilterType) value from $($Finding.Item)")
             Remove-ItemProperty -Path $data.RegistryPath -Name $data.FilterType -Force
             Add-OfflineRepairLog -Message "$($Finding.Item): removed $($data.Filters -join ', ')"
         }
         'AcpiEnumMapping' {
-            $regRoot = $SystemRoot -replace '^HKLM:', 'HKLM'
-            $sourceReg = "$regRoot\Enum\ACPI\$($data.Source)"
-            $targetReg = "$regRoot\Enum\ACPI\$($data.Target)"
-            $output = reg.exe copy "$sourceReg" "$targetReg" /s /f 2>&1 | Out-String
-            if (-not (Test-Path $data.TargetPath)) { throw "reg copy did not create $targetReg. $($output.Trim())" }
-            Add-OfflineRepairLog -Message "Copied ACPI enumeration key $($data.Source) to $($data.Target)"
+            # Detection raises this as report-only, so the repair phase never reaches it.
+            throw 'The ACPI enumeration mapping is reported for manual confirmation and is not repaired automatically.'
         }
         'SanPolicy' {
-            Set-ItemProperty -Path $data.RegistryPath -Name SanPolicy -Value 1 -Type DWord -Force
-            Add-OfflineRepairLog -Message "SAN policy: $($data.Current) -> 1 (OnlineAll)"
+            # 2 OfflineShared is the least invasive value that satisfies the boot requirement this
+            # finding is raised for. 1 OnlineAll would additionally auto-online every newly
+            # discovered disk on the repaired guest, including shared and SAN LUNs.
+            [void](Assert-OfflineTarget -Path $data.RegistryPath -Action 'set the offline partmgr SanPolicy value')
+            Set-ItemProperty -Path $data.RegistryPath -Name SanPolicy -Value 2 -Type DWord -Force
+            Add-OfflineRepairLog -Message "SAN policy: $($data.Current) -> 2 (OfflineShared)"
         }
         default { throw "No repair is implemented for cause '$($Finding.Cause)'." }
     }
@@ -501,7 +557,7 @@ try {
 
         foreach ($finding in $repairable) {
             try {
-                Repair-Finding -Finding $finding -SystemRoot $systemRoot
+                Repair-Finding -Finding $finding
                 $finding.Repaired = $true
                 $repaired++
             }
@@ -557,6 +613,10 @@ catch {
     return $STATUS_ERROR
 }
 finally {
+    # Get-OfflineWindowsDisk assigns temporary drive letters to the EFI and Recovery partitions and
+    # its OUTPUTS contract requires the caller to release them here. Without this the offline
+    # partitions stay mounted on the rescue VM after every run.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) { Clear-OfflineDriveLetter }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     "$(Get-Date -f yyyyMMddHHmmss)" | Out-File -FilePath $logFile -Append
 }
