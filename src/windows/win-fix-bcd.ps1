@@ -43,8 +43,8 @@
 #     - The winload binary named by the BCD is missing from the Windows partition. That is a
 #       damaged Windows installation rather than a boot configuration fault, and rewriting the BCD
 #       to point at a file that is not there fixes nothing. Use win-sfc-sf-corruption.
-#     - No boot partition exists at all. There is nothing to write a BCD store to. That is the
-#       win-fix-boot-partition scenario.
+#     - No boot partition exists at all. There is nothing to write a BCD store to. Repairing the
+#       system partition itself is a separate problem and is out of scope for this script.
 #     - BCD-Template is missing from the Windows installation while a rebuild is required. bcdboot
 #       seeds a new store from that file and cannot run without it. The script stops before it
 #       renames anything, so the existing store is left intact.
@@ -98,10 +98,11 @@
 #   default points at the real installation, so the repair moves the default instead of removing
 #   the operator's entries. A rebuild collapses them because it starts a fresh store.
 #
-#   Related scenarios, deliberately not folded in because they are different problems:
-#     win-fix-boot-partition    the system partition itself is damaged or missing
+#   Related problems, deliberately not folded in because they are different faults. Run
+#   'az vm repair list-scripts' to see which of these are published in the library you have:
+#     a damaged or missing system partition
 #     win-toggle-safe-mode      the safeboot flag is set
-#     win-fix-code-integrity    testsigning or nointegritychecks is set
+#     testsigning or nointegritychecks is set
 #     win-LKGC                  boot the previous control set instead
 #
 # .VERSION
@@ -258,18 +259,20 @@ function Get-BootManagerFinding {
                     -Message "The boot manager binary is not a Microsoft file (status $($signature.Status)): $($Expected.BootMgrFile)." `
                     -Tier 'Rebuild'))
     }
-    elseif (-not $signature.IsLikelyMicrosoft) {
-        # No cryptographic answer and the file does not identify itself as Microsoft either.
-        [void]$findings.Add((New-Finding -Cause 'BootManagerBinary' -Item $Expected.BootMgrFile `
-                    -Message "The boot manager binary could not be identified as a Microsoft file (status $($signature.Status)): $($Expected.BootMgrFile)." `
-                    -Tier 'Rebuild'))
+    elseif (-not $signature.IsLikelyMicrosoft -and $signature.Confidence -eq 'High') {
+        # Kept for clarity: the branch above already covers this, and no other Confidence='High'
+        # result reaches here.
+        Add-OfflineRepairLog -Level Warning -Message "The boot manager binary at $($Expected.BootMgrFile) failed verification (status $($signature.Status))."
     }
     elseif ($signature.Confidence -ne 'High') {
-        # The binary says it is Microsoft but nothing proved it. This is the ordinary result
-        # for a catalog signed inbox binary, because the catalogs that would verify it live on
-        # the offline image and are not registered on the rescue VM. Rebuilding the store on
-        # that signal alone would fire on healthy VMs, so it is reported and nothing more.
-        Add-OfflineRepairLog -Level Warning -Message "The boot manager binary at $($Expected.BootMgrFile) reports itself as Microsoft but could not be cryptographically verified (status $($signature.Status)). Continuing, because an offline image's catalogs are not available to the rescue VM."
+        # Nothing was proved either way. Test-OfflineFileSignature is explicit that Confidence='None'
+        # must not be read as untrusted - "a caller must not treat None as either trusted or
+        # untrusted, it means the file could not be checked" - and that boot manager payloads are
+        # compressed stubs that Authenticode cannot parse at all, which is the ordinary result for
+        # Gen1 bootmgr. Escalating that to a rebuild would fire on healthy VMs, so it is reported
+        # and nothing more. A definitive negative is still caught by the Confidence='High' branch
+        # above, and a missing or zero-byte binary by the two branches before it.
+        Add-OfflineRepairLog -Level Warning -Message "The boot manager binary at $($Expected.BootMgrFile) could not be cryptographically verified (status $($signature.Status), confidence $($signature.Confidence)). Continuing, because an offline image's catalogs are not registered on the rescue VM and a boot manager stub is not parseable by Authenticode."
     }
     else {
         Add-OfflineRepairLog -Level Info -Message "Boot manager binary present: $($Expected.BootMgrFile) ($($signature.Status))."
@@ -333,6 +336,18 @@ function Get-BcdEntryFinding {
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
     $loaders = @($Inventory.Loaders)
+
+    # An unreadable store is not an empty one. Get-BcdInventory documents EnumSucceeded for exactly
+    # this case: when bcdedit /enum all fails it returns Loaders = @(), which is byte-identical to a
+    # store that genuinely carries no loader entry. Rebuilding on that signal renames a store that
+    # was merely locked or access-denied and discards the serial console settings, timeouts and
+    # other customisation this script promises to preserve.
+    if (-not $Inventory.EnumSucceeded) {
+        [void]$findings.Add((New-Finding -Cause 'BcdStoreUnreadable' -Item $Offline.BcdStorePath `
+                    -Message "The BCD store at $($Offline.BcdStorePath) exists but could not be enumerated (bcdedit exit code $($Inventory.EnumExitCode)). Its contents are unknown, so no entry is corrected and the store is not rebuilt. Confirm the store is not locked by another process and re-run." `
+                    -Tier 'None' -Repairable $false))
+        return @($findings)
+    }
 
     if ($loaders.Count -eq 0) {
         [void]$findings.Add((New-Finding -Cause 'BcdLoaderEntry' -Item $Offline.BcdStorePath `
@@ -663,10 +678,13 @@ function Invoke-BcdRebuild {
     $windowsSource = $Offline.WindowsPath
     $systemTarget = $Offline.BootDrive.TrimEnd('\')
     $firmware = if ($Offline.Generation -eq 1) { 'BIOS' } else { 'UEFI' }
-    $command = "bcdboot `"$windowsSource`" /s $systemTarget /f $firmware"
 
-    Add-OfflineRepairLog -Level Info -Message "Running: $command"
-    $output = & cmd.exe /c "$command 2>&1" | Out-String
+    # Invoked directly with an argument array rather than through cmd.exe, matching the no-shell
+    # convention Get-OfflineBcdStore.ps1 sets for disk-derived values. cmd.exe expands %VAR% even
+    # inside quotes, so a Windows directory name containing % would be corrupted before bcdboot
+    # ever saw it.
+    Add-OfflineRepairLog -Level Info -Message "Running: bcdboot $windowsSource /s $systemTarget /f $firmware"
+    $output = (& bcdboot.exe $windowsSource '/s' $systemTarget '/f' $firmware 2>&1) | Out-String
     $exitCode = $LASTEXITCODE
     Add-OfflineRepairLog -Level Info -Message "bcdboot output: $($output.Trim())"
 
@@ -808,8 +826,26 @@ function Invoke-Revert {
     # ConvertFrom-Json returns the whole object as one pipeline item.
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 
+    # The manifest is read off the disk under repair, and drive letters and disk numbers are
+    # assigned per rescue-VM session. A manifest written in an earlier session, or one crafted by
+    # someone who controlled the broken disk, can therefore name a path or a disk number that now
+    # resolves somewhere else - including the rescue VM's own system disk. Everything below is
+    # checked against what this run actually bound before any of it is acted on.
+    if ($manifest.StorePath -ne $Offline.BcdStorePath) {
+        Add-OfflineRepairLog -Level Error -Message "The revert manifest records store path '$($manifest.StorePath)', but this run resolved the offline store to '$($Offline.BcdStorePath)'. The manifest belongs to a different disk or an earlier session, so nothing was reverted."
+        return $false
+    }
+    if ($null -ne $manifest.DiskNumber -and [int]$manifest.DiskNumber -ne [int]$Offline.DiskNumber) {
+        Add-OfflineRepairLog -Level Error -Message "The revert manifest records disk $($manifest.DiskNumber), but the offline Windows disk in this run is disk $($Offline.DiskNumber). Nothing was reverted."
+        return $false
+    }
+
     $reverted = $false
     if ($manifest.BackupPath -and (Test-OfflinePath $manifest.BackupPath)) {
+        # Assert-OfflineTarget is the gate every writer calls. Test-OfflinePath only proves the file
+        # exists; it says nothing about whether it belongs to the offline image.
+        [void](Assert-OfflineTarget -Path $manifest.BackupPath -Action 'read the recorded BCD backup during revert')
+        [void](Assert-OfflineTarget -Path $manifest.StorePath -Action 'restore the offline BCD store during revert')
         Copy-Item -LiteralPath $manifest.BackupPath -Destination $manifest.StorePath -Force
         Add-OfflineRepairLog -Level Info -Message "Restored $($manifest.StorePath) from $($manifest.BackupPath)."
         $reverted = $true
@@ -825,7 +861,9 @@ function Invoke-Revert {
 
     if ($manifest.ActivatedPartition -gt 0) {
         try {
-            Set-Partition -DiskNumber $manifest.DiskNumber -PartitionNumber $manifest.ActivatedPartition -IsActive $false -ErrorAction Stop
+            # Disk number was checked against this run above, so the Active flag can only be
+            # cleared on the disk this script is actually repairing.
+            Set-Partition -DiskNumber $Offline.DiskNumber -PartitionNumber $manifest.ActivatedPartition -IsActive $false -ErrorAction Stop
             Add-OfflineRepairLog -Level Info -Message "Cleared the Active flag this script set on partition $($manifest.ActivatedPartition)."
             $reverted = $true
         }
@@ -871,14 +909,25 @@ function Get-AllFinding {
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly, rebuild=$isRebuildForced, revert=$isRevert)" | Tee-Object -FilePath $logFile -Append
 
+# Declared out here so the catch and finally blocks can still name the backup after a throw.
+$backupPath = ''
+
 try {
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
     Write-OperatorLog
 
     Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber)), Gen$($offline.Generation) / $($offline.PartitionStyle)." | Tee-Object -FilePath $logFile -Append
 
+    # Rewriting the boot path for the wrong installation writes a wrong osdevice and systemroot,
+    # so the ambiguity is refused rather than guessed, matching win-enable-nvme-boot-driver.
+    if (@($offline.Candidates).Count -gt 1 -and [string]::IsNullOrWhiteSpace($windowsDrive)) {
+        Log-Error "More than one Windows installation is attached to this rescue VM ($((@($offline.Candidates) | ForEach-Object { $_.WindowsPath }) -join ', ')). Re-run with windowsDrive set to the installation you intend to repair, because rewriting the BCD for the wrong one replaces the boot path of a healthy installation." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_ERROR
+    }
+
     if (-not $offline.BootDrive) {
-        Log-Error "No boot partition was found on disk $($offline.DiskNumber), so there is nowhere to read or write a BCD store. This is a damaged or missing system partition rather than a boot configuration fault. Use run id win-fix-boot-partition." | Tee-Object -FilePath $logFile -Append
+        Log-Error "No boot partition was found on disk $($offline.DiskNumber), so there is nowhere to read or write a BCD store. This is a damaged or missing system partition rather than a boot configuration fault. Repairing the system partition itself is out of scope for this script; check 'az vm repair list-scripts' for a scenario that covers it." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_ERROR
     }
@@ -969,10 +1018,19 @@ try {
         }
 
         $backupPath = $rebuildResult.BackupPath
-        foreach ($finding in @($findings | Where-Object { $_.Repairable })) { $finding.Repaired = $true }
+        # BootPartitionActive is marked after its own attempt below, not here, so a failed Active
+        # flag write is never reported as repaired.
+        foreach ($finding in @($findings | Where-Object { $_.Repairable -and $_.Cause -ne 'BootPartitionActive' })) { $finding.Repaired = $true }
+        Save-RevertManifest -Offline $offline -BackupPath $backupPath -ActivatedPartition 0
+        Write-OperatorLog
     }
     else {
         $backupPath = Backup-BcdStore -StorePath $offline.BcdStorePath
+        # Recorded before the first write, not after the last one. A bcdedit failure part way
+        # through used to leave a modified store with no manifest beside it, so revert=true then
+        # reported that there was nothing to put back.
+        Save-RevertManifest -Offline $offline -BackupPath $backupPath -ActivatedPartition 0
+        Write-OperatorLog
         Invoke-TargetedBcdRepair -StorePath $offline.BcdStorePath -Findings @($repairable | Where-Object { $_.Cause -ne 'BootPartitionActive' })
         Write-OperatorLog
     }
@@ -985,6 +1043,8 @@ try {
     }
     Write-OperatorLog
 
+    # Rewritten now that the Active flag outcome is known. The earlier call above already recorded
+    # the backup, so an exception between the two still leaves a usable manifest on the disk.
     Save-RevertManifest -Offline $offline -BackupPath $backupPath -ActivatedPartition $activatedPartition
     Write-OperatorLog
 
@@ -1021,5 +1081,15 @@ try {
 catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
+    if ($backupPath) {
+        Log-Output "A copy of the BCD store as it was before this run is at $backupPath. Re-run with revert=true to put it back." | Tee-Object -FilePath $logFile -Append
+    }
     return $STATUS_ERROR
+}
+finally {
+    # Get-OfflineWindowsDisk assigns temporary drive letters to the EFI and Recovery partitions and
+    # requires the caller to release them here, and the log buffer has to be flushed on the failure
+    # paths too - otherwise the helper warnings that explain a thrown exception are discarded with it.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) { Clear-OfflineDriveLetter }
+    if (Get-Command Write-OperatorLog -ErrorAction SilentlyContinue) { Write-OperatorLog }
 }
