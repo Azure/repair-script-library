@@ -60,6 +60,9 @@
           mounting hives in the rescue VM's registry or replaying logs onto the source.
     v1.3: Shared writable-hive lifecycle and default-drive state across dot-source scopes.
           Added numeric, read-only native queries for mounted keys and DWORD metadata.
+    v1.4: Extended the offreg reader with subkey enumeration, key existence and
+          REG_MULTI_SZ reads, so a detect pass can read Enum tree device instances and
+          driver filter lists without mounting the hive it is only reading.
 #>
 
 function Get-OfflineRepairState {
@@ -226,6 +229,7 @@ function Initialize-OfflineRegistryReader {
     if (-not ('RslOffline.RegistryHiveReader' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -237,6 +241,10 @@ namespace RslOffline
     {
         private IntPtr handle;
         private const uint MaxValueBytes = 1024 * 1024;
+        // Enum\ACPI on a real installation holds tens of entries, not tens of thousands.
+        // A ceiling turns a corrupt subkey list - which is exactly what this library is
+        // pointed at - into a thrown error rather than a loop that never ends.
+        private const uint MaxSubKeys = 65536;
 
         [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
@@ -254,6 +262,19 @@ namespace RslOffline
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         private static extern int ORGetValue(IntPtr hive, string key, string name,
             out uint type, byte[] data, ref uint size);
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int OROpenKey(IntPtr key, string subKey, out IntPtr result);
+
+        [DllImport("offreg.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORCloseKey(IntPtr key);
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int OREnumKey(IntPtr key, uint index, StringBuilder name,
+            ref uint nameLength, StringBuilder className, IntPtr classLength, IntPtr lastWrite);
 
         private RegistryHiveReader(IntPtr value) { handle = value; }
 
@@ -319,6 +340,82 @@ namespace RslOffline
             return BitConverter.ToUInt32(data, 0);
         }
 
+        // REG_MULTI_SZ. UpperFilters and LowerFilters are the reason this exists: a driver
+        // filter list is the one boot-critical value that is never a single string, and
+        // reading it was the last thing forcing a detect pass to mount the hive.
+        public string[] ReadMultiString(string key, string name)
+        {
+            uint type;
+            byte[] data = ReadValue(key, name, out type);
+            if (data == null) return null;
+            if (type != 7 || data.Length % 2 != 0)
+                throw new InvalidDataException("'" + key + "\\" + name + "' is not a registry multi-string.");
+
+            string raw = Encoding.Unicode.GetString(data);
+            // The block is a run of null-terminated strings closed by a second null. A
+            // trailing empty element is the terminator, not a value, and a list written
+            // with padding can carry several - strip them all rather than just one.
+            string[] parts = raw.Split('\0');
+            List<string> values = new List<string>();
+            foreach (string part in parts)
+            {
+                if (part.Length > 0) values.Add(part);
+            }
+            return values.ToArray();
+        }
+
+        // Returns null when the key itself is absent, which is what lets a caller tell
+        // "no subkeys" apart from "no such key" without a second probe.
+        public string[] GetSubKeyNames(string key)
+        {
+            if (!IsOpen) throw new ObjectDisposedException("RegistryHiveReader");
+            IntPtr subKey;
+            int opened = OROpenKey(handle, key, out subKey);
+            if (opened == 2 || opened == 3) return null;
+            Check(opened, "Opening key '" + key + "'");
+
+            List<string> names = new List<string>();
+            try
+            {
+                for (uint index = 0; ; index++)
+                {
+                    if (index > MaxSubKeys)
+                        throw new InvalidDataException("Key '" + key + "' reports more than " +
+                            MaxSubKeys + " subkeys; refusing to enumerate further.");
+
+                    // A registry key name is capped at 255 characters, but ask offreg rather
+                    // than assume: ERROR_MORE_DATA means the buffer was short, so grow and retry
+                    // the same index instead of skipping it.
+                    uint capacity = 256;
+                    StringBuilder name = new StringBuilder((int)capacity + 1);
+                    uint length = capacity + 1;
+                    int result = OREnumKey(subKey, index, name, ref length, null, IntPtr.Zero, IntPtr.Zero);
+                    if (result == 234)
+                    {
+                        name = new StringBuilder((int)length + 1);
+                        uint retry = length + 1;
+                        result = OREnumKey(subKey, index, name, ref retry, null, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    if (result == 259) break;          // ERROR_NO_MORE_ITEMS
+                    Check(result, "Enumerating subkey " + index + " of '" + key + "'");
+                    names.Add(name.ToString());
+                }
+            }
+            finally { ORCloseKey(subKey); }
+            return names.ToArray();
+        }
+
+        public bool KeyExists(string key)
+        {
+            if (!IsOpen) throw new ObjectDisposedException("RegistryHiveReader");
+            IntPtr subKey;
+            int opened = OROpenKey(handle, key, out subKey);
+            if (opened == 2 || opened == 3) return false;
+            Check(opened, "Opening key '" + key + "'");
+            ORCloseKey(subKey);
+            return true;
+        }
+
         public void Dispose()
         {
             if (IsOpen)
@@ -344,13 +441,28 @@ namespace RslOffline
 function Open-OfflineRegistryReader {
     <#
     .SYNOPSIS
-        Opens an offline hive for scalar metadata reads without mounting or modifying it.
+        Opens an offline hive for read-only queries without mounting or modifying it.
 
     .DESCRIPTION
-        ReadString and ReadDword take hive-relative key paths and return $null only for
-        an absent key/value. Other read failures throw. Dirty hives may require their
-        matching recovery logs alongside them. Always Dispose the reader in a finally;
-        a failed close throws rather than reporting a successful cleanup.
+        All methods take hive-relative key paths.
+
+        ReadString (REG_SZ and REG_EXPAND_SZ), ReadDword and ReadMultiString
+        (REG_MULTI_SZ) return $null only for an absent key or value; a value of the
+        wrong type throws rather than being coerced, so a caller never silently reads
+        a filter list as a string.
+
+        GetSubKeyNames returns $null when the key itself is absent and an empty array
+        when it exists with no children, which distinguishes the two without a second
+        probe. KeyExists answers the same question as a bool where the names are not
+        needed.
+
+        Other read failures throw. Dirty hives may require their matching recovery
+        logs alongside them. Always Dispose the reader in a finally; a failed close
+        throws rather than reporting a successful cleanup.
+
+        Use this for anything a detect pass reads. Invoke-WithHive mounts the hive
+        read/write and is for repair only: mounting is not side effect free, so a
+        detectOnly run that mounts is writing to the customer disk.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Path)
