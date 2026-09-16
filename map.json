@@ -125,6 +125,11 @@
 		"description": "Workaround for machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files, loading/unloading the registry hives, and removing regtrans-ms and txr.blf files under config\\TxR folder"
 	},
 	{
+		"id": "win-download-azurerescuetoolkit",
+		"path": "src/windows/win-download-azurerescuetoolkit.ps1",
+		"description": "Script to download AzureRescueToolkit in Rescue VM to Troubleshoot Boot Issue."
+	},
+	{
 		"id": "win-crowdstrike-fix-bootloop-cvm",
 		"path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
