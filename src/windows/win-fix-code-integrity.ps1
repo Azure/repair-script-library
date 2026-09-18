@@ -130,6 +130,7 @@ Param(
 . .\src\windows\common\helpers\OfflineRepairCommon.ps1
 . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
 . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
+. .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
 . .\src\windows\common\helpers\Get-OfflineBcdStore.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
