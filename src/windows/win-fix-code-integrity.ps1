@@ -501,9 +501,11 @@ function Get-DormantDriverIndex {
 
         $resolved = Resolve-OfflineImagePath -ImagePath ([string]$properties.ImagePath) -WindowsDrive $WindowsDrive
         [void]$dormant.Add([PSCustomObject]@{
-                Service  = $key.PSChildName
-                FileName = (($resolved -split '[\\/]')[-1]).ToLowerInvariant()
-                Start    = [int]$properties.Start
+                Service      = $key.PSChildName
+                FileName     = (($resolved -split '[\\/]')[-1]).ToLowerInvariant()
+                ResolvedPath = $resolved
+                ImagePathRaw = [string]$properties.ImagePath
+                Start        = [int]$properties.Start
             })
     }
 
@@ -671,7 +673,39 @@ function Get-AllFinding {
     }
 
     foreach ($blocked in @($BlockEvidence.Files)) {
+        $eventTails = @()
+        if ($blocked.Paths.Count -gt 0) {
+            $eventTails = @($blocked.Paths | ForEach-Object { Get-ImagePathTail -Path $_ } | Where-Object { $_ })
+        }
+
         $candidates = @($Drivers | Where-Object { $_.FileName -eq $blocked.FileName })
+
+        # A file name is not an identity. Two services can load different binaries that share one,
+        # and the refusal only authorises acting on the one the record actually named - so where
+        # the record carries a full path, that path decides which candidates are even eligible.
+        #
+        # This deliberately applies at ANY candidate count, not only when there is more than one.
+        # Narrowing only an ambiguous set leaves the single-candidate case matching on file name
+        # alone, which pins the refusal on a binary the guest never refused: measured on a disk
+        # where the refused image had already been disabled, the one remaining service of that
+        # name lived in a different directory and was reported as the culprit.
+        $nameOnly = @()
+        if ($eventTails.Count -gt 0 -and $candidates.Count -gt 0) {
+            $byPath = @($candidates | Where-Object {
+                    ((Get-ImagePathTail -Path $_.ResolvedPath) -in $eventTails) -or
+                    ((Get-ImagePathTail -Path $_.ImagePathRaw) -in $eventTails)
+                })
+            if ($byPath.Count -gt 0) {
+                $candidates = $byPath
+            }
+            else {
+                # Nothing that can start loads the image the record named. Keep the same-named
+                # services for the message; they are context, not the culprit.
+                $nameOnly = $candidates
+                $candidates = @()
+            }
+        }
+
         if ($candidates.Count -eq 0) {
             # An image whose service is present but not configured to start is explained, not
             # unexplained. A driver that cannot start cannot be refused at the next boot, so there
@@ -679,6 +713,13 @@ function Get-AllFinding {
             # log an operator can act on and one that reports an issue immediately after the
             # repair that resolved it.
             $dormant = @($DormantDrivers | Where-Object { $_.FileName -eq $blocked.FileName })
+            if ($eventTails.Count -gt 0 -and $dormant.Count -gt 0) {
+                $dormantByPath = @($dormant | Where-Object {
+                        ((Get-ImagePathTail -Path $_.ResolvedPath) -in $eventTails) -or
+                        ((Get-ImagePathTail -Path $_.ImagePathRaw) -in $eventTails)
+                    })
+                if ($dormantByPath.Count -gt 0) { $dormant = $dormantByPath }
+            }
             if ($dormant.Count -gt 0) {
                 foreach ($d in $dormant) {
                     $how = if ([int]$d.Start -eq 4) { 'is disabled (Start=4)' } else { "starts on demand (Start=$($d.Start))" }
@@ -692,32 +733,16 @@ function Get-AllFinding {
             # no-findings branch and call the disk clean while the guest's own log named an image
             # it had refused to load.
             $where = if ($blocked.Paths.Count -gt 0) { " (recorded as $($blocked.Paths -join ', '))" } else { '' }
+            $others = if ($nameOnly.Count -gt 0) { " $($nameOnly.Count) service(s) load an image with the same name from a different location - $((@($nameOnly | ForEach-Object { "$($_.Service) -> $($_.ResolvedPath)" })) -join '; ') - but the record does not name those, so they are not treated as the culprit." } else { '' }
             [void]$findings.Add((New-Finding -Cause 'BlockedImageNotInInventory' -Item $blocked.FileName -Repairable $false `
-                        -Message "Code Integrity refused $($blocked.FileName) $($blocked.Count) time(s) (events $($blocked.EventIds -join '/'))$where, but no kernel driver service on this disk is configured to load that image. There is no service to disable, so it is reported for a decision: the image may be loaded by something other than a service entry, or the service may already have been removed while the log kept the record."))
+                        -Message "Code Integrity refused $($blocked.FileName) $($blocked.Count) time(s) (events $($blocked.EventIds -join '/'))$where, but no kernel driver service on this disk is configured to load that image.$others There is no service to disable, so it is reported for a decision: the image may be loaded by something other than a service entry, or the service may already have been removed while the log kept the record."))
             continue
         }
 
-        # A file name is not an identity. Two services can load different binaries that share one,
-        # and the refusal only authorises acting on the one the record actually named - so when the
-        # name is ambiguous, the full path decides, and if it cannot, nothing is disabled.
         if ($candidates.Count -gt 1) {
-            $matched = @()
-            if ($blocked.Paths.Count -gt 0) {
-                $eventTails = @($blocked.Paths | ForEach-Object { Get-ImagePathTail -Path $_ } | Where-Object { $_ })
-                $matched = @($candidates | Where-Object {
-                        ((Get-ImagePathTail -Path $_.ResolvedPath) -in $eventTails) -or
-                        ((Get-ImagePathTail -Path $_.ImagePathRaw) -in $eventTails)
-                    })
-            }
-
-            if ($matched.Count -eq 1) {
-                $candidates = $matched
-            }
-            else {
-                [void]$findings.Add((New-Finding -Cause 'BlockedDriverAmbiguous' -Item (@($candidates.Service) -join ', ') -Repairable $false `
-                            -Message "Code Integrity refused $($blocked.FileName) (events $($blocked.EventIds -join '/')), but $($candidates.Count) driver services on this disk load an image with that name: $((@($candidates | ForEach-Object { "$($_.Service) -> $($_.ResolvedPath)" })) -join '; '). $(if ($blocked.Paths.Count -gt 0) { "The recorded path(s) $($blocked.Paths -join ', ') did not single one out." } else { 'The records did not carry a full path.' }) Disabling the wrong one would break a working driver and leave the real fault in place, so it is reported instead. Identify the refused image by hand, then set Start=4 on that service."))
-                continue
-            }
+            [void]$findings.Add((New-Finding -Cause 'BlockedDriverAmbiguous' -Item (@($candidates.Service) -join ', ') -Repairable $false `
+                        -Message "Code Integrity refused $($blocked.FileName) (events $($blocked.EventIds -join '/')), but $($candidates.Count) driver services on this disk load an image with that name: $((@($candidates | ForEach-Object { "$($_.Service) -> $($_.ResolvedPath)" })) -join '; '). $(if ($blocked.Paths.Count -gt 0) { "The recorded path(s) $($blocked.Paths -join ', ') did not single one out." } else { 'The records did not carry a full path.' }) Disabling the wrong one would break a working driver and leave the real fault in place, so it is reported instead. Identify the refused image by hand, then set Start=4 on that service."))
+            continue
         }
 
         $driver = $candidates[0]
