@@ -1,15 +1,20 @@
 #########################################################################################################
 #
 # .SYNOPSIS
-#   Read-only detection for SCSI-to-NVMe disk controller migration boot failures. v1.0.0
+#   Read-only detection for SCSI-to-NVMe disk controller migration boot failures. v1.1.0
 #
 # .DESCRIPTION
 #   Runs on the repair VM against the source VM's OS disk attached as a data disk. Reports whether the
 #   guest is ready to boot from an NVMe disk controller, and collects an evidence bundle. Makes NO
 #   changes to the attached OS disk: the SYSTEM hive is mounted, read, and unmounted.
 #
+#   Also reports the Hyper-V generation of the attached installation. NVMe-capable VM sizes are
+#   Generation 2 only, so a Generation 1 (BIOS/MBR) guest needs a UEFI/GPT conversion before any NVMe
+#   boot repair applies; that case returns the GEN1_TO_GEN2_CONVERSION_REQUIRED signature.
+#
 #   Emits one machine-readable JSON line prefixed with [NVME-EVIDENCE-JSON] so a caller (diagnostics,
 #   SelfHelp, or a test harness) can extract structured evidence from the free-text run-command output.
+#   The top-level "signature" field is the stable value to route on.
 #
 # .RESOLVES
 #   Nothing. Detection only. Use the results to decide whether an NVMe boot-driver repair is warranted.
@@ -72,6 +77,45 @@ function Dismount-RegistryHive {
     }
 }
 
+function Get-OfflineWindowsGeneration {
+    # NVMe-capable VM sizes are Generation 2 only. A Generation 1 guest boots BIOS/MBR, so no stornvme
+    # registry value can make it boot on an NVMe controller - it needs a BIOS/MBR to UEFI/GPT conversion
+    # first. Reading the layout of the attached disk is the only way to tell from inside a repair VM:
+    # the ARM securityProfile is not visible here, and Trusted Launch would be the wrong signal anyway
+    # because a plain Generation 2 VM does not use it.
+    Param([string]$DriveLetter)
+
+    $result = [ordered]@{
+        partitionStyle            = 'Unknown'
+        efiSystemPartitionPresent = $null
+        firmwareType              = 'Unknown'
+        hyperVGeneration          = 'Unknown'
+    }
+
+    $partition = Get-Partition -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
+    if (-not $partition) { return $result }
+
+    $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction SilentlyContinue
+    if (-not $disk) { return $result }
+    $result.partitionStyle = "$($disk.PartitionStyle)"
+
+    # The EFI system partition holds the UEFI boot files. Its GUID is fixed by the UEFI specification.
+    $espGuid = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+    $diskPartitions = @(Get-Partition -DiskNumber $partition.DiskNumber -ErrorAction SilentlyContinue)
+    $result.efiSystemPartitionPresent = [bool](@($diskPartitions | Where-Object { "$($_.GptType)" -eq $espGuid }).Count)
+
+    if ($result.partitionStyle -eq 'GPT' -and $result.efiSystemPartitionPresent) {
+        $result.firmwareType = 'UEFI'
+        $result.hyperVGeneration = 'V2'
+    }
+    elseif ($result.partitionStyle -eq 'MBR') {
+        $result.firmwareType = 'BIOS'
+        $result.hyperVGeneration = 'V1'
+    }
+
+    return $result
+}
+
 $findings = @()
 $overallStatus = $STATUS_SUCCESS
 
@@ -104,21 +148,37 @@ try {
 
         $systemHivePath = "${drive}:\Windows\System32\config\SYSTEM"
         $driverPath = "${drive}:\Windows\System32\drivers\stornvme.sys"
+        $generation = Get-OfflineWindowsGeneration -DriveLetter $drive
 
         $finding = [ordered]@{
-            osDrive               = $drive
-            systemHiveFound       = (Test-Path -LiteralPath $systemHivePath)
-            stornvmeDriverPresent = (Test-Path -LiteralPath $driverPath)
-            controlSet            = $null
-            stornvmeStart         = $null
-            stornvmeType          = $null
-            stornvmeErrorControl  = $null
-            stornvmeGroup         = $null
-            stornvmeImagePath     = $null
-            storahciStart         = $null
-            cddbNvmeEntries       = @()
-            bootReadyForNvme      = $false
-            problems              = @()
+            osDrive                   = $drive
+            systemHiveFound           = (Test-Path -LiteralPath $systemHivePath)
+            stornvmeDriverPresent     = (Test-Path -LiteralPath $driverPath)
+            partitionStyle            = $generation.partitionStyle
+            efiSystemPartitionPresent = $generation.efiSystemPartitionPresent
+            firmwareType              = $generation.firmwareType
+            hyperVGeneration          = $generation.hyperVGeneration
+            conversionRequired        = ($generation.hyperVGeneration -eq 'V1')
+            mbr2gptAvailable          = (Test-Path -LiteralPath "${drive}:\Windows\System32\MBR2GPT.exe")
+            controlSet                = $null
+            stornvmeStart             = $null
+            stornvmeType              = $null
+            stornvmeErrorControl      = $null
+            stornvmeGroup             = $null
+            stornvmeImagePath         = $null
+            storahciStart             = $null
+            cddbNvmeEntries           = @()
+            bootReadyForNvme          = $false
+            problems                  = @()
+        }
+
+        Log-Output "${drive}: partitionStyle=$($finding.partitionStyle), efiSystemPartition=$($finding.efiSystemPartitionPresent), generation=$($finding.hyperVGeneration)" | Tee-Object -FilePath $logFile -Append
+
+        if ($finding.conversionRequired) {
+            # Reported and carried in the evidence rather than stopping the scan: the remaining
+            # stornvme facts are still worth collecting for whoever handles the conversion.
+            $finding.problems += 'GEN1_TO_GEN2_CONVERSION_REQUIRED'
+            Log-Warning "${drive}: this is a Generation 1 (BIOS/MBR) installation. NVMe-capable sizes are Generation 2 only, so it must be converted to UEFI/GPT before any NVMe boot repair can help. MBR2GPT.exe present on the image: $($finding.mbr2gptAvailable)." | Tee-Object -FilePath $logFile -Append
         }
 
         if (-not $finding.systemHiveFound) {
@@ -179,7 +239,10 @@ try {
                 $finding.problems += 'No NVMe CriticalDeviceDatabase entries'
             }
 
-            $finding.bootReadyForNvme = ($finding.stornvmeStart -eq 0) -and $finding.stornvmeDriverPresent
+            # A Generation 1 guest cannot boot on an NVMe controller whatever stornvme says, so it must
+            # not report itself ready: a caller that routes on this field would otherwise conclude the
+            # VM is fine and go looking for a different fault.
+            $finding.bootReadyForNvme = ($finding.stornvmeStart -eq 0) -and $finding.stornvmeDriverPresent -and (-not $finding.conversionRequired)
 
             # Preserve the exact pre-change state so any later repair can be audited against it.
             & reg.exe export "HKLM\$hiveMountName\$controlSet\Services\stornvme" (Join-Path $evidenceRoot "$drive-stornvme.reg") /y *>$null
@@ -201,6 +264,7 @@ try {
     }
 
     $anyNotReady = @($findings | Where-Object { -not $_.bootReadyForNvme }).Count -gt 0
+    $anyConversionRequired = @($findings | Where-Object { $_.conversionRequired }).Count -gt 0
 
     # Guest evidence alone is not enough to declare the scenario: the caller must combine it with the
     # control-plane fact that the VM is actually on (or moving to) the NVMe controller.
@@ -208,11 +272,18 @@ try {
     if ($anyNotReady -and ($attachedBusTypes -contains 'NVMe')) { $confidence = 'high' }
     elseif ($anyNotReady) { $confidence = 'medium' }
 
+    # A stable string for the caller to route on. Free text gets reworded and truncated; this does not.
+    $signature = 'NVME_REPAIR_APPLICABLE'
+    if ($anyConversionRequired) { $signature = 'GEN1_TO_GEN2_CONVERSION_REQUIRED' }
+    elseif (@($findings | Where-Object { -not $_.stornvmeDriverPresent }).Count -gt 0) { $signature = 'STORNVME_DRIVER_MISSING' }
+    elseif (-not $anyNotReady) { $signature = 'ALREADY_NVME_READY' }
+
     $evidence = [ordered]@{
-        schemaVersion    = '1.0'
+        schemaVersion    = '1.1'
         scenario         = 'scsi-to-nvme-migration'
         producedBy       = $scriptName
         producedAtUtc    = (Get-Date).ToUniversalTime().ToString('o')
+        signature        = $signature
         confidence       = $confidence
         os               = [ordered]@{ family = 'windows' }
         repairVm         = [ordered]@{ attachedDiskBusTypes = $attachedBusTypes }
