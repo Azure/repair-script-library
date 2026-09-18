@@ -70,6 +70,11 @@
 		"description" : "Enables nested hyperV using attached data disk as OS disk."
 	},
 	{
+		"id" : "win-fix-firewall-service",
+		"path" : "src/windows/win-fix-firewall-service.ps1",
+		"description" : "Restores the Windows Defender Firewall service on a VM that boots, reports Ready and listens on 3389, yet answers nothing from the virtual network - ICMP included - because mpssvc is not running and the boot-time filters Windows installs before it starts are still blocking everything. Repairs two causes read from the offline SYSTEM hive: a DebugedLoopbackApps value under Services\\mpssvc\\Parameters\\AppCs whose registry type is not the REG_SZ that CheckNetIsolation writes, and MpsSvc or the Base Filtering Engine under it left Disabled. Measured on a live build 20348 VM one reboot at a time, a value of any other type stopped the service on every boot, an empty REG_MULTI_SZ as reliably as one holding 700 SIDs. A correctly typed REG_SZ value is always preserved: these offline checks do not validate its content, so a suspected content fault is reported for manual investigation rather than repaired, and a clean result does not prove the firewall service starts. A healthy VM produces no findings and nothing is written. Only Start=4 is treated as evidence, so a deliberately demand-started service is never corrected. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-toggle-safe-mode",
 		"path" : "src/windows/win-toggle-safe-mode.ps1",
 		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
@@ -88,6 +93,11 @@
 		"id" : "win-create-troubleshooting-user",
 		"path" : "src/windows/win-create-troubleshooting-user.ps1",
 		"description" : "Create a new user account with administrator privileges. This can be used to troubleshoot a VM without an accessible administrative account."
+	},
+	{
+		"id" : "win-add-temp-user",
+		"path" : "src/windows/win-add-temp-user.ps1",
+		"description" : "Creates a local administrator on an attached OS disk through the SYSTEM\\Setup CmdLine hook and a nested Windows boot, without editing SAM structures or relying on Group Policy startup scripts. Requires a complete guest result confirming creation, administrator membership and enablement for the requested name; SAM presence alone is not proof of creation. A failed creation never promotes or enables an existing account. Verifies payload cleanup and restoration of both recorded Setup values, retaining recovery metadata and returning an error when completion cannot be verified. Pass detectOnly=true to inspect without creating an account or applying a hook; disk discovery can stop an unmanaged repair guest and prepare attached disks, and hive reads may perform recovery. Use revert=true separately to restore a recorded hook and remove leftover payload files; it does not delete the account. Supplied passwords must use printable ASCII without double quotes. Requires a rescue VM created with \"az vm repair create --enable-nested\". NOTE: use option --run-on-repair."
 	},
 	{
 		"id" : "win-get-patches",
@@ -128,6 +138,11 @@
 		"id": "win-crowdstrike-fix-bootloop-cvm",
 		"path": "src/windows/win-crowdstrike-fix-bootloop-cvm.ps1",
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
+	},
+	{
+		"id": "win-fix-transaction-logs",
+		"path": "src/windows/win-fix-transaction-logs.ps1",
+		"description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again. Clears the transactional registry logs only by default; pass scope=Config, scope=SMI or scope=All to widen that, force=true to clear without local ERROR_LOG_FULL evidence, detectOnly=true to report only, or revert=true to restore the files. NOTE: use option --run-on-repair."
 	},
 	{
 		"id": "win-fix-boot-partition",
