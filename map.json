@@ -153,5 +153,10 @@
 		"id": "linux-detect-nvme-readiness",
 		"path": "src/linux/linux-detect-nvme-readiness.sh",
 		"description": "Read-only check of whether a Linux OS disk can boot from an NVMe disk controller. Reports unstable /dev/sd* references in /etc/fstab, whether the initramfs contains an NVMe driver, and the dracut hostonly setting. Makes no changes. NOTE: use option --run-on-repair."
+	},
+	{
+		"id": "win-enable-nvme-boot-driver",
+		"path": "src/windows/win-enable-nvme-boot-driver.ps1",
+		"description": "Enables the Windows inbox stornvme boot-start driver on the offline OS disk of a VM that no longer boots after switching to an NVMe disk controller. Mode=Report (default) is read-only; Mode=Repair backs up, writes and verifies; Mode=Rollback restores the backup emitted by Repair. NOTE: use option --run-on-repair."
 	}
 ]

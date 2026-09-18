@@ -22,6 +22,10 @@
 #
 #########################################################################################################
 
+# Mode and BackupFile are used inside the Invoke-WithHive script block below; PSScriptAnalyzer
+# cannot see through that script block, so PSReviewUnusedParameter reports them as unused.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'Mode and BackupFile are used inside the Invoke-WithHive script block below; PSScriptAnalyzer cannot see through that script block.')]
 Param(
     [Parameter(Mandatory = $false)][ValidateSet('Report', 'Repair', 'Rollback')][string]$Mode = 'Report',
     [Parameter(Mandatory = $false)][ValidatePattern('^[A-Za-z]:?$')][string]$OsDriveLetter = '',
