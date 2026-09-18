@@ -456,6 +456,60 @@ function Get-KernelDriverInventory {
     return @($inventory)
 }
 
+function Get-DormantDriverIndex {
+    <#
+    .SYNOPSIS
+        Services that load a kernel image but are not configured to start.
+
+    .DESCRIPTION
+        Get-KernelDriverInventory deliberately keeps only Start 0, 1 and 2, because only a driver
+        configured to start can stop a boot, and establishing a signature for every service on the
+        disk would cost far more than it is worth.
+
+        That filter leaves a gap. A refusal recorded in the log for a service since set to Start=4
+        matches nothing in the inventory, and is then indistinguishable from an image the disk
+        cannot explain at all. It is the state this script's own repair produces, so the second
+        detect run after a successful repair walked straight into it.
+
+        This is the cheap half of the inventory: service name, start value and the file name from
+        ImagePath, with no signature check and no file access, gathered only to tell those two
+        situations apart.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SystemRoot,
+        [Parameter(Mandatory = $true)][string]$WindowsDrive
+    )
+
+    $dormant = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $servicesRoot = "$SystemRoot\Services"
+    if ((Get-OfflineHiveKeyState -HiveKey $servicesRoot) -ne 'Present') { return @() }
+
+    $keys = @()
+    try { $keys = @(Get-ChildItem -LiteralPath $servicesRoot -ErrorAction Stop) }
+    catch { return @() }
+
+    foreach ($key in $keys) {
+        # LiteralPath for the same reason the inventory uses it: a service name may contain
+        # characters -Path would read as a wildcard.
+        $properties = $null
+        try { $properties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop } catch { continue }
+        if ($null -eq $properties) { continue }
+        if ([int]($properties.Type) -notin @(1, 2)) { continue }
+        if ([int]($properties.Start) -in @(0, 1, 2)) { continue }
+        if (-not $properties.ImagePath) { continue }
+
+        $resolved = Resolve-OfflineImagePath -ImagePath ([string]$properties.ImagePath) -WindowsDrive $WindowsDrive
+        [void]$dormant.Add([PSCustomObject]@{
+                Service  = $key.PSChildName
+                FileName = (($resolved -split '[\\/]')[-1]).ToLowerInvariant()
+                Start    = [int]$properties.Start
+            })
+    }
+
+    return @($dormant)
+}
+
 function Get-ProtectionState {
     <#
     .SYNOPSIS
@@ -588,11 +642,19 @@ function Get-AllFinding {
         How recent a refusal has to be to authorise a write. An evtx file on an attached disk
         outlives the problem it recorded: the driver may already have been updated, or the log may
         have been carried over from an earlier image. Defaults to 30 days.
+
+    .PARAMETER DormantDrivers
+        Services that load a kernel image but are not configured to start, so they are absent from
+        $Drivers. They are needed to tell two different situations apart that otherwise look
+        identical: an image nothing on the disk explains, and an image whose service is already
+        disabled - including by this script's own repair, which is exactly what a second detect
+        run after a successful repair sees. Only the first is a decision for anyone to make.
     #>
     param(
         [Parameter(Mandatory = $true)]$BlockEvidence,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][PSCustomObject[]]$Drivers,
-        [Parameter(Mandatory = $false)][int]$MaxEventAgeDay = 30
+        [Parameter(Mandatory = $false)][int]$MaxEventAgeDay = 30,
+        [Parameter(Mandatory = $false)][AllowEmptyCollection()][PSCustomObject[]]$DormantDrivers = @()
     )
 
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -611,6 +673,20 @@ function Get-AllFinding {
     foreach ($blocked in @($BlockEvidence.Files)) {
         $candidates = @($Drivers | Where-Object { $_.FileName -eq $blocked.FileName })
         if ($candidates.Count -eq 0) {
+            # An image whose service is present but not configured to start is explained, not
+            # unexplained. A driver that cannot start cannot be refused at the next boot, so there
+            # is nothing to decide and nothing to repair. Saying so is the difference between a
+            # log an operator can act on and one that reports an issue immediately after the
+            # repair that resolved it.
+            $dormant = @($DormantDrivers | Where-Object { $_.FileName -eq $blocked.FileName })
+            if ($dormant.Count -gt 0) {
+                foreach ($d in $dormant) {
+                    $how = if ([int]$d.Start -eq 4) { 'is disabled (Start=4)' } else { "starts on demand (Start=$($d.Start))" }
+                    Add-OfflineRepairLog -Level Info -Message "Code Integrity refused $($blocked.FileName) $($blocked.Count) time(s), and service $($d.Service) loads that image but $how, so it cannot be refused at the next boot. No change is needed for it."
+                }
+                continue
+            }
+
             # Reported, not dropped. The .DESCRIPTION above promises that evidence this script
             # cannot act on stays visible; logging it at Info and continuing let the run reach the
             # no-findings branch and call the disk clean while the guest's own log named an image
@@ -809,7 +885,8 @@ try {
             $systemRoot = Get-OfflineSystemRootPath -Strict:(-not $isDetectOnly)
             $protection = Get-ProtectionState -SystemRoot $systemRoot -SecureBoot $secureBootState
             $drivers = @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
-            $findings = @(Get-AllFinding -BlockEvidence $blockEvidence -Drivers $drivers)
+            $dormant = @(Get-DormantDriverIndex -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive)
+            $findings = @(Get-AllFinding -BlockEvidence $blockEvidence -Drivers $drivers -DormantDrivers $dormant)
 
             return [PSCustomObject]@{
                 SystemRoot = $systemRoot
@@ -999,7 +1076,8 @@ try {
         $remaining = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
             $systemRoot = Get-OfflineSystemRootPath -Strict
             return @(Get-AllFinding -BlockEvidence $blockEvidence `
-                    -Drivers @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive))
+                    -Drivers @(Get-KernelDriverInventory -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive) `
+                    -DormantDrivers @(Get-DormantDriverIndex -SystemRoot $systemRoot -WindowsDrive $offline.WindowsDrive))
         }
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
