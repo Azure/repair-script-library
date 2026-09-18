@@ -269,9 +269,12 @@ function Get-CodeIntegrityBlockedFile {
         the rescue VM.
 
     .OUTPUTS
-        PSCustomObject with Available, Reason and Files. Files carry FileName, EventIds, Count,
-        LastSeenUtc and Dated. Dated is false when no record for that image carried a readable
-        timestamp, which the caller must treat as evidence it cannot date rather than as recent.
+        PSCustomObject with Available, Reason and Files. Files carry FileName, Paths, EventIds,
+        Count, LastSeenUtc and Dated. Dated is false when no record for that image carried a
+        readable timestamp, which the caller must treat as evidence it cannot date rather than as
+        recent. Paths holds every distinct full image path the records named, which the caller
+        needs to tell two drivers with the same file name apart; it is empty when the provider
+        rendered the name without a path.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WindowsPath
@@ -287,7 +290,12 @@ function Get-CodeIntegrityBlockedFile {
 
     $events = @()
     try {
-        $events = @(Get-WinEvent -Path $logPath -FilterXPath "*[System[(EventID=3033 or EventID=3077 or EventID=3023 or EventID=3004)]]" -MaxEvents 200 -ErrorAction Stop)
+        # No -MaxEvents cap. The cap used to be 200, which silently discarded the oldest matching
+        # records: a noisy log can hold more than that inside the authorisation window, and the
+        # image that actually stopped the boot is not guaranteed to be among the newest. Dropping
+        # it reports a clean disk. The Code Integrity channel is a small, size-capped log, so
+        # reading all of its matching records is bounded by the file itself.
+        $events = @(Get-WinEvent -Path $logPath -FilterXPath "*[System[(EventID=3033 or EventID=3077 or EventID=3023 or EventID=3004)]]" -ErrorAction Stop)
     }
     catch {
         # The message is localised, so it cannot be matched. The error identity is not.
@@ -312,11 +320,18 @@ function Get-CodeIntegrityBlockedFile {
         $carriesTime = ($null -ne $record.TimeCreated)
         if ($carriesTime) { $recordUtc = $record.TimeCreated.ToUniversalTime() } else { $recordUtc = [datetime]::MinValue }
 
-        foreach ($match in [regex]::Matches($text, '(?i)[^\s\\/"<>]+\.sys')) {
-            $fileName = $match.Value.ToLowerInvariant()
+        # Matched with the path separators left in, unlike the original expression which excluded
+        # them and so kept only the last segment. Two services can load different drivers that
+        # happen to share a file name, and a basename on its own cannot tell them apart - the
+        # uniqueness check in Get-AllFinding needs the full path to refuse an ambiguous repair.
+        foreach ($match in [regex]::Matches($text, '(?i)[^\s"''<>(),;]*[^\s\\/"''<>(),;]+\.sys')) {
+            $raw = $match.Value.Trim()
+            $fileName = (($raw -split '[\\/]')[-1]).ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($fileName)) { continue }
             if (-not $byFile.ContainsKey($fileName)) {
                 $byFile[$fileName] = [PSCustomObject]@{
                     FileName    = $fileName
+                    Paths       = [System.Collections.Generic.List[string]]::new()
                     EventIds    = [System.Collections.Generic.List[int]]::new()
                     Count       = 0
                     LastSeenUtc = [datetime]::MinValue
@@ -324,6 +339,10 @@ function Get-CodeIntegrityBlockedFile {
                 }
             }
             $entry = $byFile[$fileName]
+            if ($raw -match '[\\/]') {
+                $normalised = $raw.ToLowerInvariant()
+                if (-not $entry.Paths.Contains($normalised)) { [void]$entry.Paths.Add($normalised) }
+            }
             $entry.Count++
             if (-not $entry.EventIds.Contains([int]$record.Id)) { [void]$entry.EventIds.Add([int]$record.Id) }
             if ($carriesTime) {
@@ -389,12 +408,28 @@ function Get-KernelDriverInventory {
         if (-not $properties.ImagePath) { continue }
 
         $resolved = Resolve-OfflineImagePath -ImagePath ([string]$properties.ImagePath) -WindowsDrive $WindowsDrive
-        $exists = Test-OfflinePath $resolved
-        $signature = Test-OfflineFileSignature -FilePath $resolved
+
+        # Resolve-OfflineImagePath returns anything it does not recognise unchanged, so a UNC or
+        # relative ImagePath survives as a path that is not on the disk being repaired. Reading
+        # that file's signature would take authorisation to disable a service on the guest from a
+        # file on the rescue VM or on the network. Refuse it: an image outside the bound offline
+        # image is never checkable, and never counts as a Microsoft driver.
+        $insideRoot = $true
+        try { [void](Assert-OfflineTarget -Path $resolved -Action 'read the driver image of') }
+        catch { $insideRoot = $false }
+
+        if ($insideRoot) {
+            $exists = Test-OfflinePath $resolved
+            $signature = Test-OfflineFileSignature -FilePath $resolved
+        }
+        else {
+            $exists = $false
+            $signature = [PSCustomObject]@{ Status = 'OutsideOfflineImage'; IsLikelyMicrosoft = $false; VersionCompany = '' }
+        }
         $vendor = if ($signature.VersionCompany) { $signature.VersionCompany.Trim() } else { '' }
 
         # Nothing could be established about the file itself. Neither trusted nor untrusted.
-        $checkable = ($signature.Status -notin @('FileNotFound', 'ZeroByte', 'Error', 'NotVerifiable'))
+        $checkable = ($insideRoot -and ($signature.Status -notin @('FileNotFound', 'ZeroByte', 'Error', 'NotVerifiable')))
 
         [void]$inventory.Add([PSCustomObject]@{
                 Service        = $key.PSChildName
@@ -407,9 +442,11 @@ function Get-KernelDriverInventory {
                 Vendor         = $vendor
                 Signature      = $signature.Status
                 ImageCheckable = $checkable
+                OutsideRoot    = (-not $insideRoot)
                 # Proven by signature, or claimed by the version resource. Either one is enough to
-                # leave the driver alone; only a third party binary is ever disabled.
-                IsMicrosoft    = ($signature.IsLikelyMicrosoft -or ($vendor -match 'Microsoft'))
+                # leave the driver alone; only a third party binary is ever disabled. An image
+                # outside the offline disk proves nothing either way, so it is never trusted here.
+                IsMicrosoft    = ($insideRoot -and ($signature.IsLikelyMicrosoft -or ($vendor -match 'Microsoft')))
                 IsPlatform     = ($vendor -and $vendor -match $script:PlatformVendorPattern)
                 IsBootCritical = ($key.PSChildName.ToLowerInvariant() -in $script:BootCriticalDriver)
             })
@@ -454,7 +491,13 @@ function Get-ProtectionState {
     $policyHvci = Get-OfflineRegistryDword -Key $policyPath -Name 'HypervisorEnforcedCodeIntegrity'
 
     return [PSCustomObject]@{
-        HvciEnabled       = ([int]$hvciEnabled -eq 1)
+        # The effective state, not just the scenario key. HVCI can be turned on by policy alone,
+        # and deriving this from Scenarios\... by itself reports Memory Integrity off on a VM where
+        # it is actually enforced - which then skips the corroborating PE scan that is gated on it.
+        # The raw scenario value is kept beside it, because the restore log has to say what was
+        # really set rather than what was in effect.
+        HvciEnabled       = (([int]$hvciEnabled -eq 1) -or ([int]$policyHvci -eq 1))
+        HvciScenario      = [int]$hvciEnabled
         HvciLocked        = ([int]$hvciLocked -eq 1)
         HvciPath          = $hvciPath
         DeviceGuardPath   = $deviceGuardPath
@@ -501,6 +544,30 @@ function Get-BcdSigningState {
     return $state
 }
 
+function Get-ImagePathTail {
+    <#
+    .SYNOPSIS
+        The last few path segments of an image path, lowercased, for comparing two spellings.
+
+    .DESCRIPTION
+        A Code Integrity record names an image the way the kernel saw it - "\??\C:\Windows\..."
+        or "\Device\HarddiskVolume2\Windows\..." - and the registry names the same file as
+        "\SystemRoot\System32\drivers\foo.sys", which the helpers resolve onto whatever letter the
+        rescue VM gave the disk. None of those strings are equal, but their tails are, and the
+        tail is what distinguishes two drivers that share a file name.
+    #>
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()][AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory = $false)][int]$Segments = 3
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $parts = @(($Path.ToLowerInvariant() -split '[\\/]') | Where-Object { $_ -and $_ -ne '??' })
+    if ($parts.Count -eq 0) { return '' }
+    $take = [Math]::Min($Segments, $parts.Count)
+    return (($parts[($parts.Count - $take)..($parts.Count - 1)]) -join '\')
+}
+
 function Get-AllFinding {
     <#
     .SYNOPSIS
@@ -530,13 +597,53 @@ function Get-AllFinding {
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
     $cutoffUtc = (Get-Date).ToUniversalTime().AddDays(-$MaxEventAgeDay)
 
+    # Not being able to read the evidence is not the same as there being none. Without this the
+    # findings list comes back empty, the run takes the no-findings branch, and a disk whose log
+    # could not be inspected is reported as one where nothing was refused - the single conclusion
+    # the evidence cannot support. It fails closed instead, as a finding nobody can miss.
+    if (-not $BlockEvidence.Available) {
+        [void]$findings.Add((New-Finding -Cause 'EvidenceUnavailable' -Item 'Code Integrity log' -Repairable $false `
+                    -Message "The Code Integrity evidence could not be read: $($BlockEvidence.Reason). Nothing can be shown to have been refused, and nothing can be ruled out either, so no change was made and this disk is not being reported as healthy. Inspect System32\winevt\Logs\Microsoft-Windows-CodeIntegrity%4Operational.evtx by hand, or pursue the boot failure by another route."))
+        return @($findings)
+    }
+
     foreach ($blocked in @($BlockEvidence.Files)) {
-        $driver = @($Drivers | Where-Object { $_.FileName -eq $blocked.FileName } | Select-Object -First 1)
-        if ($driver.Count -eq 0) {
-            Add-OfflineRepairLog -Level Info -Message "Code Integrity refused $($blocked.FileName), but no driver service loads that image, so there is nothing to disable."
+        $candidates = @($Drivers | Where-Object { $_.FileName -eq $blocked.FileName })
+        if ($candidates.Count -eq 0) {
+            # Reported, not dropped. The .DESCRIPTION above promises that evidence this script
+            # cannot act on stays visible; logging it at Info and continuing let the run reach the
+            # no-findings branch and call the disk clean while the guest's own log named an image
+            # it had refused to load.
+            $where = if ($blocked.Paths.Count -gt 0) { " (recorded as $($blocked.Paths -join ', '))" } else { '' }
+            [void]$findings.Add((New-Finding -Cause 'BlockedImageNotInInventory' -Item $blocked.FileName -Repairable $false `
+                        -Message "Code Integrity refused $($blocked.FileName) $($blocked.Count) time(s) (events $($blocked.EventIds -join '/'))$where, but no kernel driver service on this disk is configured to load that image. There is no service to disable, so it is reported for a decision: the image may be loaded by something other than a service entry, or the service may already have been removed while the log kept the record."))
             continue
         }
-        $driver = $driver[0]
+
+        # A file name is not an identity. Two services can load different binaries that share one,
+        # and the refusal only authorises acting on the one the record actually named - so when the
+        # name is ambiguous, the full path decides, and if it cannot, nothing is disabled.
+        if ($candidates.Count -gt 1) {
+            $matched = @()
+            if ($blocked.Paths.Count -gt 0) {
+                $eventTails = @($blocked.Paths | ForEach-Object { Get-ImagePathTail -Path $_ } | Where-Object { $_ })
+                $matched = @($candidates | Where-Object {
+                        ((Get-ImagePathTail -Path $_.ResolvedPath) -in $eventTails) -or
+                        ((Get-ImagePathTail -Path $_.ImagePathRaw) -in $eventTails)
+                    })
+            }
+
+            if ($matched.Count -eq 1) {
+                $candidates = $matched
+            }
+            else {
+                [void]$findings.Add((New-Finding -Cause 'BlockedDriverAmbiguous' -Item (@($candidates.Service) -join ', ') -Repairable $false `
+                            -Message "Code Integrity refused $($blocked.FileName) (events $($blocked.EventIds -join '/')), but $($candidates.Count) driver services on this disk load an image with that name: $((@($candidates | ForEach-Object { "$($_.Service) -> $($_.ResolvedPath)" })) -join '; '). $(if ($blocked.Paths.Count -gt 0) { "The recorded path(s) $($blocked.Paths -join ', ') did not single one out." } else { 'The records did not carry a full path.' }) Disabling the wrong one would break a working driver and leave the real fault in place, so it is reported instead. Identify the refused image by hand, then set Start=4 on that service."))
+                continue
+            }
+        }
+
+        $driver = $candidates[0]
         $seen = if ($blocked.Dated) { "last at $($blocked.LastSeenUtc.ToString('yyyy-MM-dd HH:mm:ss')) UTC" } else { 'with no readable timestamp' }
 
         if ($driver.IsMicrosoft) {
@@ -592,8 +699,20 @@ function Repair-Finding {
         'BlockedDriver' {
             $driver = $Finding.Data
             $keyPath = "$SystemRoot\Services\$($driver.Service)"
-            if (-not (Test-Path $keyPath)) { throw "The service key $keyPath is no longer present." }
-            Set-ItemProperty -Path $keyPath -Name 'Start' -Value 4 -Type DWord -Force -ErrorAction Stop
+            # LiteralPath on both, for the reason the inventory already gives: a service name is
+            # allowed to contain characters that -Path reads as a wildcard. Enumerating with
+            # -LiteralPath and then writing with -Path is the mismatch that lets a name like
+            # "foo[1]" test one key and write a different one, or none at all.
+            if (-not (Test-Path -LiteralPath $keyPath)) { throw "The service key $keyPath is no longer present." }
+            # Through the protected writer, which proves the key is inside the mounted offline
+            # image before it writes and handles a TrustedInstaller-owned key. Writing directly
+            # skipped the gate that every other repair in the library passes through.
+            $outcome = Invoke-OfflineProtectedRegistryWrite -Path $keyPath -Description "$($driver.Service) Start" -Action {
+                Set-ItemProperty -LiteralPath $keyPath -Name 'Start' -Value 4 -Type DWord -Force -ErrorAction Stop
+            }
+            if (-not $outcome.Written) {
+                throw "The Start value of $($driver.Service) could not be written: $($outcome.Reason)"
+            }
             Add-OfflineRepairLog -Message "$($driver.Service): Start $($driver.Start) -> 4 (disabled). Memory Integrity and Credential Guard were left untouched."
             Add-OfflineRepairLog -Message "$($driver.Service): to undo this after the VM boots, run: reg add `"HKLM\SYSTEM\CurrentControlSet\Services\$($driver.Service)`" /v Start /t REG_DWORD /d $($driver.Start) /f"
             return $true
@@ -622,14 +741,24 @@ function Disable-Protection {
     $set = {
         param($Path, $Name, $Current, $LiveKey)
         if ($null -eq $Current -or [int]$Current -eq 0) { return $false }
-        if (-not (Test-Path $Path)) { return $false }
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
         Add-OfflineRepairLog -Level Warning -Message "Restore with: reg add `"$LiveKey`" /v $Name /t REG_DWORD /d $Current /f"
-        Set-ItemProperty -Path $Path -Name $Name -Value 0 -Type DWord -Force -ErrorAction Stop
+        # Through the protected writer, which asserts the key belongs to the mounted offline image
+        # before anything is written, and takes a TrustedInstaller-owned key only when the plain
+        # write is actually refused. A bare Set-ItemProperty here bypassed the fail-closed gate
+        # that every other writer in the library goes through.
+        $outcome = Invoke-OfflineProtectedRegistryWrite -Path $Path -Description "$Name" -Action {
+            Set-ItemProperty -LiteralPath $Path -Name $Name -Value 0 -Type DWord -Force -ErrorAction Stop
+        }
+        if (-not $outcome.Written) {
+            Add-OfflineRepairLog -Level Warning -Message "$Name could not be cleared: $($outcome.Reason)"
+            return $false
+        }
         Add-OfflineRepairLog -Message "$Name : $Current -> 0"
         return $true
     }
 
-    if (& $set $Protection.HvciPath 'Enabled' $(if ($Protection.HvciEnabled) { 1 } else { 0 }) 'HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity') { $changed++ }
+    if (& $set $Protection.HvciPath 'Enabled' $Protection.HvciScenario 'HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity') { $changed++ }
     if (& $set $Protection.HvciPath 'Locked' $(if ($Protection.HvciLocked) { 1 } else { 0 }) 'HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity') { $changed++ }
     if (& $set $Protection.LsaPath 'LsaCfgFlags' $Protection.LsaCfgFlags 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa') { $changed++ }
     if (& $set $Protection.LsaPath 'RunAsPPL' $Protection.RunAsPPL 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa') { $changed++ }
@@ -695,12 +824,26 @@ try {
         $thirdParty = @($context.Drivers | Where-Object { -not $_.IsMicrosoft })
 
         # Context only. None of this is a fault by itself, so none of it appears in the findings list.
-        Log-Info "Control set $($context.ControlSet): Memory Integrity $(if ($protection.HvciEnabled) { 'on' } else { 'off' })$(if ($protection.HvciLocked) { ' (locked)' }), Credential Guard $(if ($protection.CredentialGuard) { 'on' } else { 'off' })$(if ($protection.CgUefiLock) { ' (UEFI lock)' }), LSA protection $(if ($protection.RunAsPPL -eq 1) { 'on' } else { 'off' }), Secure Boot $(if (-not $protection.SecureBootKnown) { "unknown ($($protection.SecureBootSource))" } elseif ($protection.SecureBootEnabled) { 'on' } else { 'off' })" | Tee-Object -FilePath $logFile -Append
+        # Every state below distinguishes "unknown" from "off". Reporting something as off because
+        # it could not be read is reporting the opposite of what is known, and the operator acts on
+        # these lines.
+        $lsaState = switch ([int]$protection.RunAsPPL) {
+            1 { 'on' }
+            2 { 'on (locked)' }
+            default { 'off' }
+        }
+        Log-Info "Control set $($context.ControlSet): Memory Integrity $(if ($protection.HvciEnabled) { 'on' } else { 'off' })$(if ($protection.HvciLocked) { ' (locked)' }), Credential Guard $(if ($protection.CredentialGuard) { 'on' } else { 'off' })$(if ($protection.CgUefiLock) { ' (UEFI lock)' }), LSA protection $lsaState, Secure Boot $(if (-not $protection.SecureBootKnown) { "unknown ($($protection.SecureBootSource))" } elseif ($protection.SecureBootEnabled) { 'on' } else { 'off' })" | Tee-Object -FilePath $logFile -Append
         $bcdOverride = @()
         if ($bcdState.TestSigning) { $bcdOverride += 'testsigning' }
         if ($bcdState.NoIntegrityChecks) { $bcdOverride += 'nointegritychecks' }
-        if ($bcdOverride.Count -eq 0) {
+        if (-not $bcdState.Available) {
+            Log-Info 'Boot configuration: the boot configuration data could not be read, so whether any signing override is set is unknown. An unreadable store is not evidence that there are none.' | Tee-Object -FilePath $logFile -Append
+        }
+        elseif ($bcdOverride.Count -eq 0) {
             Log-Info 'Boot configuration: no signing overrides are set.' | Tee-Object -FilePath $logFile -Append
+        }
+        elseif (-not $protection.SecureBootKnown) {
+            Log-Info "Boot configuration: $($bcdOverride -join ' and ') set, with the Secure Boot state unknown ($($protection.SecureBootSource)). If Secure Boot is on the boot manager drops these at the next boot; if it is off, driver signing is relaxed and that can explain how an unsigned or tampered driver was allowed to load." | Tee-Object -FilePath $logFile -Append
         }
         elseif ($protection.SecureBootEnabled) {
             Log-Info "Boot configuration: $($bcdOverride -join ' and ') set while Secure Boot is on. Measured on this platform, the boot manager drops these at the next boot and the guest starts normally, so this is context and not a boot fault." | Tee-Object -FilePath $logFile -Append
@@ -751,6 +894,19 @@ try {
         $repairable = @($findings | Where-Object { $_.Repairable })
         $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
+        # Ahead of the detect gate on purpose. The findings above are printed by a loop, so on a
+        # healthy disk it prints nothing and the only thing left would be a count - and "found 0
+        # issue(s)" differs from "found 2 issue(s), 0 of which this script can repair" by a single
+        # digit in a log the operator skims. The repair path has its own affirmative line further
+        # down, after any protection change, so this one is scoped to detect mode and nothing on
+        # the -disableProtection path is short-circuited.
+        if ($findings.Count -eq 0 -and $isDetectOnly) {
+            Log-Output 'Detect only: no Code Integrity driver refusals were found on this disk. The Code Integrity log was read and named no image that a driver service is configured to load. No changes were made.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
         if ($isDetectOnly) {
             Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
             Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -772,6 +928,15 @@ try {
 
             $repairOutcome = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
                 $systemRoot = Get-OfflineSystemRootPath -Strict
+                # The findings were built under an earlier mount, against whichever control set
+                # Select\Current named then. This remount re-reads it, and every repair below
+                # writes under the root it returns - so if it now names a different control set,
+                # the writes would land in one the evidence was never gathered from. Refuse rather
+                # than write to a service key chosen by a selector that moved underneath us.
+                $repairControlSet = Split-Path -Path $systemRoot -Leaf
+                if ($repairControlSet -ne $context.ControlSet) {
+                    throw "The selected control set changed between detection and repair ($($context.ControlSet) -> $repairControlSet). Nothing was written. Re-run the script so the findings are rebuilt against the control set that would actually be written."
+                }
                 $done = 0
                 $errors = [System.Collections.Generic.List[string]]::new()
                 foreach ($finding in $repairable) {
