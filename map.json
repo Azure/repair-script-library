@@ -152,7 +152,7 @@
 	{
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
-		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Makes no changes. NOTE: use option --run-on-repair."
+		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the Hyper-V generation, stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Generation 1 installations return GEN1_TO_GEN2_CONVERSION_REQUIRED. Makes no changes. NOTE: use option --run-on-repair."
 	},
 	{
 		"id": "linux-detect-nvme-readiness",
