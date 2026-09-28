@@ -80,6 +80,11 @@
 		"description" : "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit and a portable executable scan for writable and executable sections as corroboration. Only a refusal from the last 30 days, naming a third-party driver whose image can actually be checked on the disk, authorises a change; stale, undated or unreadable evidence is reported for a decision instead. The offline Secure Boot state, read from the Measured Boot log, and any testsigning or nointegritychecks override are reported as context only: measurement shows the boot manager drops those overrides and the guest still boots, so they are not treated as a fault. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
 	},
 	{
+		"id" : "win-fix-system-file",
+		"path" : "src/windows/win-fix-system-file.ps1",
+		"description" : "Repairs the specific system files named with files=<name>[,<name>...] (for example files=win32kbase.sys), instead of a whole-installation DISM and sfc pass. Each file is checked against its embedded signature or the guest's own catalogs, and only a missing, empty or hash-mismatched file is changed. The replacement must match the guest's installed build exactly. It comes from an intact copy already on the disk (WinSxS, WinSxS\\Backup, DriverStore), is rebuilt from the guest's own servicing deltas, is taken from the guest's cumulative update downloaded from the Microsoft Update Catalog (disable with allowDownload=false), or as a last resort comes from a targeted offline sfc /SCANFILE. Every replaced file is verified again after the write and backed up first; pass revert=true to restore the originals, or detectOnly=true to only report. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-toggle-safe-mode",
 		"path" : "src/windows/win-toggle-safe-mode.ps1",
 		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
