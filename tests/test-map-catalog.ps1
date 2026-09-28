@@ -53,4 +53,10 @@ foreach ($detector in 'win-detect-nvme-readiness', 'linux-detect-nvme-readiness'
     Assert-True (@($catalog | Where-Object id -eq $detector).Count -eq 1) "$detector must stay registered."
 }
 
+$windowsDetector = @($catalog | Where-Object id -eq 'win-detect-nvme-readiness')
+Assert-True ($windowsDetector[0].description -match 'Hyper-V generation') `
+    'The Windows detector description must say that it reports the Hyper-V generation.'
+Assert-True ($windowsDetector[0].description -match 'GEN1_TO_GEN2_CONVERSION_REQUIRED') `
+    'The Windows detector description must document the Generation 1 result.'
+
 Write-Host "PASS: map.json catalogue — $($catalog.Count) entries, unique ids, existing paths, OS/extension agreement, NVMe run ids registered."
