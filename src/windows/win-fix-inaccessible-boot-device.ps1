@@ -129,6 +129,8 @@ function Get-StorageClassFilterSpec {
 }
 
 function New-Finding {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Builds an in-memory finding object and changes no system state.')]
     param(
         [Parameter(Mandatory = $true)][string]$Cause,
         [Parameter(Mandatory = $true)][string]$Item,
@@ -369,6 +371,91 @@ function Get-AllFinding {
     return @($all)
 }
 
+function ConvertTo-HklmSubKeyPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $subKey = $Path -replace '^((Microsoft\.PowerShell\.Core\\)?Registry::)?(HKLM:|HKEY_LOCAL_MACHINE|HKLM)\\?', ''
+    if ($subKey -eq $Path) { throw "Registry path '$Path' is not under HKEY_LOCAL_MACHINE." }
+    return $subKey.TrimEnd('\')
+}
+
+function Get-FindingRegistryPath {
+    param(
+        [Parameter(Mandatory = $true)]$Finding
+    )
+
+    $data = $Finding.Data
+    switch ($Finding.Cause) {
+        'DriverServiceKey' { return $data.ServicePath }
+        'DriverStart' { return $data.ServicePath }
+        'DriverStartOverride' { return $data.OverridePath }
+        'ClassFilter' { return $data.ClassPath }
+        'DeviceInstanceFilter' { return $data.RegistryPath }
+        'AcpiEnumMapping' { return $data.TargetPath }
+        'SanPolicy' { return $data.RegistryPath }
+        default { throw "No registry path is known for cause '$($Finding.Cause)'." }
+    }
+}
+
+function Save-RegistryKeyState {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $subKey = ConvertTo-HklmSubKeyPath -Path $Path
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($subKey, $false)
+    if ($null -eq $key) {
+        return [PSCustomObject]@{ Path = $Path; SubKey = $subKey; Existed = $false; Values = @() }
+    }
+
+    try {
+        $values = foreach ($name in $key.GetValueNames()) {
+            [PSCustomObject]@{
+                Name  = $name
+                Kind  = $key.GetValueKind($name)
+                # Raw value, so REG_EXPAND_SZ is written back unexpanded.
+                Value = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            }
+        }
+        return [PSCustomObject]@{ Path = $Path; SubKey = $subKey; Existed = $true; Values = @($values) }
+    }
+    finally {
+        $key.Close()
+    }
+}
+
+function Restore-RegistryKeyState {
+    param(
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    [void](Assert-OfflineTarget -Path $State.Path -Action 'roll back')
+    $hklm = [Microsoft.Win32.Registry]::LocalMachine
+    if (-not $State.Existed) {
+        if ($null -ne ($probe = $hklm.OpenSubKey($State.SubKey, $false))) {
+            $probe.Close()
+            $hklm.DeleteSubKeyTree($State.SubKey, $false)
+        }
+        return
+    }
+
+    $key = $hklm.CreateSubKey($State.SubKey)
+    try {
+        $keep = @($State.Values | ForEach-Object { $_.Name })
+        foreach ($name in @($key.GetValueNames())) {
+            if ($name -notin $keep) { $key.DeleteValue($name, $false) }
+        }
+        foreach ($value in @($State.Values)) {
+            $key.SetValue($value.Name, $value.Value, $value.Kind)
+        }
+    }
+    finally {
+        $key.Close()
+    }
+}
+
 function Repair-Finding {
     param(
         [Parameter(Mandatory = $true)]$Finding,
@@ -500,14 +587,31 @@ try {
         $failed = [System.Collections.Generic.List[string]]::new()
 
         foreach ($finding in $repairable) {
+            # Snapshot the one key this repair touches, so a repair that fails halfway does not leave
+            # a partially written key behind for the next boot.
+            $snapshot = $null
             try {
+                $snapshot = Save-RegistryKeyState -Path (Get-FindingRegistryPath -Finding $finding)
                 Repair-Finding -Finding $finding -SystemRoot $systemRoot
                 $finding.Repaired = $true
                 $repaired++
             }
             catch {
-                [void]$failed.Add("$($finding.Item): $($_.Exception.Message)")
-                Add-OfflineRepairLog -Level Warning -Message "Could not repair $($finding.Item): $($_.Exception.Message)"
+                $reason = $_.Exception.Message
+                $rollback = if ($null -eq $snapshot) {
+                    'nothing was changed'
+                }
+                else {
+                    try {
+                        Restore-RegistryKeyState -State $snapshot
+                        if ($snapshot.Existed) { "rolled back $($snapshot.SubKey)" } else { "removed the partially created $($snapshot.SubKey)" }
+                    }
+                    catch {
+                        "ROLLBACK FAILED for $($snapshot.SubKey) ($($_.Exception.Message)); restore it from the SYSTEM hive backup"
+                    }
+                }
+                [void]$failed.Add("$($finding.Item): $reason ($rollback)")
+                Add-OfflineRepairLog -Level Warning -Message "Could not repair $($finding.Item): $reason. Rollback: $rollback"
             }
         }
 
