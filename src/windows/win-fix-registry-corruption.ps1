@@ -17,15 +17,19 @@
 #        is recovered by log replay and correctly reported as healthy, and the file on the offline
 #        disk is never modified by the check.
 #     5. chkreg.exe reports repairable structural damage in a hive that still loads.
+#     6. SAM or SECURITY is structurally sound but has lost the keys the account database cannot
+#        start without, such as SAM\Domains\Builtin or Policy\PolEKList. Windows stops at boot
+#        with 0xC00002E3 STATUS_SAM_INIT_FAILURE, and chkreg cannot bring the keys back.
 #
 #   Repair escalates only as far as it needs to, per hive:
-#     a. chkreg.exe /R /C on a scratch copy. The result must load through reg.exe before it is
-#        allowed anywhere near the disk, so a failed repair can never replace a working hive.
+#     a. chkreg.exe /R /C on a scratch copy. The result must load, pass a fresh chkreg check and,
+#        for SAM and SECURITY, still hold the keys listed in item 6 before it is allowed anywhere
+#        near the disk, so a failed or lossy repair can never replace a working hive.
 #     b. Restore from Windows\System32\Config\RegBack, only for the hives chkreg could not repair
 #        and only when allowRegBack=true is passed. The RegBack set is validated first: every
-#        candidate must load, SYSTEM and SOFTWARE must both be present, SAM and SECURITY are
-#        restored only as a pair, and any hive whose timestamp is out of step with the core set
-#        is excluded rather than mixed in.
+#        candidate must load and pass the same content check, SYSTEM and SOFTWARE must both be
+#        present, SAM and SECURITY are restored only as a pair, and any hive whose timestamp is
+#        out of step with the core set is excluded rather than mixed in.
 #
 #   The original file is copied next to itself before any replacement, and a restore that fails
 #   part way through rolls every hive it touched back to the file it started with.
@@ -76,7 +80,9 @@
 #
 #   A hive that is structurally sound but semantically wrong is a different problem. A missing
 #   Winlogon or Session Manager key belongs to win-fix-logon-subsystem, and boot storage driver
-#   settings belong to win-fix-inaccessible-boot-device.
+#   settings belong to win-fix-inaccessible-boot-device. The account database is the exception:
+#   no other script can rebuild SAM or SECURITY, and the usual way they lose their core keys is a
+#   structural repair that discarded them, so that loss is treated as corruption here.
 #
 #   Only hives that are actually damaged are repaired or restored. A RegBack copy is always
 #   older than the file it replaces, so restoring a healthy hive would silently revert working
@@ -271,6 +277,179 @@ function Invoke-ChkReg {
     return $result
 }
 
+function Get-HiveRequiredContent {
+    <#
+    .SYNOPSIS
+        Returns the keys and values a hive cannot work without, as 'key' or 'key|value' strings.
+
+    .DESCRIPTION
+        A structural repair can succeed by discarding the cells it cannot trust, so chkreg and
+        offreg both accept a SAM that has lost its whole Builtin domain. Measured on a Windows
+        Server 2019 disk: chkreg /R returned exit 0 for a damaged SAM, the result loaded and
+        passed a fresh chkreg check, and the VM then stopped at boot with 0xC00002E3
+        STATUS_SAM_INIT_FAILURE because SAM\Domains\Builtin was gone.
+
+        Only the account database is listed, because it is the one place where losing a key is
+        fatal to the boot and no other script can rebuild it. Every entry was checked present on
+        healthy Windows Server 2016, 2019, 2022 and 2025 installations. The list is deliberately
+        short: a false positive sends a working hive down the RegBack path.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$HiveName
+    )
+
+    switch ($HiveName.ToUpperInvariant()) {
+        'SAM' {
+            return @(
+                'SAM\Domains\Account|F'
+                'SAM\Domains\Account|V'
+                'SAM\Domains\Account\Users'
+                'SAM\Domains\Account\Users\Names'
+                'SAM\Domains\Builtin|F'
+                'SAM\Domains\Builtin|V'
+                'SAM\Domains\Builtin\Aliases'
+                'SAM\Domains\Builtin\Aliases\00000220'
+            )
+        }
+        'SECURITY' {
+            return @(
+                'Policy\PolEKList'
+                'Policy\PolAcDmS'
+                'Policy\PolPrDmS'
+                'Policy\PolRevision'
+                'Policy\Secrets'
+            )
+        }
+        default { return @() }
+    }
+}
+
+function Test-HiveContentIntact {
+    <#
+    .SYNOPSIS
+        Checks that a hive file still holds the keys and values listed by Get-HiveRequiredContent.
+
+    .DESCRIPTION
+        Opens the file read-only through offreg.dll, like Test-OfflineHiveFile, so nothing is
+        mounted and the file is never written. A hive with no required content always passes.
+        An offreg error other than "not found" is thrown, so the caller decides whether an
+        unreadable hive counts as damaged.
+
+    .OUTPUTS
+        PSCustomObject with IsIntact and Missing.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$HiveName,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $required = @(Get-HiveRequiredContent -HiveName $HiveName)
+    if ($required.Count -eq 0) { return [PSCustomObject]@{ IsIntact = $true; Missing = @() } }
+
+    if (-not ('RslRegistryCorruption.HiveContentProbe' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace RslRegistryCorruption
+{
+    public static class HiveContentProbe
+    {
+        private const int ErrorFileNotFound = 2;
+        private const int ErrorPathNotFound = 3;
+        private const int ErrorMoreData = 234;
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int OROpenHive(string path, out IntPtr hive);
+
+        [DllImport("offreg.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORCloseHive(IntPtr hive);
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int OROpenKey(IntPtr parent, string subKey, out IntPtr key);
+
+        [DllImport("offreg.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORCloseKey(IntPtr key);
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORGetValue(IntPtr hive, string subKey, string name,
+            out uint type, IntPtr data, ref uint size);
+
+        // Each item is "key" or "key|value". Returns the items that are absent.
+        public static string[] FindMissing(string path, string[] items)
+        {
+            IntPtr hive;
+            int status = OROpenHive(path, out hive);
+            if (status != 0) { throw new Win32Exception(status); }
+
+            List<string> missing = new List<string>();
+            try
+            {
+                foreach (string item in items)
+                {
+                    int separator = item.IndexOf('|');
+                    if (separator < 0)
+                    {
+                        IntPtr key;
+                        status = OROpenKey(hive, item, out key);
+                        if (status == 0) { ORCloseKey(key); continue; }
+                    }
+                    else
+                    {
+                        uint type;
+                        uint size = 0;
+                        status = ORGetValue(hive, item.Substring(0, separator), item.Substring(separator + 1),
+                            out type, IntPtr.Zero, ref size);
+                        if (status == 0 || status == ErrorMoreData) { continue; }
+                    }
+
+                    if (status == ErrorFileNotFound || status == ErrorPathNotFound) { missing.Add(item); continue; }
+                    throw new Win32Exception(status);
+                }
+            }
+            finally
+            {
+                ORCloseHive(hive);
+            }
+
+            return missing.ToArray();
+        }
+    }
+}
+'@
+    }
+
+    $missing = @([RslRegistryCorruption.HiveContentProbe]::FindMissing($Path, [string[]]$required))
+    return [PSCustomObject]@{ IsIntact = ($missing.Count -eq 0); Missing = $missing }
+}
+
+function Get-HiveContentLossText {
+    <#
+    .SYNOPSIS
+        Describes a failed content check, or returns an empty string when the hive is intact.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$HiveName,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    try {
+        $content = Test-HiveContentIntact -HiveName $HiveName -Path $Path
+    }
+    catch {
+        return "its required keys could not be read ($($_.Exception.Message))"
+    }
+    if ($content.IsIntact) { return '' }
+    return "it is missing $(@($content.Missing) -join ', ')"
+}
+
 function Resolve-RegBackSource {
     <#
     .SYNOPSIS
@@ -306,10 +485,16 @@ function Resolve-RegBackSource {
 
     $result = [PSCustomObject]@{ IsUsable = $false; Path = $SourcePath; Reconciled = $false; Reason = '' }
     $canUseChkReg = ($ChkRegPath -and $ScratchDir)
+    $hiveName = Split-Path -Path $SourcePath -Leaf
 
     $validation = Test-OfflineHiveFile -Path $SourcePath
     if ($validation.IsValid) {
         if (-not $canUseChkReg) {
+            $loss = Get-HiveContentLossText -HiveName $hiveName -Path $SourcePath
+            if ($loss) {
+                $result.Reason = "The backup loads but $loss."
+                return $result
+            }
             $result.IsUsable = $true
             return $result
         }
@@ -318,6 +503,12 @@ function Resolve-RegBackSource {
         # chkreg before it is treated as a usable source.
         $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-check') -Repair $false
         if (-not $check.FoundProblem) {
+            # Recovering a structurally sound backup with chkreg cannot bring lost keys back.
+            $loss = Get-HiveContentLossText -HiveName $hiveName -Path $SourcePath
+            if ($loss) {
+                $result.Reason = "The backup validates but $loss."
+                return $result
+            }
             $result.IsUsable = $true
             return $result
         }
@@ -344,6 +535,12 @@ function Resolve-RegBackSource {
     $verify = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $fix.RepairedPath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-verify') -Repair $false
     if ($verify.FoundProblem) {
         $result.Reason = "$($result.Reason) The recovered copy still fails chkreg (exit $($verify.ExitCode))."
+        return $result
+    }
+
+    $loss = Get-HiveContentLossText -HiveName $hiveName -Path $fix.RepairedPath
+    if ($loss) {
+        $result.Reason = "$($result.Reason) The recovered copy validates but $loss."
         return $result
     }
 
@@ -609,15 +806,33 @@ function Get-AllFinding {
         if ($validation.IsValid) {
             Add-OfflineRepairLog -Message "$($spec.Name): opens with offreg ($($validation.Size) bytes)."
 
+            $structureDamaged = $false
             if ($ChkRegPath) {
                 $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $path -ScratchDir $ScratchDir -Repair $false
                 if ($check.FoundProblem) {
+                    $structureDamaged = $true
                     [void]$findings.Add((New-Finding -Cause 'HiveDamaged' -Item $spec.Name `
                                 -Message "the $($spec.Name) hive still loads but chkreg reports repairable structural damage, which degrades $($spec.Description) and can bugcheck later" `
                                 -Data ([PSCustomObject]@{ Path = $path; Spec = $spec; ChkRegOutput = $check.Output })))
                 }
                 else {
                     Add-OfflineRepairLog -Message "$($spec.Name): chkreg found no structural damage."
+                }
+            }
+
+            # A structurally clean hive can still have lost the keys it exists to hold, typically
+            # after an earlier repair discarded them. Damaged hives are covered by the repair gate.
+            if (-not $structureDamaged) {
+                try {
+                    $content = Test-HiveContentIntact -HiveName $spec.Name -Path $path
+                    if (-not $content.IsIntact) {
+                        [void]$findings.Add((New-Finding -Cause 'HiveContentLost' -Item $spec.Name `
+                                    -Message "the $($spec.Name) hive loads but is missing $(@($content.Missing) -join ', '), so Windows cannot initialize its $($spec.Description) and stops at boot" `
+                                    -Data ([PSCustomObject]@{ Path = $path; Spec = $spec; Missing = $content.Missing })))
+                    }
+                }
+                catch {
+                    Add-OfflineRepairLog -Message "$($spec.Name): the required-content check could not run ($($_.Exception.Message)), so it was skipped."
                 }
             }
             continue
@@ -687,6 +902,15 @@ function Repair-HiveInPlace {
     $recheck = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $repair.RepairedPath -ScratchDir (Join-Path $ScratchDir 'verify') -Repair $false
     if ($recheck.FoundProblem) {
         Add-OfflineRepairLog -Level $failLevel -Message "$($Finding.Item): the chkreg output still fails validation (exit $($recheck.ExitCode)), so the file on disk was left alone."
+        return $false
+    }
+
+    # chkreg reaches a clean structure by discarding what it cannot trust, which can include the
+    # keys the hive exists to hold. A SAM repaired that way passes both checks above and still
+    # stops the boot with STATUS_SAM_INIT_FAILURE.
+    $loss = Get-HiveContentLossText -HiveName $Finding.Item -Path $repair.RepairedPath
+    if ($loss) {
+        Add-OfflineRepairLog -Level $failLevel -Message "$($Finding.Item): the chkreg output validates but $loss, so the file on disk was left alone."
         return $false
     }
 
@@ -827,6 +1051,9 @@ try {
     $findings = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
     Write-OperatorLog
 
+    # chkreg works on structure, so it has nothing to offer a missing file or a hive whose
+    # structure is sound but whose required keys are gone.
+    $notRepairableInPlace = @('HiveMissing', 'HiveContentLost')
     # Per finding detail goes to the detail log; the repair narration below would push it
     # out of the returned log's 4096 character tail anyway. The authoritative list is
     # printed next to the final summary.
@@ -846,7 +1073,7 @@ try {
         # three repairs where the repair run could only deliver one, so the label is now earned.
         foreach ($finding in $findings) {
             $finding.Repairable = $false
-            if ($chkRegPath -and $finding.Cause -ne 'HiveMissing') {
+            if ($chkRegPath -and $finding.Cause -notin $notRepairableInPlace) {
                 try {
                     $finding.Repairable = Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir -TestOnly
                 }
@@ -882,7 +1109,7 @@ try {
     $needRegBack = [System.Collections.Generic.List[string]]::new()
 
     foreach ($finding in $findings) {
-        if ($chkRegPath -and $finding.Cause -ne 'HiveMissing') {
+        if ($chkRegPath -and $finding.Cause -notin $notRepairableInPlace) {
             # A failure repairing one hive must not abandon the others: it falls through to the
             # RegBack path for this hive and the run carries on.
             $inPlace = $false
