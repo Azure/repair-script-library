@@ -46,7 +46,9 @@
 #   domain joined VM the machine account password, back to the time of the backup. RegBack is
 #   therefore a last resort the operator opts into: when the periodic backup was enabled and
 #   RegBack holds a consistent set that covers the hives still damaged, the script says so and
-#   prints the command to opt in. In every other case it is skipped without comment.
+#   prints the command to opt in. In every other case it is skipped without comment. When the
+#   operator does opt in on an installation where the periodic backup was not enabled, the run
+#   warns that RegBack was not being refreshed and states the date of any set it restores.
 #
 # .PARAMETER hive
 #   Limit the run to a single hive: SYSTEM, SOFTWARE, SAM, SECURITY, DEFAULT or COMPONENTS.
@@ -94,6 +96,8 @@
 #
 #########################################################################################################
 
+# 'true'/'false' strings rather than [switch]: az vm repair passes --parameters name=value as
+# "-name value", which a [switch] would not bind correctly. See .NOTES.
 Param(
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$detectOnly = 'false',
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$allowRegBack = 'false',
@@ -911,12 +915,24 @@ try {
             Write-OperatorLog
         }
         else {
+            # The operator opted in, so a set left over from before the periodic backup was
+            # disabled is still used if it validates, but they are told it was not being refreshed.
+            $isRegBackMaintained = Test-RegBackMaintained -ConfigPath $configPath
             $plan = Get-RegBackPlan -ConfigPath $configPath -ChkRegPath $chkRegPath -ScratchDir $scratchDir
 
             foreach ($item in @($plan.Excluded)) {
                 Add-OfflineRepairLog -Message "RegBack excluded $($item.Name): $($item.Reason)"
             }
             Write-OperatorLog
+
+            if (-not $isRegBackMaintained) {
+                $staleNote = 'The periodic registry backup (EnablePeriodicBackup) was not enabled on this installation, so RegBack was not being refreshed.'
+                if ($plan.CanRestore) {
+                    $newest = (@($plan.Hives.WrittenUtc) | Sort-Object -Descending | Select-Object -First 1)
+                    $staleNote += " The usable set was written $($newest.ToString('yyyy-MM-dd HH:mm')) UTC and is restored because allowRegBack=true was passed."
+                }
+                Log-Warning $staleNote | Tee-Object -FilePath $logFile -Append
+            }
 
             if (-not $plan.CanRestore) {
                 Log-Warning "RegBack cannot be used: $($plan.Reason)" | Tee-Object -FilePath $logFile -Append
