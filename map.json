@@ -80,6 +80,11 @@
 		"description" : "Finds the driver that Code Integrity is blocking and disables that one driver, instead of turning off Memory Integrity or Credential Guard. Uses the offline Code Integrity event log to name the culprit and a portable executable scan for writable and executable sections as corroboration. Only a refusal from the last 30 days, naming a third-party driver whose image can actually be checked on the disk, authorises a change; stale, undated or unreadable evidence is reported for a decision instead. The offline Secure Boot state, read from the Measured Boot log, and any testsigning or nointegritychecks override are reported as context only: measurement shows the boot manager drops those overrides and the guest still boots, so they are not treated as a fault. A protection being enabled is never treated as a fault: nothing is changed without evidence that it broke this VM. Boot-critical and Azure platform drivers are reported, never disabled. Pass disableProtection=true only as a last resort. NOTE: use option --run-on-repair."
 	},
 	{
+		"id" : "win-fix-secure-boot",
+		"path" : "src/windows/win-fix-secure-boot.ps1",
+		"description" : "Repairs the signed EFI boot chain a Generation 2 VM starts through, for a loader failure such as 0xc0430001 that leaves no event log because nothing got far enough to write one. Integrity is decided by each file's digital signature, the same evidence the firmware and the boot manager themselves use, and never by comparing it against the component store. Repairs a boot manager that is missing from the EFI System Partition or whose signature no longer verifies, and a corrupt boot chain file with a targeted sfc against that one file. A newer boot manager installed by Secure Boot servicing is not treated as stale. A file the rescue VM merely does not trust is reported and left alone. Pass detectOnly=true to report only, revert=true to put back every file a previous run replaced, or windowsDrive to skip discovery. Never runs a full scan and never takes a file from another build. Gen2 only. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-fix-rdp-connectivity",
 		"path" : "src/windows/win-fix-rdp-connectivity.ps1",
 		"description" : "Restores Remote Desktop on a VM that boots and answers on the network but refuses every RDP connection. Repairs fDenyTSConnections on both the Terminal Server key and the Group Policy copy that overrides it - including the value being missing altogether, which stops the listener binding at all and is easily read as a healthy machine because nothing is set to deny anything - Remote Desktop and the supporting logon services the Azure guidance requires left disabled, listener values outside their documented range, a certificate pinned to the listener, which the Azure guidance removes so Windows generates a fresh self-signed one, and TLS 1.2 explicitly disabled in SCHANNEL. Every value written is the one specified by \"Prepare a Windows VHD to upload to Azure\", so the VM comes back configured the way Azure supports rather than reset to a Windows default. Only evidence that RDP is actually prevented triggers a repair, so a healthy VM produces no findings and nothing is written. Network and firewall services are reported with the script that owns them rather than changed here. NLA and the listener port are never touched unless asked for by name, with disableNla=true or resetListenerPort=true. The machine-wide SSL cipher suite policy is removed on its own only when it is present but lists no suites at all, which leaves the handshake nothing to agree on and is a fault in itself; a policy value that cannot be read is reported rather than assumed harmless; a policy that does list suites is a deliberate choice and is only removed with clearCipherSuitePolicy=true. The CredSSP encryption oracle is never weakened at all. Pass detectOnly=true to report only, or applyAzureBaseline=true to also apply the documented keep-alive, reconnect and listener values, which creates the Terminal Services Group Policy key on a VM that has none; the baseline is skipped, and reported, when the Terminal Server key or the RDP-Tcp listener key is missing, because that is a damaged installation rather than a machine to tune. NOTE: use option --run-on-repair."
@@ -155,9 +160,14 @@
 		"description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again. Clears the transactional registry logs only by default; pass scope=Config, scope=SMI or scope=All to widen that, force=true to clear without local ERROR_LOG_FULL evidence, detectOnly=true to report only, or revert=true to restore the files. NOTE: use option --run-on-repair."
 	},
 	{
+		"id": "win-fix-bcd",
+		"path": "src/windows/win-fix-bcd.ps1",
+		"description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC000000F, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot. Pass detectOnly=true to report only, revert=true to restore the previous store, or rebuild=true to force a full bcdboot rebuild instead of a targeted repair. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
-		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Makes no changes. NOTE: use option --run-on-repair."
+		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the Hyper-V generation, stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Generation 1 installations return GEN1_TO_GEN2_CONVERSION_REQUIRED. Makes no changes. NOTE: use option --run-on-repair."
 	},
 	{
 		"id": "linux-detect-nvme-readiness",
@@ -168,5 +178,10 @@
 		"id": "win-enable-nvme-boot-driver",
 		"path": "src/windows/win-enable-nvme-boot-driver.ps1",
 		"description": "Enables the Windows inbox stornvme boot-start driver on the offline OS disk of a VM that no longer boots after switching to an NVMe disk controller. Mode=Report (default) is read-only; Mode=Repair backs up, writes and verifies; Mode=Rollback restores the backup emitted by Repair. NOTE: use option --run-on-repair."
+	},
+	{
+		"id" : "win-fix-inaccessible-boot-device",
+		"path" : "src/windows/win-fix-inaccessible-boot-device.ps1",
+		"description" : "Repairs the offline registry causes of stop error 0x7B INACCESSIBLE_BOOT_DEVICE: boot storage driver Start and StartOverride values, missing boot storage service keys, dangling or third-party storage class filters, boot-critical PCI/VMBus device instance filters, missing Hyper-V ACPI enumeration keys, and a SAN policy that keeps the disk offline. Detects all causes and changes only what is actually wrong. Pass detectOnly=true to report only, or strictFilters=true to also remove Microsoft-signed class filters that are not part of the default set; by default only dangling and third-party entries are removed. NOTE: use option --run-on-repair."
 	}
 ]
