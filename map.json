@@ -150,6 +150,11 @@
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
 	},
 	{
+		"id": "win-fix-third-party-drivers",
+		"path": "src/windows/win-fix-third-party-drivers.ps1",
+		"description": "Disables third party kernel drivers that stop a VM booting, refusing to touch any driver on the storage, network or boot path. Pass detectOnly=true to report only, driverName to target a single driver, revert=true to restore what a previous run changed, or disableDriverVerifier=true to also clear Driver Verifier. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-fix-transaction-logs",
 		"path": "src/windows/win-fix-transaction-logs.ps1",
 		"description": "Clears exhausted transactional registry logs so servicing that fails with ERROR_LOG_FULL 0x800719e4 can run again. Clears the transactional registry logs only by default; pass scope=Config, scope=SMI or scope=All to widen that, force=true to clear without local ERROR_LOG_FULL evidence, detectOnly=true to report only, or revert=true to restore the files. NOTE: use option --run-on-repair."
