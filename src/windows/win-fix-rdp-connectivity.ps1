@@ -39,24 +39,24 @@
 #        everything. Both are checked and both are repaired; repairing one and leaving the other
 #        produces a VM that is exactly as unreachable and a log that claims success.
 #
-#     2. A required service disabled (Start=4). The document lists the services that must be running
-#        for a VM to be reachable, with the startup type each one needs, and a disabled service
-#        cannot start whatever else is correct. Only Start=4 is treated as evidence, so a service
-#        deliberately left demand-started is never "corrected" into something else.
+#     2. A Remote Desktop service disabled (Start=4). TermService, SessionEnv and UmRdpService are
+#        the listener path, and a disabled one cannot start whatever else is correct. Only Start=4
+#        is treated as evidence, so a service deliberately left demand-started is never "corrected"
+#        into something else. Netlogon, Netman and RemoteRegistry are also listed by the document,
+#        but none of them is in the listener path - local-account RDP does not need Netlogon - so a
+#        disabled one is reported and only restored under -applyAzureBaseline.
 #
 #     3. An out-of-range SecurityLayer, UserAuthentication or MinEncryptionLevel on the RDP-Tcp
 #        listener. Windows does not clamp these - a value outside the documented set leaves the
 #        listener unable to agree a security layer with any client, which reaches the user as an
 #        immediate disconnect with no useful error.
 #
-#     4. A certificate pinned to the listener, or TLS 1.2 explicitly disabled in SCHANNEL. Step 8 of
-#        the document removes SSLCertificateSHA1Hash for exactly this reason: if the pinned
-#        certificate's private key no longer resolves, the handshake fails before authentication and
-#        the client reports a generic internal error. Removing the pin lets Windows generate a fresh
-#        self-signed listener certificate on the next start. TLS 1.2 is not in the document, but RDP
-#        negotiates over TLS and a hardening script that disabled 1.2 alongside 1.0 and 1.1 leaves
-#        the listener with nothing to offer; enabling it is a repair rather than a downgrade, and
-#        1.0 and 1.1 are not touched either way.
+#     4. TLS 1.2 explicitly disabled for the SCHANNEL Server side. TLS 1.2 is not in the document,
+#        but the RDP listener negotiates over TLS as a server, and a hardening script that disabled
+#        1.2 alongside 1.0 and 1.1 leaves it with nothing to offer; enabling it is a repair rather
+#        than a downgrade, and 1.0 and 1.1 are not touched either way. Only the Server side is
+#        read: the Client side governs outbound connections this VM makes, not the listener, so a
+#        Client-only setting is deliberate configuration and is left alone.
 #
 #   Faults that belong to another script are reported with their owner named rather than repaired
 #   here, so two scripts never write the same value. The owner is named as a pointer to the scenario
@@ -68,7 +68,7 @@
 #     - a listener certificate that is present but broken, and its private key permissions
 #                                                 -> win-fix-rdp-certificate
 #
-#   Three things are never done unless asked for by name, because each trades away security or
+#   Four things are never done unless asked for by name, because each trades away security or
 #   working configuration to gain access, and that is an operator's decision rather than a script's:
 #
 #     - NLA is only turned off with -disableNla. The document configures UserAuthentication=1, so
@@ -85,15 +85,15 @@
 #       present on a healthy Azure image, carrying the platform's intended cipher order, so deleting
 #       it on sight would strip working configuration off every machine this ran against. Only an
 #       EMPTY suite list is treated as a fault, because that genuinely leaves nothing to negotiate.
-#
-#   A certificate pinned to the listener (SSLCertificateSHA1Hash) is removed when it is present.
-#   Windows does not write that value for the self-signed certificate it generates on its own, so
-#   its presence means something deliberately pinned a specific certificate. Measured: absent on a
-#   clean Windows Server 2019 marketplace image, and absent on a running Windows 11 host that was
-#   serving RDP over TLS with SecurityLayer=2. Removing it therefore does not disturb a machine
-#   that never pinned one. Note this script cannot resolve the pinned certificate's private key
-#   offline - it removes the pin rather than proving the key is gone - so the value is restored
-#   from the hive backup if the pin turns out to have been wanted.
+#     - A certificate pinned to the listener (SSLCertificateSHA1Hash) is only removed with
+#       -removePinnedCertificate. Step 8 of the document removes it because a pin whose private key
+#       no longer resolves fails the handshake before authentication, and removing it lets Windows
+#       generate a fresh self-signed listener certificate on the next start. But a pin is also how
+#       a valid custom certificate is configured, and this script cannot resolve the certificate's
+#       private key offline to tell the two apart, so by default the pin is reported, not removed.
+#       Windows does not write the value for its own self-signed certificate - measured absent on a
+#       clean Windows Server 2019 marketplace image and on a running Windows 11 host serving RDP over
+#       TLS with SecurityLayer=2 - so a machine that never pinned one is never reported.
 #
 #   AllowEncryptionOracle is not written by this script under any parameter. Setting it to 2 makes
 #   CredSSP accept the CVE-2018-0886 downgrade again, and a repair script is not the place to
@@ -136,6 +136,8 @@
 #   RDP-Tcp listener key is missing: that is a damaged installation rather than a machine to tune,
 #   and the baseline would be writing Remote Desktop settings - including a Group Policy key created
 #   from nothing - onto a machine that has no Remote Desktop configuration.
+#   Also restores Netlogon, Netman and RemoteRegistry to their documented startup type when one of
+#   them is disabled; without this they are reported only.
 #   Defaults to "false" - see the note above.
 #
 # .PARAMETER disableNla
@@ -153,6 +155,13 @@
 #   policy is present and correct on a healthy Azure VM. Pass this only when the configured suite
 #   list is known to exclude everything the RDP listener can offer.
 #
+# .PARAMETER removePinnedCertificate
+#   "true" to remove a certificate pinned to the listener (SSLCertificateSHA1Hash), so Windows
+#   generates a fresh self-signed listener certificate on the next start. Defaults to "false",
+#   because a pin is also how a valid custom certificate is configured. Pass this when the pinned
+#   certificate is known to be missing or its private key unusable; win-fix-rdp-certificate covers
+#   a certificate that is present but broken.
+#
 # .EXAMPLE
 #   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters detectOnly=true
 #
@@ -162,8 +171,13 @@
 #   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair
 #
 #   Re-enables remote connections, starts Remote Desktop services that were disabled, brings
-#   out-of-range listener values back into their documented set, removes a pinned listener
-#   certificate and re-enables TLS 1.2 where it was explicitly turned off.
+#   out-of-range listener values back into their documented set and re-enables server-side TLS 1.2
+#   where it was explicitly turned off. A pinned listener certificate is reported, not removed.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters removePinnedCertificate=true
+#
+#   Also removes a listener certificate pin whose certificate is known to be missing or unusable.
 #
 # .EXAMPLE
 #   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters applyAzureBaseline=true resetListenerPort=true
@@ -194,14 +208,11 @@ Param(
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$applyAzureBaseline = 'false',
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$disableNla = 'false',
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$resetListenerPort = 'false',
-    [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$clearCipherSuitePolicy = 'false'
+    [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$clearCipherSuitePolicy = 'false',
+    [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$removePinnedCertificate = 'false'
 )
 
 . .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\OfflineRepairCommon.ps1
-. .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
-. .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
-. .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
 $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
@@ -212,6 +223,7 @@ $wantBaseline = ($applyAzureBaseline -eq 'true')
 $wantDisableNla = ($disableNla -eq 'true')
 $wantResetPort = ($resetListenerPort -eq 'true')
 $wantClearCiphers = ($clearCipherSuitePolicy -eq 'true')
+$wantRemovePin = ($removePinnedCertificate -eq 'true')
 
 $script:TerminalServerSubPath = 'Control\Terminal Server'
 $script:RdpTcpSubPath = 'Control\Terminal Server\WinStations\RDP-Tcp'
@@ -232,21 +244,23 @@ $script:DocUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/pre
 # disabled, produces no finding, and is left alone.
 #
 # Owner names which script restores the value. RDP's own services are repaired here; the rest are
-# reported so that two scripts never write the same value.
+# reported so that two scripts never write the same value. BaselineOnly marks a service this script
+# owns but that is not in the listener path: a disabled one is reported, and only restored under
+# -applyAzureBaseline, so a reachable VM is never changed just because it differs from the document.
 $script:ServiceSpec = @(
-    [PSCustomObject]@{ Name = 'TermService'; DocStart = 3; Owner = $null; Source = 'documented Manual'; Purpose = 'Remote Desktop Services - the listener itself' }
-    [PSCustomObject]@{ Name = 'SessionEnv'; DocStart = 3; Owner = $null; Source = 'not in the document; Windows ships it Manual'; Purpose = 'Remote Desktop Configuration' }
-    [PSCustomObject]@{ Name = 'UmRdpService'; DocStart = 3; Owner = $null; Source = 'not in the document; Windows ships it Manual'; Purpose = 'RD User Mode Port Redirector' }
-    [PSCustomObject]@{ Name = 'Netlogon'; DocStart = 3; Owner = $null; Source = 'documented Manual'; Purpose = 'Net Logon - domain logon for domain-joined VMs' }
-    [PSCustomObject]@{ Name = 'Netman'; DocStart = 3; Owner = $null; Source = 'documented Manual'; Purpose = 'Network Connections' }
-    [PSCustomObject]@{ Name = 'RemoteRegistry'; DocStart = 2; Owner = $null; Source = 'documented Automatic'; Purpose = 'Remote Registry - remote troubleshooting of this VM' }
-    [PSCustomObject]@{ Name = 'nsi'; DocStart = 2; Owner = 'win-fix-network-connectivity'; Source = 'documented Automatic'; Purpose = 'Network Store Interface - TCP/IP does not come up without it' }
-    [PSCustomObject]@{ Name = 'Dhcp'; DocStart = 2; Owner = 'win-fix-network-connectivity'; Source = 'documented Automatic'; Purpose = 'DHCP Client - no lease means no address' }
-    [PSCustomObject]@{ Name = 'Dnscache'; DocStart = 2; Owner = 'win-fix-network-connectivity'; Source = 'documented Automatic'; Purpose = 'DNS Client' }
-    [PSCustomObject]@{ Name = 'iphlpsvc'; DocStart = 2; Owner = 'win-fix-network-connectivity'; Source = 'documented Automatic'; Purpose = 'IP Helper' }
-    [PSCustomObject]@{ Name = 'IKEEXT'; DocStart = 2; Owner = 'win-fix-network-connectivity'; Source = 'documented Automatic, though a healthy image ships it Manual'; Purpose = 'IKE and AuthIP keying modules' }
-    [PSCustomObject]@{ Name = 'BFE'; DocStart = 2; Owner = 'win-fix-firewall-service'; Source = 'documented Automatic'; Purpose = 'Base Filtering Engine - mpssvc cannot start without it' }
-    [PSCustomObject]@{ Name = 'mpssvc'; DocStart = 2; Owner = 'win-fix-firewall-service'; Source = 'documented Automatic'; Purpose = 'Windows Firewall - no inbound rules means no RDP' }
+    [PSCustomObject]@{ Name = 'TermService'; DocStart = 3; Owner = $null; BaselineOnly = $false; Source = 'documented Manual'; Purpose = 'Remote Desktop Services - the listener itself' }
+    [PSCustomObject]@{ Name = 'SessionEnv'; DocStart = 3; Owner = $null; BaselineOnly = $false; Source = 'not in the document; Windows ships it Manual'; Purpose = 'Remote Desktop Configuration' }
+    [PSCustomObject]@{ Name = 'UmRdpService'; DocStart = 3; Owner = $null; BaselineOnly = $false; Source = 'not in the document; Windows ships it Manual'; Purpose = 'RD User Mode Port Redirector' }
+    [PSCustomObject]@{ Name = 'Netlogon'; DocStart = 3; Owner = $null; BaselineOnly = $true; Source = 'documented Manual'; Purpose = 'Net Logon - domain logon for domain-joined VMs' }
+    [PSCustomObject]@{ Name = 'Netman'; DocStart = 3; Owner = $null; BaselineOnly = $true; Source = 'documented Manual'; Purpose = 'Network Connections' }
+    [PSCustomObject]@{ Name = 'RemoteRegistry'; DocStart = 2; Owner = $null; BaselineOnly = $true; Source = 'documented Automatic'; Purpose = 'Remote Registry - remote troubleshooting of this VM' }
+    [PSCustomObject]@{ Name = 'nsi'; DocStart = 2; Owner = 'win-fix-network-connectivity'; BaselineOnly = $false; Source = 'documented Automatic'; Purpose = 'Network Store Interface - TCP/IP does not come up without it' }
+    [PSCustomObject]@{ Name = 'Dhcp'; DocStart = 2; Owner = 'win-fix-network-connectivity'; BaselineOnly = $false; Source = 'documented Automatic'; Purpose = 'DHCP Client - no lease means no address' }
+    [PSCustomObject]@{ Name = 'Dnscache'; DocStart = 2; Owner = 'win-fix-network-connectivity'; BaselineOnly = $false; Source = 'documented Automatic'; Purpose = 'DNS Client' }
+    [PSCustomObject]@{ Name = 'iphlpsvc'; DocStart = 2; Owner = 'win-fix-network-connectivity'; BaselineOnly = $false; Source = 'documented Automatic'; Purpose = 'IP Helper' }
+    [PSCustomObject]@{ Name = 'IKEEXT'; DocStart = 2; Owner = 'win-fix-network-connectivity'; BaselineOnly = $false; Source = 'documented Automatic, though a healthy image ships it Manual'; Purpose = 'IKE and AuthIP keying modules' }
+    [PSCustomObject]@{ Name = 'BFE'; DocStart = 2; Owner = 'win-fix-firewall-service'; BaselineOnly = $false; Source = 'documented Automatic'; Purpose = 'Base Filtering Engine - mpssvc cannot start without it' }
+    [PSCustomObject]@{ Name = 'mpssvc'; DocStart = 2; Owner = 'win-fix-firewall-service'; BaselineOnly = $false; Source = 'documented Automatic'; Purpose = 'Windows Firewall - no inbound rules means no RDP' }
 )
 
 # Documented value sets for the listener. A value outside its set is the fault; a value inside it is
@@ -525,11 +539,15 @@ function Get-SchannelState {
     .DESCRIPTION
         Only TLS 1.2 is examined. A hardening baseline that disables 1.0 and 1.1 and leaves 1.2 on is
         healthy, common and correct, so reporting on those would fire on machines with nothing wrong.
+
+        Only the Server side is read. The RDP listener negotiates TLS as a server; the Client side
+        governs outbound connections this VM makes, so a Client-only setting does not affect RDP
+        and is deliberate configuration that this script must not rewrite.
     #>
     param([Parameter(Mandatory = $true)][string]$SystemRoot)
 
     $base = Join-Path $SystemRoot 'Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2'
-    $sides = foreach ($side in @('Client', 'Server')) {
+    $sides = foreach ($side in @('Server')) {
         $path = Join-Path $base $side
         $enabled = Get-OfflineValueState -Path $path -Name 'Enabled'
         $disabledByDefault = Get-OfflineValueState -Path $path -Name 'DisabledByDefault'
@@ -658,9 +676,14 @@ function Get-AllFinding {
 
         # Step 8 of the Azure guidance. A pin whose private key no longer resolves fails the
         # handshake before authentication; removing it lets Windows generate a fresh certificate.
+        # A pin is also how a valid custom certificate is configured, and the key cannot be resolved
+        # offline to tell the two apart, so the pin is only removed when the operator asks for it.
         if ($TerminalServer.PinnedCertificate -and $TerminalServer.PinnedCertificate.Found) {
-            [void]$findings.Add((New-Finding -Cause 'ListenerCertificatePinned' -Item 'SSLCertificateSHA1Hash' -Hive 'SYSTEM' `
-                        -Message "A certificate is pinned to the listener (SSLCertificateSHA1Hash). If its private key no longer resolves the TLS handshake fails before authentication and the client reports a generic internal error. The Azure guidance removes this value so Windows generates a fresh self-signed listener certificate on the next start. If RDP still fails afterwards, the certificate store or the private key permissions are the problem and win-fix-rdp-certificate owns those."))
+            $pinFinding = New-Finding -Cause 'ListenerCertificatePinned' -Item 'SSLCertificateSHA1Hash' -Hive 'SYSTEM' -Repairable $wantRemovePin `
+                -Message 'A certificate is pinned to the listener (SSLCertificateSHA1Hash). If its private key no longer resolves the TLS handshake fails before authentication and the client reports a generic internal error; if it is a valid custom certificate, it is working configuration.'
+            if ($wantRemovePin) { $pinFinding.Message += ' -removePinnedCertificate was passed, so the pin will be removed and Windows will generate a fresh self-signed listener certificate on the next start. If RDP still fails afterwards, the certificate store or the private key permissions are the problem and win-fix-rdp-certificate owns those.' }
+            else { $pinFinding.Message += ' This script cannot resolve the private key offline, so the pin was reported, not removed. If the certificate is known to be missing or unusable, re-run with -removePinnedCertificate true; win-fix-rdp-certificate covers a certificate that is present but broken.' }
+            [void]$findings.Add($pinFinding)
         }
 
         if ($TerminalServer.Port -and $TerminalServer.Port.Found -and (ConvertTo-DwordInt32 -Value $TerminalServer.Port.Value) -ne $script:StandardRdpPort) {
@@ -760,6 +783,12 @@ function Get-AllFinding {
             [void]$findings.Add((New-Finding -Cause 'DependencyServiceDisabled' -Item $service.Name -Hive 'SYSTEM' -Repairable $false `
                         -Message "$($service.Name) is disabled (Start=4) - $($service.Spec.Purpose). RDP cannot work while it is, but this script does not own the service and did not change it. Its documented start type is Start=$($service.Spec.DocStart) ($($service.Spec.Source)); the $($service.Spec.Owner) scenario covers it where that is available."))
         }
+        elseif ($service.Spec.BaselineOnly -and -not $wantBaseline) {
+            # Documented, but not in the listener path, so its startup type is not evidence that RDP
+            # is broken. Reported, and restored only when the operator asks for the baseline.
+            [void]$findings.Add((New-Finding -Cause 'RdpServiceDisabled' -Item $service.Name -Hive 'SYSTEM' -Repairable $false -Data $service `
+                        -Message "$($service.Name) is disabled (Start=4) - $($service.Spec.Purpose). It is not in the RDP listener path, so it was reported, not changed. Its documented start type is Start=$($service.Spec.DocStart) ($($service.Spec.Source)); re-run with -applyAzureBaseline true to restore it."))
+        }
         else {
             [void]$findings.Add((New-Finding -Cause 'RdpServiceDisabled' -Item $service.Name -Hive 'SYSTEM' -Data $service `
                         -Message "$($service.Name) is disabled (Start=4) - $($service.Spec.Purpose). It will be set to Start=$($service.Spec.DocStart), $($service.Spec.Source)."))
@@ -776,7 +805,7 @@ function Get-AllFinding {
     $disabledSides = @($Schannel.Tls12 | Where-Object { $_.IsDisabled })
     if ($disabledSides.Count -gt 0) {
         [void]$findings.Add((New-Finding -Cause 'Tls12Disabled' -Item 'TLS 1.2' -Hive 'SYSTEM' -Data $disabledSides `
-                    -Message "TLS 1.2 is explicitly disabled for $(@($disabledSides | ForEach-Object { $_.Side }) -join ' and '). RDP negotiates over TLS, so this closes the handshake. It will be enabled; TLS 1.0 and 1.1 are not touched."))
+                    -Message "TLS 1.2 is explicitly disabled for $(@($disabledSides | ForEach-Object { $_.Side }) -join ' and ') - the side the RDP listener negotiates on, so this closes the handshake. The disabling value(s) will be reversed; TLS 1.0 and 1.1 are not touched."))
     }
 
     if ($Schannel.FunctionsUnreadable) {
@@ -800,7 +829,10 @@ function Get-AllFinding {
     # Never discovered. It only exists because the operator asked for it by name.
     if ($wantDisableNla -and $TerminalServer.ListenerPresent) {
         $nla = @($TerminalServer.Listener | Where-Object { $_.Spec.Name -eq 'UserAuthentication' })
-        if ($nla.Count -eq 0 -or -not $nla[0].Found -or (ConvertTo-DwordInt32 -Value $nla[0].Value) -ne 0) {
+        # An unreadable value already raises ListenerValueUnreadable above, and is not overwritten
+        # blind just because the operator asked for NLA off: its current state is unknown.
+        $nlaUnreadable = ($nla.Count -gt 0 -and (Test-ValueUnreadable -State $nla[0]))
+        if (-not $nlaUnreadable -and ($nla.Count -eq 0 -or -not $nla[0].Found -or (ConvertTo-DwordInt32 -Value $nla[0].Value) -ne 0)) {
             [void]$findings.Add((New-Finding -Cause 'NlaDisableRequested' -Item 'UserAuthentication' -Hive 'SYSTEM' `
                         -Message '-disableNla was passed, so Network Level Authentication will be turned off (UserAuthentication=0). The Azure guidance enables NLA, so this is a deliberate deviation from it: it lets a client reach the logon screen before authenticating. Turn it back on once the VM is reachable.'))
         }
@@ -828,11 +860,11 @@ function Set-OfflineRdpDword {
         # Opt in, not opt out. New-Item -Force on every write meant any caller with a wrong or
         # unexpected path silently created a registry key instead of failing, and this script's whole
         # position on missing keys is that it does not fabricate them: TerminalServerKeyMissing and
-        # RdpListenerMissing both refuse to, and report a damaged installation instead. Only the two
-        # callers whose key is legitimately absent on a healthy machine pass this - the Schannel
-        # TLS 1.2 Client/Server subkeys, which Windows does not ship, and the Terminal Services
-        # policy key the baseline writes into. Every other caller writes under a key whose presence
-        # a finding has already established, so for those a missing key is a fault, not a step.
+        #         RdpListenerMissing both refuse to, and report a damaged installation instead. Only the
+                # caller whose key is legitimately absent on a healthy machine passes this - the Azure
+                # baseline writing into the Terminal Services policy key. Every other caller writes under a
+                # key whose presence a finding has already established (the TLS 1.2 repair only reverses a
+                # value it read), so for those a missing key is a fault, not a step.
         [Parameter(Mandatory = $false)][switch]$CreateKey
     )
 
@@ -919,6 +951,7 @@ function Repair-Finding {
         }
 
         '^ListenerCertificatePinned$' {
+            if (-not $wantRemovePin) { return $false }
             $outcome = Invoke-OfflineProtectedValueRemoval -Path $rdpPath -Name 'SSLCertificateSHA1Hash' -StillSet {
                 param($Current)
                 return ($null -ne $Current)
@@ -933,9 +966,16 @@ function Repair-Finding {
 
         '^Tls12Disabled$' {
             $changed = $false
+            # Only the value that actually disables TLS 1.2 is reversed. The key exists (a value was
+            # read from it), and a value that is absent or already permissive is left exactly as found,
+            # so a machine whose only fault is Enabled=0 does not also gain a DisabledByDefault entry.
             foreach ($side in @($Finding.Data)) {
-                if (Set-OfflineRdpDword -Path $side.Path -Name 'Enabled' -NewValue 1 -CreateKey -Message "TLS 1.2 $($side.Side): Enabled -> 1.") { $changed = $true }
-                if (Set-OfflineRdpDword -Path $side.Path -Name 'DisabledByDefault' -NewValue 0 -CreateKey -Message "TLS 1.2 $($side.Side): DisabledByDefault -> 0.") { $changed = $true }
+                if ($side.Enabled.Found -and (ConvertTo-DwordInt32 -Value $side.Enabled.Value) -eq 0) {
+                    if (Set-OfflineRdpDword -Path $side.Path -Name 'Enabled' -NewValue 1 -Message "TLS 1.2 $($side.Side): Enabled 0 -> 1.") { $changed = $true }
+                }
+                if ($side.DisabledByDefault.Found -and (ConvertTo-DwordInt32 -Value $side.DisabledByDefault.Value) -eq 1) {
+                    if (Set-OfflineRdpDword -Path $side.Path -Name 'DisabledByDefault' -NewValue 0 -Message "TLS 1.2 $($side.Side): DisabledByDefault 1 -> 0.") { $changed = $true }
+                }
             }
             return $changed
         }
@@ -991,6 +1031,13 @@ Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly)" | Tee-
 $status = $STATUS_ERROR
 
 try {
+    # Inside the try, per the caller contract in common\helpers\README.md: a helper that fails to
+    # load is caught, logged and returned as an error rather than escaping as a raw exception.
+    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
+    . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
+    . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
+    . .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
+
     :main do {
     $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -1202,10 +1249,26 @@ finally {
     # this they were discarded and only the exception survived. A dependency may have failed to
     # load before either function existed, hence the guards.
     if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
-        Clear-OfflineDriveLetter
+        try {
+            Clear-OfflineDriveLetter
+            if ((Get-Command Get-OfflineAssignedDriveLetter -ErrorAction SilentlyContinue) -and @(Get-OfflineAssignedDriveLetter).Count -gt 0) {
+                $status = $STATUS_ERROR
+                Add-OfflineRepairLog -Level Error -Message 'Temporary drive letters remain assigned. The registry repair may have completed, but cleanup is incomplete; inspect the cleanup diagnostics before swapping the disk back.'
+            }
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Add-OfflineRepairLog -Level Error -Message "Drive-letter cleanup failed: $($_.Exception.Message)"
+        }
     }
     if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        try {
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append -ErrorAction Stop
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Log-Error "Final helper diagnostics could not be written to the detail log: $($_.Exception.Message)"
+        }
     }
 }
 
