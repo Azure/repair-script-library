@@ -22,6 +22,12 @@
 #     holds no filesystem. A new one is created and populated with bcdboot. This is the second
 #     choice: it writes to the partition table, which the sector tier never does.
 #
+#     Identity, Gen2 only. The EFI System Partition is healthy but no longer matches the VM's saved
+#     "Windows Boot Manager" UEFI boot entry. That entry names the partition by its GPT unique GUID
+#     and by its 1-based slot in the GPT entry array, and a Trusted Launch or Confidential VM boots
+#     it only when both match. The entry the firmware used is read from the guest's own measured
+#     boot logs, and the partition's GUID and slot are put back to match it.
+#
 #   Causes detected:
 #     1. The disk carries no system partition at all, and the Windows partition is not itself
 #        bootable. The firmware has nothing to start.
@@ -41,6 +47,12 @@
 #        bootstrap adds this value to every relative read, so the BIOS reads the wrong absolute
 #        sectors. Windows itself ignores the field, which is why chkdsk and sfc come back clean
 #        and the volume mounts perfectly on a rescue VM.
+#    10. Gen2 only: the EFI System Partition's GPT unique GUID is not the one the VM's saved UEFI
+#        boot entry names, typically because the partition was deleted and recreated. The firmware
+#        reports "Unknown Device" without reading a single file from the disk.
+#    11. Gen2 only: the EFI System Partition sits in a different GPT slot than the saved entry
+#        names. Windows rewrites the GPT entry array sorted by start LBA, so a partition recreated
+#        elsewhere on the disk, or a deleted and recreated neighbour, moves it to another slot.
 #
 #   Reported but never repaired here:
 #     - BPB TotalSectors is larger than the partition that contains it. The filesystem believes it
@@ -66,6 +78,9 @@
 #   "Error loading operating system"
 #   Gen2 VMs that boot straight into the UEFI shell or the firmware boot menu because the EFI
 #   System Partition was deleted or left unformatted.
+#   "Unknown Device - The boot loader did not load an operating system" / "Boot loader did not load
+#   an operating system" on a Gen2 Trusted Launch or Confidential VM whose EFI System Partition was
+#   recreated or whose GPT entries were reordered.
 #
 # .PARAMETER detectOnly
 #   "true" to report the findings and make no writes at all. Defaults to "false".
@@ -102,9 +117,17 @@
 #     - The repair is verified by reading the sectors back and running the whole detect phase again.
 #
 #   revert=true writes the backed up sectors back. On a Gen1 disk that also puts back the partition
-#   table as it was, which will remove a system partition this script created. It does not undo a
-#   Gen2 EFI System Partition, because a GPT partition table is not carried in the sectors that are
-#   backed up; the created partition is reported so it can be removed by hand if that is wanted.
+#   table as it was, which will remove a system partition this script created. On a Gen2 disk the
+#   primary and backup GPT (header and entry array) are backed up as well, so revert puts back the
+#   partition table as it was: a GUID or slot change is undone, and an EFI System Partition this
+#   script created disappears from the table. Its data is not wiped, so the space simply reads as
+#   unallocated again.
+#
+#   Measured boot logs. Windows keeps a copy of every boot's TCG event log under
+#   \Windows\Logs\MeasuredBoot, and each one records the UEFI boot variables the firmware used. The
+#   "Windows Boot Manager" entry in those logs is the only offline record of the GUID and slot the
+#   VM's firmware expects. When the logs are missing, or disagree with each other, the identity is
+#   left alone and the reason is reported.
 #
 #   The Active flag is also corrected by boot configuration repair, which sets it on the partition holding the BCD
 #   store. The two agree: this script additionally clears the flag from any other partition, which
@@ -123,6 +146,8 @@
 #
 # .VERSION
 #   v1.0: Initial version.
+#   v1.1: Gen2 EFI System Partition identity: match the GPT unique GUID and GPT slot to the saved
+#         UEFI boot entry recorded in the measured boot logs, and back up and revert the GPT.
 #
 #########################################################################################################
 
@@ -187,6 +212,12 @@ $script:Crc32Mask = [UInt64]4294967295
 $script:Crc32Polynomial = [UInt64]3988292384
 $script:Crc32Table = $null
 
+# Sector 0 as it was before the partition table signature was written back, and where that image was
+# saved. The signature is restored before the Windows volume can even be found, so its backup can
+# only be put next to the other ones (and into the revert manifest) once it can.
+$script:SignatureRepair = $null
+$script:SignatureBackupPath = ''
+
 function New-Finding {
     <#
     .SYNOPSIS
@@ -194,14 +225,17 @@ function New-Finding {
 
     .PARAMETER Tier
         'Sector' when a raw sector write or an Active flag change corrects it, 'Partition' when a
-        new system partition has to be created, 'None' when nothing here can.
+        new system partition has to be created, 'Identity' when the EFI System Partition's GPT GUID
+        or slot has to be put back, 'None' when nothing here can.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Builds an object in memory. Nothing is changed.')]
     param(
         [Parameter(Mandatory = $true)][string]$Cause,
         [Parameter(Mandatory = $true)][string]$Item,
         [Parameter(Mandatory = $true)][string]$Message,
         [Parameter(Mandatory = $false)][bool]$Repairable = $true,
-        [Parameter(Mandatory = $false)][ValidateSet('Sector', 'Partition', 'None')][string]$Tier = 'Sector',
+        [Parameter(Mandatory = $false)][ValidateSet('Sector', 'Partition', 'Identity', 'None')][string]$Tier = 'Sector',
         [Parameter(Mandatory = $false)]$Data = $null
     )
 
@@ -249,7 +283,9 @@ function Read-RawDiskSector {
             $read += $count
         }
         if ($read -lt $Length) { throw "Short read at offset $ByteOffset : got $read of $Length bytes." }
-        return $buffer
+        # The comma keeps the array whole. Unrolled, callers get an object[] and any [byte[]]
+        # parameter they pass it to edits a converted copy, so the edit never reaches the buffer.
+        return , $buffer
     }
     finally {
         if ($stream) { $stream.Dispose() }
@@ -928,9 +964,22 @@ function Get-AllFinding {
     foreach ($finding in (Get-MbrFinding -Offline $Offline -Resolved $resolved -State $state)) { [void]$findings.Add($finding) }
     foreach ($finding in (Get-VbrFinding -Offline $Offline -Resolved $resolved -State $state)) { [void]$findings.Add($finding) }
 
+    $identity = $null
+    if ($Offline.Generation -eq 2) {
+        try {
+            $identity = Get-SavedBootEntry -Offline $Offline
+            Write-EspIdentitySummary -Analysis $identity
+            foreach ($finding in (Get-EspIdentityFinding -Analysis $identity)) { [void]$findings.Add($finding) }
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "Could not compare the EFI System Partition with the saved firmware boot entry: $($_.Exception.Message)"
+        }
+    }
+
     return [PSCustomObject]@{
         Resolved = $resolved
         State    = $state
+        Identity = $identity
         Findings = @($findings)
     }
 }
@@ -943,7 +992,8 @@ function Save-BootSectorBackup {
     .DESCRIPTION
         Written before the disk is taken offline, because the Windows volume has to be mounted to
         write to it. Both files are plain 512 byte images, so they can also be inspected or restored
-        by hand with any hex editor.
+        by hand with any hex editor. On Gen2 both copies of the GPT are saved as well, because the
+        identity repair edits the partition table, and revert=true writes them back.
     #>
     param(
         [Parameter(Mandatory = $true)]$Offline,
@@ -951,9 +1001,12 @@ function Save-BootSectorBackup {
     )
 
     $backup = [PSCustomObject]@{
-        MbrPath   = ''
-        VbrPath   = ''
-        VbrOffset = [UInt64]0
+        MbrPath         = ''
+        VbrPath         = ''
+        VbrOffset       = [UInt64]0
+        GptPrimaryPath  = ''
+        GptBackupPath   = ''
+        GptBackupOffset = [UInt64]0
     }
 
     $prefix = Join-OfflinePath -Root $Offline.WindowsDrive -ChildPath "$scriptName-backup-$scriptStartTime"
@@ -971,6 +1024,25 @@ function Save-BootSectorBackup {
         Add-OfflineRepairLog -Level Info -Message "Backed up the volume boot record at offset $($State.VbrOffset) to $($backup.VbrPath)."
     }
 
+    if ($Offline.Generation -eq 2) {
+        try {
+            $gpt = Get-GptCopy -DiskNumber $Offline.DiskNumber
+            $primary = $gpt.Primary
+            $backup.GptPrimaryPath = "$prefix-gpt-primary.bin"
+            [System.IO.File]::WriteAllBytes($backup.GptPrimaryPath, $primary)
+            $backup.GptBackupPath = "$prefix-gpt-backup.bin"
+            $backup.GptBackupOffset = [UInt64]$gpt.BackupOffset
+            [System.IO.File]::WriteAllBytes($backup.GptBackupPath, $gpt.Backup)
+            Add-OfflineRepairLog -Level Info -Message "Backed up the primary GPT (sectors 0-33) to $($backup.GptPrimaryPath) and the backup GPT at offset $($gpt.BackupOffset) to $($backup.GptBackupPath)."
+        }
+        catch {
+            $backup.GptPrimaryPath = ''
+            $backup.GptBackupPath = ''
+            $backup.GptBackupOffset = [UInt64]0
+            Add-OfflineRepairLog -Level Warning -Message "Could not back up the GPT: $($_.Exception.Message). revert=true will not be able to undo a partition table edit."
+        }
+    }
+
     return $backup
 }
 
@@ -984,6 +1056,8 @@ function Set-DiskOnlineState {
         for the write. Azure data disks can also come back online read only, which is why the read
         only flag is cleared on the way back in.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Internal helper of a non-interactive repair run; the run itself is the confirmed action.')]
     param(
         [Parameter(Mandatory = $true)][int]$DiskNumber,
         [Parameter(Mandatory = $true)][bool]$Online
@@ -1314,6 +1388,8 @@ function Set-GptPartitionUniqueId {
     .OUTPUTS
         $true when both copies were written and read back identical.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Internal helper of a non-interactive repair run; both GPT copies are backed up before it is called.')]
     param(
         [Parameter(Mandatory = $true)][int]$DiskNumber,
         [Parameter(Mandatory = $true)][UInt64]$PartitionOffset,
@@ -1385,8 +1461,9 @@ function Set-GptPartitionUniqueId {
     [Array]::Copy([BitConverter]::GetBytes((Get-Crc32 -Data $backup -Offset $backupHeaderAt -Length $backupHeaderSize)), 0, $backup, $backupHeaderAt + 16, 4)
 
     try {
+        # Sector 0 (the protective MBR) is not touched; only the header and entry array are written.
         Write-RawDiskSector -DiskNumber $DiskNumber -ByteOffset $backupOffset -Data $backup
-        Write-RawDiskSector -DiskNumber $DiskNumber -ByteOffset 0 -Data $primary
+        Write-RawDiskSector -DiskNumber $DiskNumber -ByteOffset 512 -Data ([byte[]]$primary[512..($primary.Length - 1)])
     }
     catch {
         Add-OfflineRepairLog -Level Error -Message "Writing the GPT partition GUID failed: $($_.Exception.Message)"
@@ -1407,7 +1484,18 @@ function Set-GptPartitionUniqueId {
         return $false
     }
 
-    Add-OfflineRepairLog -Level Info -Message "GPT entry $slot on disk $DiskNumber now carries unique GUID $UniqueId in both copies of the partition table."
+    try { $check = Get-GptCopy -DiskNumber $DiskNumber }
+    catch {
+        Add-OfflineRepairLog -Level Error -Message "The GPT of disk $DiskNumber could not be read back after the GUID write: $($_.Exception.Message)"
+        return $false
+    }
+    if (-not ($check.PrimaryCrcOk -and $check.BackupCrcOk -and $check.ArraysMatch)) {
+        Add-OfflineRepairLog -Level Error -Message ("After the GUID write the GPT of disk $DiskNumber does not verify " +
+            "(primary CRC ok=$($check.PrimaryCrcOk), backup CRC ok=$($check.BackupCrcOk), arrays identical=$($check.ArraysMatch)).")
+        return $false
+    }
+
+    Add-OfflineRepairLog -Level Info -Message "GPT slot $($slot + 1) on disk $DiskNumber now carries unique GUID $UniqueId in both copies of the partition table, and both copies pass their CRCs."
     return $true
 }
 
@@ -1504,6 +1592,840 @@ function Get-LargestFreeExtent {
     return $result
 }
 
+function Get-GptHeaderCrc {
+    <#
+    .SYNOPSIS
+        Computes a GPT header CRC32 the way the specification defines it: with its own field as zero.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Data,
+        [Parameter(Mandatory = $true)][int]$HeaderOffset,
+        [Parameter(Mandatory = $true)][int]$HeaderSize
+    )
+
+    $copy = [byte[]]::new($HeaderSize)
+    [Array]::Copy($Data, $HeaderOffset, $copy, 0, $HeaderSize)
+    for ($i = 16; $i -lt 20; $i++) { $copy[$i] = 0 }
+    return (Get-Crc32 -Data $copy -Offset 0 -Length $HeaderSize)
+}
+
+function Update-GptCopyCrc {
+    <#
+    .SYNOPSIS
+        Recomputes the entry array CRC and then the header CRC of one GPT copy held in memory.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Edits a byte array in memory. Nothing is written to disk.')]
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Data,
+        [Parameter(Mandatory = $true)][int]$HeaderOffset,
+        [Parameter(Mandatory = $true)][int]$HeaderSize,
+        [Parameter(Mandatory = $true)][int]$ArrayOffset,
+        [Parameter(Mandatory = $true)][int]$ArrayLength
+    )
+
+    $entriesCrc = Get-Crc32 -Data $Data -Offset $ArrayOffset -Length $ArrayLength
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]$entriesCrc), 0, $Data, $HeaderOffset + 88, 4)
+    for ($i = 16; $i -lt 20; $i++) { $Data[$HeaderOffset + $i] = 0 }
+    $headerCrc = Get-Crc32 -Data $Data -Offset $HeaderOffset -Length $HeaderSize
+    [Array]::Copy([BitConverter]::GetBytes([UInt32]$headerCrc), 0, $Data, $HeaderOffset + 16, 4)
+}
+
+function Get-GptCopy {
+    <#
+    .SYNOPSIS
+        Reads both copies of a disk's GPT, with their CRCs checked and their entry arrays compared.
+
+    .DESCRIPTION
+        The primary copy is the first 34 sectors: protective MBR, header and entry array. The backup
+        copy is read as one block that ends with its header, because a lone sector read in the last
+        few KB of a disk fails while a read that starts further back does not. Read only.
+    #>
+    param([Parameter(Mandatory = $true)][int]$DiskNumber)
+
+    $primary = Read-RawDiskSector -DiskNumber $DiskNumber -ByteOffset 0 -Length (34 * 512)
+    if ([System.Text.Encoding]::ASCII.GetString($primary, 512, 8) -ne 'EFI PART') {
+        throw "Disk $DiskNumber has no primary GPT header."
+    }
+
+    $headerSize = [long][BitConverter]::ToUInt32($primary, 512 + 12)
+    $alternateLba = [long][BitConverter]::ToUInt64($primary, 512 + 32)
+    $entryLba = [long][BitConverter]::ToUInt64($primary, 512 + 72)
+    $entryCount = [long][BitConverter]::ToUInt32($primary, 512 + 80)
+    $entrySize = [long][BitConverter]::ToUInt32($primary, 512 + 84)
+
+    if ($headerSize -lt 92 -or $headerSize -gt 512) { throw "Disk $DiskNumber has a GPT header size of $headerSize bytes, outside 92-512." }
+    if ($entryCount -lt 1 -or $entryCount -gt 1024 -or $entrySize -lt 128 -or $entrySize -gt 1024) {
+        throw "Disk $DiskNumber declares $entryCount GPT entries of $entrySize bytes, which this script does not handle."
+    }
+
+    $arrayLength = $entryCount * $entrySize
+    $primaryArrayOffset = $entryLba * 512
+    if (($arrayLength % 512) -ne 0 -or ($primaryArrayOffset + $arrayLength) -gt $primary.Length) {
+        throw "Disk $DiskNumber keeps its primary GPT entry array outside the first 34 sectors, which this script does not handle."
+    }
+
+    $backupOffset = ($alternateLba * 512) - $arrayLength
+    $backup = Read-RawDiskSector -DiskNumber $DiskNumber -ByteOffset ([UInt64]$backupOffset) -Length ([int]($arrayLength + 512))
+    $backupHeader = [int]$arrayLength
+
+    $backupValid = ([System.Text.Encoding]::ASCII.GetString($backup, $backupHeader, 8) -eq 'EFI PART')
+    if ($backupValid) {
+        $backupValid = (([long][BitConverter]::ToUInt64($backup, $backupHeader + 72) * 512) -eq $backupOffset) -and
+            ([long][BitConverter]::ToUInt32($backup, $backupHeader + 12) -eq $headerSize) -and
+            ([long][BitConverter]::ToUInt32($backup, $backupHeader + 80) -eq $entryCount) -and
+            ([long][BitConverter]::ToUInt32($backup, $backupHeader + 84) -eq $entrySize)
+    }
+
+    $primaryCrcOk = ([BitConverter]::ToUInt32($primary, 512 + 16) -eq (Get-GptHeaderCrc -Data $primary -HeaderOffset 512 -HeaderSize $headerSize)) -and
+        ([BitConverter]::ToUInt32($primary, 512 + 88) -eq (Get-Crc32 -Data $primary -Offset ([int]$primaryArrayOffset) -Length ([int]$arrayLength)))
+
+    $backupCrcOk = $false
+    if ($backupValid) {
+        $backupCrcOk = ([BitConverter]::ToUInt32($backup, $backupHeader + 16) -eq (Get-GptHeaderCrc -Data $backup -HeaderOffset $backupHeader -HeaderSize $headerSize)) -and
+            ([BitConverter]::ToUInt32($backup, $backupHeader + 88) -eq (Get-Crc32 -Data $backup -Offset 0 -Length ([int]$arrayLength)))
+    }
+
+    $arraysMatch = $backupValid
+    if ($arraysMatch) {
+        for ($i = 0; $i -lt $arrayLength; $i++) {
+            if ($primary[$primaryArrayOffset + $i] -ne $backup[$i]) { $arraysMatch = $false; break }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Primary            = $primary
+        PrimaryArrayOffset = [int]$primaryArrayOffset
+        Backup             = $backup
+        BackupOffset       = [UInt64]$backupOffset
+        BackupHeaderOffset = $backupHeader
+        HeaderSize         = [int]$headerSize
+        EntryCount         = [int]$entryCount
+        EntrySize          = [int]$entrySize
+        ArrayLength        = [int]$arrayLength
+        PrimaryCrcOk       = [bool]$primaryCrcOk
+        BackupCrcOk        = [bool]$backupCrcOk
+        ArraysMatch        = [bool]$arraysMatch
+    }
+}
+
+function Get-GptSlotMap {
+    <#
+    .SYNOPSIS
+        Lists the used entries of a GPT copy with their 1-based slot, which is what a UEFI boot entry
+        records as the partition number.
+    #>
+    param([Parameter(Mandatory = $true)]$Copy)
+
+    $slots = [System.Collections.Generic.List[PSCustomObject]]::new()
+    for ($i = 0; $i -lt $Copy.EntryCount; $i++) {
+        $entry = $Copy.PrimaryArrayOffset + ($i * $Copy.EntrySize)
+        $type = ConvertTo-Guid -Data $Copy.Primary -Offset $entry
+        if ($type -eq [Guid]::Empty) { continue }
+
+        [void]$slots.Add([PSCustomObject]@{
+                Slot     = $i + 1
+                Type     = $type
+                Guid     = ConvertTo-Guid -Data $Copy.Primary -Offset ($entry + 16)
+                FirstLba = [long][BitConverter]::ToUInt64($Copy.Primary, $entry + 32)
+                LastLba  = [long][BitConverter]::ToUInt64($Copy.Primary, $entry + 40)
+            })
+    }
+    return @($slots)
+}
+
+function Move-GptEntrySlot {
+    <#
+    .SYNOPSIS
+        Moves the EFI System Partition's GPT entry into another slot of the entry array.
+
+    .DESCRIPTION
+        A UEFI boot entry names its partition by GUID and by 1-based GPT slot, and Azure Gen2 firmware
+        matches both. Windows has no tool that chooses a slot, so the two entries are swapped in place
+        in both copies of the table and every CRC is recomputed. Whatever occupied the target slot
+        takes the ESP's old one; partitions keep their extents, GUIDs and data. Refuses unless both
+        copies pass their CRCs and agree, because rewriting a table that is already inconsistent
+        would pick one of two stories without evidence for either.
+
+    .OUTPUTS
+        'Moved' when the ESP is read back in the target slot with both copies verifying, 'AlreadyThere'
+        when nothing had to change, and an empty string on failure.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Internal repair step. detectOnly=true is the dry run and revert=true restores the GPT backups.')]
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][Guid]$PartitionGuid,
+        [Parameter(Mandatory = $true)][int]$TargetSlot
+    )
+
+    $disk = Get-Disk -Number $DiskNumber -ErrorAction SilentlyContinue
+    if (-not $disk -or "$($disk.PartitionStyle)" -ne 'GPT' -or $disk.IsBoot -or $disk.IsSystem -or $disk.IsReadOnly) {
+        Add-OfflineRepairLog -Level Warning -Message "Disk $DiskNumber is not a writable GPT data disk, so its partition table slots were left alone."
+        return ''
+    }
+
+    try { $copy = Get-GptCopy -DiskNumber $DiskNumber }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "Could not read the GPT of disk ${DiskNumber}: $($_.Exception.Message)"
+        return ''
+    }
+    if (-not ($copy.PrimaryCrcOk -and $copy.BackupCrcOk -and $copy.ArraysMatch)) {
+        Add-OfflineRepairLog -Level Warning -Message ("The primary and backup GPT of disk $DiskNumber do not both pass their CRCs and agree " +
+            "(primary CRC ok=$($copy.PrimaryCrcOk), backup CRC ok=$($copy.BackupCrcOk), arrays identical=$($copy.ArraysMatch)), so the slot was not moved.")
+        return ''
+    }
+
+    $slots = @(Get-GptSlotMap -Copy $copy)
+    $entry = @($slots | Where-Object { $_.Guid -eq $PartitionGuid }) | Select-Object -First 1
+    if (-not $entry -or $entry.Type -ne [Guid]$script:EspGptType) {
+        Add-OfflineRepairLog -Level Warning -Message "Disk $DiskNumber has no EFI System Partition entry with GUID $PartitionGuid, so no slot was moved."
+        return ''
+    }
+    if ($entry.Slot -eq $TargetSlot) {
+        Add-OfflineRepairLog -Level Info -Message "The EFI System Partition is already in GPT slot $TargetSlot."
+        return 'AlreadyThere'
+    }
+    if ($TargetSlot -lt 1 -or $TargetSlot -gt $copy.EntryCount) {
+        Add-OfflineRepairLog -Level Warning -Message "GPT slot $TargetSlot does not exist on disk $DiskNumber, which has $($copy.EntryCount) slots."
+        return ''
+    }
+
+    $occupant = @($slots | Where-Object { $_.Slot -eq $TargetSlot }) | Select-Object -First 1
+    $size = $copy.EntrySize
+    $from = $entry.Slot - 1
+    $to = $TargetSlot - 1
+    $tables = @(
+        @{ Data = $copy.Primary; ArrayOffset = $copy.PrimaryArrayOffset; HeaderOffset = 512 },
+        @{ Data = $copy.Backup; ArrayOffset = 0; HeaderOffset = $copy.BackupHeaderOffset }
+    )
+    foreach ($table in $tables) {
+        $a = $table.ArrayOffset + ($from * $size)
+        $b = $table.ArrayOffset + ($to * $size)
+        $held = [byte[]]::new($size)
+        [Array]::Copy($table.Data, $a, $held, 0, $size)
+        [Array]::Copy($table.Data, $b, $table.Data, $a, $size)
+        [Array]::Copy($held, 0, $table.Data, $b, $size)
+        Update-GptCopyCrc -Data $table.Data -HeaderOffset $table.HeaderOffset -HeaderSize $copy.HeaderSize -ArrayOffset $table.ArrayOffset -ArrayLength $copy.ArrayLength
+    }
+
+    # Verify the edited copies in memory before anything reaches the disk.
+    $primaryArray = $copy.PrimaryArrayOffset
+    $memoryOk = ([BitConverter]::ToUInt32($copy.Primary, 512 + 16) -eq (Get-GptHeaderCrc -Data $copy.Primary -HeaderOffset 512 -HeaderSize $copy.HeaderSize)) -and
+        ([BitConverter]::ToUInt32($copy.Primary, 512 + 88) -eq (Get-Crc32 -Data $copy.Primary -Offset $primaryArray -Length $copy.ArrayLength)) -and
+        ([BitConverter]::ToUInt32($copy.Backup, $copy.BackupHeaderOffset + 16) -eq (Get-GptHeaderCrc -Data $copy.Backup -HeaderOffset $copy.BackupHeaderOffset -HeaderSize $copy.HeaderSize)) -and
+        ([BitConverter]::ToUInt32($copy.Backup, $copy.BackupHeaderOffset + 88) -eq (Get-Crc32 -Data $copy.Backup -Offset 0 -Length $copy.ArrayLength))
+    if (-not $memoryOk) {
+        Add-OfflineRepairLog -Level Error -Message "The rebuilt GPT of disk $DiskNumber did not pass its own CRC check, so nothing was written."
+        return ''
+    }
+
+    if (-not (Set-DiskOnlineState -DiskNumber $DiskNumber -Online $false)) {
+        Add-OfflineRepairLog -Level Warning -Message "Disk $DiskNumber could not be taken offline, so the GPT slot was not moved."
+        return ''
+    }
+
+    $written = $false
+    $offlineCheck = $null
+    try {
+        # Backup first: if the primary write then fails, the firmware still reads the old primary.
+        # Sector 0, the protective MBR, is never rewritten.
+        Write-RawDiskSector -DiskNumber $DiskNumber -ByteOffset $copy.BackupOffset -Data $copy.Backup
+        Write-RawDiskSector -DiskNumber $DiskNumber -ByteOffset 512 -Data ([byte[]]$copy.Primary[512..($copy.Primary.Length - 1)])
+        $written = $true
+        # Read back while the disk is still offline, before Windows parses the new table.
+        $offlineCheck = Get-GptCopy -DiskNumber $DiskNumber
+    }
+    catch {
+        Add-OfflineRepairLog -Level Error -Message "Writing the GPT with the EFI System Partition in slot $TargetSlot failed: $($_.Exception.Message)"
+    }
+    finally {
+        Update-HostStorageCache -ErrorAction SilentlyContinue
+        [void](Set-DiskOnlineState -DiskNumber $DiskNumber -Online $true)
+        [void](Update-Disk -Number $DiskNumber -ErrorAction SilentlyContinue)
+    }
+    if (-not $written) { return '' }
+
+    if (-not $offlineCheck -or -not ($offlineCheck.PrimaryCrcOk -and $offlineCheck.BackupCrcOk -and $offlineCheck.ArraysMatch)) {
+        Add-OfflineRepairLog -Level Error -Message ("After the slot move the GPT of disk $DiskNumber does not verify " +
+            "(primary CRC ok=$($offlineCheck.PrimaryCrcOk), backup CRC ok=$($offlineCheck.BackupCrcOk), arrays identical=$($offlineCheck.ArraysMatch)). Run again with revert=true to write the saved copies back.")
+        return ''
+    }
+    $now = @(Get-GptSlotMap -Copy $offlineCheck | Where-Object { $_.Guid -eq $PartitionGuid }) | Select-Object -First 1
+    if ($now -and $now.Slot -eq $TargetSlot) {
+        $moved = if ($occupant) { " Partition GUID $($occupant.Guid) moved from slot $TargetSlot to slot $($entry.Slot) in exchange." } else { '' }
+        Add-OfflineRepairLog -Level Info -Message "Moved the EFI System Partition's GPT entry from slot $($entry.Slot) to slot $TargetSlot in both copies of the table, and both copies pass their CRCs.$moved"
+        return 'Moved'
+    }
+    Add-OfflineRepairLog -Level Error -Message "After the write the EFI System Partition reads back in slot $($now.Slot), not slot $TargetSlot."
+    return ''
+}
+
+function Format-UefiDevicePath {
+    <#
+    .SYNOPSIS
+        Decodes the parts of a UEFI device path that identify a boot partition and file.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][int]$Offset,
+        [Parameter(Mandatory = $true)][int]$Length
+    )
+
+    $end = [math]::Min($Bytes.Length, $Offset + $Length)
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $hd = $null
+    $file = $null
+    $o = $Offset
+    while ($o + 4 -le $end) {
+        $type = $Bytes[$o]
+        $subType = $Bytes[$o + 1]
+        $nodeLength = [int][BitConverter]::ToUInt16($Bytes, $o + 2)
+        if ($type -eq 0x7F -and $subType -eq 0xFF) { break }
+        if ($nodeLength -lt 4 -or $o + $nodeLength -gt $end) { [void]$parts.Add('<malformed>'); break }
+
+        if ($type -eq 4 -and $subType -eq 1 -and $nodeLength -ge 42) {
+            $signatureType = [int]$Bytes[$o + 41]
+            $guid = if ($signatureType -eq 2) { ConvertTo-Guid -Data $Bytes -Offset ($o + 24) } else { $null }
+            $hd = [PSCustomObject]@{
+                PartitionNumber = [int][BitConverter]::ToUInt32($Bytes, $o + 4)
+                Start           = [long][BitConverter]::ToUInt64($Bytes, $o + 8)
+                Size            = [long][BitConverter]::ToUInt64($Bytes, $o + 16)
+                SigType         = $signatureType
+                Guid            = $guid
+            }
+            [void]$parts.Add(('HD({0},{1},0x{2:X},0x{3:X})' -f $hd.PartitionNumber, $(if ($guid) { "GPT,$guid" } else { "Sig$signatureType" }), $hd.Start, $hd.Size))
+        }
+        elseif ($type -eq 4 -and $subType -eq 4) {
+            $file = [System.Text.Encoding]::Unicode.GetString($Bytes, $o + 4, $nodeLength - 4).TrimEnd([char]0)
+            [void]$parts.Add($file)
+        }
+        else { [void]$parts.Add("Path($type,$subType)") }
+        $o += $nodeLength
+    }
+    return [PSCustomObject]@{ Text = ($parts -join '/'); HD = $hd; FilePath = $file }
+}
+
+function Read-MeasuredBootLog {
+    <#
+    .SYNOPSIS
+        Reads the UEFI boot variables the firmware measured from one Windows measured boot log.
+
+    .DESCRIPTION
+        Windows keeps a copy of the TPM event log of every boot under Windows\Logs\MeasuredBoot. Each
+        one records the Boot#### variables the firmware held at that boot - including the saved
+        'Windows Boot Manager' entry with the GUID and GPT slot of the partition it boots from - so
+        the logs say what the firmware expects even after the partition is gone. Read only; a log
+        this parser does not understand is reported in Error and otherwise ignored.
+    #>
+    param([Parameter(Mandatory = $true)]$File)
+
+    $result = [PSCustomObject]@{ File = $File.Name; Time = $File.LastWriteTime; BootOrder = @(); Entries = @(); Error = $null }
+    $bootVariable = [long]2147483650
+    $bootVariable2 = [long]2147483660
+
+    try {
+        $b = [System.IO.File]::ReadAllBytes($File.FullName)
+        if ($b.Length -lt 64) { throw 'The log is too short.' }
+        if ([System.Text.Encoding]::ASCII.GetString($b, 32, 15) -ne 'Spec ID Event03') { throw 'Not a crypto agile TCG event log.' }
+
+        $headerSize = [int][BitConverter]::ToUInt32($b, 28)
+        $algorithmCount = [int][BitConverter]::ToUInt32($b, 56)
+        $digestSize = @{}
+        for ($i = 0; $i -lt $algorithmCount -and $i -lt 16; $i++) {
+            $digestSize[[int][BitConverter]::ToUInt16($b, 60 + $i * 4)] = [int][BitConverter]::ToUInt16($b, 62 + $i * 4)
+        }
+
+        $variables = [ordered]@{}
+        $o = 32 + $headerSize
+        while ($o + 12 -le $b.Length) {
+            $type = [long][BitConverter]::ToUInt32($b, $o + 4)
+            $digestCount = [long][BitConverter]::ToUInt32($b, $o + 8)
+            if ($digestCount -gt 8) { break }
+
+            $p = $o + 12
+            $bad = $false
+            for ($k = 0; $k -lt $digestCount; $k++) {
+                if ($p + 2 -gt $b.Length) { $bad = $true; break }
+                $algorithm = [int][BitConverter]::ToUInt16($b, $p)
+                if (-not $digestSize.ContainsKey($algorithm)) { $bad = $true; break }
+                $p += 2 + $digestSize[$algorithm]
+            }
+            if ($bad -or $p + 4 -gt $b.Length) { break }
+
+            $eventSize = [long][BitConverter]::ToUInt32($b, $p)
+            $d = $p + 4
+            if ($d + $eventSize -gt $b.Length) { break }
+            $dataEnd = $d + $eventSize
+
+            if (($type -eq $bootVariable -or $type -eq $bootVariable2) -and $eventSize -ge 32) {
+                $nameLength = [long][BitConverter]::ToUInt64($b, $d + 16)
+                $dataLength = [long][BitConverter]::ToUInt64($b, $d + 24)
+                $vd = $d + 32 + ($nameLength * 2)
+                if ($nameLength -gt 0 -and $dataLength -ge 0 -and $vd + $dataLength -le $dataEnd) {
+                    $name = [System.Text.Encoding]::Unicode.GetString($b, $d + 32, [int]($nameLength * 2)).TrimEnd([char]0)
+                    if ($name -eq 'BootOrder') {
+                        $order = [System.Collections.Generic.List[string]]::new()
+                        for ($q = 0; $q + 1 -lt $dataLength; $q += 2) { [void]$order.Add(('Boot{0:X4}' -f [BitConverter]::ToUInt16($b, [int]($vd + $q)))) }
+                        $result.BootOrder = @($order)
+                    }
+                    elseif ($name -match '^Boot[0-9A-Fa-f]{4}$' -and $dataLength -ge 8) {
+                        $valueEnd = [int]($vd + $dataLength)
+                        $attributes = [BitConverter]::ToUInt32($b, [int]$vd)
+                        $filePathLength = [int][BitConverter]::ToUInt16($b, [int]$vd + 4)
+                        $q = [int]$vd + 6
+                        while ($q + 1 -lt $valueEnd -and ($b[$q] -ne 0 -or $b[$q + 1] -ne 0)) { $q += 2 }
+                        $description = [System.Text.Encoding]::Unicode.GetString($b, [int]$vd + 6, $q - ([int]$vd + 6))
+                        $pathStart = $q + 2
+                        $path = Format-UefiDevicePath -Bytes $b -Offset $pathStart -Length ([math]::Max(0, [math]::Min($filePathLength, $valueEnd - $pathStart)))
+                        $variables[$name] = [PSCustomObject]@{
+                            Name        = $name
+                            Active      = [bool]($attributes -band 1)
+                            Description = $description
+                            Path        = $path.Text
+                            HD          = $path.HD
+                            FilePath    = $path.FilePath
+                        }
+                    }
+                }
+            }
+            $o = [int]$dataEnd
+        }
+        $result.Entries = @($variables.Values)
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+    }
+    return $result
+}
+
+function Get-SavedBootEntry {
+    <#
+    .SYNOPSIS
+        Gen2 only: works out which EFI System Partition GUID and GPT slot the VM's firmware boots
+        from, using the measured boot logs on the offline Windows volume.
+
+    .DESCRIPTION
+        Azure Gen2 and Trusted Launch firmware keep the VM's 'Windows Boot Manager' entry and boot it
+        only when a partition with the same GPT unique GUID sits in the same GPT slot. Every boot
+        is logged, so the logs show which GUID and slot the firmware held and how often each was
+        used. The firmware's choice is the most used one: a one-off boot elsewhere (a nested Hyper-V
+        guest, for example) records its own entry without changing what Azure holds.
+
+        Status:
+          NoEsp       there is no EFI System Partition; Target is the one the logs remember.
+          MultipleEsp more than one partition carries the ESP type; nothing is inferred.
+          NoLogs      no log records a 'Windows Boot Manager' entry on a GPT partition.
+          Match       the current ESP's GUID is the one the firmware uses.
+          Replaced    the current ESP is recorded, but a GUID no partition has any more was used more.
+          Mixed       the current ESP is recorded, but a newer boot used another GUID less often.
+          Stale       only GUIDs that no partition has any more are recorded; Target is the most used.
+          Ambiguous   the recorded GUIDs all belong to other partitions.
+    #>
+    param([Parameter(Mandatory = $true)]$Offline, [int]$MaxLogs = 50)
+
+    $parts = @(Get-Partition -DiskNumber $Offline.DiskNumber -ErrorAction SilentlyContinue)
+    $esps = @($parts | Where-Object { "$($_.Type)" -eq 'System' -or "$($_.GptType)".ToLowerInvariant() -eq $script:EspGptType })
+    $esp = if ($esps.Count -eq 1) { $esps[0] } else { $null }
+    $espGuid = if ($esp -and $esp.Guid) { [Guid]"$($esp.Guid)" } else { $null }
+
+    $slots = @()
+    $slotError = $null
+    try { $slots = @(Get-GptSlotMap -Copy (Get-GptCopy -DiskNumber $Offline.DiskNumber)) }
+    catch { $slotError = $_.Exception.Message }
+    $espSlot = $null
+    if ($espGuid) { $espSlot = (@($slots | Where-Object { $_.Guid -eq $espGuid }) | Select-Object -First 1).Slot }
+
+    $partitionByGuid = @{}
+    foreach ($p in $parts) { if ($p.Guid) { $partitionByGuid[([Guid]"$($p.Guid)").ToString()] = $p.PartitionNumber } }
+
+    $logDirectory = Join-OfflinePath -Root $Offline.WindowsDrive -ChildPath 'Windows\Logs\MeasuredBoot'
+    $files = @(Get-ChildItem -LiteralPath $logDirectory -Filter '*.log' -File -Force -ErrorAction SilentlyContinue |
+            Sort-Object -Property LastWriteTime, Name -Descending | Select-Object -First $MaxLogs)
+
+    $byKey = [ordered]@{}
+    $parsed = 0
+    foreach ($file in $files) {
+        $log = Read-MeasuredBootLog -File $file
+        if ($log.Error) { continue }
+        $parsed++
+        foreach ($entry in $log.Entries) {
+            if ($entry.Description -ne 'Windows Boot Manager' -or -not $entry.HD -or $entry.HD.SigType -ne 2) { continue }
+            if ($entry.FilePath -notmatch '(?i)bootmgfw\.efi') { continue }
+            $key = '{0}|{1}' -f $entry.HD.Guid, $entry.HD.PartitionNumber
+            if (-not $byKey.Contains($key)) {
+                $byKey[$key] = [PSCustomObject]@{
+                    Guid = $entry.HD.Guid; Slot = $entry.HD.PartitionNumber; Start = $entry.HD.Start; Size = $entry.HD.Size
+                    Seen = 0; FirstSeen = $log.Time; LastSeen = $log.Time; Status = $null; PartitionNumber = $null
+                }
+            }
+            $candidate = $byKey[$key]
+            $candidate.Seen++
+            if ($log.Time -lt $candidate.FirstSeen) { $candidate.FirstSeen = $log.Time }
+            if ($log.Time -gt $candidate.LastSeen) { $candidate.LastSeen = $log.Time }
+        }
+    }
+
+    $candidates = @($byKey.Values | Sort-Object -Property LastSeen -Descending)
+    foreach ($candidate in $candidates) {
+        $k = $candidate.Guid.ToString()
+        if ($espGuid -and $candidate.Guid -eq $espGuid) { $candidate.Status = 'CurrentEsp'; $candidate.PartitionNumber = $esp.PartitionNumber }
+        elseif ($partitionByGuid.ContainsKey($k)) { $candidate.Status = 'InUse'; $candidate.PartitionNumber = $partitionByGuid[$k] }
+        else { $candidate.Status = 'Missing' }
+    }
+    $current = @($candidates | Where-Object { $_.Status -eq 'CurrentEsp' })
+    $missing = @($candidates | Where-Object { $_.Status -eq 'Missing' })
+
+    $bySeen = @(@{ Expression = 'Seen'; Descending = $true }, @{ Expression = 'LastSeen'; Descending = $true })
+    $dominantOf = { param($Guid) @($candidates | Where-Object { $_.Guid -eq $Guid } | Sort-Object -Property $bySeen) | Select-Object -First 1 }
+
+    # The previous ESP is the newest recorded GUID that no partition has any more. GUIDs still on the
+    # disk are never picked, and the current ESP keeps its GUID unless the old one was used more.
+    $target = if ($missing.Count -gt 0) { & $dominantOf $missing[0].Guid } else { $null }
+
+    if ($esps.Count -eq 0) { $status = 'NoEsp' }
+    elseif ($esps.Count -gt 1) { $status = 'MultipleEsp' }
+    elseif ($candidates.Count -eq 0) { $status = 'NoLogs' }
+    elseif ($current.Count -gt 0) {
+        $currentLast = (@($current | Sort-Object -Property LastSeen -Descending) | Select-Object -First 1).LastSeen
+        $currentSeen = ($current | Measure-Object -Property Seen -Sum).Sum
+        $previousSeen = if ($target) { ($missing | Where-Object { $_.Guid -eq $target.Guid } | Measure-Object -Property Seen -Sum).Sum } else { 0 }
+        if ($target -and $previousSeen -gt $currentSeen) { $status = 'Replaced' }
+        else {
+            $target = $null
+            $newer = @($candidates | Where-Object { $_.Status -ne 'CurrentEsp' -and $_.LastSeen -gt $currentLast })
+            $status = if ($newer.Count -gt 0) { 'Mixed' } else { 'Match' }
+        }
+    }
+    elseif ($missing.Count -gt 0) { $status = 'Stale' }
+    else { $status = 'Ambiguous' }
+
+    # Windows writes the entry array sorted by start LBA, so an ESP recreated in the old extent
+    # takes slot 1 + the number of partitions that start before it.
+    $targetExtentFree = $false
+    $predictedSlot = $null
+    if ($esps.Count -eq 0 -and $target -and $target.Start -and $target.Size -and $slots.Count -gt 0 -and -not $slotError) {
+        $targetStart = [long]$target.Start
+        $targetEnd = $targetStart + [long]$target.Size - 1
+        $targetExtentFree = @($slots | Where-Object { $_.FirstLba -le $targetEnd -and $_.LastLba -ge $targetStart }).Count -eq 0
+        if ($targetExtentFree) { $predictedSlot = 1 + @($slots | Where-Object { $_.FirstLba -lt $targetStart }).Count }
+    }
+
+    $firmwareEntry = if ($target -and $target.Slot) { $target }
+    elseif ($current.Count -gt 0) { @($current | Sort-Object -Property $bySeen) | Select-Object -First 1 }
+    else { $null }
+    $slotTie = $false
+    if ($firmwareEntry -and $firmwareEntry.Slot) {
+        $sightings = @($candidates | Where-Object { $_.Guid -eq $firmwareEntry.Guid } | Sort-Object -Property $bySeen)
+        $slotTie = $sightings.Count -gt 1 -and $sightings[0].Seen -eq $sightings[1].Seen
+    }
+
+    $verdict = switch ($status) {
+        'NoEsp' { 'NoEsp' }
+        'Stale' { 'NoMatch' }
+        'Replaced' { 'NoMatch' }
+        'Match' {
+            if (-not $espSlot -or -not $firmwareEntry -or $slotTie) { 'Unknown' }
+            elseif ($firmwareEntry.Slot -ne $espSlot) { 'NoMatch' }
+            else { 'Match' }
+        }
+        default { 'Unknown' }
+    }
+
+    $requiredSlot = if ($verdict -in @('NoMatch', 'NoEsp') -and $firmwareEntry -and $firmwareEntry.Slot) { [int]$firmwareEntry.Slot } else { $null }
+    $slotMoveNeeded = [bool]($requiredSlot -and (
+            ($espSlot -and $espSlot -ne $requiredSlot) -or
+            ($esps.Count -eq 0 -and $predictedSlot -ne $requiredSlot)))
+
+    return [PSCustomObject]@{
+        Status           = $status
+        Verdict          = $verdict
+        EspPartition     = if ($esp) { $esp.PartitionNumber } else { $null }
+        EspGuid          = $espGuid
+        EspSlot          = $espSlot
+        LogsFound        = $files.Count
+        LogsParsed       = $parsed
+        Candidates       = $candidates
+        Target           = $target
+        FirmwareEntry    = $firmwareEntry
+        TargetExtentFree = $targetExtentFree
+        PredictedSlot    = $predictedSlot
+        RequiredSlot     = $requiredSlot
+        SlotMoveNeeded   = $slotMoveNeeded
+        SlotError        = $slotError
+    }
+}
+
+function Write-EspIdentitySummary {
+    <#
+    .SYNOPSIS
+        Logs what the ESP GUID/slot comparison saw, including why it had nothing to compare.
+    #>
+    param([Parameter(Mandatory = $true)]$Analysis)
+
+    $esp = if ($Analysis.EspGuid) { "ESP GUID $($Analysis.EspGuid) in GPT slot $($Analysis.EspSlot)" } else { 'no single EFI System Partition' }
+    $logs = "$($Analysis.LogsParsed) of $($Analysis.LogsFound) measured boot log(s) read"
+    if ($Analysis.LogsFound -eq 0) {
+        Add-OfflineRepairLog -Level Info -Message "ESP identity: $esp; no measured boot logs on the disk, so the firmware's saved boot entry is unknown and the ESP GUID/slot are not checked."
+        return
+    }
+    if ($Analysis.Status -eq 'NoLogs') {
+        Add-OfflineRepairLog -Level Info -Message "ESP identity: $esp; $logs, none records a saved 'Windows Boot Manager' firmware entry. The firmware uses its default boot path (\EFI\Boot\bootx64.efi), so the ESP GUID and slot do not affect boot."
+        return
+    }
+    $entry = $Analysis.FirmwareEntry
+    $saved = if ($entry) { "saved entry HD($($entry.Slot),GPT,$($entry.Guid)) seen in $($entry.Seen) log(s)" } else { "$(@($Analysis.Candidates).Count) recorded entry/entries, none attributable" }
+    Add-OfflineRepairLog -Level Info -Message "ESP identity: $esp; $logs; $saved; status $($Analysis.Status), verdict $($Analysis.Verdict)."
+}
+
+function Get-EspIdentityFinding {
+    <#
+    .SYNOPSIS
+        Gen2 only: reports an EFI System Partition whose GUID or GPT slot is not the one the
+        firmware's saved boot entry names.
+    #>
+    param([Parameter(Mandatory = $true)]$Analysis)
+
+    $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $a = $Analysis
+    if (-not $a -or -not $a.EspPartition) { return @($findings) }
+
+    $symptom = 'Azure Gen2 and Trusted Launch firmware match the saved boot entry on both, so the VM stops at "Unknown Device" / "The boot loader did not load an operating system" even though the partition and its files are intact.'
+
+    if ($a.Status -in @('Stale', 'Replaced') -and $a.Target) {
+        [void]$findings.Add((New-Finding -Cause 'EspGuidMismatch' -Item "partition $($a.EspPartition)" -Tier 'Identity' -Data $a -Message (
+                    "EFI System Partition $($a.EspPartition) has GPT GUID $($a.EspGuid), but the measured boot logs show the firmware's 'Windows Boot Manager' entry names GUID $($a.Target.Guid) " +
+                    "in GPT slot $($a.Target.Slot) (used at $($a.Target.Seen) boot(s), last $($a.Target.LastSeen)). $symptom The partition will be given GUID $($a.Target.Guid) back.")))
+    }
+
+    if ($a.SlotMoveNeeded -and $a.EspSlot) {
+        [void]$findings.Add((New-Finding -Cause 'EspSlotMismatch' -Item "partition $($a.EspPartition)" -Tier 'Identity' -Data $a -Message (
+                    "EFI System Partition $($a.EspPartition) sits in GPT slot $($a.EspSlot), but the firmware's saved 'Windows Boot Manager' entry names slot $($a.RequiredSlot). " +
+                    "$symptom Its GPT entry will be moved to slot $($a.RequiredSlot).")))
+    }
+
+    return @($findings)
+}
+
+function Set-EspBootmgrDevice {
+    <#
+    .SYNOPSIS
+        Points {bootmgr} (and {memdiag}) in the ESP's BCD store at the ESP again.
+
+    .DESCRIPTION
+        A BCD partition device names a GPT partition by its unique GUID, so after the ESP's GUID
+        changes {bootmgr} names a partition that no longer exists. The Windows loader entries name
+        the Windows partition, whose GUID is unchanged, so they are left alone.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Internal repair step. detectOnly=true is the dry run.')]
+    param(
+        [Parameter(Mandatory = $true)]$Offline,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber
+    )
+
+    $partition = Get-Partition -DiskNumber $Offline.DiskNumber -PartitionNumber $PartitionNumber -ErrorAction SilentlyContinue
+    $letter = "$($partition.DriveLetter)"
+    if ([string]::IsNullOrWhiteSpace($letter) -or $letter -eq "`0") {
+        $letter = Add-PartitionDriveLetter -DiskNumber $Offline.DiskNumber -PartitionNumber $PartitionNumber
+    }
+    if ([string]::IsNullOrWhiteSpace("$letter")) {
+        Add-OfflineRepairLog -Level Warning -Message "EFI System Partition $PartitionNumber could not be given a drive letter, so its BCD store was not updated."
+        return $false
+    }
+
+    $root = "$("$letter".TrimEnd(':', '\')):"
+    $store = Join-OfflinePath -Root $root -ChildPath 'EFI\Microsoft\Boot\BCD'
+    if (-not (Test-OfflinePath $store)) {
+        Add-OfflineRepairLog -Level Warning -Message "$store does not exist, so there is no {bootmgr} device to update."
+        return $false
+    }
+
+    $ok = $true
+    foreach ($id in @('{bootmgr}', '{memdiag}')) {
+        $null = & bcdedit.exe /store $store /enum $id 2>&1
+        if ($LASTEXITCODE -ne 0) { continue }
+        $output = & bcdedit.exe /store $store /set $id device "partition=$root" 2>&1
+        if ($LASTEXITCODE -eq 0) { Add-OfflineRepairLog -Level Info -Message "Set $id device to partition=$root in $store." }
+        else {
+            Add-OfflineRepairLog -Level Warning -Message "bcdedit could not set $id device in ${store}: $(@($output) -join ' ')"
+            $ok = $false
+        }
+    }
+
+    if (-not (Test-OfflinePath (Join-OfflinePath -Root $root -ChildPath 'EFI\Microsoft\Boot\bootmgfw.efi'))) {
+        Add-OfflineRepairLog -Level Warning -Message "$root\EFI\Microsoft\Boot\bootmgfw.efi is missing. The saved boot entry loads that file, so the VM will not boot until it is put back."
+    }
+    return $ok
+}
+
+function Sync-OfflineWindowsDrive {
+    <#
+    .SYNOPSIS
+        Re-reads where the disk's partitions are after a GPT edit took the disk offline and back.
+
+    .DESCRIPTION
+        Moving a GPT entry renumbers partitions, and a GUID change can cost a partition its drive
+        letter. The Windows partition is found again by its unchanged GUID, the offline Windows
+        drive is re-bound if its letter moved, and the drive letters this run tracks for cleanup
+        are re-pointed at the partition numbers they now belong to.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Offline,
+        [Parameter(Mandatory = $true)][Guid]$WindowsPartitionGuid
+    )
+
+    # Windows can take a few seconds to re-read a partition table rewritten underneath it.
+    $windows = $null
+    $parts = @()
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        Update-HostStorageCache -ErrorAction SilentlyContinue
+        [void](Update-Disk -Number $Offline.DiskNumber -ErrorAction SilentlyContinue)
+        $parts = @(Get-Partition -DiskNumber $Offline.DiskNumber -ErrorAction SilentlyContinue)
+        $windows = @($parts | Where-Object { "$($_.Guid)".Trim('{', '}') -eq $WindowsPartitionGuid.ToString() }) | Select-Object -First 1
+        if ($windows) { break }
+        Start-Sleep -Seconds 3
+    } while ((Get-Date) -lt $deadline)
+
+    $list = Get-OfflineAssignedDriveLetterList
+    foreach ($entry in @($list | Where-Object { $_.DiskNumber -eq $Offline.DiskNumber })) {
+        $owner = Get-Partition -DriveLetter $entry.Letter -ErrorAction SilentlyContinue
+        if ($owner -and $owner.DiskNumber -eq $Offline.DiskNumber) { $entry.PartitionNumber = $owner.PartitionNumber }
+        else { [void]$list.Remove($entry) }
+    }
+
+    if (-not $windows) {
+        Add-OfflineRepairLog -Level Error -Message ("The Windows partition (GUID $WindowsPartitionGuid) was not found on disk $($Offline.DiskNumber) " +
+            "within 30 seconds of the partition table edit ($($parts.Count) partitions visible). Run again with revert=true to write the saved partition table back.")
+        return $false
+    }
+    $Offline.PartitionNumber = $windows.PartitionNumber
+
+    $letter = "$($windows.DriveLetter)"
+    if ([string]::IsNullOrWhiteSpace($letter) -or $letter -eq "`0") {
+        $letter = Add-PartitionDriveLetter -DiskNumber $Offline.DiskNumber -PartitionNumber $windows.PartitionNumber
+    }
+    if ([string]::IsNullOrWhiteSpace("$letter")) {
+        Add-OfflineRepairLog -Level Warning -Message "The Windows partition $($windows.PartitionNumber) has no drive letter after the partition table edit."
+        return $false
+    }
+
+    $drive = "$("$letter".TrimEnd(':', '\')):"
+    if ($drive -ne $Offline.WindowsDrive) {
+        Set-OfflineWindowsDrive -WindowsDrive $drive
+        $Offline.WindowsDrive = $drive
+        $Offline.WindowsPath = Join-OfflinePath -Root $drive -ChildPath 'Windows'
+        Add-OfflineRepairLog -Level Info -Message "The offline Windows volume is now $drive."
+    }
+
+    if ($Offline.PartitionRoots -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Offline.PartitionRoots.Keys | Where-Object { "$_" -like "$($Offline.DiskNumber)-*" })) { $Offline.PartitionRoots.Remove($key) }
+        foreach ($p in @(Get-Partition -DiskNumber $Offline.DiskNumber -ErrorAction SilentlyContinue)) {
+            $pLetter = "$($p.DriveLetter)"
+            if (-not [string]::IsNullOrWhiteSpace($pLetter) -and $pLetter -ne "`0") {
+                $Offline.PartitionRoots["$($Offline.DiskNumber)-$($p.PartitionNumber)"] = @("${pLetter}:")
+            }
+        }
+    }
+    return $true
+}
+
+function Invoke-IdentityRepair {
+    <#
+    .SYNOPSIS
+        Gen2 only: gives the EFI System Partition the GPT GUID and slot the firmware's saved boot
+        entry names, then repoints {bootmgr} and re-binds the Windows volume.
+
+    .DESCRIPTION
+        The GUID is written first and the slot moved second, because the slot move finds the ESP by
+        GUID. Only the GPT entry is changed: the partition's extent, type and contents stay as they
+        are. Both copies of the GPT were saved before this runs, and revert=true writes them back.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Offline,
+        [Parameter(Mandatory = $true)]$Analysis
+    )
+
+    $result = [PSCustomObject]@{ Success = $false; GuidRestored = $false; SlotMoved = $false; Reason = '' }
+    $a = $Analysis
+
+    $esp = Get-Partition -DiskNumber $Offline.DiskNumber -PartitionNumber $a.EspPartition -ErrorAction SilentlyContinue
+    $windows = Get-Partition -DiskNumber $Offline.DiskNumber -PartitionNumber $Offline.PartitionNumber -ErrorAction SilentlyContinue
+    if (-not $esp -or -not $windows -or -not $windows.Guid) {
+        $result.Reason = 'The EFI System Partition or the Windows partition could not be read back, so their GPT identity was left alone.'
+        return $result
+    }
+    $windowsGuid = [Guid]"$($windows.Guid)"
+    $espGuid = [Guid]$a.EspGuid
+
+    $newGuid = $null
+    if ($a.Status -in @('Stale', 'Replaced') -and $a.Target -and $a.Target.Guid -ne $espGuid) { $newGuid = [Guid]$a.Target.Guid }
+    $wantSlot = if ($a.RequiredSlot) { [int]$a.RequiredSlot } elseif ($newGuid -and $a.Target.Slot) { [int]$a.Target.Slot } else { 0 }
+
+    $changed = $false
+    try {
+        if ($newGuid) {
+            $holder = @(Get-Partition -DiskNumber $Offline.DiskNumber -ErrorAction SilentlyContinue |
+                    Where-Object { "$($_.Guid)".Trim('{', '}') -eq $newGuid.ToString() })
+            if ($holder.Count -gt 0) {
+                $result.Reason = "Partition $($holder[0].PartitionNumber) already carries GUID $newGuid, so it cannot also be given to the EFI System Partition."
+                return $result
+            }
+
+            if (-not (Set-DiskOnlineState -DiskNumber $Offline.DiskNumber -Online $false)) {
+                $result.Reason = "Disk $($Offline.DiskNumber) could not be taken offline, so the EFI System Partition GUID was left alone."
+                return $result
+            }
+            try { $written = Set-GptPartitionUniqueId -DiskNumber $Offline.DiskNumber -PartitionOffset ([UInt64]$esp.Offset) -UniqueId $newGuid }
+            finally { [void](Set-DiskOnlineState -DiskNumber $Offline.DiskNumber -Online $true) }
+
+            if (-not $written) {
+                $result.Reason = "Writing GUID $newGuid to the EFI System Partition did not complete. See the detail log."
+                return $result
+            }
+            $changed = $true
+            $espGuid = $newGuid
+            $result.GuidRestored = $true
+            Add-OfflineRepairLog -Level Info -Message "Gave the EFI System Partition GPT GUID $newGuid, the one the saved boot entry names."
+        }
+
+        if ($wantSlot -gt 0) {
+            [void](Update-Disk -Number $Offline.DiskNumber -ErrorAction SilentlyContinue)
+            $slotResult = Move-GptEntrySlot -DiskNumber $Offline.DiskNumber -PartitionGuid $espGuid -TargetSlot $wantSlot
+            if (-not $slotResult) {
+                $result.Reason = "The EFI System Partition could not be moved to GPT slot $wantSlot. See the detail log."
+                return $result
+            }
+            if ($slotResult -eq 'Moved') {
+                $changed = $true
+                $result.SlotMoved = $true
+            }
+        }
+
+        $result.Success = $true
+        return $result
+    }
+    finally {
+        if ($changed) {
+            $synced = Sync-OfflineWindowsDrive -Offline $Offline -WindowsPartitionGuid $windowsGuid
+            if ($synced -and $result.GuidRestored) {
+                $espNow = @(Get-Partition -DiskNumber $Offline.DiskNumber -ErrorAction SilentlyContinue |
+                        Where-Object { "$($_.Guid)".Trim('{', '}') -eq $espGuid.ToString() }) | Select-Object -First 1
+                if ($espNow) {
+                    [void](Set-EspBootmgrDevice -Offline $Offline -PartitionNumber $espNow.PartitionNumber)
+                    $synced = Sync-OfflineWindowsDrive -Offline $Offline -WindowsPartitionGuid $windowsGuid
+                }
+            }
+            # $result is the object already handed back, so a failure here still reaches the caller.
+            if (-not $synced -and $result.Success) {
+                $result.Success = $false
+                $result.Reason = "The partition table was edited, but Windows did not show the disk's partitions again afterwards. See the detail log."
+            }
+        }
+    }
+}
+
 function New-BootPartition {
     <#
     .SYNOPSIS
@@ -1513,10 +2435,17 @@ function New-BootPartition {
         The EFI System Partition is created as a basic data partition, formatted, populated, and only
         then given the EFI System Partition type GUID. Windows hides a partition that already carries
         that GUID, so it could not be formatted or written to while it wore it.
+
+        On Gen2, -Analysis is the result of Get-SavedBootEntry. When the measured boot logs name the
+        ESP the firmware booted and its extent is still free, that record is tried first: it is the
+        one the saved boot entry actually describes.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Internal repair step. detectOnly=true is the dry run.')]
     param(
         [Parameter(Mandatory = $true)]$Offline,
-        [Parameter(Mandatory = $true)][UInt64]$FreeSpace
+        [Parameter(Mandatory = $true)][UInt64]$FreeSpace,
+        $Analysis
     )
 
     $result = [PSCustomObject]@{
@@ -1533,8 +2462,21 @@ function New-BootPartition {
     # Recover the old EFI System Partition's identity before touching the disk. Reading the offline
     # registry needs the Windows volume mounted, and creating a partition is what unmounts it.
     $recorded = @()
+    $windowsGuid = $null
     if ($isUefi) {
         $recorded = @(Get-RecordedEspIdentity -Offline $Offline)
+        $t = if ($Analysis) { $Analysis.Target } else { $null }
+        if ($t -and $t.Guid -and $t.Start -and $t.Size -and $Analysis.TargetExtentFree) {
+            $logged = [PSCustomObject]@{
+                Id             = [Guid]$t.Guid
+                StartingOffset = [UInt64]$t.Start * 512
+                Length         = [UInt64]$t.Size * 512
+                Source         = 'the measured boot logs'
+            }
+            $recorded = @($logged) + @($recorded | Where-Object { $_.StartingOffset -ne $logged.StartingOffset })
+        }
+        $windowsPartition = Get-Partition -DiskNumber $Offline.DiskNumber -PartitionNumber $Offline.PartitionNumber -ErrorAction SilentlyContinue
+        if ($windowsPartition -and $windowsPartition.Guid) { $windowsGuid = [Guid]"$($windowsPartition.Guid)" }
         if ($recorded.Count -eq 0) {
             Add-OfflineRepairLog -Level Warning -Message 'The offline registry holds no cached partition table, so the original EFI System Partition GUID cannot be recovered.'
         }
@@ -1657,6 +2599,19 @@ function New-BootPartition {
         $placed = Get-Partition -DiskNumber $Offline.DiskNumber -PartitionNumber $partition.PartitionNumber -ErrorAction SilentlyContinue
         if ($placed) {
             $result.GuidRestored = Restore-EspUniqueId -Offline $Offline -PartitionOffset ([UInt64]$placed.Offset) -Recorded $recorded
+        }
+
+        # bcdboot named the ESP by the GUID it had then, and taking the disk offline for the GUID
+        # write can cost the Windows volume its drive letter.
+        if ($result.GuidRestored -and $windowsGuid) {
+            [void](Sync-OfflineWindowsDrive -Offline $Offline -WindowsPartitionGuid $windowsGuid)
+            $placed = @(Get-Partition -DiskNumber $Offline.DiskNumber -ErrorAction SilentlyContinue |
+                    Where-Object { [UInt64]$_.Offset -eq [UInt64]$placed.Offset }) | Select-Object -First 1
+            if ($placed) {
+                $result.PartitionNumber = $placed.PartitionNumber
+                [void](Set-EspBootmgrDevice -Offline $Offline -PartitionNumber $placed.PartitionNumber)
+                [void](Sync-OfflineWindowsDrive -Offline $Offline -WindowsPartitionGuid $windowsGuid)
+            }
         }
     }
 
@@ -1791,12 +2746,28 @@ function Restore-PartitionTableSignature {
         repair. Only the two signature bytes are touched; the partition entries are left exactly as
         they are found.
 
+        The original sector is kept in memory and saved beside the detail log on the rescue VM,
+        because the offline Windows volume, where every other backup goes, cannot be reached until
+        this write has succeeded. The main flow then copies it onto that volume and records it in
+        the revert manifest, so revert=true can put this write back as well.
+
     .OUTPUTS
         $true when the disk enumerates partitions afterwards.
     #>
     param([Parameter(Mandatory = $true)][int]$DiskNumber)
 
     $original = Read-RawDiskSector -DiskNumber $DiskNumber -ByteOffset 0 -Length 512
+    Add-OfflineRepairLog -Level Info -Message ("Sector 0 of disk {0} ends in 0x{1:X2} 0x{2:X2} instead of 0x55 0xAA; those two bytes are the only ones written, and the whole sector is put back if the result is not readable." -f $DiskNumber, $original[510], $original[511])
+
+    $hostCopy = Join-Path -Path (Split-Path -Path $logFile -Parent) -ChildPath "$scriptName-backup-$scriptStartTime-disk$DiskNumber-sector0-unsigned.bin"
+    try {
+        [System.IO.File]::WriteAllBytes($hostCopy, $original)
+        Add-OfflineRepairLog -Level Info -Message "Backed up sector 0 of disk $DiskNumber to $hostCopy on this VM before writing the signature."
+    }
+    catch {
+        Add-OfflineRepairLog -Level Error -Message "Could not back up sector 0 of disk $DiskNumber to ${hostCopy}: $($_.Exception.Message). Nothing was written."
+        return $false
+    }
     $patched = [byte[]]::new(512)
     [Array]::Copy($original, $patched, 512)
     $patched[510] = 0x55
@@ -1822,6 +2793,7 @@ function Restore-PartitionTableSignature {
     $partitions = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction SilentlyContinue)
     if ($partitions.Count -gt 0) {
         Add-OfflineRepairLog -Level Info -Message "Restored the 0x55AA signature in sector 0 of disk $DiskNumber; Windows now reads $($partitions.Count) partition(s) from it."
+        $script:SignatureRepair = [PSCustomObject]@{ DiskNumber = $DiskNumber; Original = $original; HostCopy = $hostCopy }
         return $true
     }
 
@@ -1859,11 +2831,49 @@ function Save-RevertManifest {
         MbrBackupPath    = $Backup.MbrPath
         VbrBackupPath    = $Backup.VbrPath
         VbrOffset        = [string]$Backup.VbrOffset
+        GptPrimaryPath   = $Backup.GptPrimaryPath
+        GptBackupPath    = $Backup.GptBackupPath
+        GptBackupOffset  = [string]$Backup.GptBackupOffset
+        SignatureBackupPath = $script:SignatureBackupPath
         CreatedPartition = $CreatedPartition
     }
 
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
-    Add-OfflineRepairLog -Level Info -Message "Wrote the revert manifest to $manifestPath."
+    try {
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8 -ErrorAction Stop
+        Add-OfflineRepairLog -Level Info -Message "Wrote the revert manifest to $manifestPath."
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message ("Could not write the revert manifest to ${manifestPath}: $($_.Exception.Message). " +
+            "The sector backups are still at $($Backup.GptPrimaryPath) $($Backup.MbrPath), but revert=true will not find them.")
+    }
+}
+
+function Save-SignatureBackup {
+    <#
+    .SYNOPSIS
+        Puts the pre-signature sector 0 next to the other backups and records it in the revert manifest.
+
+    .DESCRIPTION
+        Called as soon as the offline Windows volume is known, before anything else can return, so
+        a run whose only change was the signature still leaves a manifest that revert=true can use.
+    #>
+    param([Parameter(Mandatory = $true)]$Offline)
+
+    if (-not $script:SignatureRepair -or $script:SignatureRepair.DiskNumber -ne $Offline.DiskNumber) { return }
+
+    $path = Join-OfflinePath -Root $Offline.WindowsDrive -ChildPath "$scriptName-backup-$scriptStartTime-sector0-unsigned.bin"
+    try {
+        [System.IO.File]::WriteAllBytes($path, $script:SignatureRepair.Original)
+        $script:SignatureBackupPath = $path
+        Add-OfflineRepairLog -Level Info -Message "Backed up sector 0 as it was before the signature was written to $path."
+    }
+    catch {
+        Add-OfflineRepairLog -Level Warning -Message "Could not copy the pre-signature sector 0 to ${path}: $($_.Exception.Message). It is still at $($script:SignatureRepair.HostCopy) on this VM, but revert=true will not find it."
+        return
+    }
+
+    $emptyBackup = [PSCustomObject]@{ MbrPath = ''; VbrPath = ''; VbrOffset = [UInt64]0; GptPrimaryPath = ''; GptBackupPath = ''; GptBackupOffset = [UInt64]0 }
+    Save-RevertManifest -Offline $Offline -Backup $emptyBackup -CreatedPartition 0
 }
 
 function Invoke-Revert {
@@ -1881,12 +2891,40 @@ function Invoke-Revert {
 
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 
+    # The backups sit next to the manifest, but the recorded paths carry the drive letter of the run
+    # that wrote them, and that letter is not stable between runs, so they are rebased onto this one.
+    foreach ($field in @('MbrBackupPath', 'VbrBackupPath', 'GptPrimaryPath', 'GptBackupPath', 'SignatureBackupPath')) {
+        $recorded = "$($manifest.$field)"
+        if (-not $recorded) { continue }
+        $rebased = Join-OfflinePath -Root $Offline.WindowsDrive -ChildPath (Split-Path -Path $recorded -Leaf)
+        if ($rebased -ne $recorded -and (Test-OfflinePath $rebased)) {
+            Add-OfflineRepairLog -Level Info -Message "Using $rebased for the backup recorded as $recorded."
+            $manifest.$field = $rebased
+        }
+    }
+
+    $signatureRestore = $manifest.SignatureBackupPath -and (Test-OfflinePath $manifest.SignatureBackupPath)
     $writes = [System.Collections.Generic.List[PSCustomObject]]::new()
-    if ($manifest.MbrBackupPath -and (Test-OfflinePath $manifest.MbrBackupPath)) {
+    $gptRestore = $manifest.GptPrimaryPath -and (Test-OfflinePath $manifest.GptPrimaryPath) -and
+        $manifest.GptBackupPath -and (Test-OfflinePath $manifest.GptBackupPath)
+    if ($gptRestore) {
+        # The backup copy first and the primary last, mirroring how the repair wrote them. The primary
+        # image starts at sector 0, so it also carries the protective MBR.
+        [void]$writes.Add([PSCustomObject]@{ Offset = [UInt64]$manifest.GptBackupOffset; Path = $manifest.GptBackupPath; Label = "the backup GPT at offset $($manifest.GptBackupOffset)" })
+        [void]$writes.Add([PSCustomObject]@{ Offset = [UInt64]0; Path = $manifest.GptPrimaryPath; Label = 'the primary GPT (sectors 0-33)' })
+    }
+    elseif (-not $signatureRestore -and $manifest.MbrBackupPath -and (Test-OfflinePath $manifest.MbrBackupPath)) {
         [void]$writes.Add([PSCustomObject]@{ Offset = [UInt64]0; Path = $manifest.MbrBackupPath; Label = 'sector 0' })
     }
     if ($manifest.VbrBackupPath -and (Test-OfflinePath $manifest.VbrBackupPath)) {
         [void]$writes.Add([PSCustomObject]@{ Offset = [UInt64]$manifest.VbrOffset; Path = $manifest.VbrBackupPath; Label = "the volume boot record at offset $($manifest.VbrOffset)" })
+    }
+    if ($signatureRestore) {
+        # The oldest image of sector 0 there is, taken before the signature was written, so it goes
+        # last and also undoes any later change to the partition entries in that sector. Windows will
+        # read the disk as RAW again afterwards, exactly as it did before the repair.
+        Add-OfflineRepairLog -Level Warning -Message 'This run also writes back sector 0 as it was before its 0x55AA signature was restored, so Windows will no longer read the partition table and the volumes on this disk will disappear.'
+        [void]$writes.Add([PSCustomObject]@{ Offset = [UInt64]0; Path = $manifest.SignatureBackupPath; Label = 'sector 0 as it was before the signature repair' })
     }
 
     if ($writes.Count -eq 0) {
@@ -1899,8 +2937,8 @@ function Invoke-Revert {
     $pending = [System.Collections.Generic.List[PSCustomObject]]::new()
     foreach ($write in $writes) {
         $bytes = [System.IO.File]::ReadAllBytes($write.Path)
-        if ($bytes.Length -ne 512) {
-            Add-OfflineRepairLog -Level Warning -Message "$($write.Path) is $($bytes.Length) bytes, not a 512 byte sector image. Skipped."
+        if ($bytes.Length -eq 0 -or ($bytes.Length % 512) -ne 0) {
+            Add-OfflineRepairLog -Level Warning -Message "$($write.Path) is $($bytes.Length) bytes, not a whole number of 512 byte sectors. Skipped."
             continue
         }
         [void]$pending.Add([PSCustomObject]@{ Offset = $write.Offset; Path = $write.Path; Label = $write.Label; Data = $bytes })
@@ -1912,8 +2950,11 @@ function Invoke-Revert {
     }
 
     if ($manifest.CreatedPartition -gt 0) {
-        if ($manifest.Generation -eq 2) {
-            Add-OfflineRepairLog -Level Warning -Message "This script created EFI System Partition $($manifest.CreatedPartition). A GPT partition table is not carried in the sectors that were backed up, so revert leaves it in place. Remove it by hand if that is wanted."
+        if ($manifest.Generation -eq 2 -and $gptRestore) {
+            Add-OfflineRepairLog -Level Warning -Message "This script created EFI System Partition $($manifest.CreatedPartition). Writing both GPT copies back restores the partition table as it was, which removes that partition's entry and returns the disk to its earlier unbootable state."
+        }
+        elseif ($manifest.Generation -eq 2) {
+            Add-OfflineRepairLog -Level Warning -Message "This script created EFI System Partition $($manifest.CreatedPartition). No GPT backup was recorded, so revert leaves it in place. Remove it by hand if that is wanted."
         }
         else {
             Add-OfflineRepairLog -Level Warning -Message "This script created system partition $($manifest.CreatedPartition). Writing sector 0 back also restores the partition table as it was, which removes that partition and returns the disk to its earlier unbootable state."
@@ -1987,6 +3028,11 @@ try {
 
     Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber)), Gen$($offline.Generation) / $($offline.PartitionStyle)." | Tee-Object -FilePath $logFile -Append
 
+    if (-not $isRevert -and -not $isDetectOnly) {
+        Save-SignatureBackup -Offline $offline
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    }
+
     if ($offline.PartitionStyle -notin @('MBR', 'GPT')) {
         Log-Error "Disk $($offline.DiskNumber) has partition style '$($offline.PartitionStyle)'. This script only understands MBR and GPT disks." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -2037,6 +3083,11 @@ try {
     }
 
     if ($findings.Count -eq 0) {
+        if ($script:SignatureRepair) {
+            Log-Output "Partition table signature restored on disk $($script:SignatureRepair.DiskNumber); no other system partition fault was found. Run this script again with revert=true to undo it." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            return $STATUS_SUCCESS
+        }
         Log-Output "No system partition fault was found. The firmware can reach a boot partition on this disk. If the VM still does not boot, the fault is in the boot configuration inside it; run 'az vm repair list-scripts' to see what the library offers." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_SUCCESS
@@ -2067,7 +3118,7 @@ try {
     $partitionRepairRan = $false
 
     foreach ($finding in @($repairable | Where-Object { $_.Cause -eq 'NoBootPartition' })) {
-        $created = New-BootPartition -Offline $offline -FreeSpace ([UInt64]$finding.Data)
+        $created = New-BootPartition -Offline $offline -FreeSpace ([UInt64]$finding.Data) -Analysis $detected.Identity
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
         if (-not $created.Success) {
@@ -2114,13 +3165,49 @@ try {
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     }
 
-    $sectorOk = Invoke-SectorRepair -Offline $offline -State $sectorSource.State -Findings $sectorSource.Findings
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    if ($offline.Generation -eq 2) {
+        # UEFI firmware never runs the MBR or VBR boot code, so there is no sector tier on Gen2. Its
+        # counterpart is the ESP's GPT identity, which the firmware's saved boot entry has to match.
+        Log-Info 'Platform=Gen2 Action=skip-sector-repair Reason=UEFI' | Tee-Object -FilePath $logFile -Append
 
-    if (-not $sectorOk) {
-        Log-Error 'Writing the repaired boot sectors did not complete. The disk is back online and the original sectors are available in the backup files listed above.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
+        # Read again whatever ran before: a recreated ESP lands in whichever GPT slot Windows gives it,
+        # and that is only known now.
+        $identityFindings = @()
+        $identity = $null
+        try {
+            $identity = Get-SavedBootEntry -Offline $offline
+            $identityFindings = @(Get-EspIdentityFinding -Analysis $identity)
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "Could not compare the EFI System Partition with the saved firmware boot entry: $($_.Exception.Message)"
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if ($identityFindings.Count -gt 0) {
+            Log-Info "Platform=Gen2 Action=identity-repair Status=$($identity.Status) Verdict=$($identity.Verdict) Causes=$(($identityFindings.Cause | Sort-Object -Unique) -join ',')" | Tee-Object -FilePath $logFile -Append
+            $identityRepair = Invoke-IdentityRepair -Offline $offline -Analysis $identity
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+            if (-not $identityRepair.Success) {
+                Log-Error $identityRepair.Reason | Tee-Object -FilePath $logFile -Append
+                Log-Output 'The original GPT copies are available in the backup files listed above; run this script again with revert=true to write them back.' | Tee-Object -FilePath $logFile -Append
+                Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+                return $STATUS_ERROR
+            }
+            foreach ($finding in @($repairable | Where-Object { $_.Tier -eq 'Identity' })) { $finding.Repaired = $true }
+            if ($identityRepair.GuidRestored) { Log-Output "Gave the EFI System Partition GPT GUID $($identity.Target.Guid) back, the one the firmware's saved boot entry names, and repointed {bootmgr} at it." | Tee-Object -FilePath $logFile -Append }
+            if ($identityRepair.SlotMoved) { Log-Output "Moved the EFI System Partition to GPT slot $($identity.RequiredSlot), the slot the firmware's saved boot entry names." | Tee-Object -FilePath $logFile -Append }
+        }
+    }
+    else {
+        $sectorOk = Invoke-SectorRepair -Offline $offline -State $sectorSource.State -Findings $sectorSource.Findings
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if (-not $sectorOk) {
+            Log-Error 'Writing the repaired boot sectors did not complete. The disk is back online and the original sectors are available in the backup files listed above.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            return $STATUS_ERROR
+        }
     }
 
     Save-RevertManifest -Offline $offline -Backup $backup -CreatedPartition $createdPartition
@@ -2136,7 +3223,7 @@ try {
     if ($stillBroken.Count -gt 0) {
         Log-Error "Repair ran but $($stillBroken.Count) issue(s) are still present:" | Tee-Object -FilePath $logFile -Append
         foreach ($finding in $stillBroken) { Log-Error "  $($finding.Message)" | Tee-Object -FilePath $logFile -Append }
-        Log-Output "Run this script again with revert=true to write the original sectors back." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Run this script again with revert=true to write the original sectors and partition table back." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
         return $STATUS_ERROR
     }
@@ -2147,6 +3234,7 @@ try {
     }
     if ($backup.MbrPath) { Log-Output "The original sector 0 was kept at $($backup.MbrPath)." | Tee-Object -FilePath $logFile -Append }
     if ($backup.VbrPath) { Log-Output "The original volume boot record was kept at $($backup.VbrPath)." | Tee-Object -FilePath $logFile -Append }
+    if ($backup.GptPrimaryPath) { Log-Output "The original GPT was kept at $($backup.GptPrimaryPath) and $($backup.GptBackupPath)." | Tee-Object -FilePath $logFile -Append }
     Log-Output "If the VM still does not boot, the boot configuration inside the partition is the next layer. Run 'az vm repair list-scripts' to see what else the library offers." | Tee-Object -FilePath $logFile -Append
     Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
     Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append

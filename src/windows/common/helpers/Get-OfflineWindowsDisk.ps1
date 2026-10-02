@@ -374,24 +374,40 @@ function Test-TemporaryStorageDisk {
         'Temporary Storage' label or the language-independent DATALOSS_WARNING_README.txt
         at a volume root. Inspect existing access paths only; this check never mounts a disk.
 
+        A disk that holds a Windows SYSTEM hive is an OS disk and is never treated as the
+        resource disk. On a rescue VM the attached disk's small boot partition can be the
+        first volume to take D:, and the guest agent then writes DATALOSS_WARNING_README.txt
+        to it, so the marker alone would hide the very disk being repaired.
+
     .OUTPUTS
-        $true when any volume on the disk has either resource-disk marker.
+        $true when any volume on the disk has either resource-disk marker and no volume
+        holds a Windows installation.
     #>
     param(
         [Parameter(Mandatory = $true)]$Disk
     )
 
     try {
-        foreach ($partition in @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue)) {
-            $volumes = @($partition | Get-Volume -ErrorAction SilentlyContinue)
-            $labels = @($volumes | ForEach-Object { $_.FileSystemLabel })
-            if ($labels -contains 'Temporary Storage') { return $true }
+        $volumesByPartition = @(foreach ($partition in @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue)) {
+                $volumes = @($partition | Get-Volume -ErrorAction SilentlyContinue)
+                $roots = @($partition.AccessPaths) + @($volumes | ForEach-Object {
+                        $_.Path
+                        if ($_.DriveLetter) { "$($_.DriveLetter):\" }
+                    })
+                [PSCustomObject]@{
+                    Labels = @($volumes | ForEach-Object { $_.FileSystemLabel })
+                    Roots  = @($roots | Where-Object { $_ } | Select-Object -Unique)
+                }
+            })
 
-            $roots = @($partition.AccessPaths) + @($volumes | ForEach-Object {
-                    $_.Path
-                    if ($_.DriveLetter) { "$($_.DriveLetter):\" }
-                })
-            foreach ($root in @($roots | Where-Object { $_ } | Select-Object -Unique)) {
+        foreach ($root in @($volumesByPartition | ForEach-Object { $_.Roots })) {
+            $hive = Join-OfflinePath -Root $root -ChildPath 'Windows\System32\config\SYSTEM'
+            if ($hive -and (Test-OfflinePath $hive)) { return $false }
+        }
+
+        foreach ($entry in $volumesByPartition) {
+            if ($entry.Labels -contains 'Temporary Storage') { return $true }
+            foreach ($root in $entry.Roots) {
                 $marker = Join-OfflinePath -Root $root -ChildPath 'DATALOSS_WARNING_README.txt'
                 if ($marker -and (Test-OfflinePath $marker)) { return $true }
             }
@@ -935,15 +951,20 @@ function Get-OfflineWindowsDisk {
     # Select by bus type, not model name: Azure NVMe disks report 'Microsoft NVMe Direct
     # Disk', which the old '*Virtual Disk*' match missed. The rescue VM's own system disk,
     # any boot/system disk, and the 'Temporary Storage' resource disk are all excluded so a
-    # broken precondition can never route the repair onto the live OS.
-    $disks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
-            $_.BusType -in @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual') -and
-            $_.Number -ne $systemDiskNumber -and
-            $_.Number -in $onlineDiskNumbers -and
-            -not ($_.IsOffline -or $_.IsReadOnly) -and
-            -not ($_.IsBoot -or $_.IsSystem) -and
-            -not (Test-TemporaryStorageDisk -Disk $_) -and
-            ($DiskNumber -lt 0 -or $_.Number -eq $DiskNumber)
+    # broken precondition can never route the repair onto the live OS. Each rejected disk is
+    # logged with its reason, so a missing disk can be explained from the log alone.
+    $disks = @(foreach ($candidateDisk in @(Get-Disk -ErrorAction SilentlyContinue)) {
+            $reason = if ($candidateDisk.BusType -notin @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual')) { "bus type $($candidateDisk.BusType)" }
+            elseif ($candidateDisk.Number -eq $systemDiskNumber) { "it is the rescue VM's own system disk" }
+            elseif ($DiskNumber -ge 0 -and $candidateDisk.Number -ne $DiskNumber) { "disk $DiskNumber was requested" }
+            elseif ($candidateDisk.IsBoot -or $candidateDisk.IsSystem) { 'it is a boot or system disk' }
+            elseif ($candidateDisk.Number -notin $onlineDiskNumbers) { 'it was not brought online and writable' }
+            elseif ($candidateDisk.IsOffline -or $candidateDisk.IsReadOnly) { "it is still offline ($($candidateDisk.IsOffline)) or read only ($($candidateDisk.IsReadOnly))" }
+            elseif (Test-TemporaryStorageDisk -Disk $candidateDisk) { 'it carries the Azure temporary storage markers' }
+            else { $null }
+
+            if ($reason) { Add-OfflineRepairLog -Level Info -Message "Skipped disk $($candidateDisk.Number) ($([math]::Round($candidateDisk.Size / 1GB)) GB): $reason." }
+            else { $candidateDisk }
         })
 
     if ($disks.Count -eq 0) {
