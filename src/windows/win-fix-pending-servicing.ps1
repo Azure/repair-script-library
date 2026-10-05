@@ -514,7 +514,9 @@ function Get-DismPendingPackage {
         $result.Packages = @($packages | Where-Object { $_.State -eq 'Pending' } | ForEach-Object { $_.'Package Identity' })
     }
     catch {
+        # Warning, not Error: the package list is evidence only and the repair goes on without it.
         $result.Message = $_.Exception.Message
+        Add-OfflineRepairLog -Level Warning -Message "DISM /Get-Packages could not be run or its output could not be parsed ($($_.Exception.GetType().FullName): $($_.Exception.Message))."
     }
 
     return $result
@@ -867,6 +869,7 @@ try {
 
     # Name the pending packages. Evidence only; nothing here is removed by this script.
     $dism = Get-DismPendingPackage -Drive $offline.WindowsDrive
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     if ($dism.Succeeded) {
         if (@($dism.Packages).Count -gt 0) {
             Log-Info "DISM reports $(@($dism.Packages).Count) package(s) in the Pending state:" | Tee-Object -FilePath $logFile -Append
