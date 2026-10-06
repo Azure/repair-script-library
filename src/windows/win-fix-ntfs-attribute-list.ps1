@@ -58,6 +58,8 @@
 # .EXAMPLE
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-ntfs-attribute-list --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-ntfs-attribute-list --parameters detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-ntfs-attribute-list --parameters volume=F --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-ntfs-attribute-list --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
