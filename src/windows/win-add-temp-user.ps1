@@ -69,6 +69,13 @@
 # .EXAMPLE
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-add-temp-user --parameters detectOnly=true --run-on-repair --verbose
 #
+# .EXAMPLE
+#   Other options. Replace REPLACE_WITH_PASSWORD with your own password, or omit it to have one generated.
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-add-temp-user --parameters username=supportadmin password=REPLACE_WITH_PASSWORD --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-add-temp-user --parameters bootTimeoutSeconds=900 --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-add-temp-user --parameters windowsDrive=F --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-add-temp-user --parameters revert=true --run-on-repair --verbose
+#
 # .NOTES
 #   Requires the rescue VM to have been created with --enable-nested. That flag makes the CLI pick a
 #   SKU that supports nested virtualization, derive the guest generation from the source VM, install
