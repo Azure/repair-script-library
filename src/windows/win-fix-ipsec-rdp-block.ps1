@@ -68,6 +68,12 @@
 #   Reports every connection security rule that blocks or may block Remote Desktop and changes
 #   nothing.
 #
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-ipsec-rdp-block --run-on-repair --parameters windowsDrive=F
+#
+#   Repairs the Windows installation on F: instead of the automatically detected one. Only needed
+#   when more than one Windows installation is attached to the repair VM.
+#
 # .PARAMETER detectOnly
 #   "true" to report what was found and change nothing at all. Defaults to "false".
 #
