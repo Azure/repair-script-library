@@ -134,6 +134,12 @@
 #
 #   Puts back everything the previous run changed.
 #
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-network-connectivity --run-on-repair --parameters windowsDrive=F
+#
+#   Repairs the Windows installation on F: instead of the automatically detected one. Only needed
+#   when more than one Windows installation is attached to the repair VM.
+#
 # .NOTES
 #   Not ported from the source material, on purpose:
 #
