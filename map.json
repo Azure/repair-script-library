@@ -72,7 +72,7 @@
 	{
 		"id" : "win-reset-group-policy",
 		"path" : "src/windows/win-reset-group-policy.ps1",
-		"description" : "Clears the local Group Policy that refuses every logon on a VM that boots but will not let anyone sign in, on an offline Windows disk. By default (scope=targeted) it changes something only when it finds a policy that refuses a logon by itself: Software Restriction Policies with a Disallowed default level, an enforced AppLocker rule collection, or a machine startup or user logon script defined in scripts.ini or psscripts.ini. It then renames whichever of the System32\\GroupPolicy, GroupPolicyUsers and AppLocker folders hold files aside and removes only the blocking SOFTWARE\\Policies key(s); a disk with none of those is reported and left unchanged. Use scope=files, registry or all to clear policy that detection cannot prove is blocking; scope=all removes every SOFTWARE\\Policies setting except certificate and cryptography trust material. The SOFTWARE hive is backed up and verified before any change, and the undo commands are logged. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+		"description" : "Clears the local Group Policy that refuses every logon on a VM that boots but lets no one sign in. By default (scope=targeted) it acts only on a policy that blocks logon by itself (SRP Disallowed default, an enforced AppLocker collection, a startup or logon script): the local policy folders are renamed aside and only the blocking SOFTWARE\\Policies keys removed. scope=files|registry|all clears more; trust material is always kept. The SOFTWARE hive is backed up first. detectOnly=true reports only. NOTE: use option --run-on-repair."
 	},
 	{
 		"id" : "win-fix-firewall-service",
