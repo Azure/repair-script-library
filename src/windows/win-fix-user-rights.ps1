@@ -5,10 +5,10 @@
 #   refuses every logon - can be signed into again. Works on the running VM or on its disk.
 #
 # .DESCRIPTION
-#   Runs in one of two modes, chosen by how it is launched rather than by a parameter:
+#   Runs in one of two modes:
 #
-#     az vm repair run ... --run-id win-fix-user-rights                   ONLINE  - repairs this VM
-#     az vm repair run ... --run-id win-fix-user-rights --run-on-repair   OFFLINE - repairs the disk
+#     az vm repair run ... --run-id win-fix-user-rights                                   ONLINE
+#     az vm repair run ... --run-id win-fix-user-rights --run-on-repair --parameters mode=offline
 #
 #   ONLINE FIRST. A user-rights lockout stops people signing in; it does not stop the machine
 #   running or the guest agent answering. So the usual case needs no rescue VM at all: Run Command
@@ -16,11 +16,12 @@
 #   supported writer, which also recreates a deleted account entry itself. Escalate to OFFLINE only
 #   when the VM cannot boot or the agent does not answer.
 #
-#   The mode is discovered, not declared, because the extension gives the script no way to know
-#   which way it was launched: an attached offline Windows installation means OFFLINE, and its
-#   absence means the machine underfoot is the target. Getting that wrong is safe in the direction
-#   that matters - a rescue VM has default rights, so an ONLINE run there finds nothing to repair
-#   and writes nothing.
+#   The extension does not tell the script which way it was launched, so 'mode' says it. The
+#   default, mode=auto, only goes online when the machine shows no sign of an attached data disk
+#   that could hold another Windows installation; it never brings a disk online or assigns a drive
+#   letter to find out. When such a disk is present, auto runs the offline discovery and, if that
+#   fails, stops and asks for mode=online or mode=offline rather than guessing - a guess in either
+#   direction would repair the wrong machine or report a broken disk as healthy.
 #
 #   THE FAULT
 #
@@ -138,10 +139,13 @@
 #   CmdLine, re-entering the setup boot path on every boot thereafter.
 #
 #   Writing the hive directly finishes the repair while the disk is still attached to the rescue VM.
-#   Nothing is armed, nothing is left in Windows\Temp, and the VM needs no extra boot.
+#   Nothing is armed and the VM needs no extra boot. SYSTEM\Setup is read for reporting only and is
+#   never written: a SetupType other than 0 is reported as context, because it can be legitimate
+#   servicing or provisioning state that this script has no way to tell apart from residue.
 #
-#   A disk still carrying that residue from an earlier version is detected as StaleSetupType and
-#   reset to 0.
+#   Before the first offline write the SECURITY hive file is copied next to itself
+#   (SECURITY.bak-<timestamp>), and the masks it changes are recorded in
+#   Windows\Temp\win-fix-user-rights-revert.json for revert=true.
 #
 #   Reference: "User Rights Assignment"
 #   https://learn.microsoft.com/windows/security/threat-protection/security-policy-settings/user-rights-assignment
@@ -154,14 +158,21 @@
 #   Report what is on the disk and change nothing.
 #
 # .PARAMETER revert
-#   Put the logon-right masks recorded by the last repair back as they were, and clear any Setup
-#   hook left behind by an earlier version of this script. An account entry the repair recreated is
-#   deliberately left in place - deleting one to reimpose a lockout is the riskier write and not a
-#   rollback worth doing automatically - so revert names it and reports itself as partial.
+#   Put the logon-right masks recorded by the first repair back as they were. Revert reports
+#   success, and deletes the record, only when every recorded mask was written back and reads back
+#   as recorded; otherwise it returns an error and keeps the record so it can be retried. An account
+#   entry the repair recreated is deliberately left in place - deleting one to reimpose a lockout is
+#   the riskier write and not a rollback worth doing automatically - so revert names it and reports
+#   itself as partial. Revert never touches SYSTEM\Setup.
+#
+# .PARAMETER mode
+#   auto (default), online or offline. online repairs the machine the script runs on and never looks
+#   for an attached disk. offline requires an attached Windows installation and fails without one -
+#   use it with --run-on-repair. auto picks online only when no attached data disk is visible.
 #
 # .PARAMETER windowsDrive
-#   Drive letter of the offline Windows installation, when it should not be auto-detected. Offline
-#   mode only; it is ignored on a running machine, which has no attached installation to point at.
+#   Drive letter of the offline Windows installation, when it should not be auto-detected. Implies
+#   an offline run under mode=auto, and is refused with mode=online.
 #
 # .PARAMETER force
 #   Carry on past a clean detect instead of returning early. The plan is built from the same
@@ -176,7 +187,7 @@
 # .EXAMPLE
 #   # Offline - only when the VM cannot boot or its agent does not answer.
 #   az vm repair create -g sourceRG -n sourceVM --verbose
-#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --run-on-repair --parameters mode=offline --verbose
 #   az vm repair restore -g sourceRG -n sourceVM --yes
 #
 # .NOTES
@@ -200,15 +211,11 @@ Param(
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$detectOnly = 'false',
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$revert = 'false',
     [Parameter(Mandatory = $false)][ValidateSet('true', 'false', IgnoreCase = $true)][string]$force = 'false',
+    [Parameter(Mandatory = $false)][ValidateSet('auto', 'online', 'offline', IgnoreCase = $true)][string]$mode = 'auto',
     [Parameter(Mandatory = $false)][string]$windowsDrive = ''
 )
 
 . .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\OfflineRepairCommon.ps1
-. .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
-. .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
-. .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
-. .\src\windows\common\helpers\Use-OfflinePrivilegedRegistry.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
 $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
@@ -218,16 +225,12 @@ $isDetectOnly = ($detectOnly -eq 'true')
 $isRevert = ($revert -eq 'true')
 $isForced = ($force -eq 'true')
 
-# Residue an earlier version of this script wrote into Windows\Temp. The repair no longer creates
-# any of these - they are still named so a run can recognise and clear what it finds.
-$script:PayloadRelativePath = 'Temp\win-fix-user-rights.cmd'
-$script:ResultRelativePath = 'Temp\win-fix-user-rights.result'
+# The undo record for revert=true, relative to the target's Windows directory.
 $script:ManifestRelativePath = 'Temp\win-fix-user-rights-revert.json'
 
 # Registry value types. Passed explicitly on every write because the LSA policy database stores its
 # values as REG_NONE, and rewriting the same bytes as REG_BINARY changes the shape of the value.
 $script:RegNone = 0
-$script:RegBinary = 3
 
 # What this run is repairing, in words, for the operator-facing messages. Both modes share the same
 # detect and repair code, so the messages are shared too - but "no account on this disk holds ..."
@@ -298,6 +301,24 @@ $script:SidAdministrators = 'S-1-5-32-544'
 $script:SidRemoteDesktopUsers = 'S-1-5-32-555'
 $script:SidAllServices = 'S-1-5-80-0'
 
+# When a sign-in right counts as a lockout, and what is restored to end it. A right is locked out
+# only when none of its Holders has it: those are the groups an administrator (or, for RDP, the
+# Remote Desktop Users group) signs in through. Any other difference from the shipped template is
+# reported but left alone, because a hardening baseline that limits "Allow log on locally" or RDP
+# to Administrators is a deliberate decision, not a fault. Broad-group deny rights are cleared by
+# the repair regardless, so grants alone decide whether a lockout remains. Keyed by integer:
+# iterate with GetEnumerator only.
+$script:LockoutRules = [ordered]@{
+    0x0001 = [PSCustomObject]@{
+        Holders = @('S-1-5-32-544', 'S-1-5-32-545', 'S-1-5-11', 'S-1-1-0')
+        Restore = @('S-1-5-32-544')
+    }
+    0x0400 = [PSCustomObject]@{
+        Holders = @('S-1-5-32-544', 'S-1-5-32-555', 'S-1-5-32-545', 'S-1-5-11', 'S-1-1-0')
+        Restore = @('S-1-5-32-544', 'S-1-5-32-555')
+    }
+}
+
 function New-Finding {
     param(
         [Parameter(Mandatory = $true)][string]$Cause,
@@ -312,6 +333,48 @@ function New-Finding {
         Message    = $Message
         Repairable = $Repairable
     }
+}
+
+function Get-LogonRightRestoreTarget {
+    <#
+    .SYNOPSIS
+        The sign-in bits to restore, per SID, to end a real lockout - and nothing else.
+
+    .DESCRIPTION
+        For each rule in LockoutRules, the right is locked out only when no Holder group has it.
+        Only then are the Restore groups given the right back, and only where the shipped template
+        grants it to them. A hardened VM where Administrators can still sign in returns nothing.
+
+    .OUTPUTS
+        Hashtable of SID -> uint32 mask of the bits to restore.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts,
+        [Parameter(Mandatory = $true)][hashtable]$DefaultGrants
+    )
+
+    $bySid = @{}
+    foreach ($a in $Accounts) { $bySid[$a.Sid] = $a }
+
+    $targets = @{}
+    foreach ($rule in $script:LockoutRules.GetEnumerator()) {
+        $bit = [uint32]$rule.Key
+        $held = $false
+        foreach ($sid in $rule.Value.Holders) {
+            $account = $bySid[$sid]
+            if ($null -ne $account -and ([uint32]$account.Mask -band $bit) -ne 0) { $held = $true; break }
+        }
+        if ($held) { continue }
+
+        foreach ($sid in $rule.Value.Restore) {
+            if (-not $DefaultGrants.ContainsKey($sid)) { continue }
+            if (([uint32]$DefaultGrants[$sid] -band $bit) -eq 0) { continue }
+            $existing = [uint32]0
+            if ($targets.ContainsKey($sid)) { $existing = [uint32]$targets[$sid] }
+            $targets[$sid] = [uint32]($existing -bor $bit)
+        }
+    }
+    return $targets
 }
 
 function Write-OperatorLog {
@@ -420,12 +483,29 @@ function Get-OfflineLogonRight {
         $accounts = New-Object System.Collections.ArrayList
 
         foreach ($sid in @($listing.Names)) {
-            $value = Get-OfflinePrivilegedRegistryValue -Path "$accountsPath\$sid\ActSysAc" -Name ''
+            # The subkeys are listed before ActSysAc is read. An account with privileges but no logon
+            # rights has no ActSysAc subkey at all, which is a normal shape and carries no logon right
+            # to judge - and asking the native reader for a key that is not there is not a pure read.
+            $children = Get-OfflinePrivilegedRegistrySubKeyName -Path "$accountsPath\$sid"
+            if (-not $children.Ok) {
+                $result.Reason = "the entry for $sid could not be listed: $($children.Error)"
+                return $result
+            }
+            if (@($children.Names) -notcontains 'ActSysAc') { continue }
 
-            # An account with privileges but no logon rights has no ActSysAc subkey at all. That is
-            # a normal shape, not a read failure, and it carries no logon right to judge.
-            if (-not $value.Ok -or -not $value.Found) { continue }
-            if ($value.ByteLength -lt 4) { continue }
+            # Present but unreadable is a failed read, not a missing right. Skipping it would report
+            # an account with a deny right as one with no rights at all, and on the account that
+            # holds the lockout that turns a broken disk into a clean detect.
+            $value = Get-OfflinePrivilegedRegistryValue -Path "$accountsPath\$sid\ActSysAc" -Name ''
+            if (-not $value.Ok) {
+                $result.Reason = "the logon-right mask of $sid could not be read: $($value.Error)"
+                return $result
+            }
+            if (-not $value.Found) { continue }
+            if ($value.ByteLength -lt 4) {
+                $result.Reason = "the logon-right mask of $sid is $($value.ByteLength) byte(s) long instead of 4"
+                return $result
+            }
 
             $mask = [System.BitConverter]::ToUInt32($value.Bytes, 0)
 
@@ -450,7 +530,8 @@ function Get-OfflineLogonRight {
         # Assigned to $null because Dismount-OfflineHive returns $true, and a finally block still
         # writes to the output stream after the return above has run. Unsuppressed, the caller
         # receives the result object AND a bare True, so $rights becomes a two-element array.
-        try { $null = Dismount-OfflineHive -Hive 'SECURITY' } catch { }
+        try { $null = Dismount-OfflineHive -Hive 'SECURITY' }
+        catch { Add-OfflineRepairLog -Level Warning -Message "The SECURITY hive could not be unloaded after the read: $($_.Exception.Message)" }
     }
 }
 
@@ -645,50 +726,67 @@ function Get-LiveLogonRight {
         shaped exactly like Get-OfflineLogonRight's, so detection runs unchanged in either mode.
 
     .OUTPUTS
-        PSCustomObject with Ok, Accounts (Sid/Name/Mask/Rights/Type), ExportPath and Reason.
+        PSCustomObject with Ok, Accounts (Sid/Name/Mask/Rights/Type), Skipped (right=holder entries
+        that are not SIDs) and Reason. The export file is deleted before returning.
     #>
     param()
 
-    $result = [PSCustomObject]@{ Ok = $false; Accounts = @(); ExportPath = $null; Reason = $null }
+    $result = [PSCustomObject]@{ Ok = $false; Accounts = @(); Skipped = @(); Reason = $null }
 
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $export = Join-Path $env:TEMP "win-fix-user-rights-export-$stamp.inf"
 
     try {
-        $null = & secedit.exe /export /areas USER_RIGHTS /cfg $export /quiet 2>&1
+        # A file already at this path would be parsed as if secedit had just written it.
+        if (Test-Path -LiteralPath $export) { Remove-Item -LiteralPath $export -Force -ErrorAction Stop }
+
+        $output = & secedit.exe /export /areas USER_RIGHTS /cfg $export /quiet 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            $result.Reason = "secedit /export returned $exitCode`: $((@($output) | Out-String).Trim())"
+            return $result
+        }
+
+        if (-not (Test-Path -LiteralPath $export)) {
+            $result.Reason = "secedit did not produce an export at $export, so the current user rights could not be read"
+            return $result
+        }
+
+        $parsed = ConvertFrom-SecurityTemplateRights -Path $export
+        if (-not $parsed.Ok) {
+            $result.Reason = $parsed.Error
+            return $result
+        }
+
+        $accounts = New-Object System.Collections.ArrayList
+        foreach ($sid in $parsed.Grants.Keys) {
+            $mask = [uint32]$parsed.Grants[$sid]
+            [void]$accounts.Add([PSCustomObject]@{
+                    Sid    = $sid
+                    Name   = (Resolve-SidFriendlyName -Sid $sid)
+                    Mask   = $mask
+                    Type   = $script:RegNone
+                    Rights = (ConvertTo-LogonRightName -Mask $mask)
+                })
+        }
+
+        $result.Accounts = @($accounts)
+        $result.Skipped = @($parsed.Skipped)
+        $result.Ok = $true
+        return $result
     }
     catch {
         $result.Reason = "secedit could not export the current user rights: $($_.Exception.Message)"
         return $result
     }
-
-    if (-not (Test-Path -LiteralPath $export)) {
-        $result.Reason = "secedit did not produce an export at $export, so the current user rights could not be read"
-        return $result
+    finally {
+        if (Test-Path -LiteralPath $export) {
+            Remove-Item -LiteralPath $export -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $export) {
+                Add-OfflineRepairLog -Level Warning -Message "The temporary export '$export' could not be deleted."
+            }
+        }
     }
-    $result.ExportPath = $export
-
-    $parsed = ConvertFrom-SecurityTemplateRights -Path $export
-    if (-not $parsed.Ok) {
-        $result.Reason = $parsed.Error
-        return $result
-    }
-
-    $accounts = New-Object System.Collections.ArrayList
-    foreach ($sid in $parsed.Grants.Keys) {
-        $mask = [uint32]$parsed.Grants[$sid]
-        [void]$accounts.Add([PSCustomObject]@{
-                Sid    = $sid
-                Name   = (Resolve-SidFriendlyName -Sid $sid)
-                Mask   = $mask
-                Type   = $script:RegNone
-                Rights = (ConvertTo-LogonRightName -Mask $mask)
-            })
-    }
-
-    $result.Accounts = @($accounts)
-    $result.Ok = $true
-    return $result
 }
 
 function Repair-LiveLogonRight {
@@ -707,13 +805,18 @@ function Repair-LiveLogonRight {
         full intended holder list - the accounts that already hold it, plus the ones being restored
         - which keeps a deliberate grant to a custom group in place instead of quietly dropping it.
 
+        Holders that the export listed by name rather than by SID cannot be carried across, so a
+        right that has one is refused rather than rewritten without it. The template, database and
+        secedit log files are deleted before returning.
+
     .OUTPUTS
         PSCustomObject with Ok, Applied (right names), TemplatePath and Reason.
     #>
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Absent
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Absent,
+        [Parameter(Mandatory = $false)][AllowEmptyCollection()][string[]]$Skipped = @()
     )
 
     $result = [PSCustomObject]@{ Ok = $false; Applied = @(); TemplatePath = $null; Reason = $null }
@@ -755,9 +858,16 @@ function Repair-LiveLogonRight {
         [void]$applied.Add($entry.Value)
     }
 
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $unresolved = @($Skipped | Where-Object { $applied -contains ("$_" -split '=', 2)[0] })
+    if ($unresolved.Count -gt 0) {
+        $result.Reason = "these holders are listed by name rather than SID and would be dropped from the rights being rewritten: $($unresolved -join '; ')"
+        return $result
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $template = Join-Path $env:TEMP "win-fix-user-rights-apply-$stamp.inf"
     $database = Join-Path $env:TEMP "win-fix-user-rights-apply-$stamp.sdb"
+    $scratch = @($template, $database, [System.IO.Path]::ChangeExtension($database, '.jfm'))
 
     $content = @(
         '[Unicode]'
@@ -769,26 +879,37 @@ function Repair-LiveLogonRight {
     ) + @($body)
 
     try {
-        # secedit requires UTF-16 when the template declares Unicode=yes.
-        Set-Content -LiteralPath $template -Value $content -Encoding Unicode -ErrorAction Stop
-    }
-    catch {
-        $result.Reason = "the repair template could not be written to $template : $($_.Exception.Message)"
+        try {
+            # secedit requires UTF-16 when the template declares Unicode=yes.
+            Set-Content -LiteralPath $template -Value $content -Encoding Unicode -ErrorAction Stop
+        }
+        catch {
+            $result.Reason = "the repair template could not be written to $template : $($_.Exception.Message)"
+            return $result
+        }
+        $result.TemplatePath = $template
+
+        $output = & secedit.exe /configure /db $database /cfg $template /areas USER_RIGHTS /quiet 2>&1
+        $code = $LASTEXITCODE
+
+        if ($code -ne 0) {
+            $result.Reason = "secedit /configure returned $code : $(($output | Out-String).Trim())"
+            return $result
+        }
+
+        $result.Applied = @($applied)
+        $result.Ok = $true
         return $result
     }
-    $result.TemplatePath = $template
-
-    $output = & secedit.exe /configure /db $database /cfg $template /areas USER_RIGHTS /quiet 2>&1
-    $code = $LASTEXITCODE
-
-    if ($code -ne 0) {
-        $result.Reason = "secedit /configure returned $code : $(($output | Out-String).Trim())"
-        return $result
+    finally {
+        foreach ($file in $scratch) {
+            if (-not (Test-Path -LiteralPath $file)) { continue }
+            Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $file) {
+                Add-OfflineRepairLog -Level Warning -Message "The temporary file '$file' could not be deleted."
+            }
+        }
     }
-
-    $result.Applied = @($applied)
-    $result.Ok = $true
-    return $result
 }
 
 function Get-AbsentGrantTarget {
@@ -803,10 +924,11 @@ function Get-AbsentGrantTarget {
         deleted S-1-5-32-555 outright, because that right was the only one it held. Any group that
         holds a single right by default is one policy away from disappearing the same way.
 
-        These are the accounts the shipped template grants a sign-in right to that have no entry on
-        this disk. New-OfflineLogonRightAccount puts them back; this exists so the repair can tell
-        the difference between an account it corrected and one it had to recreate, and so the gap is
-        still reported when recreating it is not possible.
+        These are the accounts the repair has to give a sign-in right back to, to end a real lockout
+        (see Get-LogonRightRestoreTarget), that have no entry here. New-OfflineLogonRightAccount puts
+        them back; this exists so the repair can tell the difference between an account it corrected
+        and one it had to recreate, and so the gap is still reported when recreating it is not
+        possible. A default grantee that is absent while nobody is locked out is not returned.
 
     .OUTPUTS
         Array of PSCustomObject with Sid, Name, Right and Mask.
@@ -819,11 +941,13 @@ function Get-AbsentGrantTarget {
     $present = @{}
     foreach ($a in $Accounts) { $present[$a.Sid] = $true }
 
+    $restore = Get-LogonRightRestoreTarget -Accounts $Accounts -DefaultGrants $DefaultGrants
+
     $absent = New-Object System.Collections.ArrayList
-    foreach ($sid in $DefaultGrants.Keys) {
+    foreach ($sid in @($restore.Keys | Sort-Object)) {
         if ($present.ContainsKey($sid)) { continue }
 
-        $wanted = [uint32]([uint32]$DefaultGrants[$sid] -band $script:SignInGrantBits)
+        $wanted = [uint32]$restore[$sid]
         if ($wanted -eq 0) { continue }
 
         [void]$absent.Add([PSCustomObject]@{
@@ -845,14 +969,10 @@ function Get-LogonRightRepairPlan {
         The plan is derived from the same conditions Get-UserRightsFinding reports, so the repair
         can never act on something detect did not report. Only the bits named here are touched:
         every other bit of the account's mask is carried across untouched, which is the difference
-        between this and applying defltbase.inf, where every user right on the machine returns to
-        the shipped default and any deliberate customisation is lost.
-
-        Only the bits named here are touched: every other bit of the account's mask is carried
-        across untouched, which is the difference between this and applying defltbase.inf wholesale
-        with secedit, where every user right on the machine returns to the shipped default and any
-        deliberate customisation is lost. The template is read for what the default *is*, not
-        applied as a whole.
+        between this and applying defltbase.inf wholesale with secedit, where every user right on
+        the machine returns to the shipped default and any deliberate customisation is lost. The
+        template is read for what the default *is*, not applied as a whole, and a sign-in right is
+        only given back when nobody who should hold it does (see Get-LogonRightRestoreTarget).
 
         An account that is absent from Policy\Accounts is not planned here, because there is no mask
         to adjust. Get-AbsentGrantTarget reports those and the repair recreates them separately.
@@ -891,36 +1011,20 @@ function Get-LogonRightRepairPlan {
         }
     }
 
-    # 2. Every account the shipped template grants a sign-in right to, that is missing it here. This
-    #    is the general case of the fault: a policy replaced the shipped list and dropped principals
-    #    from it. Restoring is additive - a grant this disk has that the template does not is left
-    #    alone, because a deliberate grant to a custom group is not a fault to be repaired.
-    foreach ($sid in $DefaultGrants.Keys) {
+    # 2. A sign-in right nobody who should hold it still holds. Only that is a lockout: a hardened
+    #    baseline that limits the right to Administrators is left alone, because a deliberate
+    #    restriction is not a fault to be repaired. Restoring is additive. The partner deny rights
+    #    on the restored groups are broad-group denies, so step 1 has already planned their removal.
+    $restore = Get-LogonRightRestoreTarget -Accounts $Accounts -DefaultGrants $DefaultGrants
+    foreach ($sid in @($restore.Keys | Sort-Object)) {
         $account = $byName[$sid]
         if ($null -eq $account) { continue }
 
-        $wanted = [uint32]([uint32]$DefaultGrants[$sid] -band $script:SignInGrantBits)
-        if ($wanted -eq 0) { continue }
-
         $mask = [uint32]$account.Mask
-        $missing = [uint32]($wanted -band (-bnot $mask))
+        $missing = [uint32]([uint32]$restore[$sid] -band (-bnot $mask))
         if ($missing -ne 0) {
             $reason = (ConvertTo-LogonRightName -Mask $missing | ForEach-Object { "grant $_" }) -join ', '
             Add-Change -Sid $sid -SetBits $missing -ClearBits 0 -Reason $reason
-        }
-
-        # Deny overrides allow, so a grant restored while its partner deny is still tattooed changes
-        # nothing the account can actually do. The shipped template leaves all five deny rights
-        # empty, so a deny sitting on a default grantee is by definition not the default.
-        $denies = [uint32]0
-        foreach ($pair in $script:GrantToDenyBit.GetEnumerator()) {
-            if (([uint32]$pair.Key -band $wanted) -eq 0) { continue }
-            if (($mask -band [uint32]$pair.Value) -eq 0) { continue }
-            $denies = [uint32]($denies -bor [uint32]$pair.Value)
-        }
-        if ($denies -ne 0) {
-            $reason = (ConvertTo-LogonRightName -Mask $denies | ForEach-Object { "clear $_" }) -join ', '
-            Add-Change -Sid $sid -SetBits 0 -ClearBits $denies -Reason $reason
         }
     }
     $svc = $byName[$script:SidAllServices]
@@ -1026,7 +1130,8 @@ function Set-OfflineLogonRight {
         return $result
     }
     finally {
-        try { $null = Dismount-OfflineHive -Hive 'SECURITY' } catch { }
+        try { $null = Dismount-OfflineHive -Hive 'SECURITY' }
+        catch { Add-OfflineRepairLog -Level Warning -Message "The SECURITY hive could not be unloaded after the logon rights were written: $($_.Exception.Message)" }
     }
 }
 
@@ -1102,15 +1207,43 @@ function New-OfflineLogonRightAccount {
             return $result
         }
 
-        # The account key itself carries an empty default value, which is what LSA leaves there.
-        $null = Set-OfflinePrivilegedRegistryValue -Path "$root\$Sid" -Name '' `
-            -Type $script:RegBinary -Bytes ([byte[]]@()) -Confirm:$false
-
         $values = @(
             @{ Key = 'ActSysAc'; Bytes = [System.BitConverter]::GetBytes([uint32]$Mask) }
             @{ Key = 'SecDesc'; Bytes = [byte[]]$donor.Bytes }
             @{ Key = 'Sid'; Bytes = $sidBytes }
         )
+
+        if ($newKey.Created) {
+            $result.Created = $true
+
+            # The account key itself carries an empty REG_NONE default value, which is what LSA leaves.
+            $default = Set-OfflinePrivilegedRegistryValue -Path "$root\$Sid" -Name '' `
+                -Type $script:RegNone -Bytes ([byte[]]@()) -Confirm:$false
+            if (-not $default.Written) {
+                $result.Reason = "the account key's default value could not be written: $($default.Error)"
+                return $result
+            }
+        }
+        else {
+            # The account entry exists but carried no logon right - an account that still holds
+            # privileges keeps its key when its last logon right goes. Only the missing ActSysAc is
+            # added; the existing SecDesc, Sid and default value belong to LSA and are not rewritten.
+            # An entry that already has ActSysAc was written by something else since detect ran.
+            $existing = Get-OfflinePrivilegedRegistrySubKeyName -Path "$root\$Sid"
+            if (-not $existing.Ok) {
+                $result.Reason = "the existing entry for $Sid could not be listed: $($existing.Error)"
+                return $result
+            }
+            if (@($existing.Names) -contains 'ActSysAc') {
+                $result.Reason = "an entry for $Sid with a logon-right mask already exists on this disk, so it was not overwritten"
+                return $result
+            }
+            if (@($existing.Names) -notcontains 'Sid' -or @($existing.Names) -notcontains 'SecDesc') {
+                $result.Reason = "the existing entry for $Sid has no Sid or SecDesc subkey, so it is not an entry this script will add a mask to"
+                return $result
+            }
+            $values = @($values | Where-Object { $_.Key -eq 'ActSysAc' })
+        }
 
         foreach ($value in $values) {
             $path = "$root\$Sid\$($value.Key)"
@@ -1139,7 +1272,6 @@ function New-OfflineLogonRightAccount {
             return $result
         }
 
-        $result.Created = $newKey.Created
         $result.Ok = $true
         return $result
     }
@@ -1148,7 +1280,8 @@ function New-OfflineLogonRightAccount {
         return $result
     }
     finally {
-        try { $null = Dismount-OfflineHive -Hive 'SECURITY' } catch { }
+        try { $null = Dismount-OfflineHive -Hive 'SECURITY' }
+        catch { Add-OfflineRepairLog -Level Warning -Message "The SECURITY hive could not be unloaded after recreating $Sid : $($_.Exception.Message)" }
     }
 }
 
@@ -1183,56 +1316,6 @@ function Get-OfflineSetupState {
     if ($null -ne $props.CmdLine) { $state.CmdLine = "$($props.CmdLine)".Trim() }
 
     return $state
-}
-
-
-function Restore-OfflineSetupHook {
-    <#
-    .SYNOPSIS
-        Puts SYSTEM\Setup back the way it was found.
-
-    .DESCRIPTION
-        Restores the recorded values rather than assuming the healthy state, so a disk that
-        legitimately carried a setup command keeps it. An empty recorded CmdLine means the value was
-        absent or blank, and it is removed rather than written as an empty string.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$WindowsPath,
-        [Parameter(Mandatory = $true)][int]$SetupType,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$CmdLine
-    )
-
-    $result = [PSCustomObject]@{ Restored = $false; Reason = $null }
-
-    $targetSetupType = $SetupType
-    $targetCmdLine = $CmdLine
-
-    try {
-        $readBack = Invoke-WithHive -WindowsPath $WindowsPath -Hive 'SYSTEM' -ScriptBlock {
-            $key = 'HKLM:\BROKENSYSTEM\Setup'
-            Set-ItemProperty -Path $key -Name 'SetupType' -Value $targetSetupType -Type DWord -Force -ErrorAction Stop
-            if ([string]::IsNullOrWhiteSpace($targetCmdLine)) {
-                Remove-ItemProperty -Path $key -Name 'CmdLine' -Force -ErrorAction SilentlyContinue
-            }
-            else {
-                Set-ItemProperty -Path $key -Name 'CmdLine' -Value $targetCmdLine -Type String -Force -ErrorAction Stop
-            }
-            $props = Get-ItemProperty -Path $key -ErrorAction Stop
-            return [PSCustomObject]@{ CmdLine = "$($props.CmdLine)"; SetupType = [int]$props.SetupType }
-        }
-    }
-    catch {
-        $result.Reason = "the Setup hook could not be restored: $($_.Exception.Message)"
-        return $result
-    }
-
-    if ($null -eq $readBack -or $readBack.SetupType -ne $SetupType) {
-        $result.Reason = "SetupType did not read back as $SetupType after being restored"
-        return $result
-    }
-
-    $result.Restored = $true
-    return $result
 }
 
 
@@ -1278,12 +1361,27 @@ function Write-RevertManifest {
         remembered value is the only honest undo: recomputing a 'healthy' mask would put the disk
         into a state it was never in, and on a machine whose rights were deliberately customised
         that is a second fault rather than a rollback.
+
+        A manifest that already exists is kept, not overwritten. It holds the masks from before the
+        first repair; a second run would record the already-repaired masks as "previous", and a
+        revert would then restore the repair instead of the original state.
+
+    .OUTPUTS
+        PSCustomObject with Ok, Kept and Error.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$ManifestPath,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan,
         [Parameter(Mandatory = $false)][AllowEmptyCollection()][array]$Recreated = @()
     )
+
+    $result = [PSCustomObject]@{ Ok = $false; Kept = $false; Error = $null }
+
+    if (Test-Path -LiteralPath $ManifestPath) {
+        $result.Kept = $true
+        $result.Ok = $true
+        return $result
+    }
 
     try {
         $manifest = [PSCustomObject]@{
@@ -1307,25 +1405,39 @@ function Write-RevertManifest {
                     }
                 })
         }
-        $manifest | ConvertTo-Json -Depth 4 | Out-File -FilePath $ManifestPath -Encoding ascii -Force
-        return $true
+        $manifest | ConvertTo-Json -Depth 4 | Out-File -FilePath $ManifestPath -Encoding ascii -Force -ErrorAction Stop
+        $result.Ok = $true
+        return $result
     }
     catch {
-        return $false
+        $result.Error = $_.Exception.Message
+        return $result
     }
 }
 
 function Read-RevertManifest {
+    <#
+    .SYNOPSIS
+        Reads the revert manifest, telling "there is none" apart from "it cannot be read".
+
+    .OUTPUTS
+        PSCustomObject with Exists, Manifest and Error.
+    #>
     param([Parameter(Mandatory = $true)][string]$ManifestPath)
 
-    if (-not (Test-Path -LiteralPath $ManifestPath)) { return $null }
+    $result = [PSCustomObject]@{ Exists = $false; Manifest = $null; Error = $null }
+    if (-not (Test-Path -LiteralPath $ManifestPath)) { return $result }
+    $result.Exists = $true
 
     try {
         $raw = Get-Content -LiteralPath $ManifestPath -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return ($raw | ConvertFrom-Json)
+        if ([string]::IsNullOrWhiteSpace($raw)) { throw 'the file is empty' }
+        $manifest = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $manifest -or $manifest.Script -ne 'win-fix-user-rights') { throw 'the file is not a manifest written by this script' }
+        $result.Manifest = $manifest
     }
-    catch { return $null }
+    catch { $result.Error = "$($_.Exception.Message)" }
+    return $result
 }
 
 function Get-UserRightsFinding {
@@ -1347,29 +1459,45 @@ function Get-UserRightsFinding {
     $byName = @{}
     foreach ($a in $Accounts) { $byName[$a.Sid] = $a }
 
-    # 0. The general fault: an account the shipped template grants a sign-in right to that no longer
-    #    holds it here. User-rights assignment is replace and not merge, so one over-restrictive
-    #    policy strips every principal it does not name - and LSA deletes the account from
-    #    Policy\Accounts altogether when that right was the only one it held.
-    foreach ($sid in $DefaultGrants.Keys) {
+    # 0. A sign-in right that nobody who should hold it still holds. User-rights assignment is
+    #    replace and not merge, so one over-restrictive policy strips every principal it does not
+    #    name - and LSA deletes the account from Policy\Accounts altogether when that right was the
+    #    only one it held. Only a real lockout is repairable (see Get-LogonRightRestoreTarget); any
+    #    other difference from the shipped template is reported and left as it is, because a
+    #    hardening baseline removes these grants deliberately while an administrator can still sign in.
+    $restore = Get-LogonRightRestoreTarget -Accounts $Accounts -DefaultGrants $DefaultGrants
+    foreach ($sid in @($DefaultGrants.Keys | Sort-Object)) {
         $wanted = [uint32]([uint32]$DefaultGrants[$sid] -band $script:SignInGrantBits)
         if ($wanted -eq 0) { continue }
 
         $friendly = Resolve-SidFriendlyName -Sid $sid
-        $wantedNames = (ConvertTo-LogonRightName -Mask $wanted) -join ', '
         $account = $byName[$sid]
+        $held = [uint32]0
+        if ($null -ne $account) { $held = [uint32]$account.Mask }
 
-        if ($null -eq $account) {
-            [void]$findings.Add((New-Finding -Cause 'MissingAccountEntry' -Item "$friendly / $wantedNames" `
-                        -Message "$friendly has no entry in $($script:TargetNoun)'s LSA policy database, so it holds no logon right at all. Windows grants it $wantedNames by default on this build, and LSA removes an account outright once its last right is taken away - which is what an over-restrictive user-rights policy does."))
-            continue
+        $missing = [uint32]($wanted -band (-bnot $held))
+        if ($missing -eq 0) { continue }
+
+        $restoreBits = [uint32]0
+        if ($restore.ContainsKey($sid)) { $restoreBits = [uint32]([uint32]$restore[$sid] -band $missing) }
+        $reportBits = [uint32]($missing -band (-bnot $restoreBits))
+
+        if ($restoreBits -ne 0) {
+            $names = (ConvertTo-LogonRightName -Mask $restoreBits) -join ', '
+            if ($null -eq $account) {
+                [void]$findings.Add((New-Finding -Cause 'MissingAccountEntry' -Item "$friendly / $names" `
+                            -Message "$friendly has no entry in $($script:TargetNoun)'s LSA policy database, so it holds no logon right at all, and no group an administrator signs in through holds $names. Windows grants it $names by default on this build, and LSA removes an account outright once its last right is taken away - which is what an over-restrictive user-rights policy does."))
+            }
+            else {
+                [void]$findings.Add((New-Finding -Cause 'MissingDefaultLogonRight' -Item "$friendly / $names" `
+                            -Message "$friendly does not hold $names, and no group an administrator signs in through does either. Windows grants it $names by default on this build. Its mask is 0x$('{0:X4}' -f [uint32]$account.Mask)."))
+            }
         }
 
-        $missing = [uint32]($wanted -band (-bnot [uint32]$account.Mask))
-        if ($missing -ne 0) {
-            $missingNames = (ConvertTo-LogonRightName -Mask $missing) -join ', '
-            [void]$findings.Add((New-Finding -Cause 'MissingDefaultLogonRight' -Item "$friendly / $missingNames" `
-                        -Message "$friendly does not hold $missingNames, which Windows grants it by default on this build. Its mask is 0x$('{0:X4}' -f [uint32]$account.Mask)."))
+        if ($reportBits -ne 0) {
+            $names = (ConvertTo-LogonRightName -Mask $reportBits) -join ', '
+            [void]$findings.Add((New-Finding -Cause 'DefaultLogonRightDeviation' -Item "$friendly / $names" -Repairable $false `
+                        -Message "$friendly does not hold $names, which Windows grants it by default on this build. Another group an administrator signs in through still holds it, so this is not a lockout and is left as it is: hardening baselines remove these grants deliberately."))
         }
     }
 
@@ -1387,7 +1515,7 @@ function Get-UserRightsFinding {
         foreach ($right in $denyMap.Keys) {
             if ($account.Rights -notcontains $right) { continue }
             [void]$findings.Add((New-Finding -Cause 'TattooedDenyRight' -Item "$($script:BroadSids[$sid]) / $right" `
-                        -Message "$($script:BroadSids[$sid]) is denied '$($denyMap[$right])'. A deny right overrides every allow right, so this refuses that logon type for the whole group even though no Group Policy still sets it."))
+                        -Message "$($script:BroadSids[$sid]) is denied '$($denyMap[$right])'. A deny right overrides every allow right, so this refuses that logon type for the whole group. It may be left behind by a policy that has since been removed, or still applied by one; confirm with 'gpresult /scope computer /v' on the VM before relying on the repair surviving the next policy refresh."))
         }
     }
 
@@ -1434,442 +1562,696 @@ function Get-UserRightsFinding {
     return @($findings)
 }
 
+function Test-OfflineDiskCandidate {
+    <#
+    .SYNOPSIS
+        Reports whether this machine shows any sign of an attached disk that could hold another
+        Windows installation, without changing anything to find out.
+
+    .DESCRIPTION
+        Used by mode=auto to decide whether the offline discovery should run at all. That discovery
+        stops nested guests, brings disks online and assigns drive letters, which is right on a
+        rescue VM and wrong on the live VM this script usually runs on - so it must not run there
+        just to learn that there is nothing to find.
+
+        Read-only: a lettered volume holding Windows\System32\config\SECURITY, or a data disk on the
+        bus the offline discovery searches that is offline or carries an unlettered partition. The
+        Azure temporary disk is excluded, the same way the offline discovery excludes it.
+
+    .OUTPUTS
+        $true when a candidate is visible.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (@(Get-AttachedWindowsInstallation).Count -gt 0) { return $true }
+
+    $busTypes = @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual')
+    $canTestTemporary = [bool](Get-Command -Name Test-TemporaryStorageDisk -ErrorAction SilentlyContinue)
+
+    foreach ($disk in @(Get-Disk -ErrorAction SilentlyContinue)) {
+        if ($null -eq $disk) { continue }
+        if ($busTypes -notcontains "$($disk.BusType)") { continue }
+        if ($disk.IsBoot -or $disk.IsSystem) { continue }
+
+        if ($canTestTemporary) {
+            $isTemporary = $false
+            try { $isTemporary = [bool](Test-TemporaryStorageDisk -Disk $disk) } catch { $isTemporary = $false }
+            if ($isTemporary) { continue }
+        }
+
+        if ($disk.IsOffline) { return $true }
+
+        foreach ($partition in @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)) {
+            if ($null -eq $partition) { continue }
+            if ("$($partition.Type)" -eq 'Reserved') { continue }
+            if ([uint64]$partition.Size -lt 1MB) { continue }
+            if (-not $partition.DriveLetter -or [char]$partition.DriveLetter -eq [char]0) { return $true }
+        }
+    }
+
+    return $false
+}
+
+function Resolve-RunMode {
+    <#
+    .SYNOPSIS
+        Decides whether this run repairs the running machine or an attached disk.
+
+    .DESCRIPTION
+        mode=online never calls the offline discovery, so it has no side effects on the disks of the
+        machine it runs on. mode=offline requires an attached installation and fails without one.
+        mode=auto goes online only when Test-OfflineDiskCandidate sees nothing, and fails closed -
+        asking for an explicit mode - when a candidate is visible but the discovery fails. Guessing
+        online there would repair the rescue VM and report the patient disk as fixed.
+
+    .OUTPUTS
+        PSCustomObject with Mode, Offline, WindowsPath, GuestComputerName, Reason and Error.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('auto', 'online', 'offline')][string]$Mode,
+        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$WindowsDrive = ''
+    )
+
+    $result = [PSCustomObject]@{ Mode = $null; Offline = $false; WindowsPath = $null; GuestComputerName = $null; Reason = $null; Error = $null }
+    $requested = $Mode.ToLowerInvariant()
+    $hasDrive = -not [string]::IsNullOrWhiteSpace($WindowsDrive)
+
+    if ($requested -eq 'online') {
+        if ($hasDrive) {
+            $result.Error = "windowsDrive=$WindowsDrive names an attached installation, but mode=online repairs the machine the script runs on. Use mode=offline with windowsDrive, or drop windowsDrive."
+            return $result
+        }
+        $result.Mode = 'online'
+        $result.WindowsPath = $env:windir
+        $result.Reason = 'mode=online was requested'
+        return $result
+    }
+
+    if ($requested -eq 'auto' -and -not $hasDrive -and -not (Test-OfflineDiskCandidate)) {
+        $result.Mode = 'online'
+        $result.WindowsPath = $env:windir
+        $result.Reason = 'mode=auto found no attached data disk that could hold another Windows installation'
+        return $result
+    }
+
+    $discovery = @{}
+    if ($hasDrive) { $discovery['WindowsDrive'] = $WindowsDrive }
+    try { $disk = Get-OfflineWindowsDisk @discovery }
+    catch {
+        if ($requested -eq 'offline') {
+            $result.Error = "mode=offline needs an attached Windows installation and none could be used: $($_.Exception.Message)"
+        }
+        else {
+            $result.Error = "mode=auto saw an attached data disk but could not identify an offline Windows installation on it ($($_.Exception.Message)). Nothing was changed. Re-run with mode=online to repair this machine, or with mode=offline (optionally windowsDrive) on a rescue VM."
+        }
+        return $result
+    }
+
+    if ($null -eq $disk -or [string]::IsNullOrWhiteSpace("$($disk.WindowsPath)")) {
+        $result.Error = 'The offline discovery returned no Windows path, so there is no installation to repair. Nothing was changed.'
+        return $result
+    }
+
+    $result.Mode = 'offline'
+    $result.Offline = $true
+    $result.WindowsPath = "$($disk.WindowsPath)"
+    if ($disk.PSObject.Properties['GuestComputerName']) { $result.GuestComputerName = "$($disk.GuestComputerName)" }
+    $result.Reason = if ($requested -eq 'offline') { 'mode=offline was requested' } elseif ($hasDrive) { "windowsDrive=$WindowsDrive was given" } else { 'mode=auto found an attached Windows installation' }
+    return $result
+}
+
+function Test-LogonRightApplied {
+    <#
+    .SYNOPSIS
+        Compares a fresh read of the logon rights with what a write was meant to leave behind.
+
+    .DESCRIPTION
+        Only the bits a plan entry changes are compared, so an unrelated bit that moved for some
+        other reason does not fail the check. An account that should exist but has no entry counts
+        as holding nothing.
+
+    .OUTPUTS
+        Array of mismatch descriptions; empty when every planned bit reads back as intended.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Accounts,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Plan,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Absent
+    )
+
+    $bySid = @{}
+    foreach ($account in $Accounts) { $bySid["$($account.Sid)"] = [uint32]$account.Mask }
+
+    $mismatch = New-Object System.Collections.ArrayList
+    foreach ($entry in $Plan) {
+        $changed = [uint32]([uint32]$entry.OldMask -bxor [uint32]$entry.NewMask)
+        $current = [uint32]0
+        if ($bySid.ContainsKey("$($entry.Sid)")) { $current = [uint32]$bySid["$($entry.Sid)"] }
+        $wanted = [uint32]([uint32]$entry.NewMask -band $changed)
+        $got = [uint32]($current -band $changed)
+        if ($got -ne $wanted) {
+            [void]$mismatch.Add(("{0} [{1}]: bits 0x{2:X4} should read 0x{3:X4} but read 0x{4:X4}" -f $entry.Name, $entry.Sid, $changed, $wanted, $got))
+        }
+    }
+
+    foreach ($entry in $Absent) {
+        $mask = [uint32]$entry.Mask
+        if (-not $bySid.ContainsKey("$($entry.Sid)")) {
+            [void]$mismatch.Add(("{0} [{1}]: still has no policy entry" -f $entry.Name, $entry.Sid))
+            continue
+        }
+        $current = [uint32]$bySid["$($entry.Sid)"]
+        if (($current -band $mask) -ne $mask) {
+            [void]$mismatch.Add(("{0} [{1}]: should hold 0x{2:X4} but its mask is 0x{3:X4}" -f $entry.Name, $entry.Sid, $mask, $current))
+        }
+    }
+
+    return @($mismatch)
+}
+
+function Invoke-LogonRightRevert {
+    <#
+    .SYNOPSIS
+        Puts the logon-right bits recorded by the first repair back, and proves it.
+
+    .DESCRIPTION
+        Only the bits the repair changed are reverted, against a fresh read of the current masks, so
+        a right granted or removed since the repair is left as it is. Every write is read back. The
+        record is deleted only when every recorded bit reads back as it was before the repair; on
+        any failure it is kept so the revert can be retried. SYSTEM is never read or written.
+
+        Log lines stream to the output; the run status is left in $script:RevertStatus.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ManifestPath,
+        [Parameter(Mandatory = $true)][string]$WindowsPath,
+        [Parameter(Mandatory = $true)][bool]$Online
+    )
+
+    $script:RevertStatus = $STATUS_ERROR
+    $source = if ($Online) { 'the running machine (secedit /export)' } else { 'the offline SECURITY hive' }
+
+    Log-Output 'REVERT: putting back the logon-right bits recorded by the first repair.' | Tee-Object -FilePath $logFile -Append
+
+    $read = Read-RevertManifest -ManifestPath $ManifestPath
+    if (-not $read.Exists) {
+        Log-Warning "No revert record was found at $ManifestPath, so there is nothing recorded to undo. Nothing was changed." | Tee-Object -FilePath $logFile -Append
+        $script:RevertStatus = $STATUS_SUCCESS
+        return
+    }
+    if ($read.Error) {
+        Log-Error "REVERT FAILED: the revert record at $ManifestPath could not be read ($($read.Error)). Nothing was changed and the record was kept." | Tee-Object -FilePath $logFile -Append
+        return
+    }
+
+    $recorded = @(@($read.Manifest.Accounts) | Where-Object { $_ -and $_.Sid })
+    $recreated = @(@($read.Manifest.Recreated) | Where-Object { $_ -and $_.Name })
+
+    $current = if ($Online) { Get-LiveLogonRight } else { Get-OfflineLogonRight -WindowsPath $WindowsPath }
+    Write-OperatorLog
+    if (-not $current.Ok) {
+        Log-Error "REVERT FAILED: the current logon rights could not be read from $source ($($current.Reason)). Nothing was changed and the record was kept." | Tee-Object -FilePath $logFile -Append
+        return
+    }
+
+    $bySid = @{}
+    foreach ($account in @($current.Accounts)) { $bySid["$($account.Sid)"] = $account }
+
+    $undo = New-Object System.Collections.ArrayList
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($record in $recorded) {
+        $previous = [uint32]$record.PreviousMask
+        $changed = [uint32]($previous -bxor [uint32]$record.AppliedMask)
+        if ($changed -eq 0) { continue }
+
+        $account = $bySid["$($record.Sid)"]
+        if ($null -eq $account) {
+            # Offline, a mask can only be written into an entry that exists; building one here would
+            # be inventing structure to reimpose a state, which revert never does.
+            if (-not $Online) { [void]$missing.Add($record); continue }
+            $mask = [uint32]0
+            $type = [int]$script:RegNone
+        }
+        else {
+            $mask = [uint32]$account.Mask
+            $type = [int]$account.Type
+        }
+
+        $restoreSet = [uint32]($previous -band $changed)
+        $target = Get-AdjustedLogonRightMask -Mask $mask -Set $restoreSet -Clear ([uint32]($changed -bxor $restoreSet))
+        if ($target -eq $mask) { continue }
+
+        [void]$undo.Add([PSCustomObject]@{
+                Sid = "$($record.Sid)"; Name = "$($record.Name)"; OldMask = $mask; NewMask = $target
+                Type = $type; Reason = 'revert'
+            })
+    }
+
+    if ($missing.Count -gt 0) {
+        foreach ($record in $missing) {
+            Log-Error ("  [NOT REVERTED] {0} [{1}] has no policy entry on this disk any more, so its recorded mask cannot be written back." -f $record.Name, $record.Sid) | Tee-Object -FilePath $logFile -Append
+        }
+        Log-Error "REVERT FAILED: $($missing.Count) recorded account(s) have no entry. Nothing was changed and the record at $ManifestPath was kept." | Tee-Object -FilePath $logFile -Append
+        return
+    }
+
+    foreach ($entry in $undo) {
+        Log-Output ("  PLAN [{0}] {1}: 0x{2:X4} -> 0x{3:X4} (revert)" -f $entry.Sid, $entry.Name, [uint32]$entry.OldMask, [uint32]$entry.NewMask) | Tee-Object -FilePath $logFile -Append
+    }
+
+    if ($undo.Count -gt 0) {
+        if ($Online) {
+            $apply = Repair-LiveLogonRight -Accounts @($current.Accounts) -Plan @($undo) -Absent @() -Skipped @($current.Skipped)
+            Write-OperatorLog
+            if (-not $apply.Ok) {
+                Log-Error "REVERT INCOMPLETE: secedit could not apply the revert ($($apply.Reason)). The record at $ManifestPath was kept so the revert can be retried." | Tee-Object -FilePath $logFile -Append
+                return
+            }
+        }
+        else {
+            $backup = $null
+            try { $backup = Backup-OfflineHiveFile -WindowsPath $WindowsPath -Hive 'SECURITY' }
+            catch { $backup = $null; Add-OfflineRepairLog -Level Error -Message "The SECURITY hive could not be backed up: $($_.Exception.Message)" }
+            Write-OperatorLog
+            if (-not $backup -or -not (Test-Path -LiteralPath $backup)) {
+                Log-Error "REVERT FAILED: the SECURITY hive could not be backed up, so nothing was written. The record at $ManifestPath was kept." | Tee-Object -FilePath $logFile -Append
+                return
+            }
+            Log-Output "SECURITY hive backed up to $backup before the revert." | Tee-Object -FilePath $logFile -Append
+
+            $write = Set-OfflineLogonRight -WindowsPath $WindowsPath -Plan @($undo)
+            Write-OperatorLog
+            foreach ($failure in @($write.Failed)) {
+                Log-Error ("  [FAILED] {0}: {1}" -f $failure.Entry.Name, $failure.Error) | Tee-Object -FilePath $logFile -Append
+            }
+            if (-not $write.Ok) {
+                Log-Error "REVERT INCOMPLETE: not every mask could be written back ($($write.Reason)). The record at $ManifestPath was kept so the revert can be retried; the hive as it was before this revert is at $backup." | Tee-Object -FilePath $logFile -Append
+                return
+            }
+        }
+
+        $after = if ($Online) { Get-LiveLogonRight } else { Get-OfflineLogonRight -WindowsPath $WindowsPath }
+        Write-OperatorLog
+        if (-not $after.Ok) {
+            Log-Error "REVERT INCOMPLETE: the logon rights could not be read back from $source ($($after.Reason)), so the revert is unverified. The record at $ManifestPath was kept." | Tee-Object -FilePath $logFile -Append
+            return
+        }
+
+        $mismatch = @(Test-LogonRightApplied -Accounts @($after.Accounts) -Plan @($undo) -Absent @())
+        if ($mismatch.Count -gt 0) {
+            foreach ($line in $mismatch) { Log-Error "  [NOT REVERTED] $line" | Tee-Object -FilePath $logFile -Append }
+            Log-Error "REVERT INCOMPLETE: $($mismatch.Count) account(s) do not read back as recorded. The record at $ManifestPath was kept so the revert can be retried." | Tee-Object -FilePath $logFile -Append
+            return
+        }
+        $bySid = @{}
+        foreach ($account in @($after.Accounts)) { $bySid["$($account.Sid)"] = $account }
+
+        foreach ($entry in $undo) {
+            Log-Output ("  [REVERTED] {0}: 0x{1:X4} -> 0x{2:X4}, read back" -f $entry.Name, [uint32]$entry.OldMask, [uint32]$entry.NewMask) | Tee-Object -FilePath $logFile -Append
+        }
+    }
+    else {
+        Log-Output 'Every recorded bit already reads as it did before the repair, so nothing needed writing.' | Tee-Object -FilePath $logFile -Append
+    }
+
+    Remove-Item -LiteralPath $ManifestPath -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $ManifestPath) {
+        Log-Error "REVERT INCOMPLETE: the masks were reverted and verified, but the record at $ManifestPath could not be deleted. Delete it before running the repair again, or that repair will keep this stale record." | Tee-Object -FilePath $logFile -Append
+        return
+    }
+
+    # Only entries that exist now are reported as kept; one the repair failed to recreate was never there.
+    $kept = @($recreated | Where-Object { $bySid.ContainsKey("$($_.Sid)") })
+    foreach ($entry in $kept) {
+        Log-Output ("  [KEPT] {0}: the policy entry the repair recreated is left in place, holding {1}." -f $entry.Name, $entry.Right) | Tee-Object -FilePath $logFile -Append
+    }
+
+    if ($kept.Count -gt 0) {
+        Log-Output "Recreated entries are not removed: that means deleting an LSA account entry to reimpose a lockout, the riskier write. To remove one, export with 'secedit /export /areas USER_RIGHTS' on the running VM, drop the SID from the right and re-import." | Tee-Object -FilePath $logFile -Append
+        Log-Output ("REVERT COMPLETE (partial): {0} mask(s) written back and verified; {1} recreated entry/entries kept. The record was deleted." -f $undo.Count, $kept.Count) | Tee-Object -FilePath $logFile -Append
+    }
+    else {
+        Log-Output ("REVERT COMPLETE: {0} mask(s) written back and verified. The bits the repair changed are as they were before it ran. The record was deleted." -f $undo.Count) | Tee-Object -FilePath $logFile -Append
+    }
+    $script:RevertStatus = $STATUS_SUCCESS
+}
+
 #########################################################################################################
 # Main
 #########################################################################################################
 
+"$scriptStartTime" | Out-File -FilePath $logFile -Append
+Log-Output "START: Running script $scriptName" | Tee-Object -FilePath $logFile -Append
+$status = $STATUS_ERROR
+
 try {
-    Log-Output "START: Running script $scriptName" | Tee-Object -FilePath $logFile -Append
-    $scriptStartTime | Out-File -FilePath $logFile -Append
+    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
+    . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
+    . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
+    . .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
+    . .\src\windows\common\helpers\Use-OfflinePrivilegedRegistry.ps1
 
-    Clear-OfflineRepairLog
+    :Main do {
+        Clear-OfflineRepairLog
 
-    # Which side of the fault this run is on. Nothing chooses here: the caller already did, by
-    # deciding where to run the script. 'az vm repair run --run-on-repair' puts it on a rescue VM
-    # with the patient disk attached; without that flag the same script id runs on the live VM
-    # through Run Command, as SYSTEM, which needs no logon right and is why it still works when
-    # nobody can sign in. The offline disk is the discriminator, so the script simply reports which
-    # situation it is in rather than being told.
-    #
-    # Getting this wrong is safe in the direction that matters: run online on a rescue VM by
-    # mistake and that VM's rights are already the default, so detect returns nothing and nothing
-    # is written.
-    # Get-OfflineWindowsDisk throws when it finds no attached Windows installation. On a rescue VM
-    # that is a genuine failure, but online it is simply the correct answer, so the absence has to
-    # be read rather than allowed to end the run. It is confirmed independently before it is
-    # believed: a helper that failed for some other reason while a patient disk really is attached
-    # must stay loud, or this run would quietly repair the rescue VM's own rights and call it a fix.
-    $offline = $null
-    $offlineProbeError = $null
-    try { $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive }
-    catch { $offlineProbeError = $_ }
-    Write-OperatorLog
-
-    if ($offlineProbeError -and @(Get-AttachedWindowsInstallation).Count -gt 0) { throw $offlineProbeError }
-
-    $script:OnlineMode = ($offlineProbeError -or -not $offline -or -not $offline.WindowsPath)
-
-    if ($script:OnlineMode) {
-        $windowsPath = $env:windir
-        $script:TargetNoun = 'this machine'
-        Log-Output "MODE: online. No offline Windows installation is attached, so this is the machine being repaired and Windows writes its own policy through secedit." | Tee-Object -FilePath $logFile -Append
-        Log-Output "      To repair a VM that cannot boot or whose agent does not answer, attach its disk with 'az vm repair create' and re-run with --run-on-repair." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        $windowsPath = $offline.WindowsPath
-        $script:TargetNoun = 'this disk'
-        Log-Output "MODE: offline. Repairing the attached installation at $windowsPath." | Tee-Object -FilePath $logFile -Append
-    }
-
-    # Files an earlier version of this script left on the disk. Nothing is written to any of them
-    # now - they are resolved so the run can clear residue it finds.
-    $payloadPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:PayloadRelativePath
-    $resultPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ResultRelativePath
-    $manifestPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ManifestRelativePath
-
-    #####################################################################################################
-    # Revert
-    #####################################################################################################
-    if ($isRevert) {
-        Log-Output 'REVERT: putting the recorded logon-right masks back.' | Tee-Object -FilePath $logFile -Append
-
-        $manifest = Read-RevertManifest -ManifestPath $manifestPath
-        if ($null -eq $manifest) {
-            Log-Warning 'No revert manifest was found, so there is nothing recorded to undo.' | Tee-Object -FilePath $logFile -Append
+        # Which machine is being repaired. The extension does not say which way it launched the
+        # script, so 'mode' does; auto only goes online when nothing that could be the patient disk
+        # is visible, and fails closed rather than guessing when the discovery fails.
+        $run = Resolve-RunMode -Mode $mode -WindowsDrive $windowsDrive
+        Write-OperatorLog
+        if ($run.Error) {
+            Log-Error $run.Error | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
         }
 
-        $restoredCount = 0
+        $isOffline = [bool]$run.Offline
+        $windowsPath = $run.WindowsPath
+        if ($isOffline) {
+            $script:TargetNoun = 'this disk'
+            $guest = if ([string]::IsNullOrWhiteSpace($run.GuestComputerName)) { 'unknown' } else { $run.GuestComputerName }
+            Log-Output "MODE: offline ($($run.Reason)). Repairing the attached installation at $windowsPath (computer name: $guest)." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            $script:TargetNoun = 'this machine'
+            Log-Output "MODE: online ($($run.Reason)). Repairing the machine this runs on ($env:COMPUTERNAME); Windows writes its own policy through secedit." | Tee-Object -FilePath $logFile -Append
+            Log-Output "      For a VM that cannot boot or whose agent does not answer, attach its disk with 'az vm repair create' and re-run with --run-on-repair and mode=offline." | Tee-Object -FilePath $logFile -Append
+        }
 
-        if ($null -ne $manifest -and $null -ne $manifest.Accounts) {
-            # NewMask carries PreviousMask on purpose: reverting is the same write in the other
-            # direction, so it goes through the same verified path rather than a second one.
-            $undo = @(@($manifest.Accounts) | ForEach-Object {
-                    [PSCustomObject]@{
-                        Sid = "$($_.Sid)"; Name = "$($_.Name)"
-                        OldMask = [uint32]$_.AppliedMask; NewMask = [uint32]$_.PreviousMask
-                        Type = [int]$_.Type; Reason = 'revert'
+        $manifestPath = Join-OfflinePath -Root $windowsPath -ChildPath $script:ManifestRelativePath
+        if ([string]::IsNullOrWhiteSpace($manifestPath)) {
+            Log-Error "The revert record path could not be built from '$windowsPath', so nothing was changed." | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        #################################################################################################
+        # Revert
+        #################################################################################################
+        if ($isRevert) {
+            Invoke-LogonRightRevert -ManifestPath $manifestPath -WindowsPath $windowsPath -Online (-not $isOffline)
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $script:RevertStatus
+            break Main
+        }
+
+        #################################################################################################
+        # Detect
+        #################################################################################################
+        if ($isOffline) {
+            $rights = Get-OfflineLogonRight -WindowsPath $windowsPath
+            $source = 'the offline SECURITY hive'
+        }
+        else {
+            $rights = Get-LiveLogonRight
+            $source = 'the running machine (secedit /export)'
+        }
+        Write-OperatorLog
+
+        if (-not $rights.Ok) {
+            Log-Error "The current user rights could not be read from $source, so nothing was changed: $($rights.Reason)." | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        Log-Output "Read logon rights for $(@($rights.Accounts).Count) account(s) from $source." | Tee-Object -FilePath $logFile -Append
+
+        # The full table goes to the detail log; the returned log keeps the findings.
+        foreach ($account in @($rights.Accounts)) {
+            "  $($account.Sid) [$($account.Name)] mask=0x$('{0:X4}' -f $account.Mask) $(@($account.Rights) -join ', ')" |
+                Out-File -FilePath $logFile -Append
+        }
+
+        # The defaults are read from the installation being repaired, so they are right for its
+        # build and SKU.
+        $shipped = Get-ShippedLogonRightDefault -WindowsPath $windowsPath
+        Write-OperatorLog
+        if ($shipped.Ok) {
+            Log-Output "Shipped defaults read from $($shipped.TemplatePath): $($shipped.RightCount) logon right(s) across $($shipped.Grants.Count) account(s)." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Warning "The shipped defaults could not be read from $($script:TargetNoun) ($($shipped.Error)). Falling back to the built-in defaults for Administrators, Remote Desktop Users and NT SERVICE\ALL SERVICES." | Tee-Object -FilePath $logFile -Append
+            $shipped.Grants = @{
+                $script:SidAdministrators     = [uint32]($script:BitInteractive -bor $script:BitRemoteInteractive)
+                $script:SidRemoteDesktopUsers = [uint32]$script:BitRemoteInteractive
+                $script:SidAllServices        = [uint32]$script:BitService
+            }
+        }
+
+        $findings = @(Get-UserRightsFinding -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
+
+        # SYSTEM\Setup is read for reporting only and never written: a SetupType other than 0 can be
+        # legitimate servicing or provisioning state, and nothing here can tell it apart from residue.
+        # Not read online, where it is the running machine's own boot state.
+        $setupState = $null
+        if ($isOffline) {
+            $setupState = Get-OfflineSetupState -WindowsPath $windowsPath
+            Write-OperatorLog
+            if (-not $setupState.Available) {
+                Log-Warning "SYSTEM\Setup could not be read on this disk ($($setupState.Reason)), so the boot-time state is unknown. The logon-right repair does not depend on it." | Tee-Object -FilePath $logFile -Append
+            }
+            elseif ($setupState.SetupType -ne 0 -and -not [string]::IsNullOrWhiteSpace($setupState.CmdLine)) {
+                $findings += New-Finding -Cause 'SetupHookInUse' -Item 'SYSTEM\Setup' -Repairable $false `
+                    -Message "SYSTEM\Setup is in setup mode (SetupType=$($setupState.SetupType)) running '$($setupState.CmdLine)'. Left as it is: it may be servicing or provisioning, and this repair never writes SYSTEM\Setup."
+            }
+            elseif ($setupState.SetupType -ne 0) {
+                $findings += New-Finding -Cause 'SetupTypeNonZero' -Item 'SYSTEM\Setup' -Repairable $false `
+                    -Message "SYSTEM\Setup\SetupType is $($setupState.SetupType) with no CmdLine. Left as it is: it may be servicing or provisioning state, and this repair never writes SYSTEM\Setup."
+            }
+        }
+
+        #################################################################################################
+        # Report
+        #################################################################################################
+        foreach ($finding in $findings) {
+            $tag = if ($finding.Repairable) { 'FOUND' } else { 'FOUND (not repairable here)' }
+            Log-Output "  [$tag] $($finding.Cause) - $($finding.Item)" | Tee-Object -FilePath $logFile -Append
+            Log-Output "           $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+
+        # The count comes after the list: Run Command keeps the tail of a 4096-character log.
+        $repairable = @($findings | Where-Object { $_.Repairable })
+        if ($findings.Count -eq 0) {
+            Log-Output "No user-rights fault was found: every logon right this script checks on $($script:TargetNoun) permits sign-in." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Output "Detect found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair." | Tee-Object -FilePath $logFile -Append
+        }
+
+        if ($isDetectOnly) {
+            Log-Output "DETECT ONLY: nothing was changed on $($script:TargetNoun)." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        #################################################################################################
+        # Repair
+        #################################################################################################
+        if ($repairable.Count -eq 0 -and -not $isForced) {
+            Log-Output "Nothing was changed: $($script:TargetNoun) has no user-rights fault this script repairs." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        if ($repairable.Count -eq 0 -and $isForced) {
+            Log-Warning 'FORCED: no repairable fault was detected. The plan is derived from the same conditions detect reports, so on a healthy installation it comes out empty and nothing is written.' | Tee-Object -FilePath $logFile -Append
+        }
+
+        $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
+
+        # Absent accounts carry no mask, so they never appear in the plan; counted separately so a
+        # deleted entry is not mistaken for a healthy installation.
+        $absentTargets = @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
+
+        foreach ($entry in $plan) {
+            Log-Output ("  PLAN [{0}] {1}: 0x{2:X4} -> 0x{3:X4} ({4})" -f $entry.Sid, $entry.Name, [uint32]$entry.OldMask, [uint32]$entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
+        }
+        foreach ($target in $absentTargets) {
+            Log-Output ("  PLAN [{0}] {1}: recreate the policy entry holding {2} (0x{3:X4})" -f $target.Sid, $target.Name, $target.Right, [uint32]$target.Mask) | Tee-Object -FilePath $logFile -Append
+        }
+        Log-Output ("Plan: {0} mask change(s), {1} account entry/entries to recreate." -f $plan.Count, $absentTargets.Count) | Tee-Object -FilePath $logFile -Append
+
+        if ($plan.Count -eq 0 -and $absentTargets.Count -eq 0) {
+            Log-Output "Nothing was changed: the logon-right masks on $($script:TargetNoun) already permit sign-in." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        # Written before the first write, so a run that dies part way still has an undo record.
+        $record = Write-RevertManifest -ManifestPath $manifestPath -Plan $plan -Recreated $absentTargets
+        if (-not $record.Ok) {
+            Log-Error "The revert record could not be written to $manifestPath ($($record.Error)), so nothing was changed." | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+        if ($record.Kept) {
+            Log-Warning "A revert record from an earlier repair already exists at $manifestPath and was kept, so revert=true returns to the state before that first repair. This run's changes are not recorded separately." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Output "Revert record written to $manifestPath." | Tee-Object -FilePath $logFile -Append
+        }
+
+        $failed = $false
+        $recreated = 0
+        $backupPath = $null
+
+        if ($isOffline) {
+            try { $backupPath = Backup-OfflineHiveFile -WindowsPath $windowsPath -Hive 'SECURITY' }
+            catch { $backupPath = $null; Add-OfflineRepairLog -Level Error -Message "The SECURITY hive could not be backed up: $($_.Exception.Message)" }
+            Write-OperatorLog
+            if (-not $backupPath -or -not (Test-Path -LiteralPath $backupPath)) {
+                Log-Error 'The SECURITY hive could not be backed up, so nothing was written.' | Tee-Object -FilePath $logFile -Append
+                $status = $STATUS_ERROR
+                break Main
+            }
+            Log-Output "SECURITY hive backed up to $backupPath before the first write." | Tee-Object -FilePath $logFile -Append
+
+            $write = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $plan
+            Write-OperatorLog
+            foreach ($entry in @($write.Applied)) {
+                Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, [uint32]$entry.OldMask, [uint32]$entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
+            }
+            foreach ($failure in @($write.Failed)) {
+                $label = if ([string]::IsNullOrWhiteSpace($failure.Entry.Name)) { "SID $($failure.Entry.Sid)" } else { $failure.Entry.Name }
+                Log-Error ("  [FAILED] {0}: {1}" -f $label, $failure.Error) | Tee-Object -FilePath $logFile -Append
+            }
+            if (-not $write.Ok) {
+                Log-Error "The logon-right masks could not all be written: $($write.Reason)." | Tee-Object -FilePath $logFile -Append
+                $failed = $true
+            }
+
+            # An entry the fault deleted is recreated only after the masks were written cleanly.
+            $adminBits = [uint32]0
+            $adminAccount = @($rights.Accounts | Where-Object { $_.Sid -eq $script:SidAdministrators }) | Select-Object -First 1
+            if ($null -ne $adminAccount) { $adminBits = [uint32]$adminAccount.Mask }
+            $adminPlan = @($plan | Where-Object { $_.Sid -eq $script:SidAdministrators }) | Select-Object -First 1
+            if ($null -ne $adminPlan) { $adminBits = [uint32]$adminPlan.NewMask }
+            $adminsHoldRdp = (($adminBits -band $script:BitRemoteInteractive) -ne 0)
+
+            if (-not $failed) {
+                foreach ($absent in $absentTargets) {
+                    $made = New-OfflineLogonRightAccount -WindowsPath $windowsPath -Sid $absent.Sid `
+                        -Mask ([uint32]$absent.Mask) -DonorSid $script:SidAdministrators
+                    Write-OperatorLog
+
+                    if ($made.Ok) {
+                        $recreated++
+                        Log-Output ("  [FIXED] {0}: policy entry recreated holding {1} (0x{2:X4})" -f $absent.Name, $absent.Right, [uint32]$absent.Mask) | Tee-Object -FilePath $logFile -Append
                     }
-                })
-
-            if ($script:OnlineMode) {
-                # Read live first. secedit rewrites each named right in full, so the current holder
-                # list is what stops the undo from stripping every other account off the rights it
-                # touches. Detect has not run at this point, so nothing else has read it yet.
-                $liveNow = Get-LiveLogonRight
-                if (-not $liveNow.Ok) {
-                    Log-Error "The current logon rights could not be read, so the undo was not applied: $($liveNow.Reason)." | Tee-Object -FilePath $logFile -Append
-                    return $STATUS_ERROR
+                    else {
+                        $failed = $true
+                        Log-Error "  [NOT RESTORED] $($absent.Name) has no entry in this disk's LSA policy database and one could not be created: $($made.Reason)" | Tee-Object -FilePath $logFile -Append
+                        if ($adminsHoldRdp) {
+                            Log-Output '                 BUILTIN\Administrators can still sign in over RDP. To put the group back once the VM is up, run as administrator:' | Tee-Object -FilePath $logFile -Append
+                        }
+                        else {
+                            Log-Output '                 To put the group back once the VM is up, run as administrator:' | Tee-Object -FilePath $logFile -Append
+                        }
+                        Log-Output '                 secedit /export /areas USER_RIGHTS /cfg %temp%\ur.inf, add the SID to the right, then secedit /configure /db %temp%\ur.sdb /cfg %temp%\ur.inf /areas USER_RIGHTS' | Tee-Object -FilePath $logFile -Append
+                    }
                 }
-
-                $backResult = Repair-LiveLogonRight -Accounts @($liveNow.Accounts) -Plan @($undo) -Absent @()
-                if ($backResult.Ok) {
-                    $back = [PSCustomObject]@{ Applied = @($undo); Failed = @() }
-                }
-                else {
-                    $back = [PSCustomObject]@{ Applied = @(); Failed = @(@{ Entry = @{ Name = 'secedit' }; Error = $backResult.Reason }) }
-                }
+            }
+        }
+        else {
+            # One secedit call carries both halves: the mask corrections and any account entry the
+            # policy deleted outright, which Windows recreates itself.
+            $apply = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($plan) -Absent @($absentTargets) -Skipped @($rights.Skipped)
+            Write-OperatorLog
+            if (-not $apply.Ok) {
+                Log-Error "  [FAILED] secedit could not apply the repair: $($apply.Reason)" | Tee-Object -FilePath $logFile -Append
+                $failed = $true
             }
             else {
-                $back = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $undo
-            }
-
-            foreach ($entry in @($back.Applied)) {
-                Log-Output ("Reverted {0} to 0x{1:X4}." -f $entry.Name, $entry.NewMask) | Tee-Object -FilePath $logFile -Append
-                $restoredCount++
-            }
-            foreach ($failure in @($back.Failed)) {
-                Log-Warning "$($failure.Entry.Name) could not be reverted: $($failure.Error)" | Tee-Object -FilePath $logFile -Append
+                Log-Output ("  secedit rewrote only: {0}" -f (@($apply.Applied) -join ', ')) | Tee-Object -FilePath $logFile -Append
             }
         }
 
-        # Earlier versions of this script armed a Setup hook instead of writing the hive. A disk
-        # repaired by one of those is still carrying it, and SetupType is the half the payload
-        # could never clear from inside its own boot, so clear it here. Offline only: SYSTEM\Setup
-        # on a running machine is the live boot state, not residue for this script to tidy.
-        $legacy = if ($script:OnlineMode) { [PSCustomObject]@{ Available = $false } } else { Get-OfflineSetupState -WindowsPath $windowsPath }
-        if ($legacy.Available -and ($legacy.SetupType -ne 0 -or $legacy.CmdLine -like '*win-fix-user-rights*')) {
-            $cleared = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType 0 -CmdLine ''
-            if ($cleared.Restored) {
-                Log-Output 'Cleared a Setup hook left by an earlier version of this script.' | Tee-Object -FilePath $logFile -Append
-                $restoredCount++
+        if ($failed) {
+            Log-Error "REPAIR INCOMPLETE on $($script:TargetNoun). The revert record at $manifestPath holds the masks from before the first repair; revert=true puts back whatever was written." | Tee-Object -FilePath $logFile -Append
+            if ($backupPath) {
+                Log-Output "The SECURITY hive as it was before this run is at $backupPath." | Tee-Object -FilePath $logFile -Append
             }
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
         }
 
-        foreach ($stale in @($payloadPath, $resultPath)) {
-            if (Test-Path -LiteralPath $stale) {
-                Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
-                if (Test-Path -LiteralPath $stale) {
-                    Log-Warning "'$stale' could not be removed." | Tee-Object -FilePath $logFile -Append
-                }
-                else {
-                    Log-Output "Removed '$stale'." | Tee-Object -FilePath $logFile -Append
-                    $restoredCount++
-                }
+        # Read back: a write counts only if a fresh read shows it.
+        $after = if ($isOffline) { Get-OfflineLogonRight -WindowsPath $windowsPath } else { Get-LiveLogonRight }
+        Write-OperatorLog
+        if (-not $after.Ok) {
+            Log-Error "The logon rights could not be read back from $source ($($after.Reason)), so the repair is unverified." | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        $mismatch = @(Test-LogonRightApplied -Accounts @($after.Accounts) -Plan @($plan) -Absent @($absentTargets))
+        foreach ($line in $mismatch) {
+            Log-Error "  [NOT APPLIED] $line" | Tee-Object -FilePath $logFile -Append
+        }
+        if ($mismatch.Count -gt 0) {
+            Log-Error "REPAIR INCOMPLETE: $($mismatch.Count) planned change(s) do not read back. revert=true puts back whatever was written." | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        if (-not $isOffline) {
+            foreach ($entry in $plan) {
+                Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3}), read back" -f $entry.Name, [uint32]$entry.OldMask, [uint32]$entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
             }
-        }
-
-        if (Test-Path -LiteralPath $manifestPath) {
-            Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
-        }
-
-        # Filtered, not just wrapped. A manifest written by an earlier version has no Recreated
-        # property at all, and @($null) is a one-element array holding $null - which would report a
-        # kept entry with no name and turn every revert into a "partial" one.
-        $kept = @($manifest.Recreated | Where-Object { $_ -and $_.Name })
-        foreach ($entry in $kept) {
-            Log-Output ("Kept {0}: the policy entry this repair recreated is left in place." -f $entry.Name) | Tee-Object -FilePath $logFile -Append
-        }
-
-        if ($kept.Count -gt 0) {
-            Log-Output 'The masks above are back to what they were before this script ran. The account entries listed as kept are not put back the way they were found: undoing those means deleting an LSA account entry to reimpose a lockout, which is the riskier of the two writes and not a rollback worth performing automatically.' | Tee-Object -FilePath $logFile -Append
-            Log-Output ("So this is a partial revert: {0} account(s) can still sign in that could not before the repair. To remove one, run 'secedit /export /areas USER_RIGHTS' on the running VM, drop the SID from the right and re-import." -f $kept.Count) | Tee-Object -FilePath $logFile -Append
-        }
-        else {
-            Log-Output 'The masks above are back to what they were before this script ran, so the logon rights are once again whatever they were on arrival - including the fault, if the disk arrived with one.' | Tee-Object -FilePath $logFile -Append
-        }
-        Log-Output "REVERT COMPLETE: restored $restoredCount item(s)." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    #####################################################################################################
-    # Detect
-    #####################################################################################################
-    if ($script:OnlineMode) {
-        $rights = Get-LiveLogonRight
-        $source = 'the running machine (secedit /export)'
-    }
-    else {
-        $rights = Get-OfflineLogonRight -WindowsPath $windowsPath
-        $source = 'the offline SECURITY hive'
-    }
-    Write-OperatorLog
-
-    if (-not $rights.Ok) {
-        Log-Error "The current user rights could not be read from $source, so nothing is armed: $($rights.Reason)." | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    Log-Output "Read logon rights for $(@($rights.Accounts).Count) account(s) from $source." | Tee-Object -FilePath $logFile -Append
-
-    # The full table goes to the detail log; the returned log keeps the findings.
-    foreach ($account in @($rights.Accounts)) {
-        "  $($account.Sid) [$($account.Name)] mask=0x$('{0:X4}' -f $account.Mask) $(@($account.Rights) -join ', ')" |
-            Out-File -FilePath $logFile -Append
-    }
-
-    # What the defaults actually are is read from the disk being repaired rather than carried as an
-    # opinion, so the answer is right for this build and this SKU. A lockout is usually a policy
-    # that replaced the shipped list, and it is rarely one of the two examples this was built on.
-    $shipped = Get-ShippedLogonRightDefault -WindowsPath $windowsPath
-    if ($shipped.Ok) {
-        Log-Output "Shipped defaults read from $($shipped.TemplatePath): $($shipped.RightCount) logon right(s) across $($shipped.Grants.Count) account(s)." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Warning "The shipped defaults could not be read from $($script:TargetNoun) ($($shipped.Error)). Falling back to the built-in defaults for the two groups Windows grants RDP to." | Tee-Object -FilePath $logFile -Append
-        $shipped.Grants = @{
-            $script:SidAdministrators     = [uint32]($script:BitInteractive -bor $script:BitRemoteInteractive)
-            $script:SidRemoteDesktopUsers = [uint32]$script:BitRemoteInteractive
-            $script:SidAllServices        = [uint32]$script:BitService
-        }
-    }
-
-    $findings = @(Get-UserRightsFinding -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
-
-    # SYSTEM\Setup is read for reporting only now: the repair writes to the SECURITY hive and never
-    # touches it. An unreadable SYSTEM hive is worth saying out loud, but it is not a reason to
-    # refuse a logon-right repair that does not depend on it. Skipped online, where SYSTEM\Setup is
-    # the live machine's own boot state rather than something this script has any business reading.
-    $setupState = if ($script:OnlineMode) { [PSCustomObject]@{ Available = $true; SetupType = 0; CmdLine = '' } } else { Get-OfflineSetupState -WindowsPath $windowsPath }
-    if (-not $setupState.Available) {
-        Log-Warning "SYSTEM\Setup could not be read on this disk ($($setupState.Reason)), so the boot-time state is unknown. The logon-right repair does not depend on it, so it continues." | Tee-Object -FilePath $logFile -Append
-    }
-
-    # A setup command already pointing at something real is a servicing or provisioning step. The
-    # repair no longer touches SYSTEM\Setup at all, so this does not block anything - it is
-    # reported because an operator looking at a machine that will not sign in needs to know the
-    # image is part way through something.
-    $hookInUse = ($setupState.Available -and $setupState.SetupType -ne 0 -and
-        -not [string]::IsNullOrWhiteSpace($setupState.CmdLine) -and
-        $setupState.CmdLine -notlike '*win-fix-user-rights*')
-
-    if ($hookInUse) {
-        $findings += New-Finding -Cause 'SetupHookInUse' -Item 'CmdLine' -Repairable $false `
-            -Message "SYSTEM\Setup is already in setup mode running '$($setupState.CmdLine)'. That is left alone: this script repairs the LSA policy database directly and never arms a boot-time command."
-    }
-
-    # A SetupType left armed with nothing to run is residue from an earlier version of this script,
-    # which cleared CmdLine from inside its own payload but could never make SetupType stick -
-    # Windows rewrites it when the setup pass completes, after the payload has exited. Measured on
-    # Server 2022 20348: the payload's write succeeded and was overwritten, leaving SetupType=2 with
-    # an empty CmdLine on every boot thereafter.
-    $staleSetupType = ($setupState.Available -and $setupState.SetupType -ne 0 -and
-        [string]::IsNullOrWhiteSpace($setupState.CmdLine))
-
-    if ($staleSetupType) {
-        $findings += New-Finding -Cause 'StaleSetupType' -Item 'SetupType' `
-            -Message "SYSTEM\Setup\SetupType is $($setupState.SetupType) with no CmdLine to run. The machine re-enters the setup boot path on every boot for nothing, and this is left behind by an earlier version of this repair. It is reset to 0."
-    }
-
-    #####################################################################################################
-    # Report
-    #####################################################################################################
-    foreach ($finding in $findings) {
-        $tag = if ($finding.Repairable) { 'FOUND' } else { 'FOUND (not repairable here)' }
-        Log-Output "  [$tag] $($finding.Cause) - $($finding.Item)" | Tee-Object -FilePath $logFile -Append
-        Log-Output "           $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
-
-    # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
-    # so a summary printed first is the first thing a long run loses.
-    if ($findings.Count -eq 0) {
-        Log-Output 'No user-rights fault was found: every logon right this script checks is in a state that permits sign-in.' | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Output "Detect found $($findings.Count) issue(s)." | Tee-Object -FilePath $logFile -Append
-    }
-
-    if ($isDetectOnly) {
-        Log-Output "DETECT ONLY: nothing was changed on $($script:TargetNoun)." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    #####################################################################################################
-    # Repair
-    #####################################################################################################
-    $repairable = @($findings | Where-Object { $_.Repairable })
-
-    if ($repairable.Count -eq 0 -and -not $isForced) {
-        Log-Output "Nothing was changed: $($script:TargetNoun) has no user-rights fault to repair." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($repairable.Count -eq 0 -and $isForced) {
-        Log-Warning 'FORCED: no fault was detected. The plan is derived from the same conditions detect reports, so on a disk that is already healthy it comes out empty and nothing is written.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    $plan = @(Get-LogonRightRepairPlan -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
-
-    # Absent accounts carry no mask, so they never appear in the plan. Counting them here as well
-    # is what stops a disk whose only remaining fault is a deleted entry from being declared healthy
-    # and returned untouched - the plan is legitimately empty in exactly that case.
-    $absentTargets = @(Get-AbsentGrantTarget -Accounts @($rights.Accounts) -DefaultGrants $shipped.Grants)
-
-    # Stated before the first write, not after. A repair that reports only what it managed to do
-    # cannot be checked against what it intended to do, and the SID is carried alongside the name
-    # so an entry that resolves to nothing is still identifiable.
-    Log-Output ("Plan: {0} mask change(s), {1} account entry/entries to recreate." -f $plan.Count, $absentTargets.Count) | Tee-Object -FilePath $logFile -Append
-    foreach ($entry in $plan) {
-        Log-Output ("  PLAN [{0}] {1}: 0x{2:X4} -> 0x{3:X4} ({4})" -f $entry.Sid, $entry.Name, [uint32]$entry.OldMask, [uint32]$entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
-    }
-
-    if ($plan.Count -eq 0 -and $absentTargets.Count -eq 0 -and -not $staleSetupType) {
-        Log-Output "Nothing was changed: the logon-right masks on $($script:TargetNoun) already permit sign-in." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    # Written before the first hive write, not after. A run that dies part way still needs an undo
-    # record for whatever it managed to change.
-    [void](Write-RevertManifest -ManifestPath $manifestPath -Plan $plan -Recreated $absentTargets)
-
-    if ($script:OnlineMode) {
-        # One secedit call carries both halves: the mask corrections and any account entry the
-        # policy deleted outright. Windows recreates the entry itself, so nothing here has to
-        # assemble LSA policy structure by hand.
-        $absentTargets = @($absentTargets)
-        $applyResult = Repair-LiveLogonRight -Accounts @($rights.Accounts) -Plan @($plan) -Absent $absentTargets
-
-        Log-Output '' | Tee-Object -FilePath $logFile -Append
-
-        if (-not $applyResult.Ok) {
-            Log-Error "  [FAILED] secedit could not apply the repair: $($applyResult.Reason)" | Tee-Object -FilePath $logFile -Append
-            $write = [PSCustomObject]@{
-                Ok      = $false
-                Reason  = $applyResult.Reason
-                Applied = @()
-                Failed  = @(@{ Entry = @{ Name = 'secedit' }; Error = $applyResult.Reason })
-            }
-        }
-        else {
-            foreach ($entry in @($plan)) {
-                Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
-            }
-
-            # Reported separately because these accounts have no mask to move from: the policy
-            # deleted the entry outright, so there is no "0x... -> 0x..." to show. Leaving them out
-            # of the output entirely would under-report the repair - the RDP group most VMs rely on
-            # is usually exactly this case.
             foreach ($target in $absentTargets) {
-                Log-Output ("  [FIXED] {0}: entry recreated by Windows, granted {1}" -f $target.Name, $target.Right) | Tee-Object -FilePath $logFile -Append
+                Log-Output ("  [FIXED] {0}: entry recreated by Windows holding {1}, read back" -f $target.Name, $target.Right) | Tee-Object -FilePath $logFile -Append
             }
-
-            Log-Output ("  Applied through secedit, rewriting only: {0}" -f (@($applyResult.Applied) -join ', ')) | Tee-Object -FilePath $logFile -Append
-            $write = [PSCustomObject]@{
-                Ok      = $true
-                Reason  = ''
-                Applied = @(@($plan) + @($absentTargets))
-                Failed  = @()
-            }
-        }
-    }
-    else {
-        $write = Set-OfflineLogonRight -WindowsPath $windowsPath -Plan $plan
-
-        Log-Output '' | Tee-Object -FilePath $logFile -Append
-        foreach ($entry in @($write.Applied)) {
-            Log-Output ("  [FIXED] {0}: 0x{1:X4} -> 0x{2:X4} ({3})" -f $entry.Name, $entry.OldMask, $entry.NewMask, $entry.Reason) | Tee-Object -FilePath $logFile -Append
-        }
-        foreach ($failure in @($write.Failed)) {
-            $label = if ([string]::IsNullOrWhiteSpace($failure.Entry.Name)) { "SID $($failure.Entry.Sid)" } else { $failure.Entry.Name }
-            Log-Error ("  [FAILED] {0}: {1}" -f $label, $failure.Error) | Tee-Object -FilePath $logFile -Append
-        }
-    }
-
-    # SetupType is cleared last. It is not part of the logon-rights fault, so a failure to write the
-    # policy database must not be masked by a successful tidy-up of somebody else's residue.
-    if ($staleSetupType -and -not $script:OnlineMode) {
-        $cleared = Restore-OfflineSetupHook -WindowsPath $windowsPath -SetupType 0 -CmdLine ''
-        if ($cleared.Restored) {
-            Log-Output '  [FIXED] SYSTEM\Setup\SetupType reset to 0, so the disk no longer re-enters the setup boot path.' | Tee-Object -FilePath $logFile -Append
+            Log-Output ("REPAIRED {0} mask(s) and {1} account entry/entries through secedit on this machine, verified by a fresh export." -f $plan.Count, $absentTargets.Count) | Tee-Object -FilePath $logFile -Append
+            Log-Output 'Only the rights listed above were rewritten. A logon right applies at the next logon attempt; no reboot is needed.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "If a domain policy still assigns the right, it returns at the next policy refresh - check with 'gpresult /h' on the VM." | Tee-Object -FilePath $logFile -Append
         }
         else {
-            Log-Warning "SetupType could not be reset: $($cleared.Reason)" | Tee-Object -FilePath $logFile -Append
+            Log-Output ("REPAIRED {0} mask(s) and recreated {1} account entry/entries in the offline LSA policy database, verified by reading the hive back." -f $plan.Count, $recreated) | Tee-Object -FilePath $logFile -Append
+            Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
+            if ($setupState -and $setupState.Available -and $setupState.SetupType -eq 0 -and [string]::IsNullOrWhiteSpace($setupState.CmdLine)) {
+                Log-Output 'Verified on this disk: SetupType=0 and no boot-time command is armed.' | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output "Run 'az vm repair restore' and start the VM; no extra boot is needed. $backupPath can be deleted once the VM is healthy." | Tee-Object -FilePath $logFile -Append
         }
-    }
 
-    if (-not $write.Ok) {
-        Log-Error "The logon rights could not be fully repaired: $($write.Reason)." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    # The disk is handed back with no boot-time work outstanding. This is asserted rather than
-    # assumed: the previous design armed SYSTEM\Setup and could not clear it again from inside the
-    # boot it started, so the one thing worth proving is that nothing here left that state behind.
-    $final = if ($script:OnlineMode) { [PSCustomObject]@{ Available = $false } } else { Get-OfflineSetupState -WindowsPath $windowsPath }
-    if ($final.Available -and ($final.SetupType -ne 0 -or -not [string]::IsNullOrWhiteSpace($final.CmdLine))) {
-        Log-Warning "SYSTEM\Setup still reads SetupType=$($final.SetupType) CmdLine='$($final.CmdLine)'. That is not this repair, but the VM will run it on the next boot." | Tee-Object -FilePath $logFile -Append
-    }
-
-    # The shipped default grants RDP to two groups. When the fault deleted one of them outright,
-    # repairing only the survivor leaves the group most VMs actually put their RDP users in still
-    # locked out - measured: administrators could sign in, Remote Desktop Users could not. So the
-    # entry is put back, from values read off this same disk. Gated on the finding, so a healthy
-    # disk that simply has no such group is still left alone.
-    #
-    # Done before the closing count, not after it, so a run that recreates an entry cannot report
-    # "REPAIRED 0 account(s)" above the line saying which account it just put back.
-    $recreated = 0
-    $rdpFaultFound = @($repairable | Where-Object { $_.Cause -eq 'MissingAccountEntry' }).Count -gt 0
-    if ($rdpFaultFound -and -not $script:OnlineMode) {
-        foreach ($absent in $absentTargets) {
-            $made = New-OfflineLogonRightAccount -WindowsPath $windowsPath -Sid $absent.Sid `
-                -Mask ([uint32]$absent.Mask) -DonorSid $script:SidAdministrators
-
-            if ($made.Ok) {
-                $recreated++
-                Log-Output ("  [FIXED] {0}: policy entry recreated holding {1} (0x{2:X4})" -f $absent.Name, $absent.Right, [uint32]$absent.Mask) | Tee-Object -FilePath $logFile -Append
-            }
-            else {
-                Log-Warning "  [NOT RESTORED] $($absent.Name) has no entry in this disk's LSA policy database and one could not be created: $($made.Reason)" | Tee-Object -FilePath $logFile -Append
-                Log-Output "                 Access is still restored through BUILTIN\Administrators above. To put the group back once the VM is up, run as administrator:" | Tee-Object -FilePath $logFile -Append
-                Log-Output '                 secedit /export /areas USER_RIGHTS /cfg %temp%\ur.inf  then add the SID to SeRemoteInteractiveLogonRight and re-import with secedit /configure /areas USER_RIGHTS' | Tee-Object -FilePath $logFile -Append
-            }
-        }
-    }
-
-    if ($script:OnlineMode) {
-        Log-Output "REPAIRED $($write.Applied.Count) account(s) through secedit on the running machine." | Tee-Object -FilePath $logFile -Append
-        Log-Output 'Only the rights listed above were rewritten; every other user right on this machine was left as it was.' | Tee-Object -FilePath $logFile -Append
-        Log-Output 'The change is effective immediately - no reboot is needed for a logon right to take effect.' | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        # Two different operations, counted separately: a mask corrected in place is not the same
-        # repair as an account entry rebuilt from nothing, and collapsing them hides which happened.
-        Log-Output ("REPAIRED {0} mask(s) and recreated {1} account entry/entries in the offline LSA policy database." -f $write.Applied.Count, $recreated) | Tee-Object -FilePath $logFile -Append
-        Log-Output 'Only the logon-right bits listed above were changed; no other user right on this disk was touched.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    if ($script:OnlineMode) {
-        Log-Output 'Sign-in is possible again now: LSA applies a logon right at the next logon attempt, so nothing further is needed.' | Tee-Object -FilePath $logFile -Append
-        Log-Output 'If RDP is still refused, the cause is no longer user rights - check the listener, the firewall and the certificate.' | Tee-Object -FilePath $logFile -Append
-    }
-    elseif ($final.Available) {
-        Log-Output "Verified on this disk: SetupType=$($final.SetupType), no boot-time command armed." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Output 'SYSTEM\Setup could not be read back, so the boot-time state is unverified. This repair never writes to it.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Run 'az vm repair restore' and start the VM; the rights are already correct, so no extra boot is needed." | Tee-Object -FilePath $logFile -Append
-    }
-    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
+    $status = $STATUS_ERROR
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
 }
+finally {
+    if (Get-Command -Name Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        try {
+            Clear-OfflineDriveLetter
+            if (@(Get-OfflineAssignedDriveLetter).Count -gt 0) {
+                $status = $STATUS_ERROR
+                Add-OfflineRepairLog -Level Error -Message 'Temporary drive letters remain assigned. Registry repair may have completed, but cleanup is incomplete; inspect the cleanup diagnostics before proceeding.'
+            }
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Add-OfflineRepairLog -Level Error -Message "Drive-letter cleanup failed: $($_.Exception.Message)"
+        }
+    }
+
+    if (Get-Command -Name Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        try {
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append -ErrorAction Stop
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Log-Error "Final helper diagnostics could not be written to the detail log: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+    }
+}
+
+return $status
