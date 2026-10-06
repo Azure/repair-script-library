@@ -83,6 +83,8 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-applocker-blocking --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-applocker-blocking --parameters detectOnly=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-applocker-blocking --parameters disableEnforcement=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-applocker-blocking --parameters disableLsaProtection=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-applocker-blocking --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
