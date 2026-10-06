@@ -185,6 +185,23 @@
 #   Also applies the document's full Remote Desktop registry configuration and moves the listener
 #   back to port 3389. Only pass resetListenerPort when the port was not moved deliberately.
 #
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters disableNla=true
+#
+#   Also turns Network Level Authentication off, for a VM whose clients cannot pre-authenticate.
+#   Turn NLA back on once the VM is reachable.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters clearCipherSuitePolicy=true
+#
+#   Also removes the machine-wide SSL cipher suite policy. Only pass this when the configured suite
+#   list is known to exclude everything the listener can offer.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-connectivity --run-on-repair --parameters windowsDrive=F
+#
+#   Uses F: as the offline Windows volume instead of finding it automatically.
+#
 # .NOTES
 #   A hive that will not load at all is a different problem and belongs to
 #   win-fix-registry-corruption. This script needs SYSTEM and SOFTWARE to mount before it can read
