@@ -147,7 +147,7 @@
 	{
 		"id": "win-fix-pending-servicing",
 		"path": "src/windows/win-fix-pending-servicing.ps1",
-		"description": "Clears an unfinished Windows Update transaction that leaves a VM looping on Undoing changes made to your computer. Pass detectOnly=true to report only, or revert=true to undo a previous run. disableWindowsUpdate=true additionally leaves the Windows Update services disabled, which is never done by default. NOTE: use option --run-on-repair."
+		"description": "Clears an unfinished Windows Update transaction that leaves a VM looping on Undoing changes made to your computer. Pass detectOnly=true to report only, or revert=true to restore pending.xml, the TxR files and the service start types from a previous run. disableWindowsUpdate=true additionally leaves the Windows Update services disabled, which is never done by default. NOTE: use option --run-on-repair."
 	},
 	{
 		"id": "win-fix-transaction-logs",
