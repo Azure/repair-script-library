@@ -69,6 +69,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --parameters scope=files --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --parameters scope=all --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-reset-group-policy --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
