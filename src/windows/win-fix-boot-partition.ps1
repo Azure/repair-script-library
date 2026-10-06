@@ -97,6 +97,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-boot-partition --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-boot-partition --parameters detectOnly=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-boot-partition --parameters revert=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-boot-partition --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
