@@ -29,7 +29,8 @@
 #   Each rule is parsed with the grammar in [MS-GPFAS] section 2.2.6.2
 #   (https://learn.microsoft.com/openspecs/windows_protocols/ms-gpfas/885f236b-39f5-4a83-bac8-3c5459e88a9a).
 #
-#   TRIGGER. A rule is repaired only when the offline disk proves it blocks RDP: it is Active, its
+#   TRIGGER. A rule is repaired only when the offline disk shows it demands inbound IPsec for RDP,
+#   which a client with no matching IPsec policy cannot satisfy: it is Active, its
 #   action is Secure or SecureServer (the two that require inbound security), and its protocol and
 #   local port scope include TCP on the port the RDP listener actually uses. Boundary and
 #   DoNotSecure rules, inactive rules, and rules scoped to another protocol or port are left alone.
@@ -85,10 +86,10 @@
 #
 #   A firewall that blocks inbound TCP 3389, a firewall service that will not start, and Remote
 #   Desktop turned off in the Terminal Server configuration are different faults. They are covered
-#   by win-fix-firewall-service and win-fix-rdp-connectivity respectively, and nothing in the
+#   handled separately (the firewall service by win-fix-firewall-service), and nothing in the
 #   firewall's rule set, profile configuration or the Terminal Server configuration is written
 #   here. This script needs SYSTEM and SOFTWARE to mount before it can read anything; if either
-#   hive is damaged, run win-fix-registry-corruption first.
+#   hive is damaged, repair the hive first.
 #
 # .VERSION
 #   v1.0: Initial version.
@@ -503,6 +504,49 @@ function ConvertFrom-RegistryStringByte {
     return [System.Text.Encoding]::Unicode.GetString($Bytes).TrimEnd([char]0)
 }
 
+function Test-OfflineRegistryKeyPath {
+    <#
+    .SYNOPSIS
+        Whether a key exists in a loaded offline hive, found without ever opening a missing key.
+
+    .DESCRIPTION
+        The privileged helpers open keys with RegCreateKeyEx, which treats a missing key as an
+        error rather than "absent" and, for a missing parent, creates the parent before removing
+        only the leaf. Walking down from the hive root and listing each existing parent's subkeys
+        answers the question without either problem, so a probe never writes to the customer's
+        hive. Ok is $false only when a parent that exists could not be listed.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{ Ok = $false; Exists = $false; Error = '' }
+
+    $match = [regex]::Match($Path, '^(HKLM:\\[^\\]+)\\?(.*)$')
+    if (-not $match.Success) {
+        $result.Error = "$Path is not a path under a loaded hive."
+        return $result
+    }
+
+    $current = $match.Groups[1].Value
+    foreach ($segment in @($match.Groups[2].Value.Split('\') | Where-Object { $_ })) {
+        $children = Get-OfflinePrivilegedRegistrySubKeyName -Path $current
+        if (-not $children.Ok) {
+            $result.Error = "$current could not be listed ($($children.Error))"
+            return $result
+        }
+        $child = @($children.Names | Where-Object { $_ -eq $segment }) | Select-Object -First 1
+        if (-not $child) {
+            $result.Ok = $true
+            return $result
+        }
+        $current = Join-Path $current $child
+    }
+
+    $result.Ok = $true
+    $result.Exists = $true
+    return $result
+}
+
 function Get-RdpListenerPort {
     <#
     .SYNOPSIS
@@ -518,6 +562,17 @@ function Get-RdpListenerPort {
 
     $path = Join-Path $SystemRoot $script:RdpTcpSubPath
     $state = [PSCustomObject]@{ Port = $script:StandardRdpPort; Known = $true; Note = '' }
+
+    $key = Test-OfflineRegistryKeyPath -Path $path
+    if (-not $key.Ok) {
+        $state.Known = $false
+        $state.Note = "the RDP-Tcp key could not be checked ($($key.Error)); $($script:StandardRdpPort) is assumed and port-scoped rules are reported rather than judged"
+        return $state
+    }
+    if (-not $key.Exists) {
+        $state.Note = "the RDP-Tcp key is not present, so $($script:StandardRdpPort) is assumed"
+        return $state
+    }
 
     $value = Get-OfflinePrivilegedRegistryValue -Path $path -Name 'PortNumber'
     if (-not $value.Ok) {
@@ -570,6 +625,14 @@ function Get-LocalRuleMergeState {
 
     foreach ($profileName in @($script:ProfileKey.Keys)) {
         $path = Join-Path $script:PolicyFirewallPath $script:ProfileKey[$profileName]
+        # No Group Policy profile key at all is the usual case and means local rules are merged.
+        $key = Test-OfflineRegistryKeyPath -Path $path
+        if (-not $key.Ok) {
+            [void]$unknown.Add($profileName)
+            [void]$notes.Add("$profileName could not be checked ($($key.Error))")
+            continue
+        }
+        if (-not $key.Exists) { continue }
         $value = Get-OfflinePrivilegedRegistryValue -Path $path -Name 'AllowLocalIPsecPolicyMerge'
         if (-not $value.Ok) {
             [void]$unknown.Add($profileName)
@@ -620,6 +683,17 @@ function Get-ConSecStoreState {
         KeyExists = $false
         Error     = ''
         Rules     = @()
+    }
+
+    $key = Test-OfflineRegistryKeyPath -Path $Path
+    if (-not $key.Ok) {
+        $state.Error = $key.Error
+        Add-OfflineRepairLog -Level Warning -Message "The $Label connection security rule store could not be opened: $($key.Error)"
+        return $state
+    }
+    if (-not $key.Exists) {
+        $state.Readable = $true
+        return $state
     }
 
     $names = Get-OfflinePrivilegedRegistryValueName -Path $Path
@@ -988,7 +1062,7 @@ try {
     }
 
     $summary = "Repaired $repairedCount of $($repairable.Count) issue(s) that could be repaired."
-    if ($unrepairable.Count -gt 0) { $summary += " $($unrepairable.Count) issue(s) need a decision and were only reported." }
+    if ($unrepairable.Count -gt 0) { $summary += " $($unrepairable.Count) issue(s) need a decision and were only reported; Remote Desktop may still be blocked until they are resolved." }
 
     # Ahead of the failure gate on purpose, so both exits carry the rules that need a decision.
     foreach ($finding in $unrepairable) {
