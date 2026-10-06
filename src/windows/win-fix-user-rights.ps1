@@ -190,6 +190,13 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --run-on-repair --parameters mode=offline --verbose
 #   az vm repair restore -g sourceRG -n sourceVM --yes
 #
+# .EXAMPLE
+#   # Other options. Add --run-on-repair to any offline (mode=offline or windowsDrive) command.
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --parameters force=true --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --parameters revert=true --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --run-on-repair --parameters mode=offline revert=true --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-user-rights --run-on-repair --parameters mode=offline windowsDrive=F --verbose
+#
 # .NOTES
 #   Switch parameters are declared as ValidateSet strings on purpose. The extension turns
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
