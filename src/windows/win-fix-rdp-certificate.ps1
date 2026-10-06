@@ -184,6 +184,11 @@
 #   SYSTEM on the Remote Desktop store, and deletes an expired or key-less listener certificate so
 #   Windows mints a fresh one on the next start.
 #
+# .EXAMPLE
+#   az vm repair run -g MyRg -n MyVm --run-id win-fix-rdp-certificate --run-on-repair --parameters windowsDrive=F
+#
+#   Uses F: as the offline Windows volume instead of finding it automatically.
+#
 # .NOTES
 #   A VM that refuses RDP because remote connections are turned off, because the listener values are
 #   out of range, or because a certificate is pinned to the listener, is win-fix-rdp-connectivity's
