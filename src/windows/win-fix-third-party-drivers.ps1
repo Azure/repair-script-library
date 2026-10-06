@@ -87,6 +87,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --parameters disableDriverVerifier=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --parameters revert=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-third-party-drivers --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
