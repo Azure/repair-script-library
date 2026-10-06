@@ -407,7 +407,11 @@ function Get-DriverInventory {
             # exposed - that is the set this scenario exists to find - so only the throw sets the
             # flag, never an empty-but-readable CompanyName.
             try { $vendor = (Get-Item -LiteralPath $resolved -ErrorAction Stop).VersionInfo.CompanyName }
-            catch { $vendor = ''; $vendorUnreadable = $true }
+            catch {
+                $vendor = ''
+                $vendorUnreadable = $true
+                Add-OfflineRepairLog -Level Warning -Message "$($service.PSChildName): the publisher of $resolved could not be read ($($_.Exception.GetType().FullName): $($_.Exception.Message)). The driver is kept protected."
+            }
         }
         elseif (-not [string]::IsNullOrWhiteSpace($resolved)) {
             # Test-OfflinePath is Test-Path wrapped in a try/catch that returns $false on error, so
@@ -427,7 +431,10 @@ function Get-DriverInventory {
                 # The only outcome that proves the image is genuinely gone.
                 $exists = $false
             }
-            catch { $imageUnreadable = $true }
+            catch {
+                $imageUnreadable = $true
+                Add-OfflineRepairLog -Level Warning -Message "$($service.PSChildName): whether $resolved exists could not be established ($($_.Exception.GetType().FullName): $($_.Exception.Message)). The driver is kept protected."
+            }
         }
 
         $isMicrosoft = $false
@@ -705,7 +712,8 @@ function Invoke-DriverRevert {
                 $restored += Restore-DriverVerifier -SystemRoot $SystemRoot -Entry $entry
             }
             catch {
-                [void]$errors.Add("Driver Verifier: $($_.Exception.Message)")
+                # Collected rather than logged here: the caller writes every entry as a warning.
+                [void]$errors.Add("Driver Verifier: $($_.Exception.GetType().FullName): $($_.Exception.Message)")
             }
             continue
         }
@@ -728,7 +736,7 @@ function Invoke-DriverRevert {
             $restored++
         }
         catch {
-            [void]$errors.Add("$($entry.Service): $($_.Exception.Message)")
+            [void]$errors.Add("$($entry.Service): $($_.Exception.GetType().FullName): $($_.Exception.Message)")
         }
     }
 
