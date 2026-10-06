@@ -79,7 +79,19 @@
 #   placed alongside it under a suffixed name instead of replacing it, because discarding a
 #   catalog can only ever reduce coverage. The only files it replaces are ones that cannot be
 #   opened at all - a zero-length or truncated .cat publishes nothing and can only be an
-#   improvement to replace.
+#   improvement to replace - and only when the source holds a copy under the same name.
+#
+#   The widening is bounded. The default source is the payload this installation was serviced
+#   from, which a healthy store already contains (measured above: every servicing catalog is also
+#   in CatRoot), so the merge only restores what the store held before it was damaged. When the
+#   only fault is unopenable catalogs, the merge is limited to replacing exactly those files and
+#   adds nothing else. A -donorPath source is trusted as far as the operator points it.
+#
+#   Before the first write, every catalog about to be replaced is copied to
+#   <windows>\Temp\win-fix-catalog-store\<timestamp>, together with manifest.csv listing every
+#   file that is added, replaced or placed alongside. Undoing the repair is deleting the added
+#   files listed there and copying the backed-up ones back. Ownership of the store folder is taken
+#   only if a plain copy is refused, and its original descriptor is put back and verified.
 #
 #   DETECTION, AND WHY A HEALTHY DISK IS LEFT ALONE
 #
@@ -100,8 +112,9 @@
 #   On a healthy disk every check passes, no finding is produced, and this script writes nothing.
 #
 # .PARAMETER detectOnly
-#   'true' reports what is wrong and changes nothing at all. No catalog is copied and no backup is
-#   taken.
+#   'true' reports what is wrong and writes nothing to the catalog store: no catalog is copied, no
+#   ownership is taken and no backup is made. Disk discovery still assigns a temporary drive letter
+#   and the SYSTEM hive is mounted to read the boot drivers; both are released before exit.
 #
 # .PARAMETER windowsDrive
 #   Skips discovery and uses this drive letter as the offline Windows volume.
@@ -135,10 +148,6 @@ Param(
 )
 
 . .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\OfflineRepairCommon.ps1
-. .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
-. .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
-. .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
 $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
@@ -161,10 +170,6 @@ $script:MinCoverageRatio = 0.9
 
 # Below this many resolvable reference files the ratio is not evidence of anything.
 $script:MinSampleSize = 6
-
-# A catalog smaller than this cannot hold a signed member list; it is treated as truncated only if
-# it also fails to open.
-$script:MinPlausibleCatalogBytes = 512
 
 # Inbox binaries every healthy Windows publishes in a servicing catalog. Used for two judgements:
 # is the guest's own store complete enough for a miss to mean corruption, and does a donor match
@@ -317,12 +322,13 @@ namespace OfflineRepair
         // Maps every member reference tag to the catalog that publishes it. Catalogs are opened in
         // parallel: each thread owns the handle it opens, so no wintrust state is shared, and a
         // serial walk of several thousand catalogs is otherwise the slowest step in a repair run.
-        // stats[0] = catalogs opened, stats[1] = member entries seen.
+        // stats[0] = catalogs opened, stats[1] = member entries seen, stats[2] = catalogs whose member
+        // walk failed part-way (their members up to that point are kept).
         public static Dictionary<string, int> BuildIndex(string[] catalogPaths, int[] stats)
         {
             ConcurrentDictionary<string, int> index =
                 new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            int opened = 0, members = 0;
+            int opened = 0, members = 0, walkFailures = 0;
 
             ParallelOptions options = new ParallelOptions();
             options.MaxDegreeOfParallelism = Math.Min(16, Math.Max(2, Environment.ProcessorCount * 2));
@@ -348,12 +354,13 @@ namespace OfflineRepair
                         index.TryAdd(tag, i);
                     }
                 }
-                catch { }
+                catch { Interlocked.Increment(ref walkFailures); }
                 finally { CryptCATClose(hCat); }
                 Interlocked.Add(ref members, localMembers);
             });
 
             if (stats != null && stats.Length >= 2) { stats[0] = opened; stats[1] = members; }
+            if (stats != null && stats.Length >= 3) { stats[2] = walkFailures; }
             return new Dictionary<string, int>(index, StringComparer.OrdinalIgnoreCase);
         }
 
@@ -461,11 +468,14 @@ function New-CatalogIndex {
         return $result
     }
 
-    $stats = [int[]]@(0, 0)
+    $stats = [int[]]@(0, 0, 0)
     try {
         $result.Index = [OfflineRepair.CatalogNative]::BuildIndex([string[]]($files.FullName), $stats)
         $result.Opened = $stats[0]
         $result.Members = $stats[1]
+        if ($stats[2] -gt 0) {
+            Add-OfflineRepairLog -Level Warning -Message "$($stats[2]) catalog(s) in $Path opened but their member list could not be read to the end, so the hashes after the failure point are not indexed."
+        }
     }
     catch {
         $result.Error = $_.Exception.Message
@@ -606,14 +616,14 @@ function Get-UnresolvedBootDriver {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]$Drivers,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Drivers,
         [Parameter(Mandatory = $true)]$CatalogIndex
     )
 
     $unresolved = [System.Collections.Generic.List[object]]::new()
     if (-not $CatalogIndex.Index) { return @($unresolved) }
 
-    foreach ($driver in @($Drivers)) {
+    foreach ($driver in @($Drivers | Where-Object { $null -ne $_ })) {
         if (-not (Test-Path -LiteralPath $driver.Path -PathType Leaf)) { continue }
         if ((Get-PeCertificateTableSize -Path $driver.Path) -ne 0) { continue }
 
@@ -658,16 +668,22 @@ function Get-AllFinding {
     .DESCRIPTION
         A healthy disk produces an empty list. Each finding names the evidence that produced it, so
         nothing is reported on inference alone.
+
+        SourceNames is a hashtable keyed by the file names of the source catalogs that open. An
+        unopenable store catalog is repairable only when its name is in it.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Store,
         [Parameter(Mandatory = $true)]$Coverage,
-        [Parameter(Mandatory = $true)]$Unresolved,
-        [Parameter(Mandatory = $true)][bool]$SourceUsable
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Unresolved,
+        [Parameter(Mandatory = $true)][bool]$SourceUsable,
+        [Parameter(Mandatory = $false)][AllowNull()][hashtable]$SourceNames = $null
     )
 
     $findings = [System.Collections.Generic.List[object]]::new()
+    # @($null) has one element, so a null list is emptied explicitly.
+    $Unresolved = @($Unresolved | Where-Object { $null -ne $_ })
 
     if (-not $Store.Exists) {
         [void]$findings.Add((New-Finding -Cause 'StoreMissing' -Item $Store.Path `
@@ -721,12 +737,28 @@ function Get-AllFinding {
                     -Repairable $SourceUsable -Data $Coverage))
     }
 
-    # Files that are present but publish nothing.
-    if (@($Store.Unopenable).Count -gt 0) {
-        $sample = @($Store.Unopenable | Select-Object -First 5 | ForEach-Object { Split-Path $_ -Leaf })
+    # Files that are present but publish nothing. Only a file the source holds under the same name
+    # can be replaced, so the rest are reported for a decision instead of triggering a merge that
+    # cannot fix them.
+    $replaceable = [System.Collections.Generic.List[string]]::new()
+    $noSource = [System.Collections.Generic.List[string]]::new()
+    foreach ($bad in @($Store.Unopenable)) {
+        if ($SourceUsable -and $null -ne $SourceNames -and $SourceNames.ContainsKey((Split-Path $bad -Leaf))) { [void]$replaceable.Add($bad) }
+        else { [void]$noSource.Add($bad) }
+    }
+
+    if ($replaceable.Count -gt 0) {
+        $sample = @($replaceable | Select-Object -First 5 | ForEach-Object { Split-Path $_ -Leaf })
         [void]$findings.Add((New-Finding -Cause 'CatalogUnopenable' -Item $Store.Path `
-                    -Message "$(@($Store.Unopenable).Count) catalog file(s) in the store cannot be opened by wintrust and publish no hashes at all - truncated or zero-length. Example(s): $($sample -join ', ')" `
-                    -Repairable $SourceUsable -Data @($Store.Unopenable)))
+                    -Message "$($replaceable.Count) catalog file(s) in the store cannot be opened by wintrust and publish no hashes at all - truncated or zero-length. The repair source holds a valid copy of each under the same name. Example(s): $($sample -join ', ')" `
+                    -Repairable $true -Data @($replaceable)))
+    }
+
+    if ($noSource.Count -gt 0) {
+        $sample = @($noSource | Select-Object -First 5 | ForEach-Object { Split-Path $_ -Leaf })
+        [void]$findings.Add((New-Finding -Cause 'CatalogUnopenableNoSource' -Item $Store.Path `
+                    -Message "$($noSource.Count) catalog file(s) in the store cannot be opened by wintrust and no usable repair source holds a valid copy under the same name, so this script will not replace them. Restore them from a backup of this disk, or rerun with donorPath set to a machine at the same build AND patch level that holds them. Example(s): $($sample -join ', ')" `
+                    -Repairable $false -Data @($noSource)))
     }
 
     return @($findings)
@@ -767,19 +799,32 @@ function Invoke-CatalogMerge {
     .DESCRIPTION
         Never overwrites a catalog that opens. Identical content is skipped, different content with
         the same name is placed alongside under a suffixed name, and only a file that wintrust
-        cannot open at all is replaced.
+        cannot open at all is replaced. With -ReplaceOnly nothing is added: only the unopenable
+        files are replaced, which keeps a repair of that fault alone from widening the store.
 
-        The store folder's descriptor is taken once rather than per file: at several thousand
-        catalogs, per-file ownership changes dominate the runtime by a wide margin.
+        Before the first write every file about to be replaced is copied to BackupPath, and
+        manifest.csv there lists every file the merge writes. If either cannot be written the merge
+        stops without touching the store.
+
+        A plain copy is tried first. Only if the store refuses it is the folder's descriptor taken,
+        once rather than per file - at several thousand catalogs per-file ownership changes would
+        dominate the runtime - and its original binary descriptor is put back and verified.
+        AclRestored is $null when no access was taken, otherwise whether every descriptor that was
+        taken (the folder's, or a per-file fallback's) was restored and verified.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$StorePath,
-        [Parameter(Mandatory = $true)]$SourceFiles,
-        [Parameter(Mandatory = $true)]$Unopenable
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$SourceFiles,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Unopenable,
+        [Parameter(Mandatory = $true)][string]$BackupPath,
+        [Parameter(Mandatory = $false)][switch]$ReplaceOnly
     )
 
-    $outcome = [PSCustomObject]@{ Added = 0; Replaced = 0; SideBySide = 0; Skipped = 0; Failed = 0; Errors = @() }
+    $outcome = [PSCustomObject]@{
+        Added = 0; Replaced = 0; SideBySide = 0; Skipped = 0; Failed = 0; Errors = @()
+        Aborted = $false; BackupPath = ''; ManifestPath = ''; AclRestored = $null
+    }
 
     $existing = @{}
     foreach ($file in @(Get-ChildItem -LiteralPath $StorePath -Filter '*.cat' -File -ErrorAction SilentlyContinue)) {
@@ -791,15 +836,17 @@ function Invoke-CatalogMerge {
     $plan = [System.Collections.Generic.List[object]]::new()
     foreach ($source in @($SourceFiles)) {
         if (-not $existing.ContainsKey($source.Name)) {
-            [void]$plan.Add([PSCustomObject]@{ Source = $source.FullName; Target = (Join-Path $StorePath $source.Name); Kind = 'Added' })
+            if ($ReplaceOnly) { continue }
+            [void]$plan.Add([PSCustomObject]@{ Kind = 'Added'; Target = (Join-Path $StorePath $source.Name); Source = $source.FullName; Backup = '' })
             continue
         }
 
         # Present but broken: replacing it can only be an improvement.
         if ($badNames.ContainsKey($source.Name)) {
-            [void]$plan.Add([PSCustomObject]@{ Source = $source.FullName; Target = (Join-Path $StorePath $source.Name); Kind = 'Replaced' })
+            [void]$plan.Add([PSCustomObject]@{ Kind = 'Replaced'; Target = (Join-Path $StorePath $source.Name); Source = $source.FullName; Backup = (Join-Path $BackupPath $source.Name) })
             continue
         }
+        if ($ReplaceOnly) { continue }
 
         $current = $existing[$source.Name]
         if ($current.Length -eq $source.Length -and
@@ -811,7 +858,7 @@ function Invoke-CatalogMerge {
 
         $sideBySide = Join-Path $StorePath ('{0}.local{1}' -f [IO.Path]::GetFileNameWithoutExtension($source.Name), [IO.Path]::GetExtension($source.Name))
         if (Test-Path -LiteralPath $sideBySide) { $outcome.Skipped++; continue }
-        [void]$plan.Add([PSCustomObject]@{ Source = $source.FullName; Target = $sideBySide; Kind = 'SideBySide' })
+        [void]$plan.Add([PSCustomObject]@{ Kind = 'SideBySide'; Target = $sideBySide; Source = $source.FullName; Backup = '' })
     }
 
     if ($plan.Count -eq 0) {
@@ -819,41 +866,96 @@ function Invoke-CatalogMerge {
         return $outcome
     }
 
+    # Nothing is written until the backup and the manifest that undo depends on both exist.
+    try {
+        Assert-OfflineTarget -Path $StorePath -Action 'merge catalogs into'
+        Assert-OfflineTarget -Path $BackupPath -Action 'back up catalogs to'
+        [void](New-Item -Path $BackupPath -ItemType Directory -Force -ErrorAction Stop)
+        foreach ($item in @($plan | Where-Object { $_.Kind -eq 'Replaced' })) {
+            Copy-Item -LiteralPath $item.Target -Destination $item.Backup -Force -ErrorAction Stop
+        }
+        $manifest = Join-Path $BackupPath 'manifest.csv'
+        $plan | Select-Object -Property Kind, Target, Source, Backup |
+            Export-Csv -LiteralPath $manifest -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        $outcome.BackupPath = $BackupPath
+        $outcome.ManifestPath = $manifest
+    }
+    catch {
+        $outcome.Aborted = $true
+        $outcome.Errors += "backup to $BackupPath failed, so nothing was written to the store: $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Error -Message "The backup of the store could not be completed in $BackupPath ($($_.Exception.Message)). The merge was not started and the store is unchanged."
+        return $outcome
+    }
+
+    $replacedCount = @($plan | Where-Object { $_.Kind -eq 'Replaced' }).Count
+    Add-OfflineRepairLog -Level Info -Message "Backed up $replacedCount catalog(s) about to be replaced and wrote the list of all $($plan.Count) planned write(s) to $($outcome.ManifestPath). To undo: delete every Added and SideBySide target listed there and copy each Backup file back over its Target."
     Add-OfflineRepairLog -Level Info -Message "Merging $($plan.Count) catalog(s) into $StorePath."
 
     $storeSddl = $null
+    $storeBinary = $null
+    $accessTried = $false
+    $fileAclLost = $false
     try {
-        $storeSddl = Grant-OfflinePathAccess -Path $StorePath
-
         foreach ($item in $plan) {
+            $copied = $false
+            $reason = ''
             try {
                 Copy-Item -LiteralPath $item.Source -Destination $item.Target -Force -ErrorAction Stop
+                $copied = $true
+            }
+            catch {
+                $reason = $_.Exception.Message
+            }
+
+            if (-not $copied -and -not $accessTried) {
+                $accessTried = $true
+                Add-OfflineRepairLog -Level Info -Message "The store refused a plain copy ($reason), so temporary access to $StorePath is being taken."
+                $storeSddl = Grant-OfflinePathAccess -Path $StorePath -CapturedBinary ([ref]$storeBinary)
+                if ($storeSddl) {
+                    try {
+                        Copy-Item -LiteralPath $item.Source -Destination $item.Target -Force -ErrorAction Stop
+                        $copied = $true
+                    }
+                    catch { $reason = $_.Exception.Message }
+                }
+            }
+
+            if (-not $copied) {
+                # The per-file protected copy takes and hands back ownership of the individual file
+                # when the folder grant was not enough or could not be taken.
+                $fallback = Copy-OfflineProtectedFile -Source $item.Source -Destination $item.Target
+                if ($fallback.Copied) { $copied = $true }
+                else { $reason = $fallback.Reason }
+                if ($fallback.TookOwnership -and -not $fallback.Restored) {
+                    $fileAclLost = $true
+                    Add-OfflineRepairLog -Level Error -Message "The original security descriptor around $($item.Target) could not be restored after the per-file copy."
+                }
+            }
+
+            if ($copied) {
                 switch ($item.Kind) {
                     'Added' { $outcome.Added++ }
                     'Replaced' { $outcome.Replaced++ }
                     'SideBySide' { $outcome.SideBySide++ }
                 }
             }
-            catch {
-                # Fall back to the per-file protected copy, which takes and hands back ownership of
-                # the individual file when the folder grant was not enough.
-                $fallback = Copy-OfflineProtectedFile -Source $item.Source -Destination $item.Target
-                if ($fallback.Copied) {
-                    switch ($item.Kind) {
-                        'Added' { $outcome.Added++ }
-                        'Replaced' { $outcome.Replaced++ }
-                        'SideBySide' { $outcome.SideBySide++ }
-                    }
-                }
-                else {
-                    $outcome.Failed++
-                    $outcome.Errors += "$(Split-Path $item.Target -Leaf): $($fallback.Reason)"
-                }
+            else {
+                $outcome.Failed++
+                $outcome.Errors += "$(Split-Path $item.Target -Leaf): $reason"
             }
         }
     }
     finally {
-        if ($storeSddl) { [void](Restore-OfflinePathSecurity -Path $StorePath -Sddl $storeSddl) }
+        if ($storeSddl) {
+            $outcome.AclRestored = [bool](Restore-OfflinePathSecurity -Path $StorePath -Sddl $storeSddl -BinaryDescriptor $storeBinary)
+            if ($outcome.AclRestored) {
+                Add-OfflineRepairLog -Level Info -Message "The original security descriptor of $StorePath was restored and verified."
+            }
+            else {
+                Add-OfflineRepairLog -Level Error -Message "The original security descriptor of $StorePath could not be restored. Its original SDDL was: $storeSddl"
+            }
+        }
+        if ($fileAclLost) { $outcome.AclRestored = $false }
     }
 
     return $outcome
@@ -862,182 +964,268 @@ function Invoke-CatalogMerge {
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly)" | Tee-Object -FilePath $logFile -Append
 
+$status = $STATUS_ERROR
+
 try {
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    # Inside the try so that a helper which fails to load is reported and still cleaned up.
+    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
+    . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
+    . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
+    . .\src\windows\common\helpers\Use-OfflineProtectedResource.ps1
 
-    $windowsPath = $offline.WindowsPath
-    $volumeRoot = Split-Path -Path $windowsPath -Parent
+    # A labelled single-pass loop. A bare "return" at script scope would leave the finally
+    # block's cleanup and buffered log output unwritten, so early exits break out instead.
+    :Main do {
+        $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    Log-Info "Offline Windows installation: $windowsPath on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
-    Log-Info "$($script:DocUrl) describes why a kernel-mode driver must be signed; this script checks that the store which publishes those signatures can still resolve this machine's own binaries." | Tee-Object -FilePath $logFile -Append
+        $windowsPath = $offline.WindowsPath
+        $volumeRoot = Split-Path -Path $windowsPath -Parent
 
-    if (-not (Initialize-CatalogNativeType)) {
-        Log-Error 'The wintrust catalog APIs are unavailable on this rescue VM, so the catalog store cannot be assessed. No changes were made.' | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
+        Log-Info "Offline Windows installation: $windowsPath on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
+        Log-Info "$($script:DocUrl) describes why a kernel-mode driver must be signed; this script checks that the store which publishes those signatures can still resolve this machine's own binaries." | Tee-Object -FilePath $logFile -Append
 
-    $storePath = Get-CatalogStorePath -WindowsPath $windowsPath
-    Log-Info "Catalog store: $storePath" | Tee-Object -FilePath $logFile -Append
-    Log-Info 'CatRoot2 is a CryptSvc database that only exists once the OS runs. It is not consulted during boot and is not touched by this script.' | Tee-Object -FilePath $logFile -Append
-
-    $store = New-CatalogIndex -Path $storePath
-    if ($store.Exists) {
-        Log-Info ("Store contents: {0:N0} catalog file(s), {1:N1} MB, {2:N0} opened, {3:N0} published hashes." -f `
-                $store.FileCount, ($store.TotalBytes / 1MB), $store.Opened, $(if ($store.Index) { $store.Index.Count } else { 0 })) | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Warning "The catalog store folder is not present at $storePath." | Tee-Object -FilePath $logFile -Append
-    }
-
-    $coverage = Get-StoreCoverage -CatalogIndex $store -WindowsPath $windowsPath
-    Log-Info "Reference coverage: $($coverage.Resolved) of $($coverage.Present) inbox binaries resolve in this store (ratio $($coverage.Ratio); healthy measured 1.00, threshold $($script:MinCoverageRatio))." | Tee-Object -FilePath $logFile -Append
-
-    # Which source will be used if anything needs repairing.
-    $sourcePath = $null
-    $sourceKind = ''
-    if ($donorPath) {
-        $sourcePath = Resolve-DonorStorePath -Path $donorPath
-        $sourceKind = 'donor'
-        if (-not $sourcePath) {
-            Log-Warning "No catalogs were found at or under the donor path '$donorPath'." | Tee-Object -FilePath $logFile -Append
+        if (-not (Initialize-CatalogNativeType)) {
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            Log-Error 'The wintrust catalog APIs are unavailable on this rescue VM, so the catalog store cannot be assessed. No changes were made.' | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
         }
-    }
-    else {
-        $localSource = Get-LocalCatalogSourcePath -WindowsPath $windowsPath
-        if (Test-Path -LiteralPath $localSource -PathType Container) {
-            $sourcePath = $localSource
-            $sourceKind = 'the guest''s own servicing store'
+
+        $storePath = Get-CatalogStorePath -WindowsPath $windowsPath
+        Log-Info "Catalog store: $storePath" | Tee-Object -FilePath $logFile -Append
+        Log-Info 'CatRoot2 is a CryptSvc database that only exists once the OS runs. It is not consulted during boot and is not touched by this script.' | Tee-Object -FilePath $logFile -Append
+
+        $store = New-CatalogIndex -Path $storePath
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        if ($store.Exists) {
+            Log-Info ("Store contents: {0:N0} catalog file(s), {1:N1} MB, {2:N0} opened, {3:N0} published hashes." -f `
+                    $store.FileCount, ($store.TotalBytes / 1MB), $store.Opened, $(if ($store.Index) { $store.Index.Count } else { 0 })) | Tee-Object -FilePath $logFile -Append
         }
         else {
-            Log-Warning "This installation has no $($script:LocalSourceRelative) folder, so no local catalog source is available." | Tee-Object -FilePath $logFile -Append
+            Log-Warning "The catalog store folder is not present at $storePath." | Tee-Object -FilePath $logFile -Append
         }
-    }
 
-    $source = if ($sourcePath) { New-CatalogIndex -Path $sourcePath } else { $null }
-    $sourceCoverage = $null
-    $sourceUsable = $false
+        $coverage = Get-StoreCoverage -CatalogIndex $store -WindowsPath $windowsPath
+        Log-Info "Reference coverage: $($coverage.Resolved) of $($coverage.Present) inbox binaries resolve in this store (ratio $($coverage.Ratio); healthy measured 1.00, threshold $($script:MinCoverageRatio))." | Tee-Object -FilePath $logFile -Append
 
-    if ($source -and $source.FileCount -gt 0 -and $source.Index) {
-        $sourceCoverage = Get-StoreCoverage -CatalogIndex $source -WindowsPath $windowsPath
-        Log-Info ("Repair source ({0}): {1} - {2:N0} catalog(s), resolves {3} of {4} of this machine's own reference binaries (ratio {5})." -f `
-                $sourceKind, $sourcePath, $source.FileCount, $sourceCoverage.Resolved, $sourceCoverage.Present, $sourceCoverage.Ratio) | Tee-Object -FilePath $logFile -Append
-
-        if ($sourceCoverage.Present -ge $script:MinSampleSize -and $sourceCoverage.Ratio -lt $script:MinCoverageRatio) {
-            if ($isForceDonor) {
-                Log-Warning "This source resolves only $($sourceCoverage.Ratio) of this machine's reference binaries, so it does not match this build. forceDonor=true was passed, so it will be used anyway." | Tee-Object -FilePath $logFile -Append
-                $sourceUsable = $true
+        # Which source will be used if anything needs repairing.
+        $sourcePath = $null
+        $sourceKind = ''
+        if ($donorPath) {
+            $sourcePath = Resolve-DonorStorePath -Path $donorPath
+            $sourceKind = 'donor'
+            if (-not $sourcePath) {
+                Log-Warning "No catalogs were found at or under the donor path '$donorPath'." | Tee-Object -FilePath $logFile -Append
+            }
+        }
+        else {
+            $localSource = Get-LocalCatalogSourcePath -WindowsPath $windowsPath
+            if (Test-Path -LiteralPath $localSource -PathType Container) {
+                $sourcePath = $localSource
+                $sourceKind = 'the guest''s own servicing store'
             }
             else {
-                Log-Warning "This source does not match this installation: it resolves only $($sourceCoverage.Resolved) of $($sourceCoverage.Present) of the machine's own reference binaries. Merging it would add files without making the machine bootable, so it will not be used. Pass forceDonor=true to override, or point donorPath at a machine at the same build AND patch level." | Tee-Object -FilePath $logFile -Append
+                Log-Warning "This installation has no $($script:LocalSourceRelative) folder, so no local catalog source is available." | Tee-Object -FilePath $logFile -Append
             }
         }
-        else {
-            $sourceUsable = $true
+
+        $source = if ($sourcePath) { New-CatalogIndex -Path $sourcePath } else { $null }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        $sourceCoverage = $null
+        $sourceUsable = $false
+        # Only source catalogs that open are offered: copying a broken one in fixes nothing.
+        $sourceFiles = @()
+        $sourceNames = @{}
+
+        if ($source -and $source.FileCount -gt 0 -and $source.Index) {
+            $sourceBad = @{}
+            foreach ($bad in @($source.Unopenable)) { $sourceBad[$bad] = $true }
+            $sourceFiles = @($source.Files | Where-Object { -not $sourceBad.ContainsKey($_.FullName) })
+            foreach ($file in $sourceFiles) { $sourceNames[$file.Name] = $true }
+
+            $sourceCoverage = Get-StoreCoverage -CatalogIndex $source -WindowsPath $windowsPath
+            Log-Info ("Repair source ({0}): {1} - {2:N0} catalog(s), resolves {3} of {4} of this machine's own reference binaries (ratio {5})." -f `
+                    $sourceKind, $sourcePath, $source.FileCount, $sourceCoverage.Resolved, $sourceCoverage.Present, $sourceCoverage.Ratio) | Tee-Object -FilePath $logFile -Append
+
+            if ($sourceCoverage.Present -ge $script:MinSampleSize -and $sourceCoverage.Ratio -lt $script:MinCoverageRatio) {
+                if ($isForceDonor) {
+                    Log-Warning "This source resolves only $($sourceCoverage.Ratio) of this machine's reference binaries, so it does not match this build. forceDonor=true was passed, so it will be used anyway." | Tee-Object -FilePath $logFile -Append
+                    $sourceUsable = $true
+                }
+                else {
+                    Log-Warning "This source does not match this installation: it resolves only $($sourceCoverage.Resolved) of $($sourceCoverage.Present) of the machine's own reference binaries. Merging it would add files without making the machine bootable, so it will not be used. Pass forceDonor=true to override, or point donorPath at a machine at the same build AND patch level." | Tee-Object -FilePath $logFile -Append
+                }
+            }
+            else {
+                $sourceUsable = $true
+            }
         }
-    }
-    elseif ($sourcePath) {
-        Log-Warning "The repair source at $sourcePath holds no usable catalogs$(if ($source.Error) { " ($($source.Error))" })." | Tee-Object -FilePath $logFile -Append
-    }
+        elseif ($sourcePath) {
+            Log-Warning "The repair source at $sourcePath holds no usable catalogs$(if ($source.Error) { " ($($source.Error))" })." | Tee-Object -FilePath $logFile -Append
+        }
 
-    # Boot drivers come from the hive; the catalog work above is all file work and needs no hive.
-    $drivers = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $windowsPath -ScriptBlock {
-        $systemRoot = Get-OfflineSystemRootPath
-        Add-OfflineRepairLog -Level Info -Message "Control set $(Split-Path -Path $systemRoot -Leaf)."
-        return @(Get-BootDriverRecord -SystemRoot $systemRoot -WindowsDrive $volumeRoot)
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        # Boot drivers come from the hive; the catalog work above is all file work and needs no hive.
+        # Invoke-WithHive returns $null for an empty result, so the array is rebuilt here.
+        $drivers = @(Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $windowsPath -ScriptBlock {
+                $systemRoot = Get-OfflineSystemRootPath
+                Add-OfflineRepairLog -Level Info -Message "Control set $(Split-Path -Path $systemRoot -Leaf)."
+                return @(Get-BootDriverRecord -SystemRoot $systemRoot -WindowsDrive $volumeRoot)
+            })
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $unresolved = @(Get-UnresolvedBootDriver -Drivers $drivers -CatalogIndex $store)
-    Log-Info "Boot-critical drivers examined: $(@($drivers).Count). Depending on the catalog store and unresolved by it: $(@($unresolved).Count)." | Tee-Object -FilePath $logFile -Append
+        # Every Windows installation has boot-start drivers. Reading none means the hive was not
+        # read, not that nothing depends on the store, so no verdict is given.
+        if ($drivers.Count -eq 0) {
+            Log-Error 'No boot-start driver could be read from the offline SYSTEM hive, so whether the store resolves them cannot be judged. No changes were made.' | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
 
-    $findings = @(Get-AllFinding -Store $store -Coverage $coverage -Unresolved $unresolved -SourceUsable $sourceUsable)
+        $unresolved = @(Get-UnresolvedBootDriver -Drivers $drivers -CatalogIndex $store)
+        Log-Info "Boot-critical drivers examined: $($drivers.Count). Depending on the catalog store and unresolved by it: $($unresolved.Count)." | Tee-Object -FilePath $logFile -Append
 
-    foreach ($finding in $findings) {
-        Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
+        $findings = @(Get-AllFinding -Store $store -Coverage $coverage -Unresolved $unresolved -SourceUsable $sourceUsable -SourceNames $sourceNames)
 
-    $repairable = @($findings | Where-Object { $_.Repairable })
-    $unrepairable = @($findings | Where-Object { -not $_.Repairable })
+        $repairable = @($findings | Where-Object { $_.Repairable })
+        $unrepairable = @($findings | Where-Object { -not $_.Repairable })
 
-    if ($findings.Count -eq 0) {
-        Log-Output "No catalog store fault was found. The store resolves $($coverage.Resolved) of $($coverage.Present) inbox reference binaries and every catalog-dependent boot driver on this machine verifies against it. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
+        if ($findings.Count -eq 0) {
+            Log-Output "No catalog store fault was found. The store resolves $($coverage.Resolved) of $($coverage.Present) inbox reference binaries, and none of the $($drivers.Count) boot-start drivers examined depends on a hash it lacks. No changes were made." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
 
-    if ($isDetectOnly) {
+        if ($isDetectOnly) {
+            foreach ($finding in $findings) {
+                Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            }
+            # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
+            # so a summary printed first is the first thing a long run loses.
+            Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. Nothing was written to the catalog store." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
         foreach ($finding in $findings) {
-            Log-Output "  [$(if ($finding.Repairable) { 'FIXABLE' } else { 'MANUAL ' })] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            Log-Info "FOUND [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
-        # The count comes after the list on purpose. Run Command keeps the tail of a 4096-character log,
-        # so a summary printed first is the first thing a long run loses.
-        Log-Output "Detect only: found $($findings.Count) issue(s), $($repairable.Count) of which this script can repair. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
 
-    if ($repairable.Count -eq 0) {
-        Log-Warning 'Every finding needs a decision that this script will not make on its own.' | Tee-Object -FilePath $logFile -Append
+        if ($repairable.Count -eq 0) {
+            Log-Warning 'Every finding needs a decision that this script will not make on its own.' | Tee-Object -FilePath $logFile -Append
+            foreach ($finding in $unrepairable) {
+                Log-Output "  [MANUAL] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        # One merge repairs the whole class: every finding above is the same store missing hashes.
+        if (-not (Test-Path -LiteralPath $storePath -PathType Container)) {
+            Assert-OfflineTarget -Path $storePath -Action 'recreate the catalog store'
+            Add-OfflineRepairLog -Level Info -Message "Recreating the missing store folder $storePath."
+            [void](New-Item -Path $storePath -ItemType Directory -Force -ErrorAction Stop)
+        }
+
+        # Unopenable catalogs alone are fixed by replacing exactly those files; nothing is added.
+        $replaceOnly = (@($repairable | Where-Object { $_.Cause -ne 'CatalogUnopenable' }).Count -eq 0)
+        $backupPath = Join-OfflinePath $windowsPath "Temp\$scriptName\$scriptStartTime"
+        $merge = Invoke-CatalogMerge -StorePath $storePath -SourceFiles $sourceFiles -Unopenable $store.Unopenable -BackupPath $backupPath -ReplaceOnly:$replaceOnly
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if ($merge.Aborted) {
+            Log-Error "The backup could not be written, so the store was not changed: $(@($merge.Errors) -join '; ')" | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        Log-Info "Merge result: $($merge.Added) added, $($merge.Replaced) replaced, $($merge.SideBySide) kept alongside an existing name, $($merge.Skipped) already identical, $($merge.Failed) failed." | Tee-Object -FilePath $logFile -Append
+        if ($merge.ManifestPath) {
+            Log-Info "Backup of replaced catalogs and the manifest of every write: $($merge.ManifestPath)" | Tee-Object -FilePath $logFile -Append
+        }
+        foreach ($mergeError in @($merge.Errors | Select-Object -First 10)) {
+            Log-Warning "  $mergeError" | Tee-Object -FilePath $logFile -Append
+        }
+
+        # Verify against freshly read state rather than trusting the writes above.
+        $storeAfter = New-CatalogIndex -Path $storePath
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        $coverageAfter = Get-StoreCoverage -CatalogIndex $storeAfter -WindowsPath $windowsPath
+        $unresolvedAfter = @(Get-UnresolvedBootDriver -Drivers $drivers -CatalogIndex $storeAfter)
+
+        Log-Info ("After repair: {0:N0} catalog(s), {1:N0} published hashes, reference coverage {2} of {3} (ratio {4}), unresolved boot drivers {5}." -f `
+                $storeAfter.FileCount, $(if ($storeAfter.Index) { $storeAfter.Index.Count } else { 0 }), `
+                $coverageAfter.Resolved, $coverageAfter.Present, $coverageAfter.Ratio, $unresolvedAfter.Count) | Tee-Object -FilePath $logFile -Append
+
+        $remaining = @(Get-AllFinding -Store $storeAfter -Coverage $coverageAfter -Unresolved $unresolvedAfter -SourceUsable $sourceUsable -SourceNames $sourceNames)
+        $stillRepairable = @($remaining | Where-Object { $_.Repairable })
+
+        $repairedCount = $repairable.Count - $stillRepairable.Count
+        if ($repairedCount -lt 0) { $repairedCount = 0 }
+
+        foreach ($finding in $stillRepairable) {
+            Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+
+        $summary = "Repaired $repairedCount of $($repairable.Count) issue(s) that could be repaired."
+        if ($unrepairable.Count -gt 0) { $summary += " $($unrepairable.Count) issue(s) need a decision and were only reported." }
+
+        if ($merge.AclRestored -eq $false) {
+            Log-Error "$summary A security descriptor taken to write into the catalog store could not be restored; the detail log names it and, for the store folder, its original SDDL." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        if ($merge.Failed -gt 0 -or $stillRepairable.Count -gt 0) {
+            Log-Error "$summary $($merge.Failed) copy(s) failed and $($stillRepairable.Count) issue(s) are still present." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        Log-Output $summary | Tee-Object -FilePath $logFile -Append
         foreach ($finding in $unrepairable) {
             Log-Output "  [MANUAL] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
+        Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM. Boot code integrity can resolve this machine's catalog-signed drivers again, so the 0xC0000428 load failure and the 0x5A bugcheck it caused do not recur." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    # One merge repairs the whole class: every finding above is the same store missing hashes.
-    if (-not (Test-Path -LiteralPath $storePath -PathType Container)) {
-        Add-OfflineRepairLog -Level Info -Message "Recreating the missing store folder $storePath."
-        [void](New-Item -Path $storePath -ItemType Directory -Force -ErrorAction Stop)
-    }
-
-    $merge = Invoke-CatalogMerge -StorePath $storePath -SourceFiles $source.Files -Unopenable $store.Unopenable
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    Log-Info "Merge result: $($merge.Added) added, $($merge.Replaced) replaced, $($merge.SideBySide) kept alongside an existing name, $($merge.Skipped) already identical, $($merge.Failed) failed." | Tee-Object -FilePath $logFile -Append
-    foreach ($mergeError in @($merge.Errors | Select-Object -First 10)) {
-        Log-Warning "  $mergeError" | Tee-Object -FilePath $logFile -Append
-    }
-
-    # Verify against freshly read state rather than trusting the writes above.
-    $storeAfter = New-CatalogIndex -Path $storePath
-    $coverageAfter = Get-StoreCoverage -CatalogIndex $storeAfter -WindowsPath $windowsPath
-    $unresolvedAfter = @(Get-UnresolvedBootDriver -Drivers $drivers -CatalogIndex $storeAfter)
-
-    Log-Info ("After repair: {0:N0} catalog(s), {1:N0} published hashes, reference coverage {2} of {3} (ratio {4}), unresolved boot drivers {5}." -f `
-            $storeAfter.FileCount, $(if ($storeAfter.Index) { $storeAfter.Index.Count } else { 0 }), `
-            $coverageAfter.Resolved, $coverageAfter.Present, $coverageAfter.Ratio, @($unresolvedAfter).Count) | Tee-Object -FilePath $logFile -Append
-
-    $remaining = @(Get-AllFinding -Store $storeAfter -Coverage $coverageAfter -Unresolved $unresolvedAfter -SourceUsable $sourceUsable)
-    $stillRepairable = @($remaining | Where-Object { $_.Repairable })
-
-    $repairedCount = $repairable.Count - $stillRepairable.Count
-    if ($repairedCount -lt 0) { $repairedCount = 0 }
-
-    foreach ($finding in $stillRepairable) {
-        Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
-
-    $summary = "Repaired $repairedCount of $($repairable.Count) issue(s) that could be repaired."
-    if ($unrepairable.Count -gt 0) { $summary += " $($unrepairable.Count) issue(s) need a decision and were only reported." }
-
-    if ($merge.Failed -gt 0 -or $stillRepairable.Count -gt 0) {
-        Log-Error "$summary $($merge.Failed) copy(s) failed and $($stillRepairable.Count) issue(s) are still present." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    Log-Output $summary | Tee-Object -FilePath $logFile -Append
-    foreach ($finding in $unrepairable) {
-        Log-Output "  [MANUAL] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
-    Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM. Boot code integrity can resolve this machine's catalog-signed drivers again, so the 0xC0000428 load failure and the 0x5A bugcheck it caused do not recur." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
+    $status = $STATUS_ERROR
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
 }
+finally {
+    # A dependency may have failed to load before these functions became available.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        try {
+            Clear-OfflineDriveLetter
+            if (@(Get-OfflineAssignedDriveLetter).Count -gt 0) {
+                $status = $STATUS_ERROR
+                Add-OfflineRepairLog -Level Error -Message 'Temporary drive letters remain assigned. The repair may have completed, but cleanup is incomplete; inspect the cleanup diagnostics before proceeding.'
+            }
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Add-OfflineRepairLog -Level Error -Message "Drive-letter cleanup failed: $($_.Exception.Message)"
+        }
+    }
+
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        try {
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append -ErrorAction Stop
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Log-Error "Final helper diagnostics could not be written to the detail log: $($_.Exception.Message)"
+        }
+    }
+}
+return $status
