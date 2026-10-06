@@ -67,6 +67,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-registry-corruption --parameters detectOnly=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-registry-corruption --parameters allowRegBack=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-registry-corruption --parameters hive=SOFTWARE --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-registry-corruption --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
