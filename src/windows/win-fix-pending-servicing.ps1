@@ -88,6 +88,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-pending-servicing --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-pending-servicing --parameters disableWindowsUpdate=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-pending-servicing --parameters revert=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-pending-servicing --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
