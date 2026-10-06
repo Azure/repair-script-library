@@ -72,7 +72,7 @@
 	{
 		"id" : "win-fix-ntfs-attribute-list",
 		"path" : "src/windows/win-fix-ntfs-attribute-list.ps1",
-		"description" : "Repairs the NTFS metafile attribute list entries that make a volume fail to mount with stop error 0x24 NTFS_FILE_SYSTEM, typically after a servicing operation. Corrects the single non-canonical name offset byte in place. This is not a chkdsk wrapper and chkdsk is not a substitute: faced with this layout chkdsk discards the whole attribute list, which orphans the child records it referenced and can leave $Secure without its security descriptor stream. Scans the reserved file records of every NTFS volume on the attached disk, writes a byte level restore manifest before the first write, and verifies through the same locked handle. Nothing is written when no correctable entry is found. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+		"description" : "Repairs NTFS metafile attribute list entries whose non-canonical name offset makes a volume fail to mount with stop error 0x24 NTFS_FILE_SYSTEM, correcting the byte in place where chkdsk would discard the whole list. Saves a restore manifest of the original bytes before writing and verifies the result; a healthy disk is not written to. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
 	},
 	{
 		"id" : "win-fix-firewall-service",
