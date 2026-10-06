@@ -56,12 +56,13 @@
 #   loss, a forced deallocation or a crash mid-servicing.
 #
 # .PARAMETER detectOnly
-#   "true" to report the servicing state and what would be cleared, and make no changes at all.
+#   "true" to report the servicing state and what would be cleared, and make no repair changes.
 #   Defaults to "false".
 #
 # .PARAMETER disableWindowsUpdate
-#   "true" to also set Start=4 on wuauserv, UsoSvc, WaaSMedicSvc and UpdateOrchestrator, so the VM
-#   cannot immediately re-download and re-stage the update that broke it. Defaults to "false".
+#   "true" to also set Start=4 on wuauserv, UsoSvc and WaaSMedicSvc, so the VM cannot immediately
+#   re-download and re-stage the update that broke it. Defaults to "false". If any of them cannot be
+#   disabled the run reports which one and ends in ERROR.
 #
 #   This is a workaround, not a repair, which is why it is off by default and has to be asked for by
 #   name. It leaves the VM unpatched and therefore exposed, so it is only appropriate as a way to
@@ -70,17 +71,19 @@
 #   from inside the running VM.
 #
 # .PARAMETER revert
-#   "true" to undo a previous run of this script from the manifest it left on the offline disk:
-#   Windows Update services go back to their original Start values, the renamed pending.xml is
-#   renamed back, and the TxR logs are restored from the copy taken before they were deleted.
-#   Defaults to "false". Cannot be combined with detectOnly.
+#   "true" to undo, as far as it can be undone, a previous run of this script from the manifest it
+#   left on the offline disk: Windows Update services go back to their original Start values, the
+#   renamed pending.xml is renamed back, and the TxR logs are restored from the copy taken before
+#   they were deleted. Defaults to "false". Cannot be combined with detectOnly.
 #
-#   Reverting deliberately puts the servicing transaction back, so a VM that was in a boot loop will
-#   go back into it. It exists for the case where this script was aimed at the wrong problem and the
-#   disk needs to be handed on unchanged. The removed registry markers are not restored, because they
-#   are what causes the loop. The manifest is kept after a revert, marked RegistryNotReverted, and
-#   lists the hive backups taken before they were removed. A manifest that is malformed, written by
-#   another script, or points outside its own backup folders is refused and left in place.
+#   Revert is partial by design. It does not restore the removed registry markers, because they are
+#   what causes the boot loop, and it cannot undo the DISM /RevertPendingActions step, which
+#   rewrites the component store. The restored TxR logs describe the registry as it was before the
+#   repair, so they can disagree with hives that changed since. Use
+#   it when this script was aimed at the wrong problem, not to get the original disk back - the hive
+#   backups listed in the manifest are the way to do that by hand. The manifest is kept after a
+#   revert, marked RegistryNotReverted. A manifest that is malformed, written by another script, or
+#   points outside its own backup folders is refused and left in place.
 #
 # .PARAMETER windowsDrive
 #   Drive letter of the offline Windows installation, for example "F". Only needed when more than
@@ -212,9 +215,10 @@ $script:PendingCbsKey = @('PackagesPending', 'RebootPending', 'RebootInProgress'
 $script:SessionsPendingKey = 'SessionsPending'
 
 # The services that re-download and re-stage an update. Only touched when disableWindowsUpdate is
-# asked for by name. UpdateOrchestrator is included because it schedules the install that UsoSvc
-# then drives; leaving it running puts the VM straight back where it started.
-$script:WindowsUpdateService = @('wuauserv', 'UsoSvc', 'WaaSMedicSvc', 'UpdateOrchestrator')
+# asked for by name. WaaSMedicSvc is included because it re-enables the other two; it is protected on
+# some builds, and a service that cannot be disabled fails the run rather than being skipped quietly.
+# UpdateOrchestrator is a Task Scheduler folder, not a service, so it is not listed here.
+$script:WindowsUpdateService = @('wuauserv', 'UsoSvc', 'WaaSMedicSvc')
 
 # CLFS transaction artifacts under config\TxR. Selection is delegated to Use-OfflineFileRemoval,
 # which applies these as a two-layer allow-list: a file must match an allowed extension AND must not
@@ -950,663 +954,709 @@ if ($isDetectOnly -and $isRevert) {
     return $STATUS_ERROR
 }
 
+$status = $STATUS_ERROR
 try {
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
-
-    $manifestPath = Get-RevertManifestPath -Drive $offline.WindowsDrive
-    $pendingXmlPath = Join-Path $offline.WindowsPath 'WinSxS\pending.xml'
-
-    # COMPONENTS is present on a normal installation, but Mount-OfflineHive throws when a hive file
-    # is missing, and mounting it together with SOFTWARE would then lose the CBS read as well. It is
-    # only ever mounted once it is known to be there.
-    $componentsHivePath = Get-OfflineHiveFilePath -WindowsPath $offline.WindowsPath -Hive 'COMPONENTS'
-    $hasComponentsHive = Test-OfflinePath $componentsHivePath
-    $servicingHive = if ($hasComponentsHive) { @('SOFTWARE', 'COMPONENTS') } else { @('SOFTWARE') }
-    if (-not $hasComponentsHive) {
-        Log-Warning "The COMPONENTS hive is not present at $componentsHivePath. The CBS keys in SOFTWARE are still checked; the COMPONENTS transaction values are reported as absent." | Tee-Object -FilePath $logFile -Append
-    }
-
-    # ---------------------------------------------------------------------------------------------
-    # Revert
-    # ---------------------------------------------------------------------------------------------
-    if ($isRevert) {
-        # Validated before anything is touched. A manifest that cannot be read or proven to name this
-        # script's own backups is an error, and it is left exactly as found.
-        $rawManifest = Read-RevertManifest -Path $manifestPath
-        if ($null -eq $rawManifest) {
-            Log-Output "No revert manifest was found at $manifestPath, so this script has not changed anything on this disk. No changes were made." | Tee-Object -FilePath $logFile -Append
-            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-            return $STATUS_SUCCESS
-        }
-        $manifest = ConvertTo-ValidatedRevertManifest -Manifest $rawManifest -WindowsPath $offline.WindowsPath
-
-        foreach ($backup in @($manifest.HiveBackups)) {
-            Log-Info "Registry hive backup from an earlier run: $($backup.Hive) at $(Join-Path $offline.WindowsPath "System32\config\$($backup.Path)")" | Tee-Object -FilePath $logFile -Append
-        }
-
-        if (-not (Test-RevertManifestHasUndo -Manifest $manifest)) {
-            Log-Output "The revert manifest at $manifestPath holds nothing left to restore. No changes were made." | Tee-Object -FilePath $logFile -Append
-            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-            return $STATUS_SUCCESS
-        }
-
-        $restored = 0
-
-        # Each step removes what it restored from the manifest and checkpoints it, so a revert that
-        # stops part-way can simply be run again and continues where it stopped.
-        $services = @($manifest.Services)
-        if ($services.Count -gt 0) {
-            Log-Info "Revert manifest holds $($services.Count) Windows Update service(s): $(($services | ForEach-Object { $_.Service }) -join ', ')" | Tee-Object -FilePath $logFile -Append
-
-            # Lists rather than counters, because the hive script block runs in a child scope.
-            $serviceRestored = [System.Collections.Generic.List[string]]::new()
-            $serviceFailed = [System.Collections.Generic.List[string]]::new()
-            Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-                $root = Get-OfflineSystemRootPath -Strict
-                foreach ($entry in $services) {
-                    $path = "$root\Services\$($entry.Service)"
-                    if (-not (Test-Path -LiteralPath $path)) {
-                        Add-OfflineRepairLog -Level Error -Message "$($entry.Service): the service key is not present, so its Start value could not be restored. The entry was kept in the manifest."
-                        $serviceFailed.Add($entry.Service)
-                        continue
-                    }
-                    try {
-                        $current = (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).Start
-                        Set-ItemProperty -LiteralPath $path -Name Start -Value ([int]$entry.OriginalStart) -Type DWord -Force -ErrorAction Stop
-                        $readBack = (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).Start
-                        if ($readBack -ne [int]$entry.OriginalStart) { throw "Start reads back as $readBack." }
-                        Add-OfflineRepairLog -Level Info -Message "$($entry.Service): Start $current -> $($entry.OriginalStart) (restored and read back)."
-                        $serviceRestored.Add($entry.Service)
-                    }
-                    catch {
-                        Add-OfflineRepairLog -Level Error -Message "$($entry.Service): Start could not be restored to $($entry.OriginalStart) ($($_.Exception.Message)). The entry was kept in the manifest."
-                        $serviceFailed.Add($entry.Service)
-                    }
-                }
-            }
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-            if ($serviceRestored.Count -gt 0) {
-                $manifest.Services = @($manifest.Services | Where-Object { $serviceRestored -notcontains $_.Service })
-                Save-RevertManifest -Path $manifestPath -Manifest $manifest
-                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                $restored += $serviceRestored.Count
-            }
-            if ($serviceFailed.Count -gt 0) {
-                Log-Error "$($serviceFailed.Count) Windows Update service(s) could not be restored: $($serviceFailed -join ', '). Nothing else was reverted; the manifest at $manifestPath keeps the remaining entries, so revert can be run again once they are fixed." | Tee-Object -FilePath $logFile -Append
-                return $STATUS_ERROR
-            }
-        }
-
-        # TxR before pending.xml, so a failed restore cannot consume the pending.xml undo file.
-        if ($manifest.TxRBackupFolder) {
-            # Restore-OfflineFileSet rather than a copy loop, so the attributes come back too. A
-            # transaction log restored without its original attributes is not the file that was taken.
-            $txrBackup = Resolve-TxRBackupFolder -WindowsPath $offline.WindowsPath -RelativePath $manifest.TxRBackupFolder
-            $txrPath = Join-Path $offline.WindowsPath 'System32\config\TxR'
-            $result = Restore-OfflineFileSet -BackupPath $txrBackup -TargetPath $txrPath -FileRecord @($manifest.TxRBackupRecord)
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-            if (-not $result.Succeeded) {
-                Log-Error "TxR files were not fully restored and verified from $txrBackup ($($result.Restored) of $($result.Expected) file(s)): $($result.Detail -join '; '). The revert manifest at $manifestPath was retained." | Tee-Object -FilePath $logFile -Append
-                return $STATUS_ERROR
-            }
-            Log-Info "Restored and hash-verified $([int]$result.Restored) TxR transaction file(s) from $txrBackup." | Tee-Object -FilePath $logFile -Append
-            $restored += [int]$result.Restored
-            $manifest.TxRBackupFolder = $null
-            $manifest.TxRBackupRecord = @()
-            Save-RevertManifest -Path $manifestPath -Manifest $manifest
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-        }
-
-        if ($manifest.PendingXmlRenamedTo) {
-            $pendingBackup = Resolve-PendingXmlBackupPath -WindowsPath $offline.WindowsPath -Leaf $manifest.PendingXmlRenamedTo
-            if (-not (Test-Path -LiteralPath $pendingBackup -PathType Leaf -ErrorAction Stop)) {
-                Log-Error "The recorded pending.xml backup $pendingBackup is not present. The revert manifest at $manifestPath was retained." | Tee-Object -FilePath $logFile -Append
-                return $STATUS_ERROR
-            }
-            if (Test-Path -LiteralPath $pendingXmlPath -ErrorAction Stop) {
-                Log-Error "pending.xml already exists, so $pendingBackup was not restored. The backup and revert manifest were retained." | Tee-Object -FilePath $logFile -Append
-                return $STATUS_ERROR
-            }
-            $rename = Rename-OfflineProtectedFile -Path $pendingBackup -NewName 'pending.xml'
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-            if (-not $rename.Renamed -or
-                -not (Test-Path -LiteralPath $pendingXmlPath -PathType Leaf -ErrorAction Stop) -or
-                (Test-Path -LiteralPath $pendingBackup -ErrorAction Stop)) {
-                Log-Error "Restoring pending.xml from $pendingBackup could not be confirmed ($($rename.Reason)). The revert manifest at $manifestPath was retained." | Tee-Object -FilePath $logFile -Append
-                return $STATUS_ERROR
-            }
-            Log-Info "Renamed $pendingBackup back to pending.xml." | Tee-Object -FilePath $logFile -Append
-            $restored++
-            $manifest.PendingXmlRenamedTo = $null
-            Save-RevertManifest -Path $manifestPath -Manifest $manifest
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-        }
-
-        # The manifest is kept: it still lists the registry hive backups, which are the only way back
-        # to the registry state before the repair, and records that the registry was not reverted.
-        $manifest.RegistryNotReverted = $true
-        Save-RevertManifest -Path $manifestPath -Manifest $manifest
+:Main do {
+        $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
         Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-        Log-Output "Restored $restored item(s). The manifest at $manifestPath was kept and lists the registry hive backups." | Tee-Object -FilePath $logFile -Append
-        Log-Output "The servicing registry markers this script cleared are deliberately not restored: putting them back recreates the 'Undoing changes' boot loop. Restore a listed hive backup manually only if they are genuinely needed." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
+        Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
 
-    # ---------------------------------------------------------------------------------------------
-    # Detect
-    # ---------------------------------------------------------------------------------------------
-    $findings = [System.Collections.Generic.List[object]]::new()
+        $manifestPath = Get-RevertManifestPath -Drive $offline.WindowsDrive
+        $pendingXmlPath = Join-Path $offline.WindowsPath 'WinSxS\pending.xml'
 
-    $hasPendingXml = Test-Path -LiteralPath $pendingXmlPath
-    $pendingXmlSize = if ($hasPendingXml) { (Get-Item -LiteralPath $pendingXmlPath).Length } else { 0 }
-
-    $registryState = Invoke-WithHive -Hive $servicingHive -WindowsPath $offline.WindowsPath -ScriptBlock {
-        return (Get-ServicingRegistryState)
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    # Wrapped in @() at the CALL SITE, which is the only place the wrap works. Get-ServicingFinding
-    # already ends in "return @($findings)", but that is not enough: Windows PowerShell 5.1 unrolls a
-    # returned collection, so when it holds exactly ONE finding the caller receives the bare
-    # PSCustomObject rather than an array. A PSCustomObject has no Count, so $findings.Count is $null,
-    # and $null -gt 0 and $null -eq 0 are BOTH false. Every branch below keyed on Count then takes the
-    # wrong path at once: the marker is never printed, "nothing to do" is never printed either, TxR is
-    # not cleared, and the repair block is skipped - so a disk carrying a single marker, which is the
-    # ordinary case when only pending.xml is present, is silently left unrepaired. PowerShell 7 does
-    # not reproduce this, so it cannot be caught by testing locally on pwsh; the rescue VM runs 5.1.
-    $findings = @(Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState)
-
-    $txr = Get-TxRState -WindowsPath $offline.WindowsPath
-
-    # Log exhaustion is a second, independent reason the transaction logs need clearing. A servicing
-    # transaction that hit ERROR_LOG_FULL stalls in exactly the same way as one that was interrupted,
-    # but leaves none of the markers above behind, so without this check the operator would be told
-    # nothing is wrong on a VM that is genuinely stuck.
-    $logFull = Get-LogExhaustionEvidence -WindowsPath $offline.WindowsPath
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-    if ($logFull.Found) {
-        Log-Warning "Log exhaustion: ERROR_LOG_FULL was reported in $($logFull.Source): $($logFull.Line)" | Tee-Object -FilePath $logFile -Append
-    }
-    elseif ($logFull.LogsRead -gt 0) {
-        Log-Info "No ERROR_LOG_FULL entry was found in the last $($script:CbsTailLine) lines of $($logFull.LogsRead) CBS log(s)." | Tee-Object -FilePath $logFile -Append
-    }
-
-    # Two separate authorisations, each tied to its own evidence. The servicing markers authorise the
-    # DISM revert, the pending.xml rename and the CBS registry edits. Either the markers or log
-    # exhaustion authorise clearing config\TxR. Clearing the logs on log exhaustion alone is the whole
-    # point: that is the case where there is no marker to find.
-    $clearTxR = ($findings.Count -gt 0 -or $logFull.Found) -and $txr.Actionable
-
-    # Report the state before deciding anything.
-    if ($findings.Count -gt 0) {
-        Log-Info "Servicing is mid-transaction. $($findings.Count) marker(s) found:" | Tee-Object -FilePath $logFile -Append
-        foreach ($finding in $findings) {
-            Log-Info "  $($finding.Marker): $($finding.Detail)" | Tee-Object -FilePath $logFile -Append
-        }
-    }
-    else {
-        Log-Info 'No servicing pending markers are present: pending.xml is absent, the CBS pending keys do not exist, every recorded servicing session completed, and the COMPONENTS transaction values are unset or zero.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    if ($txr.Present) {
-        # Built as whole sentences rather than by splicing a reason into "cleared only because ...".
-        # That phrasing rendered, in the no-evidence branch, as "are cleared only because neither a
-        # servicing marker nor log exhaustion was found, so they are left alone" - stating both that
-        # the files were cleared and that they were not.
-        $txrNote = if ($findings.Count -gt 0) { 'They are cleared here because a servicing marker above was found.' }
-        elseif ($logFull.Found) { 'They are cleared here because CBS reported log exhaustion.' }
-        else { 'Neither a servicing marker nor CBS log exhaustion was found, so they are left alone.' }
-        Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only when a stuck transaction is proven. $txrNote" | Tee-Object -FilePath $logFile -Append
-    }
-
-    # Name the pending packages. Evidence only; nothing here is removed by this script.
-    $dism = Get-DismPendingPackage -Drive $offline.WindowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-    if ($dism.Succeeded) {
-        if (@($dism.Packages).Count -gt 0) {
-            Log-Info "DISM reports $(@($dism.Packages).Count) package(s) in the Pending state:" | Tee-Object -FilePath $logFile -Append
-            foreach ($package in @($dism.Packages)) {
-                Log-Info "  $package" | Tee-Object -FilePath $logFile -Append
-            }
-            Log-Info 'This script does not remove packages. If the VM still fails after this repair, win-get-patches and win-remove-patch are the pair that remove one by name.' | Tee-Object -FilePath $logFile -Append
-        }
-        else {
-            Log-Info 'DISM reports no packages in the Pending state.' | Tee-Object -FilePath $logFile -Append
-        }
-    }
-    else {
-        Log-Info "DISM could not enumerate the packages on this image$(if ($dism.Message) { ": $($dism.Message)." } else { '.' }) That is common while a transaction is outstanding and does not stop the repair." | Tee-Object -FilePath $logFile -Append
-    }
-
-    $updateServices = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        return (Get-WindowsUpdateServiceState -Strict:((-not $isDetectOnly) -and $doDisableWindowsUpdate))
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    if ($doDisableWindowsUpdate) {
-        Log-Info "Windows Update services on this disk: $((@($updateServices) | ForEach-Object { "$($_.Service)=Start $($_.Start)" }) -join ', ')" | Tee-Object -FilePath $logFile -Append
-    }
-
-    # ---------------------------------------------------------------------------------------------
-    # Detect only
-    # ---------------------------------------------------------------------------------------------
-    if ($isDetectOnly) {
-        if ($findings.Count -gt 0) {
-            $clearable = @($findings | Where-Object { $_.Kind -ne 'Session' }).Count
-            $sessions = @($findings).Count - $clearable
-            Log-Output "$clearable servicing marker(s) would be cleared, and DISM would be asked to revert the pending actions." | Tee-Object -FilePath $logFile -Append
-            if ($sessions -gt 0) {
-                Log-Output "$sessions incomplete servicing session(s) would be left in place for DISM to resolve. Their records are history this script does not rewrite." | Tee-Object -FilePath $logFile -Append
-            }
-        }
-        if ($clearTxR) {
-            Log-Output "$(@($txr.Files).Count) TxR transaction file(s) would be backed up and removed, and the removal verified before the run is called a success." | Tee-Object -FilePath $logFile -Append
-        }
-        if ($findings.Count -eq 0 -and -not $clearTxR) {
-            Log-Output 'Nothing would be changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
-        }
-        if ($doDisableWindowsUpdate) {
-            Log-Output "$(@($updateServices).Count) Windows Update service(s) would be disabled." | Tee-Object -FilePath $logFile -Append
-        }
-        Log-Output 'Re-run without detectOnly to apply.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($findings.Count -eq 0 -and -not $clearTxR -and -not $doDisableWindowsUpdate) {
-        Log-Output 'Nothing was changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
-        Log-Output 'win-fix-inaccessible-boot-device covers a stop 0x7B, win-fix-registry-corruption covers a damaged hive, and win-sfc-sf-corruption covers damaged system files.' | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    # ---------------------------------------------------------------------------------------------
-    # Repair
-    # ---------------------------------------------------------------------------------------------
-    # The manifest is checkpointed after every reversible change, so it is never behind the disk. An
-    # earlier run's manifest is validated first and carried forward rather than overwritten: a
-    # manifest that cannot be read or validated stops the repair before anything is changed.
-    #
-    # HiveBackups are not read by revert - the registry markers are deliberately not put back. They
-    # are recorded because the only other place they appear is the rescue VM's desktop log, which is
-    # destroyed by 'az vm repair restore'.
-    $previousManifest = Read-RevertManifest -Path $manifestPath
-    if ($null -ne $previousManifest) {
-        $manifest = ConvertTo-ValidatedRevertManifest -Manifest $previousManifest -WindowsPath $offline.WindowsPath
-        $manifest.Timestamp = $scriptStartTime
-        $manifest.RegistryNotReverted = $false
-        Log-Info "Carrying forward the revert manifest of an earlier run at $manifestPath." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        $manifest = New-RevertManifest
-    }
-    $changes = 0
-    $txrRemoved = 0
-    $servicesDisabled = 0
-
-    if ($findings.Count -gt 0) {
-        $softwareBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SOFTWARE'
-        Log-Info "SOFTWARE hive backed up to $softwareBackup" | Tee-Object -FilePath $logFile -Append
-        $manifest.HiveBackups = @($manifest.HiveBackups) + [PSCustomObject]@{ Hive = 'SOFTWARE'; Path = (Split-Path -Leaf "$softwareBackup") }
-        if ($hasComponentsHive) {
-            $componentsBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'COMPONENTS'
-            Log-Info "COMPONENTS hive backed up to $componentsBackup" | Tee-Object -FilePath $logFile -Append
-            $manifest.HiveBackups = @($manifest.HiveBackups) + [PSCustomObject]@{ Hive = 'COMPONENTS'; Path = (Split-Path -Leaf "$componentsBackup") }
+        # COMPONENTS is present on a normal installation, but Mount-OfflineHive throws when a hive file
+        # is missing, and mounting it together with SOFTWARE would then lose the CBS read as well. It is
+        # only ever mounted once it is known to be there.
+        $componentsHivePath = Get-OfflineHiveFilePath -WindowsPath $offline.WindowsPath -Hive 'COMPONENTS'
+        $hasComponentsHive = Test-OfflinePath $componentsHivePath
+        $servicingHive = if ($hasComponentsHive) { @('SOFTWARE', 'COMPONENTS') } else { @('SOFTWARE') }
+        if (-not $hasComponentsHive) {
+            Log-Warning "The COMPONENTS hive is not present at $componentsHivePath. The CBS keys in SOFTWARE are still checked; the COMPONENTS transaction values are reported as absent." | Tee-Object -FilePath $logFile -Append
         }
 
-        # Nothing has been changed yet, so a manifest that cannot be saved simply stops the run.
-        Save-RevertManifest -Path $manifestPath -Manifest $manifest
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-        # DISM first: a successful revert consumes pending.xml itself, and there is no point renaming
-        # a file the supported tool is about to remove properly.
-        Invoke-DismRevertPendingAction -Drive $offline.WindowsDrive | Out-Null
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-        if (Test-Path -LiteralPath $pendingXmlPath) {
-            # WinSxS is owned by TrustedInstaller and denies writes even to SYSTEM, so the plain
-            # rename is refused on a real image. Rename-OfflineProtectedFile retries it after taking
-            # the parent folder, and puts the folder's owner and DACL back either way - measured on
-            # Server 2022, where the unassisted rename failed every time.
-            $renamedTo = "pending.xml.bak-$scriptStartTime"
-            $rename = Rename-OfflineProtectedFile -Path $pendingXmlPath -NewName $renamedTo
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-            if ($rename.Renamed) {
-                if ($manifest.PendingXmlRenamedTo) {
-                    Log-Warning "An earlier run's pending.xml backup $(Resolve-PendingXmlBackupPath -WindowsPath $offline.WindowsPath -Leaf $manifest.PendingXmlRenamedTo) is superseded in the manifest by this one. It stays on disk." | Tee-Object -FilePath $logFile -Append
-                }
-                $manifest.PendingXmlRenamedTo = $renamedTo
-                try {
-                    Save-RevertManifest -Path $manifestPath -Manifest $manifest
-                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                }
-                catch {
-                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                    Log-Error "$($_.Exception.Message) Renaming pending.xml back so the disk is not left with an unrecorded change." | Tee-Object -FilePath $logFile -Append
-                    $undo = Rename-OfflineProtectedFile -Path $rename.NewPath -NewName 'pending.xml'
-                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                    if ($undo.Renamed) {
-                        Log-Error 'pending.xml was put back. Nothing else was changed.' | Tee-Object -FilePath $logFile -Append
-                    }
-                    else {
-                        Log-Error "FATAL: pending.xml could not be put back ($($undo.Reason)). Rename $($rename.NewPath) to pending.xml manually." | Tee-Object -FilePath $logFile -Append
-                    }
-                    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-                    return $STATUS_ERROR
-                }
-                Log-Info "Renamed pending.xml to $renamedTo. $($rename.Reason) To undo: Rename-Item -LiteralPath '$($rename.NewPath)' -NewName 'pending.xml'" | Tee-Object -FilePath $logFile -Append
-                if ($rename.TookOwnership) {
-                    Log-Info "WinSxS ownership was borrowed for the rename and its original owner and ACL have been put back: restored=$($rename.Restored)." | Tee-Object -FilePath $logFile -Append
-                }
-                $changes++
-            }
-            else {
-                Log-Warning "pending.xml could not be renamed. $($rename.Reason) The DISM revert above is the supported way to consume it." | Tee-Object -FilePath $logFile -Append
-                if ($rename.TookOwnership -and -not $rename.Restored) {
-                    Log-Warning "WinSxS ownership was taken for the retry and could not be put back. Restore it with: icacls `"$(Split-Path -Path $pendingXmlPath -Parent)`" /setowner `"NT SERVICE\TrustedInstaller`"" | Tee-Object -FilePath $logFile -Append
-                }
-            }
-        }
-        else {
-            Log-Info 'pending.xml is no longer present, so there was nothing to rename.' | Tee-Object -FilePath $logFile -Append
-        }
-
-        $script:RegistryChanges = 0
-        Invoke-WithHive -Hive $servicingHive -WindowsPath $offline.WindowsPath -ScriptBlock {
-            foreach ($key in $script:PendingCbsKey) {
-                $path = Join-Path $script:CbsSoftwareKey $key
-                if (-not (Test-Path $path)) { continue }
-
-                # The CBS pending keys are TrustedInstaller's and deny delete to everyone else, so
-                # the plain Remove-Item is refused and - with SilentlyContinue - refused silently.
-                # Invoke-OfflineProtectedKeyRemoval verifies the plain attempt, takes the subtree
-                # only if it is still there, and puts every descriptor back if the delete still
-                # fails, so a refusal never leaves a key owned by SYSTEM.
-                $outcome = Invoke-OfflineProtectedKeyRemoval -Path $path -Label "CBS\$key"
-                if ($outcome.Removed) {
-                    Add-OfflineRepairLog -Level Info -Message "Removed CBS\$key. $($outcome.Reason)"
-                    $script:RegistryChanges++
-                }
-                else {
-                    Add-OfflineRepairLog -Level Warning -Message "CBS\$key could not be removed. $($outcome.Reason)"
-                }
-            }
-
-            foreach ($name in $script:PendingComponentValue) {
-                $value = (Get-ItemProperty $script:ComponentsKey -ErrorAction SilentlyContinue).$name
-                if (-not (Test-PendingComponentValue -Value $value)) { continue }
-
-                # The value is read back rather than assumed either way: these keys carry their own
-                # ACL, and the removal reports nothing when it is denied. Unlike the CBS keys the
-                # COMPONENTS key survives, so its descriptor is always put back.
-                $outcome = Invoke-OfflineProtectedValueRemoval -Path $script:ComponentsKey -Name $name -StillSet {
-                    param($current) Test-PendingComponentValue -Value $current
-                }
-                if ($outcome.Removed) {
-                    Add-OfflineRepairLog -Level Info -Message "Cleared COMPONENTS\$name (was '$value'). $($outcome.Reason)"
-                    $script:RegistryChanges++
-                }
-                else {
-                    Add-OfflineRepairLog -Level Warning -Message "COMPONENTS\$name could not be cleared. $($outcome.Reason)"
-                }
-            }
-        }
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-        $changes += [int]$script:RegistryChanges
-    }
-
-    # ---------------------------------------------------------------------------------------------
-    # Transaction logs
-    #
-    # Deliberately after the DISM revert rather than before it. The CLFS logs under config\TxR hold
-    # the uncommitted state of the transaction, which is what DISM reads to work out what to undo.
-    # Deleting them first would take that away from the supported tool and leave the revert with
-    # nothing to act on. Clearing them afterwards removes what the revert could not consume.
-    #
-    # Removal runs through Use-OfflineFileRemoval, so every file is hash-verified into a backup before
-    # anything is deleted, the folder is re-examined afterwards against six checks, and a failure
-    # restores everything it removed. A raw copy-then-delete loop cannot tell the difference between a
-    # clean removal and one that silently took a file it should not have.
-    # ---------------------------------------------------------------------------------------------
-    if ($clearTxR) {
-        $backupRoot = Join-Path $offline.WindowsPath "Temp\$scriptName\$scriptStartTime"
-        $outcome = Invoke-OfflineRemovalPlan -Plan $txr -BackupRoot $backupRoot
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-        if ($outcome.Success) {
-            if ($manifest.TxRBackupFolder) {
-                Log-Warning "An earlier run's TxR backup $(Resolve-TxRBackupFolder -WindowsPath $offline.WindowsPath -RelativePath $manifest.TxRBackupFolder) is superseded in the manifest by this one. It stays on disk." | Tee-Object -FilePath $logFile -Append
-            }
-            # Stored relative to its base, which revert re-derives from the disk it is run against.
-            $txrBase = Get-TxRBackupBase -WindowsPath $offline.WindowsPath
-            $manifest.TxRBackupFolder = [System.IO.Path]::GetFullPath($outcome.BackupPath).TrimEnd('\').Substring($txrBase.Length + 1)
-            $manifest.TxRBackupRecord = @($outcome.BackupRecord)
-            try {
-                Save-RevertManifest -Path $manifestPath -Manifest $manifest
-                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-            }
-            catch {
-                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                Log-Error "$($_.Exception.Message) Restoring the TxR files so the disk is not left with an unrecorded change." | Tee-Object -FilePath $logFile -Append
-                $undo = Restore-OfflineFileSet -BackupPath $outcome.BackupPath -TargetPath (Join-Path $offline.WindowsPath 'System32\config\TxR') -FileRecord @($outcome.BackupRecord)
-                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                if ($undo.Succeeded) {
-                    Log-Error "The $([int]$undo.Restored) TxR file(s) were restored and hash-verified." | Tee-Object -FilePath $logFile -Append
-                }
-                else {
-                    Log-Error "FATAL: the TxR files were not all restored ($($undo.Detail -join '; ')). Keep the backup at $($outcome.BackupPath); manual recovery is required." | Tee-Object -FilePath $logFile -Append
-                }
+        # ---------------------------------------------------------------------------------------------
+        # Revert
+        # ---------------------------------------------------------------------------------------------
+        if ($isRevert) {
+            # Validated before anything is touched. A manifest that cannot be read or proven to name this
+            # script's own backups is an error, and it is left exactly as found.
+            $rawManifest = Read-RevertManifest -Path $manifestPath
+            if ($null -eq $rawManifest) {
+                Log-Output "No revert manifest was found at $manifestPath, so this script has not changed anything on this disk. No changes were made." | Tee-Object -FilePath $logFile -Append
                 Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-                return $STATUS_ERROR
+                $status = $STATUS_SUCCESS
+                break Main
             }
-            $txrRemoved = @($outcome.Removed).Count
-            Log-Info "Removed $txrRemoved TxR transaction file(s) and verified the removal. Backed up to $($outcome.BackupPath)." | Tee-Object -FilePath $logFile -Append
-            $changes += $txrRemoved
-        }
-        else {
-            Log-Error "The transaction logs could not be cleared safely: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
-            foreach ($failure in @($outcome.Verification.Failure)) {
-                Log-Error "  $failure" | Tee-Object -FilePath $logFile -Append
-            }
-            if ($outcome.RollbackAttempted -and $outcome.RollbackSucceeded) {
-                Log-Error 'The removed TxR files were restored and hash-verified by the automatic rollback.' | Tee-Object -FilePath $logFile -Append
-            }
-            elseif ($outcome.RollbackAttempted) {
-                Log-Error "FATAL: Automatic rollback did not restore and verify every TxR file. Keep the backup at $($outcome.BackupPath); manual recovery is required." | Tee-Object -FilePath $logFile -Append
-            }
-            else {
-                Log-Error 'No automatic rollback was attempted. Review the removal failure above before proceeding.' | Tee-Object -FilePath $logFile -Append
-            }
-            try { Save-RevertManifest -Path $manifestPath -Manifest $manifest }
-            catch { Log-Error $_.Exception.Message | Tee-Object -FilePath $logFile -Append }
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-            return $STATUS_ERROR
-        }
-    }
+            $manifest = ConvertTo-ValidatedRevertManifest -Manifest $rawManifest -WindowsPath $offline.WindowsPath
 
-    # ---------------------------------------------------------------------------------------------
-    # Windows Update services, only when asked for by name
-    # ---------------------------------------------------------------------------------------------
-    if ($doDisableWindowsUpdate) {
-        Log-Warning 'Disabling Windows Update is a workaround, not a repair. The VM stays unpatched until the services are turned back on.' | Tee-Object -FilePath $logFile -Append
-
-        $recorded = [System.Collections.Generic.List[object]]::new()
-        foreach ($service in @($updateServices)) {
-            if ($service.Start -eq 4) {
-                Log-Info "  $($service.Service) is already disabled." | Tee-Object -FilePath $logFile -Append
-                continue
+            foreach ($backup in @($manifest.HiveBackups)) {
+                Log-Info "Registry hive backup from an earlier run: $($backup.Hive) at $(Join-Path $offline.WindowsPath "System32\config\$($backup.Path)")" | Tee-Object -FilePath $logFile -Append
             }
-            [void]$recorded.Add([PSCustomObject]@{ Service = $service.Service; OriginalStart = [int]$service.Start })
-        }
 
-        if ($recorded.Count -gt 0) {
-            $systemBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SYSTEM'
-            Log-Info "SYSTEM hive backed up to $systemBackup" | Tee-Object -FilePath $logFile -Append
-            $manifest.HiveBackups = @($manifest.HiveBackups) + [PSCustomObject]@{ Hive = 'SYSTEM'; Path = (Split-Path -Leaf "$systemBackup") }
-            Save-RevertManifest -Path $manifestPath -Manifest $manifest
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-            # Each Start value is read back: only a service the disk now reports as disabled is
-            # recorded, and so only that one is put back on revert.
-            $disabled = [System.Collections.Generic.List[object]]::new()
-            Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-                $root = Get-OfflineSystemRootPath -Strict
-                foreach ($entry in $recorded) {
-                    $path = "$root\Services\$($entry.Service)"
-                    if (-not (Test-Path $path)) { continue }
-                    Set-ItemProperty -Path $path -Name Start -Value 4 -Type DWord -Force -ErrorAction SilentlyContinue
-                    $now = (Get-ItemProperty -Path $path -Name Start -ErrorAction SilentlyContinue).Start
-                    if ($now -eq 4) {
-                        Add-OfflineRepairLog -Level Info -Message "reg add `"$($path -replace '^HKLM:\\BROKENSYSTEM', 'HKLM\SYSTEM')`" /v Start /t REG_DWORD /d 4 /f   # was $($entry.OriginalStart)"
-                        [void]$disabled.Add($entry)
-                    }
-                    else {
-                        Add-OfflineRepairLog -Level Warning -Message "$($entry.Service) could not be disabled: Start reads back as '$now'."
-                    }
-                }
+            if (-not (Test-RevertManifestHasUndo -Manifest $manifest)) {
+                Log-Output "The revert manifest at $manifestPath holds nothing left to restore. No changes were made." | Tee-Object -FilePath $logFile -Append
+                Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+                $status = $STATUS_SUCCESS
+                break Main
             }
-            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-            if ($disabled.Count -gt 0) {
-                # A service an earlier run disabled keeps the start type that run recorded, which is
-                # the one the VM actually had.
-                $known = @(@($manifest.Services) | ForEach-Object { $_.Service })
-                $manifest.Services = @(@($manifest.Services) + @($disabled | Where-Object { $known -notcontains $_.Service }))
-                try {
-                    Save-RevertManifest -Path $manifestPath -Manifest $manifest
-                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                }
-                catch {
-                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                    Log-Error "$($_.Exception.Message) Putting the Windows Update start types back so the disk is not left with an unrecorded change." | Tee-Object -FilePath $logFile -Append
-                    $script:ServiceUndoFailed = [System.Collections.Generic.List[string]]::new()
-                    Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
-                        $root = Get-OfflineSystemRootPath -Strict
-                        foreach ($entry in $disabled) {
-                            $path = "$root\Services\$($entry.Service)"
-                            Set-ItemProperty -Path $path -Name Start -Value ([int]$entry.OriginalStart) -Type DWord -Force -ErrorAction SilentlyContinue
-                            if ((Get-ItemProperty -Path $path -Name Start -ErrorAction SilentlyContinue).Start -ne [int]$entry.OriginalStart) {
-                                [void]$script:ServiceUndoFailed.Add("$($entry.Service) (Start $($entry.OriginalStart))")
-                            }
+            $restored = 0
+
+            # Each step removes what it restored from the manifest and checkpoints it, so a revert that
+            # stops part-way can simply be run again and continues where it stopped.
+            $services = @($manifest.Services)
+            if ($services.Count -gt 0) {
+                Log-Info "Revert manifest holds $($services.Count) Windows Update service(s): $(($services | ForEach-Object { $_.Service }) -join ', ')" | Tee-Object -FilePath $logFile -Append
+
+                # Lists rather than counters, because the hive script block runs in a child scope.
+                $serviceRestored = [System.Collections.Generic.List[string]]::new()
+                $serviceFailed = [System.Collections.Generic.List[string]]::new()
+                Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+                    $root = Get-OfflineSystemRootPath -Strict
+                    foreach ($entry in $services) {
+                        $path = "$root\Services\$($entry.Service)"
+                        if (-not (Test-Path -LiteralPath $path)) {
+                            Add-OfflineRepairLog -Level Error -Message "$($entry.Service): the service key is not present, so its Start value could not be restored. The entry was kept in the manifest."
+                            $serviceFailed.Add($entry.Service)
+                            continue
+                        }
+                        try {
+                            $current = (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).Start
+                            Set-ItemProperty -LiteralPath $path -Name Start -Value ([int]$entry.OriginalStart) -Type DWord -Force -ErrorAction Stop
+                            $readBack = (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).Start
+                            if ($readBack -ne [int]$entry.OriginalStart) { throw "Start reads back as $readBack." }
+                            Add-OfflineRepairLog -Level Info -Message "$($entry.Service): Start $current -> $($entry.OriginalStart) (restored and read back)."
+                            $serviceRestored.Add($entry.Service)
+                        }
+                        catch {
+                            Add-OfflineRepairLog -Level Error -Message "$($entry.Service): Start could not be restored to $($entry.OriginalStart) ($($_.Exception.Message)). The entry was kept in the manifest."
+                            $serviceFailed.Add($entry.Service)
                         }
                     }
+                }
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+                if ($serviceRestored.Count -gt 0) {
+                    $manifest.Services = @($manifest.Services | Where-Object { $serviceRestored -notcontains $_.Service })
+                    Save-RevertManifest -Path $manifestPath -Manifest $manifest
                     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-                    if ($script:ServiceUndoFailed.Count -eq 0) {
-                        Log-Error 'The Windows Update start types were put back.' | Tee-Object -FilePath $logFile -Append
-                    }
-                    else {
-                        Log-Error "FATAL: these start types could not be put back: $($script:ServiceUndoFailed -join ', ')." | Tee-Object -FilePath $logFile -Append
-                    }
-                    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-                    return $STATUS_ERROR
+                    $restored += $serviceRestored.Count
+                }
+                if ($serviceFailed.Count -gt 0) {
+                    Log-Error "$($serviceFailed.Count) Windows Update service(s) could not be restored: $($serviceFailed -join ', '). Nothing else was reverted; the manifest at $manifestPath keeps the remaining entries, so revert can be run again once they are fixed." | Tee-Object -FilePath $logFile -Append
+                    $status = $STATUS_ERROR
+                    break Main
                 }
             }
 
-            $servicesDisabled = $disabled.Count
-            $changes += $servicesDisabled
-            Log-Info "Disabled $servicesDisabled Windows Update service(s)." | Tee-Object -FilePath $logFile -Append
+            # TxR before pending.xml, so a failed restore cannot consume the pending.xml undo file.
+            if ($manifest.TxRBackupFolder) {
+                # Restore-OfflineFileSet rather than a copy loop, so the attributes come back too. A
+                # transaction log restored without its original attributes is not the file that was taken.
+                $txrBackup = Resolve-TxRBackupFolder -WindowsPath $offline.WindowsPath -RelativePath $manifest.TxRBackupFolder
+                $txrPath = Join-Path $offline.WindowsPath 'System32\config\TxR'
+                $result = Restore-OfflineFileSet -BackupPath $txrBackup -TargetPath $txrPath -FileRecord @($manifest.TxRBackupRecord)
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                if (-not $result.Succeeded) {
+                    Log-Error "TxR files were not fully restored and verified from $txrBackup ($($result.Restored) of $($result.Expected) file(s)): $($result.Detail -join '; '). The revert manifest at $manifestPath was retained." | Tee-Object -FilePath $logFile -Append
+                    $status = $STATUS_ERROR
+                    break Main
+                }
+                Log-Info "Restored and hash-verified $([int]$result.Restored) TxR transaction file(s) from $txrBackup." | Tee-Object -FilePath $logFile -Append
+                $restored += [int]$result.Restored
+                $manifest.TxRBackupFolder = $null
+                $manifest.TxRBackupRecord = @()
+                Save-RevertManifest -Path $manifestPath -Manifest $manifest
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            }
+
+            if ($manifest.PendingXmlRenamedTo) {
+                $pendingBackup = Resolve-PendingXmlBackupPath -WindowsPath $offline.WindowsPath -Leaf $manifest.PendingXmlRenamedTo
+                if (-not (Test-Path -LiteralPath $pendingBackup -PathType Leaf -ErrorAction Stop)) {
+                    Log-Error "The recorded pending.xml backup $pendingBackup is not present. The revert manifest at $manifestPath was retained." | Tee-Object -FilePath $logFile -Append
+                    $status = $STATUS_ERROR
+                    break Main
+                }
+                if (Test-Path -LiteralPath $pendingXmlPath -ErrorAction Stop) {
+                    Log-Error "pending.xml already exists, so $pendingBackup was not restored. The backup and revert manifest were retained." | Tee-Object -FilePath $logFile -Append
+                    $status = $STATUS_ERROR
+                    break Main
+                }
+                $rename = Rename-OfflineProtectedFile -Path $pendingBackup -NewName 'pending.xml'
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                if (-not $rename.Renamed -or
+                    -not (Test-Path -LiteralPath $pendingXmlPath -PathType Leaf -ErrorAction Stop) -or
+                    (Test-Path -LiteralPath $pendingBackup -ErrorAction Stop)) {
+                    Log-Error "Restoring pending.xml from $pendingBackup could not be confirmed ($($rename.Reason)). The revert manifest at $manifestPath was retained." | Tee-Object -FilePath $logFile -Append
+                    $status = $STATUS_ERROR
+                    break Main
+                }
+                Log-Info "Renamed $pendingBackup back to pending.xml." | Tee-Object -FilePath $logFile -Append
+                $restored++
+                $manifest.PendingXmlRenamedTo = $null
+                Save-RevertManifest -Path $manifestPath -Manifest $manifest
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            }
+
+            # The manifest is kept: it still lists the registry hive backups, which are the only way back
+            # to the registry state before the repair, and records that the registry was not reverted.
+            $manifest.RegistryNotReverted = $true
+            Save-RevertManifest -Path $manifestPath -Manifest $manifest
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+            Log-Output "Restored $restored item(s). The manifest at $manifestPath was kept and lists the registry hive backups." | Tee-Object -FilePath $logFile -Append
+            Log-Output "This revert is partial. The servicing registry markers this script cleared are deliberately not restored, because putting them back recreates the 'Undoing changes' boot loop, and the DISM /RevertPendingActions step cannot be undone. Restore a listed hive backup manually only if the original registry state is genuinely needed." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        # ---------------------------------------------------------------------------------------------
+        # Detect
+        # ---------------------------------------------------------------------------------------------
+        $findings = [System.Collections.Generic.List[object]]::new()
+
+        $hasPendingXml = Test-Path -LiteralPath $pendingXmlPath
+        $pendingXmlSize = if ($hasPendingXml) { (Get-Item -LiteralPath $pendingXmlPath).Length } else { 0 }
+
+        $registryState = Invoke-WithHive -Hive $servicingHive -WindowsPath $offline.WindowsPath -ScriptBlock {
+            return (Get-ServicingRegistryState)
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        # Wrapped in @() at the CALL SITE, which is the only place the wrap works. Get-ServicingFinding
+        # already ends in "return @($findings)", but that is not enough: Windows PowerShell 5.1 unrolls a
+        # returned collection, so when it holds exactly ONE finding the caller receives the bare
+        # PSCustomObject rather than an array. A PSCustomObject has no Count, so $findings.Count is $null,
+        # and $null -gt 0 and $null -eq 0 are BOTH false. Every branch below keyed on Count then takes the
+        # wrong path at once: the marker is never printed, "nothing to do" is never printed either, TxR is
+        # not cleared, and the repair block is skipped - so a disk carrying a single marker, which is the
+        # ordinary case when only pending.xml is present, is silently left unrepaired. PowerShell 7 does
+        # not reproduce this, so it cannot be caught by testing locally on pwsh; the rescue VM runs 5.1.
+        $findings = @(Get-ServicingFinding -HasPendingXml $hasPendingXml -PendingXmlSize $pendingXmlSize -RegistryState $registryState)
+
+        $txr = Get-TxRState -WindowsPath $offline.WindowsPath
+
+        # Log exhaustion is a second, independent reason the transaction logs need clearing. A servicing
+        # transaction that hit ERROR_LOG_FULL stalls in exactly the same way as one that was interrupted,
+        # but leaves none of the markers above behind, so without this check the operator would be told
+        # nothing is wrong on a VM that is genuinely stuck.
+        $logFull = Get-LogExhaustionEvidence -WindowsPath $offline.WindowsPath
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        if ($logFull.Found) {
+            Log-Warning "Log exhaustion: ERROR_LOG_FULL was reported in $($logFull.Source): $($logFull.Line)" | Tee-Object -FilePath $logFile -Append
+        }
+        elseif ($logFull.LogsRead -gt 0) {
+            Log-Info "No ERROR_LOG_FULL entry was found in the last $($script:CbsTailLine) lines of $($logFull.LogsRead) CBS log(s)." | Tee-Object -FilePath $logFile -Append
+        }
+
+        # Two separate authorisations, each tied to its own evidence. The servicing markers authorise the
+        # DISM revert, the pending.xml rename and the CBS registry edits. Either the markers or log
+        # exhaustion authorise clearing config\TxR. Clearing the logs on log exhaustion alone is the whole
+        # point: that is the case where there is no marker to find.
+        $clearTxR = ($findings.Count -gt 0 -or $logFull.Found) -and $txr.Actionable
+
+        # Report the state before deciding anything.
+        if ($findings.Count -gt 0) {
+            Log-Info "Servicing is mid-transaction. $($findings.Count) marker(s) found:" | Tee-Object -FilePath $logFile -Append
+            foreach ($finding in $findings) {
+                Log-Info "  $($finding.Marker): $($finding.Detail)" | Tee-Object -FilePath $logFile -Append
+            }
         }
         else {
-            Log-Info 'Every Windows Update service on this disk is already disabled.' | Tee-Object -FilePath $logFile -Append
+            Log-Info 'No servicing pending markers are present: pending.xml is absent, the CBS pending keys do not exist, every recorded servicing session completed, and the COMPONENTS transaction values are unset or zero.' | Tee-Object -FilePath $logFile -Append
         }
-    }
 
-    # ---------------------------------------------------------------------------------------------
-    # Summary
-    # ---------------------------------------------------------------------------------------------
-    # Re-read, so the summary reports what the disk now says rather than what was intended.
-    $after = Invoke-WithHive -Hive $servicingHive -WindowsPath $offline.WindowsPath -ScriptBlock {
-        return (Get-ServicingRegistryState)
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        if ($txr.Present) {
+            # Built as whole sentences rather than by splicing a reason into "cleared only because ...".
+            # That phrasing rendered, in the no-evidence branch, as "are cleared only because neither a
+            # servicing marker nor log exhaustion was found, so they are left alone" - stating both that
+            # the files were cleared and that they were not.
+            $txrNote = if ($findings.Count -gt 0) { 'They are cleared here because a servicing marker above was found.' }
+            elseif ($logFull.Found) { 'They are cleared here because CBS reported log exhaustion.' }
+            else { 'Neither a servicing marker nor CBS log exhaustion was found, so they are left alone.' }
+            Log-Info "config\TxR holds $(@($txr.Files).Count) transaction file(s). These are normal on a healthy installation and are cleared only when a stuck transaction is proven. $txrNote" | Tee-Object -FilePath $logFile -Append
+        }
 
-    $remaining = [System.Collections.Generic.List[string]]::new()
-    if (Test-Path -LiteralPath $pendingXmlPath) { [void]$remaining.Add('WinSxS\pending.xml') }
-    foreach ($key in $script:PendingCbsKey) {
-        if ($after.Cbs[$key].Present) { [void]$remaining.Add("CBS\$key") }
-    }
-    foreach ($name in $script:PendingComponentValue) {
-        if (Test-PendingComponentValue -Value $after.ComponentValues[$name]) { [void]$remaining.Add("COMPONENTS\$name") }
-    }
+        # Name the pending packages. Evidence only; nothing here is removed by this script.
+        $dism = Get-DismPendingPackage -Drive $offline.WindowsDrive
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        if ($dism.Succeeded) {
+            if (@($dism.Packages).Count -gt 0) {
+                Log-Info "DISM reports $(@($dism.Packages).Count) package(s) in the Pending state:" | Tee-Object -FilePath $logFile -Append
+                foreach ($package in @($dism.Packages)) {
+                    Log-Info "  $package" | Tee-Object -FilePath $logFile -Append
+                }
+                Log-Info 'This script does not remove packages. If the VM still fails after this repair, win-get-patches and win-remove-patch are the pair that remove one by name.' | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                Log-Info 'DISM reports no packages in the Pending state.' | Tee-Object -FilePath $logFile -Append
+            }
+        }
+        else {
+            Log-Info "DISM could not enumerate the packages on this image$(if ($dism.Message) { ": $($dism.Message)." } else { '.' }) That is common while a transaction is outstanding and does not stop the repair." | Tee-Object -FilePath $logFile -Append
+        }
 
-    if ($changes -eq 0 -and $remaining.Count -eq 0) {
-        Log-Output 'Nothing was changed.' | Tee-Object -FilePath $logFile -Append
+        $updateServices = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            return (Get-WindowsUpdateServiceState -Strict:((-not $isDetectOnly) -and $doDisableWindowsUpdate))
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        if ($doDisableWindowsUpdate) {
+            Log-Info "Windows Update services on this disk: $((@($updateServices) | ForEach-Object { "$($_.Service)=Start $($_.Start)" }) -join ', ')" | Tee-Object -FilePath $logFile -Append
+        }
+
+        # ---------------------------------------------------------------------------------------------
+        # Detect only
+        # ---------------------------------------------------------------------------------------------
+        if ($isDetectOnly) {
+            if ($findings.Count -gt 0) {
+                $clearable = @($findings | Where-Object { $_.Kind -ne 'Session' }).Count
+                $sessions = @($findings).Count - $clearable
+                Log-Output "$clearable servicing marker(s) would be cleared, and DISM would be asked to revert the pending actions." | Tee-Object -FilePath $logFile -Append
+                if ($sessions -gt 0) {
+                    Log-Output "$sessions incomplete servicing session(s) would be left in place for DISM to resolve. Their records are history this script does not rewrite." | Tee-Object -FilePath $logFile -Append
+                }
+            }
+            if ($clearTxR) {
+                Log-Output "$(@($txr.Files).Count) TxR transaction file(s) would be backed up and removed, and the removal verified before the run is called a success." | Tee-Object -FilePath $logFile -Append
+            }
+            if ($findings.Count -eq 0 -and -not $clearTxR) {
+                Log-Output 'Nothing would be changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
+            }
+            if ($doDisableWindowsUpdate) {
+                $toDisable = @(@($updateServices) | Where-Object { $null -ne $_.Start -and [int]$_.Start -ne 4 })
+                Log-Output "$($toDisable.Count) Windows Update service(s) would be disabled$(if ($toDisable.Count -gt 0) { ": $(($toDisable | ForEach-Object { $_.Service }) -join ', ')" })." | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output 'Re-run without detectOnly to apply.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        if ($findings.Count -eq 0 -and -not $clearTxR -and -not $doDisableWindowsUpdate) {
+            Log-Output 'Nothing was changed. This disk shows no sign of an unfinished servicing transaction, so an "Undoing changes" boot loop on this VM has some other cause.' | Tee-Object -FilePath $logFile -Append
+            Log-Output 'win-fix-inaccessible-boot-device covers a stop 0x7B, win-fix-registry-corruption covers a damaged hive, and win-sfc-sf-corruption covers damaged system files.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        # ---------------------------------------------------------------------------------------------
+        # Repair
+        # ---------------------------------------------------------------------------------------------
+        # The manifest is checkpointed after every reversible change, so it is never behind the disk. An
+        # earlier run's manifest is validated first and carried forward rather than overwritten: a
+        # manifest that cannot be read or validated stops the repair before anything is changed.
+        #
+        # HiveBackups are not read by revert - the registry markers are deliberately not put back. They
+        # are recorded because the only other place they appear is the rescue VM's desktop log, which is
+        # destroyed by 'az vm repair restore'.
+        $previousManifest = Read-RevertManifest -Path $manifestPath
+        if ($null -ne $previousManifest) {
+            $manifest = ConvertTo-ValidatedRevertManifest -Manifest $previousManifest -WindowsPath $offline.WindowsPath
+            $manifest.Timestamp = $scriptStartTime
+            $manifest.RegistryNotReverted = $false
+            Log-Info "Carrying forward the revert manifest of an earlier run at $manifestPath." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            $manifest = New-RevertManifest
+        }
+        $changes = 0
+        $txrRemoved = 0
+        $servicesDisabled = 0
+        # A list rather than a counter, because it is filled inside the hive script block's child scope.
+        $disableFailed = [System.Collections.Generic.List[string]]::new()
+        if ($findings.Count -gt 0) {
+            $softwareBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SOFTWARE'
+            Log-Info "SOFTWARE hive backed up to $softwareBackup" | Tee-Object -FilePath $logFile -Append
+            $manifest.HiveBackups = @($manifest.HiveBackups) + [PSCustomObject]@{ Hive = 'SOFTWARE'; Path = (Split-Path -Leaf "$softwareBackup") }
+            if ($hasComponentsHive) {
+                $componentsBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'COMPONENTS'
+                Log-Info "COMPONENTS hive backed up to $componentsBackup" | Tee-Object -FilePath $logFile -Append
+                $manifest.HiveBackups = @($manifest.HiveBackups) + [PSCustomObject]@{ Hive = 'COMPONENTS'; Path = (Split-Path -Leaf "$componentsBackup") }
+            }
+
+            # Nothing has been changed yet, so a manifest that cannot be saved simply stops the run.
+            Save-RevertManifest -Path $manifestPath -Manifest $manifest
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+            # DISM first: a successful revert consumes pending.xml itself, and there is no point renaming
+            # a file the supported tool is about to remove properly.
+            Invoke-DismRevertPendingAction -Drive $offline.WindowsDrive | Out-Null
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+            if (Test-Path -LiteralPath $pendingXmlPath) {
+                # WinSxS is owned by TrustedInstaller and denies writes even to SYSTEM, so the plain
+                # rename is refused on a real image. Rename-OfflineProtectedFile retries it after taking
+                # the parent folder, and puts the folder's owner and DACL back either way - measured on
+                # Server 2022, where the unassisted rename failed every time.
+                $renamedTo = "pending.xml.bak-$scriptStartTime"
+                $rename = Rename-OfflineProtectedFile -Path $pendingXmlPath -NewName $renamedTo
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+                if ($rename.Renamed) {
+                    if ($manifest.PendingXmlRenamedTo) {
+                        Log-Warning "An earlier run's pending.xml backup $(Resolve-PendingXmlBackupPath -WindowsPath $offline.WindowsPath -Leaf $manifest.PendingXmlRenamedTo) is superseded in the manifest by this one. It stays on disk." | Tee-Object -FilePath $logFile -Append
+                    }
+                    $manifest.PendingXmlRenamedTo = $renamedTo
+                    try {
+                        Save-RevertManifest -Path $manifestPath -Manifest $manifest
+                        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                    }
+                    catch {
+                        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                        Log-Error "$($_.Exception.Message) Renaming pending.xml back so the disk is not left with an unrecorded change." | Tee-Object -FilePath $logFile -Append
+                        $undo = Rename-OfflineProtectedFile -Path $rename.NewPath -NewName 'pending.xml'
+                        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                        if ($undo.Renamed) {
+                            Log-Error 'pending.xml was put back. Nothing else was changed.' | Tee-Object -FilePath $logFile -Append
+                        }
+                        else {
+                            Log-Error "FATAL: pending.xml could not be put back ($($undo.Reason)). Rename $($rename.NewPath) to pending.xml manually." | Tee-Object -FilePath $logFile -Append
+                        }
+                        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+                        $status = $STATUS_ERROR
+                        break Main
+                    }
+                    Log-Info "Renamed pending.xml to $renamedTo. $($rename.Reason) To undo: Rename-Item -LiteralPath '$($rename.NewPath)' -NewName 'pending.xml'" | Tee-Object -FilePath $logFile -Append
+                    if ($rename.TookOwnership) {
+                        Log-Info "WinSxS ownership was borrowed for the rename and its original owner and ACL have been put back: restored=$($rename.Restored)." | Tee-Object -FilePath $logFile -Append
+                    }
+                    $changes++
+                }
+                else {
+                    Log-Warning "pending.xml could not be renamed. $($rename.Reason) The DISM revert above is the supported way to consume it." | Tee-Object -FilePath $logFile -Append
+                    if ($rename.TookOwnership -and -not $rename.Restored) {
+                        Log-Warning "WinSxS ownership was taken for the retry and could not be put back. Restore it with: icacls `"$(Split-Path -Path $pendingXmlPath -Parent)`" /setowner `"NT SERVICE\TrustedInstaller`"" | Tee-Object -FilePath $logFile -Append
+                    }
+                }
+            }
+            else {
+                Log-Info 'pending.xml is no longer present, so there was nothing to rename.' | Tee-Object -FilePath $logFile -Append
+            }
+
+            $script:RegistryChanges = 0
+            Invoke-WithHive -Hive $servicingHive -WindowsPath $offline.WindowsPath -ScriptBlock {
+                foreach ($key in $script:PendingCbsKey) {
+                    $path = Join-Path $script:CbsSoftwareKey $key
+                    if (-not (Test-Path $path)) { continue }
+
+                    # The CBS pending keys are TrustedInstaller's and deny delete to everyone else, so
+                    # the plain Remove-Item is refused and - with SilentlyContinue - refused silently.
+                    # Invoke-OfflineProtectedKeyRemoval verifies the plain attempt, takes the subtree
+                    # only if it is still there, and puts every descriptor back if the delete still
+                    # fails, so a refusal never leaves a key owned by SYSTEM.
+                    $outcome = Invoke-OfflineProtectedKeyRemoval -Path $path -Label "CBS\$key"
+                    if ($outcome.Removed) {
+                        Add-OfflineRepairLog -Level Info -Message "Removed CBS\$key. $($outcome.Reason)"
+                        $script:RegistryChanges++
+                    }
+                    else {
+                        Add-OfflineRepairLog -Level Warning -Message "CBS\$key could not be removed. $($outcome.Reason)"
+                    }
+                }
+
+                foreach ($name in $script:PendingComponentValue) {
+                    $value = (Get-ItemProperty $script:ComponentsKey -ErrorAction SilentlyContinue).$name
+                    if (-not (Test-PendingComponentValue -Value $value)) { continue }
+
+                    # The value is read back rather than assumed either way: these keys carry their own
+                    # ACL, and the removal reports nothing when it is denied. Unlike the CBS keys the
+                    # COMPONENTS key survives, so its descriptor is always put back.
+                    $outcome = Invoke-OfflineProtectedValueRemoval -Path $script:ComponentsKey -Name $name -StillSet {
+                        param($current) Test-PendingComponentValue -Value $current
+                    }
+                    if ($outcome.Removed) {
+                        Add-OfflineRepairLog -Level Info -Message "Cleared COMPONENTS\$name (was '$value'). $($outcome.Reason)"
+                        $script:RegistryChanges++
+                    }
+                    else {
+                        Add-OfflineRepairLog -Level Warning -Message "COMPONENTS\$name could not be cleared. $($outcome.Reason)"
+                    }
+                }
+            }
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            $changes += [int]$script:RegistryChanges
+        }
+
+        # ---------------------------------------------------------------------------------------------
+        # Transaction logs
+        #
+        # Deliberately after the DISM revert rather than before it. The CLFS logs under config\TxR hold
+        # the uncommitted state of the transaction, which is what DISM reads to work out what to undo.
+        # Deleting them first would take that away from the supported tool and leave the revert with
+        # nothing to act on. Clearing them afterwards removes what the revert could not consume.
+        #
+        # Removal runs through Use-OfflineFileRemoval, so every file is hash-verified into a backup before
+        # anything is deleted, the folder is re-examined afterwards against six checks, and a failure
+        # restores everything it removed. A raw copy-then-delete loop cannot tell the difference between a
+        # clean removal and one that silently took a file it should not have.
+        # ---------------------------------------------------------------------------------------------
+        if ($clearTxR) {
+            $backupRoot = Join-Path $offline.WindowsPath "Temp\$scriptName\$scriptStartTime"
+            $outcome = Invoke-OfflineRemovalPlan -Plan $txr -BackupRoot $backupRoot
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+            if ($outcome.Success) {
+                if ($manifest.TxRBackupFolder) {
+                    Log-Warning "An earlier run's TxR backup $(Resolve-TxRBackupFolder -WindowsPath $offline.WindowsPath -RelativePath $manifest.TxRBackupFolder) is superseded in the manifest by this one. It stays on disk." | Tee-Object -FilePath $logFile -Append
+                }
+                # Stored relative to its base, which revert re-derives from the disk it is run against.
+                $txrBase = Get-TxRBackupBase -WindowsPath $offline.WindowsPath
+                $manifest.TxRBackupFolder = [System.IO.Path]::GetFullPath($outcome.BackupPath).TrimEnd('\').Substring($txrBase.Length + 1)
+                $manifest.TxRBackupRecord = @($outcome.BackupRecord)
+                try {
+                    Save-RevertManifest -Path $manifestPath -Manifest $manifest
+                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                }
+                catch {
+                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                    Log-Error "$($_.Exception.Message) Restoring the TxR files so the disk is not left with an unrecorded change." | Tee-Object -FilePath $logFile -Append
+                    $undo = Restore-OfflineFileSet -BackupPath $outcome.BackupPath -TargetPath (Join-Path $offline.WindowsPath 'System32\config\TxR') -FileRecord @($outcome.BackupRecord)
+                    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                    if ($undo.Succeeded) {
+                        Log-Error "The $([int]$undo.Restored) TxR file(s) were restored and hash-verified." | Tee-Object -FilePath $logFile -Append
+                    }
+                    else {
+                        Log-Error "FATAL: the TxR files were not all restored ($($undo.Detail -join '; ')). Keep the backup at $($outcome.BackupPath); manual recovery is required." | Tee-Object -FilePath $logFile -Append
+                    }
+                    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+                    $status = $STATUS_ERROR
+                    break Main
+                }
+                $txrRemoved = @($outcome.Removed).Count
+                Log-Info "Removed $txrRemoved TxR transaction file(s) and verified the removal. Backed up to $($outcome.BackupPath)." | Tee-Object -FilePath $logFile -Append
+                $changes += $txrRemoved
+            }
+            else {
+                Log-Error "The transaction logs could not be cleared safely: $($outcome.Reason)" | Tee-Object -FilePath $logFile -Append
+                foreach ($failure in @($outcome.Verification.Failure)) {
+                    Log-Error "  $failure" | Tee-Object -FilePath $logFile -Append
+                }
+                if ($outcome.RollbackAttempted -and $outcome.RollbackSucceeded) {
+                    Log-Error 'The removed TxR files were restored and hash-verified by the automatic rollback.' | Tee-Object -FilePath $logFile -Append
+                }
+                elseif ($outcome.RollbackAttempted) {
+                    Log-Error "FATAL: Automatic rollback did not restore and verify every TxR file. Keep the backup at $($outcome.BackupPath); manual recovery is required." | Tee-Object -FilePath $logFile -Append
+                }
+                else {
+                    Log-Error 'No automatic rollback was attempted. Review the removal failure above before proceeding.' | Tee-Object -FilePath $logFile -Append
+                }
+                try { Save-RevertManifest -Path $manifestPath -Manifest $manifest }
+                catch { Log-Error $_.Exception.Message | Tee-Object -FilePath $logFile -Append }
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+                $status = $STATUS_ERROR
+                break Main
+            }
+        }
+
+        # ---------------------------------------------------------------------------------------------
+        # Windows Update services, only when asked for by name
+        # ---------------------------------------------------------------------------------------------
+        if ($doDisableWindowsUpdate) {
+            Log-Warning 'Disabling Windows Update is a workaround, not a repair. The VM stays unpatched until the services are turned back on.' | Tee-Object -FilePath $logFile -Append
+
+            $recorded = [System.Collections.Generic.List[object]]::new()
+            foreach ($service in @($updateServices)) {
+                if ($null -eq $service.Start) {
+                    # Without a recorded start type there is nothing to put back on revert, so it is left alone.
+                    Log-Info "  $($service.Service) has no Start value, so it was left alone." | Tee-Object -FilePath $logFile -Append
+                    continue
+                }
+                if ([int]$service.Start -eq 4) {
+                    Log-Info "  $($service.Service) is already disabled." | Tee-Object -FilePath $logFile -Append
+                    continue
+                }
+                [void]$recorded.Add([PSCustomObject]@{ Service = $service.Service; OriginalStart = [int]$service.Start })
+            }
+
+            if ($recorded.Count -gt 0) {
+                $systemBackup = Backup-OfflineHiveFile -WindowsPath $offline.WindowsPath -Hive 'SYSTEM'
+                Log-Info "SYSTEM hive backed up to $systemBackup" | Tee-Object -FilePath $logFile -Append
+                $manifest.HiveBackups = @($manifest.HiveBackups) + [PSCustomObject]@{ Hive = 'SYSTEM'; Path = (Split-Path -Leaf "$systemBackup") }
+                Save-RevertManifest -Path $manifestPath -Manifest $manifest
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+                # Each Start value is read back: only a service the disk now reports as disabled is
+                # recorded, and so only that one is put back on revert.
+                # A protected key (WaaSMedicSvc on newer builds) is taken only if the plain write is refused,
+                # and its ACL put back afterwards.
+                $disabled = [System.Collections.Generic.List[object]]::new()
+                Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+                    $root = Get-OfflineSystemRootPath -Strict
+                    foreach ($entry in $recorded) {
+                        $path = "$root\Services\$($entry.Service)"
+                        if (-not (Test-Path -LiteralPath $path)) {
+                            [void]$disableFailed.Add("$($entry.Service) (the service key is gone)")
+                            continue
+                        }
+                        $reason = ''
+                        try {
+                            $outcome = Invoke-OfflineProtectedRegistryWrite -Path $path -Description "$($entry.Service) Start" -Action {
+                                Set-ItemProperty -LiteralPath $path -Name Start -Value 4 -Type DWord -Force -ErrorAction Stop
+                            }
+                            $reason = $outcome.Reason
+                        }
+                        catch { $reason = $_.Exception.Message }
+                        $now = (Get-ItemProperty -LiteralPath $path -Name Start -ErrorAction SilentlyContinue).Start
+                        if ($now -eq 4) {
+                            Add-OfflineRepairLog -Level Info -Message "reg add `"$($path -replace '^HKLM:\\BROKENSYSTEM', 'HKLM\SYSTEM')`" /v Start /t REG_DWORD /d 4 /f   # was $($entry.OriginalStart)"
+                            [void]$disabled.Add($entry)
+                        }
+                        else {
+                            Add-OfflineRepairLog -Level Error -Message "$($entry.Service) could not be disabled: Start reads back as '$now'. $reason"
+                            [void]$disableFailed.Add("$($entry.Service) (Start is still $now)")
+                        }
+                    }
+                }
+                Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+                if ($disabled.Count -gt 0) {
+                    # A service an earlier run disabled keeps the start type that run recorded, which is
+                    # the one the VM actually had.
+                    $known = @(@($manifest.Services) | ForEach-Object { $_.Service })
+                    $manifest.Services = @(@($manifest.Services) + @($disabled | Where-Object { $known -notcontains $_.Service }))
+                    try {
+                        Save-RevertManifest -Path $manifestPath -Manifest $manifest
+                        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                    }
+                    catch {
+                        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                        Log-Error "$($_.Exception.Message) Putting the Windows Update start types back so the disk is not left with an unrecorded change." | Tee-Object -FilePath $logFile -Append
+                        $script:ServiceUndoFailed = [System.Collections.Generic.List[string]]::new()
+                        Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $offline.WindowsPath -ScriptBlock {
+                            $root = Get-OfflineSystemRootPath -Strict
+                            foreach ($entry in $disabled) {
+                                $path = "$root\Services\$($entry.Service)"
+                                Set-ItemProperty -Path $path -Name Start -Value ([int]$entry.OriginalStart) -Type DWord -Force -ErrorAction SilentlyContinue
+                                if ((Get-ItemProperty -Path $path -Name Start -ErrorAction SilentlyContinue).Start -ne [int]$entry.OriginalStart) {
+                                    [void]$script:ServiceUndoFailed.Add("$($entry.Service) (Start $($entry.OriginalStart))")
+                                }
+                            }
+                        }
+                        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+                        if ($script:ServiceUndoFailed.Count -eq 0) {
+                            Log-Error 'The Windows Update start types were put back.' | Tee-Object -FilePath $logFile -Append
+                        }
+                        else {
+                            Log-Error "FATAL: these start types could not be put back: $($script:ServiceUndoFailed -join ', ')." | Tee-Object -FilePath $logFile -Append
+                        }
+                        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+                        $status = $STATUS_ERROR
+                        break Main
+                    }
+                }
+
+                $servicesDisabled = $disabled.Count
+                $changes += $servicesDisabled
+                Log-Info "Disabled $servicesDisabled Windows Update service(s)." | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                Log-Info 'No Windows Update service on this disk needed disabling.' | Tee-Object -FilePath $logFile -Append
+            }
+        }
+
+        # ---------------------------------------------------------------------------------------------
+        # Summary
+        # ---------------------------------------------------------------------------------------------
+        # Re-read, so the summary reports what the disk now says rather than what was intended.
+        $after = Invoke-WithHive -Hive $servicingHive -WindowsPath $offline.WindowsPath -ScriptBlock {
+            return (Get-ServicingRegistryState)
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        $remaining = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path -LiteralPath $pendingXmlPath) { [void]$remaining.Add('WinSxS\pending.xml') }
+        foreach ($key in $script:PendingCbsKey) {
+            if ($after.Cbs[$key].Present) { [void]$remaining.Add("CBS\$key") }
+        }
+        foreach ($name in $script:PendingComponentValue) {
+            if (Test-PendingComponentValue -Value $after.ComponentValues[$name]) { [void]$remaining.Add("COMPONENTS\$name") }
+        }
+
+        # A run that found markers has at least asked DISM to revert, which is a change this script does not
+        # count, so only a run that found nothing to do may say so.
+        if ($changes -eq 0 -and $remaining.Count -eq 0 -and $findings.Count -eq 0 -and $disableFailed.Count -eq 0) {
+            Log-Output 'Nothing needed changing on this disk.' | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        # Report what was actually done rather than infer it from one condition. Three things can change
+        # this disk independently - the servicing markers, the transaction logs, and the Windows Update
+        # services - and any combination of them is possible, because the markers and log exhaustion are
+        # separate authorisations. Keying the summary on the markers alone produced "No stuck servicing
+        # transaction was found, so nothing was cleared. 7 change(s) ... all of them to the Windows
+        # Update services" on a run that had removed 7 transaction logs and touched no service at all.
+        #
+        # Finding a marker is not the same as clearing it. WinSxS is owned by TrustedInstaller and the
+        # CBS keys carry their own ACL, so the rename and the deletes can all be refused while the run
+        # still succeeds at everything else. Claim the transaction only when the disk agrees it is gone.
+        $serviceChanges = $servicesDisabled
+        $markerWork = $changes - $txrRemoved - $serviceChanges
+
+        $did = [System.Collections.Generic.List[string]]::new()
+        if ($findings.Count -gt 0) {
+            if ($remaining.Count -eq 0) {
+                # Either the edits landed, or the DISM revert consumed pending.xml on its own - that one
+                # leaves nothing for this script to count, so trust the re-read rather than the counter.
+                [void]$did.Add('cleared the stuck servicing transaction')
+            }
+            elseif ($markerWork -gt 0) {
+                [void]$did.Add('cleared part of the stuck servicing transaction')
+            }
+        }
+        if ($txrRemoved -gt 0) { [void]$did.Add("removed $txrRemoved transaction log file(s) from config\TxR") }
+        if ($serviceChanges -gt 0) { [void]$did.Add("disabled $serviceChanges Windows Update service(s)") }
+
+        if ($did.Count -gt 0) {
+            $summary = $did -join ', '
+            Log-Output "$($summary.Substring(0, 1).ToUpper())$($summary.Substring(1)): $changes change(s) on $($offline.WindowsPath)." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Output "$changes change(s) on $($offline.WindowsPath)." | Tee-Object -FilePath $logFile -Append
+        }
+
+        if ($remaining.Count -gt 0) {
+            # Log-Output, not Log-Warning: only Log-Output reaches the summary az prints. As a warning
+            # the one line that says the repair did not work was invisible to the operator, who saw
+            # only the success lines above it.
+            Log-Output "These markers are still present after the repair: $($remaining -join ', '). They are owned by TrustedInstaller and this script could not take them. Re-run this script, and if they persist the component store itself is damaged - win-sfc-sf-corruption is the next step." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Output 'No servicing pending markers remain on this disk.' | Tee-Object -FilePath $logFile -Append
+        }
+
+        if (@($manifest.Services).Count -gt 0) {
+            Log-Output 'Windows Update is disabled on this disk. Turn it back on from inside the VM once it boots:' | Tee-Object -FilePath $logFile -Append
+            foreach ($entry in @($manifest.Services)) {
+                Log-Output "  sc.exe config $($entry.Service) start= $(switch ([int]$entry.OriginalStart) { 2 { 'auto' } 3 { 'demand' } 0 { 'boot' } 1 { 'system' } default { 'demand' } })" | Tee-Object -FilePath $logFile -Append
+            }
+        }
+
+        Log-Output "revert=true is partial: it puts back pending.xml, the TxR files and the service start types recorded in $manifestPath. It does not restore the removed registry markers, because they are what caused the boot loop, and it cannot undo the DISM /RevertPendingActions step. The hive backups are listed in the same manifest." | Tee-Object -FilePath $logFile -Append
+        if ($disableFailed.Count -gt 0) {
+            Log-Output "These Windows Update services could not be disabled, although disableWindowsUpdate=true asked for it: $($disableFailed -join ', '). Disable them from inside the VM once it boots." | Tee-Object -FilePath $logFile -Append
+        }
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    # Report what was actually done rather than infer it from one condition. Three things can change
-    # this disk independently - the servicing markers, the transaction logs, and the Windows Update
-    # services - and any combination of them is possible, because the markers and log exhaustion are
-    # separate authorisations. Keying the summary on the markers alone produced "No stuck servicing
-    # transaction was found, so nothing was cleared. 7 change(s) ... all of them to the Windows
-    # Update services" on a run that had removed 7 transaction logs and touched no service at all.
-    #
-    # Finding a marker is not the same as clearing it. WinSxS is owned by TrustedInstaller and the
-    # CBS keys carry their own ACL, so the rename and the deletes can all be refused while the run
-    # still succeeds at everything else. Claim the transaction only when the disk agrees it is gone.
-    $serviceChanges = $servicesDisabled
-    $markerWork = $changes - $txrRemoved - $serviceChanges
-
-    $did = [System.Collections.Generic.List[string]]::new()
-    if ($findings.Count -gt 0) {
-        if ($remaining.Count -eq 0) {
-            # Either the edits landed, or the DISM revert consumed pending.xml on its own - that one
-            # leaves nothing for this script to count, so trust the re-read rather than the counter.
-            [void]$did.Add('cleared the stuck servicing transaction')
+        if ($remaining.Count -gt 0 -or $disableFailed.Count -gt 0) {
+            # Remaining markers: the VM would boot straight back into the same loop. A service that could
+            # not be disabled: the run did not do what it was explicitly asked to do.
+            $status = $STATUS_ERROR
+            break Main
         }
-        elseif ($markerWork -gt 0) {
-            [void]$did.Add('cleared part of the stuck servicing transaction')
-        }
-    }
-    if ($txrRemoved -gt 0) { [void]$did.Add("removed $txrRemoved transaction log file(s) from config\TxR") }
-    if ($serviceChanges -gt 0) { [void]$did.Add("disabled $serviceChanges Windows Update service(s)") }
-
-    if ($did.Count -gt 0) {
-        $summary = $did -join ', '
-        Log-Output "$($summary.Substring(0, 1).ToUpper())$($summary.Substring(1)): $changes change(s) on $($offline.WindowsPath)." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Output "$changes change(s) on $($offline.WindowsPath)." | Tee-Object -FilePath $logFile -Append
-    }
-
-    if ($remaining.Count -gt 0) {
-        # Log-Output, not Log-Warning: only Log-Output reaches the summary az prints. As a warning
-        # the one line that says the repair did not work was invisible to the operator, who saw
-        # only the success lines above it.
-        Log-Output "These markers are still present after the repair: $($remaining -join ', '). They are owned by TrustedInstaller and this script could not take them. Re-run this script, and if they persist the component store itself is damaged - win-sfc-sf-corruption is the next step." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Output 'No servicing pending markers remain on this disk.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    if (@($manifest.Services).Count -gt 0) {
-        Log-Output 'Windows Update is disabled on this disk. Turn it back on from inside the VM once it boots:' | Tee-Object -FilePath $logFile -Append
-        foreach ($entry in @($manifest.Services)) {
-            Log-Output "  sc.exe config $($entry.Service) start= $(switch ([int]$entry.OriginalStart) { 2 { 'auto' } 3 { 'demand' } 0 { 'boot' } 1 { 'system' } default { 'demand' } })" | Tee-Object -FilePath $logFile -Append
-        }
-    }
-
-    Log-Output "revert=true puts back pending.xml, the TxR files and the service start types recorded in $manifestPath. It does not restore the removed registry markers, because they are what caused the boot loop; the hive backups are listed in the same manifest." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    if ($remaining.Count -gt 0) {
-        # The VM would boot straight back into the same loop, so this run did not fix it.
-        return $STATUS_ERROR
-    }
-    return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+        break Main
+    } while ($false)
 }
 catch {
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
+    $status = $STATUS_ERROR
 }
 finally {
     # A dependency may have failed to load before these functions became available.
@@ -1614,6 +1664,7 @@ finally {
         Clear-OfflineDriveLetter
     }
     if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
-        Write-OfflineRepairLog
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
     }
 }
+return $status

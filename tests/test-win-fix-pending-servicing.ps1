@@ -39,6 +39,7 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($sourceScript, [ref]$tokens, [ref]$parseErrors)
 Assert-Equal 0 @($parseErrors).Count 'The script must parse.'
+$scriptText = $ast.Extent.Text
 
 # The manifest functions are loaded on their own, so they are tested exactly as shipped.
 $manifestFunction = @(
@@ -193,15 +194,31 @@ try {
     # --- Exit paths, checked in the shipped script ------------------------------------------------
     $ifStatements = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] }, $true)
     $remainingError = @($ifStatements | Where-Object {
-            $_.Clauses[0].Item1.Extent.Text -eq '$remaining.Count -gt 0' -and
-            $_.Clauses[0].Item2.Extent.Text -match 'return \$STATUS_ERROR'
+            $_.Clauses[0].Item1.Extent.Text -eq '$remaining.Count -gt 0 -or $disableFailed.Count -gt 0' -and
+            $_.Clauses[0].Item2.Extent.Text -match '\$status = \$STATUS_ERROR'
         })
-    Assert-Equal 1 $remainingError.Count 'Servicing markers still present after the repair must return an error.'
+    Assert-Equal 1 $remainingError.Count 'Remaining servicing markers or a service that could not be disabled must end in an error.'
     $lastSuccess = @($ast.FindAll({
-                $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -and
-                $args[0].Extent.Text -eq 'return $STATUS_SUCCESS'
+                $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $args[0].Extent.Text -eq '$status = $STATUS_SUCCESS'
             }, $true))[-1]
     Assert-True ($remainingError[0].Extent.StartOffset -lt $lastSuccess.Extent.StartOffset) 'The remaining-marker error must come before the final success.'
+
+    # The status must be the last line the script writes, so it is returned after the finally block
+    # has flushed its own log lines, never from inside the try.
+    $tryStatement = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] })
+    Assert-Equal 1 $tryStatement.Count 'Exactly one top-level try is expected.'
+    Assert-Equal 'return $status' $ast.EndBlock.Statements[-1].Extent.Text 'The script must end by returning the status.'
+    $returnsInTry = @($tryStatement[0].Body.FindAll({
+                $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -and
+                $args[0].Extent.Text -match '\$STATUS_'
+            }, $true))
+    Assert-Equal 0 $returnsInTry.Count 'No status may be returned from inside the try; set $status and break Main instead.'
+
+    # Windows Update: only real services, and the disable goes through the protected writer.
+    Assert-True ($scriptText -notmatch "'UpdateOrchestrator'") 'UpdateOrchestrator is a scheduled-task folder, not a service.'
+    Assert-True ($scriptText -match "Invoke-OfflineProtectedRegistryWrite -Path \`$path -Description `"\`$\(\`$entry\.Service\) Start`"") 'Disabling a service must use the protected registry writer.'
+    Assert-True ($scriptText -match '\[void\]\$disableFailed\.Add') 'A service that could not be disabled must be recorded as a failure.'
 
     $revertBlock = @($ifStatements | Where-Object { $_.Clauses[0].Item1.Extent.Text -eq '$isRevert' })
     Assert-Equal 1 $revertBlock.Count 'Exactly one revert block is expected.'
