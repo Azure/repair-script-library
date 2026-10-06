@@ -282,6 +282,7 @@ function Resolve-LogonCommand {
             # read must not become authority for a write. Only ItemNotFoundException above is proof
             # the file is absent; everything else is an unknown and is reported as one.
             $metadataUnreadable = $true
+            Add-OfflineRepairLog -Level Warning -Message "Could not read the file metadata of $candidate ($($_.Exception.GetType().FullName): $($_.Exception.Message)). The entry is left unchanged."
         }
 
         $result.Resolved = $candidate
@@ -316,6 +317,7 @@ function Resolve-LogonCommand {
             # from LastKnownGood - a write driven by an I/O error on a healthy csrss.exe.
             $result.HashUnreadable = $true
             $result.Reason = "the binary exists but its SHA-256 could not be read: $candidate"
+            Add-OfflineRepairLog -Level Warning -Message "Could not hash $candidate ($($_.Exception.GetType().FullName): $($_.Exception.Message)). The binary is not treated as corrupt."
         }
 
         # Exists means the command can at least be started. Signature and hash trust are tracked
