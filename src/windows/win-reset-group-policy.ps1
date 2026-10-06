@@ -7,34 +7,36 @@
 # .DESCRIPTION
 #   Runs against the broken OS disk attached to a rescue VM by "az vm repair create".
 #
-#   This is a deliberate blanket reset, not a targeted repair. It is a separate script for exactly
-#   that reason: every other script in this family only writes what it can prove is broken, while
-#   this one clears a whole subsystem because the operator has decided a local policy is the cause.
-#   Nothing here is inferred, so nothing here runs unless it is asked for by name.
+#   By default (scope "targeted") this is a targeted repair. It first reports what local policy is
+#   configured and calls out the three policies that can refuse a logon on their own:
+#     1. Software Restriction Policies with a default level of Disallowed.
+#     2. AppLocker with a rule collection that is enforced. A collection with rules is enforced
+#        unless its EnforcementMode is explicitly 0 (audit only); "Not configured" also enforces.
+#     3. A machine startup or user logon script defined in a policy scripts.ini or psscripts.ini.
+#        Shutdown and logoff scripts, and an ini with no command line, are reported but cannot hold
+#        a logon open, so they do not count.
+#   Only when at least one of those is found does it change anything: the policy folders that hold
+#   files are renamed aside and only the blocking key(s) - Safer\CodeIdentifiers and/or SrpV2 - are
+#   removed from SOFTWARE\Policies. When none is found, nothing is written at all, because Windows
+#   ships gpt.ini and a Registry.pol and their presence is not evidence of a fault.
 #
-#   What it clears:
-#     1. %SystemRoot%\System32\GroupPolicy and GroupPolicyUsers. These hold registry.pol, the
-#        machine and user startup/logon script definitions, and the local security policy database.
-#     2. Every subkey of SOFTWARE\Policies. That is the branch Group Policy authors, and it holds
-#        Software Restriction Policies, AppLocker rules and the interactive logon restrictions.
+#   Blanket resets are opt-in through the scope parameter, for when an operator has decided a local
+#   policy is the cause but detection cannot say which one: "files" renames the policy folders aside,
+#   "registry" clears every SOFTWARE\Policies branch that holds a value, and "all" does both.
 #
-#   The folders are renamed aside rather than deleted, so the change can be undone by renaming them
-#   back, and the SOFTWARE hive is backed up before the registry side is touched. Both undo paths are
-#   written to the log before the change is made. A policy folder that exists but holds no file is
-#   left alone, because Windows ships those folders and their presence is not evidence of anything.
-#
-#   Before changing anything the script reports what is actually configured, and calls out the three
-#   policies that genuinely stop a logon: Software Restriction Policies with a Disallowed default,
-#   AppLocker in enforce mode, and machine startup or user logon scripts. If none of those are set it
-#   says so, so an operator can tell whether this script is even aimed at the right problem before
-#   letting it clear anything.
+#   The policy folders are %SystemRoot%\System32\GroupPolicy, GroupPolicyUsers and AppLocker. They
+#   hold gpt.ini, the Registry.pol files, the startup/logon script definitions and scripts, and the
+#   AppLocker policy cache. They are renamed aside rather than deleted, and a folder that exists but
+#   holds no file is left alone. Before any of them is renamed or any key is removed, the SOFTWARE
+#   hive is copied and the copy is verified against the source; if that verification fails the run
+#   stops with an error and nothing is changed. Undo commands are written to the log.
 #
 # .RESOLVES
-#   A VM that boots but cannot be logged on to because of its own local policy: Software Restriction
-#   Policies set to Disallowed, AppLocker enforcing rules that do not permit userinit.exe or
-#   explorer.exe, a machine startup or user logon script that hangs or fails, an interactive logon
-#   policy that blocks the account, and a logon that is refused immediately after the credentials are
-#   accepted.
+#   A VM that boots but refuses every interactive logon because of its own local policy: Software
+#   Restriction Policies with a Disallowed default level, or an enforced AppLocker collection whose
+#   rules do not allow userinit.exe or explorer.exe - typically seen as the session closing straight
+#   after the credentials are accepted - or a machine startup or user logon script that hangs.
+#   User rights assignments and the local security database are not changed.
 #
 # .PARAMETER detectOnly
 #   "true" to report what is configured and what would be cleared, and make no changes at all.
@@ -43,9 +45,9 @@
 # .PARAMETER scope
 #   How much of local Group Policy to clear. Defaults to "targeted".
 #     "targeted" - acts only on what detection proved is refusing the logon: Software Restriction
-#                  Policies at Disallowed, AppLocker in enforce mode, or a policy startup/logon
-#                  script. When one of those is found, the policy folders are renamed aside and only
-#                  those key(s) are removed; the rest of SOFTWARE\Policies is left alone. When none
+#                  Policies at Disallowed, an enforced AppLocker collection, or a policy startup or
+#                  logon script. When one of those is found, the policy folders are renamed aside and
+#                  only those key(s) are removed; the rest of SOFTWARE\Policies is left alone. When none
 #                  of them is found, nothing is changed at all, because Windows ships a gpt.ini and
 #                  a Registry.pol and their presence is not evidence of a fault. This is the default
 #                  because it repairs the lockout without discarding unrelated policy, and leaves a
@@ -88,19 +90,24 @@
 #
 #   Not used here: "secedit /configure /cfg %windir%\inf\defltbase.inf". That resets security policy,
 #   including user rights, which is a different fault from the Group Policy files this script owns.
-#   It is the accepted fix for user rights left tattooed after a GPO is removed - internal TSGs cover
-#   it and it is used in the field for exactly that - but it belongs to win-fix-user-rights, gated
-#   behind detection, not to a blanket policy reset here.
+#   It is the usual fix for user rights left tattooed after a GPO is removed, but that is a separate
+#   user-rights repair, gated behind its own detection, not part of a policy reset here.
 #
 #   Switch parameters are declared as ValidateSet strings on purpose. The extension turns
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
 #   that value to the next positional parameter.
 #
-#   Run this only after win-fix-logon-subsystem has come back clean. That script repairs the values
-#   the logon actually depends on - Winlogon, Session Manager, the profile list and the setup-mode
-#   command - and a fault there looks the same from the outside as a policy lockout. There is no
-#   overlap between the two: this script never touches those values, and that one never touches
-#   policy.
+#   A fault in the values the logon itself depends on - Winlogon, Session Manager, the profile list
+#   or the setup-mode command - looks the same from the outside as a policy lockout. This script
+#   never reads or touches those values, so rule them out separately when no blocking policy is
+#   reported here.
+#
+#   Per-user policy stored in each profile's NTUSER.DAT (HKCU\Software\Policies) is out of scope:
+#   no user hive is loaded or changed.
+#
+#   detectOnly makes no change of its own, but it still loads the offline SOFTWARE hive to read it,
+#   and the shared hive helper has no read-only mount. Loading a hive that was not shut down cleanly
+#   lets Windows replay its transaction logs into it, as any registry load would.
 #
 #   A domain-joined VM re-applies its domain policy at the next refresh, so on a domain member this
 #   clears the local policy for good and the domain policy only until the VM can reach a domain
@@ -122,10 +129,10 @@
 #   choosing "all".
 #
 #   "targeted" removes only what detection proved can refuse a logon on its own: Software Restriction
-#   Policies with a default level of Disallowed, and AppLocker with a collection in enforce mode. If
-#   neither is set, the registry is not touched at all and the script says so, rather than clearing
-#   policy on the off chance. The policy folders are still renamed aside in that case, because they
-#   are the source the policy would be re-applied from and renaming them is reversible.
+#   Policies with a default level of Disallowed, and AppLocker with an enforced collection. If
+#   neither is set, the registry is not touched. The policy folders are renamed aside only when at
+#   least one blocker was found, a startup or logon script included; when none was found, nothing
+#   is changed at all and the script says so, rather than clearing policy on the off chance.
 #
 #   Not everything under SOFTWARE\Policies is the kind of policy that can refuse a logon, and two
 #   branches are never cleared. Microsoft\SystemCertificates holds the enterprise root and
@@ -159,9 +166,6 @@ Param(
 )
 
 . .\src\windows\common\setup\init.ps1
-. .\src\windows\common\helpers\OfflineRepairCommon.ps1
-. .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
-. .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
 
 $scriptStartTime = Get-Date -f yyyyMMddHHmmss
 $scriptName = (Split-Path -Path $MyInvocation.MyCommand.Path -Leaf).Split('.')[0]
@@ -169,8 +173,9 @@ $logFile = "$env:PUBLIC\Desktop\$($scriptName).log"
 
 $isDetectOnly = ($detectOnly -eq 'true')
 
-# 'targeted' clears the policy files and only the two registry keys that can refuse a logon.
-# 'all' and 'registry' are the blanket reset: everything under SOFTWARE\Policies that holds a value.
+# 'targeted' clears the policy files and only the two registry keys that can refuse a logon, and
+# only when detection found a blocker. 'all' and 'registry' are the blanket registry reset:
+# everything under SOFTWARE\Policies that holds a value.
 $isTargeted = ($scope -eq 'targeted')
 $clearFiles = ($scope -eq 'targeted' -or $scope -eq 'all' -or $scope -eq 'files')
 $clearRegistry = ($scope -eq 'targeted' -or $scope -eq 'all' -or $scope -eq 'registry')
@@ -249,15 +254,84 @@ function Test-PreservedPolicyPath {
 # disallowed unless a rule explicitly allows it, and the logon needs userinit.exe and explorer.exe.
 $script:SaferLevels = @{
     0      = 'Disallowed'
-    4096   = 'Basic User'
+    4096   = 'Untrusted'
+    65536  = 'Constrained'
+    131072 = 'Basic User'
     262144 = 'Unrestricted'
+}
+
+function ConvertFrom-PolicyScriptIni {
+    <#
+    .SYNOPSIS
+        Lists the script entries a policy scripts.ini or psscripts.ini actually defines.
+
+    .DESCRIPTION
+        Group Policy runs only what an ini names in a numbered CmdLine line under its section, so
+        a script file sitting in Scripts\Startup with no entry runs nothing. Only Startup (machine,
+        as SYSTEM before the logon UI) and Logon (user, before the desktop) run in a position to
+        hold a logon open, so only those are Blocking. Shutdown and Logoff run after the session.
+
+    .OUTPUTS
+        One object per non-empty CmdLine: Source, Section, Index, CmdLine and Blocking.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Source
+    )
+
+    # The editor writes these as UTF-16 with a BOM. Without the BOM the text decodes with a NUL
+    # after every character, and stripping those leaves the same ASCII.
+    $Text = $Text -replace "`0", ''
+
+    $section = $null
+    foreach ($line in ($Text -split "`r?`n")) {
+        $trimmed = $line.Trim().TrimStart([char]0xFEFF)
+        if ($trimmed -match '^\[(.+)\]$') {
+            $section = $Matches[1].Trim()
+            continue
+        }
+        if ($null -eq $section) { continue }
+        if ($trimmed -match '^(\d+)CmdLine\s*=\s*(.*)$') {
+            $command = $Matches[2].Trim()
+            if (-not $command) { continue }
+            [PSCustomObject]@{
+                Source   = $Source
+                Section  = $section
+                Index    = [int]$Matches[1]
+                CmdLine  = $command
+                Blocking = ($section -eq 'Startup' -or $section -eq 'Logon')
+            }
+        }
+    }
+}
+
+function Get-AppLockerCollectionMode {
+    <#
+    .SYNOPSIS
+        Classifies one AppLocker rule collection under SrpV2 as Enforced, Audit or NoRules.
+
+    .DESCRIPTION
+        Measured on a live enforcing VM: EnforcementMode 1 (Enabled) enforces, 0 (AuditOnly) only
+        audits, and "Not configured" stores no EnforcementMode value at all and still enforces any
+        rules the collection holds, which is also what Microsoft documents. So only an explicit 0
+        is audit. A collection with no rule subkeys enforces nothing whatever its mode, and Group
+        Policy recreates such empty collections on its own.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$RuleCount,
+        [Parameter(Mandatory = $false)][AllowNull()]$EnforcementMode
+    )
+
+    if ($RuleCount -le 0) { return 'NoRules' }
+    if ($null -ne $EnforcementMode -and [int]$EnforcementMode -eq 0) { return 'Audit' }
+    return 'Enforced'
 }
 
 function Get-PolicyFileState {
     <#
     .SYNOPSIS
-        Reads the file side of local Group Policy: which folders exist, what is in them, and whether
-        any startup or logon scripts are defined.
+        Reads the file side of local Group Policy: which folders exist, what is in them, and which
+        startup or logon scripts are defined.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$WindowsPath
@@ -266,6 +340,7 @@ function Get-PolicyFileState {
     $present = [System.Collections.Generic.List[object]]::new()
     $empty = [System.Collections.Generic.List[string]]::new()
     $scripts = [System.Collections.Generic.List[string]]::new()
+    $scriptsInfo = [System.Collections.Generic.List[string]]::new()
     $totalFiles = 0
 
     foreach ($relative in $script:PolicyFolders) {
@@ -290,21 +365,36 @@ function Get-PolicyFileState {
                 Files     = @($files | ForEach-Object { $_.FullName.Substring($folder.Length).TrimStart('\') })
             })
 
-        # Scripts defined here run as SYSTEM at boot or as the user at logon, before the desktop is
-        # usable. One that hangs holds the boot or the logon open with no visible error.
+        # Startup scripts run as SYSTEM before the logon UI and logon scripts run before the desktop
+        # is usable, so one that hangs holds the boot or the logon open with no visible error.
         foreach ($file in $files) {
-            if ($file.Name -match '^(ps)?scripts\.ini$' -or $file.FullName -match '\\Scripts\\(Startup|Shutdown|Logon|Logoff)\\') {
-                [void]$scripts.Add($file.FullName.Substring($folder.Length).TrimStart('\'))
+            if ($file.Name -notmatch '^(ps)?scripts\.ini$') { continue }
+            $source = "$relative\$($file.FullName.Substring($folder.Length).TrimStart('\'))"
+            try {
+                $entries = @(ConvertFrom-PolicyScriptIni -Text ([System.IO.File]::ReadAllText($file.FullName)) -Source $source)
+            }
+            catch {
+                [void]$scriptsInfo.Add("$source (could not be read: $($_.Exception.Message))")
+                continue
+            }
+            if ($entries.Count -eq 0) {
+                [void]$scriptsInfo.Add("$source (defines no script)")
+                continue
+            }
+            foreach ($entry in $entries) {
+                $text = "$($entry.Source) [$($entry.Section)] $($entry.CmdLine)"
+                if ($entry.Blocking) { [void]$scripts.Add($text) } else { [void]$scriptsInfo.Add($text) }
             }
         }
     }
 
     return [PSCustomObject]@{
-        Folders    = @($present)
-        Empty      = @($empty)
-        FileCount  = $totalFiles
-        Scripts    = @($scripts)
-        HasContent = ($present.Count -gt 0)
+        Folders     = @($present)
+        Empty       = @($empty)
+        FileCount   = $totalFiles
+        Scripts     = @($scripts)
+        ScriptsInfo = @($scriptsInfo)
+        HasContent  = ($present.Count -gt 0)
     }
 }
 
@@ -362,18 +452,25 @@ function Get-PolicyRegistryState {
         }
     }
 
-    # AppLocker. EnforcementMode 1 on any collection means the rules are enforced, not audited.
+    # AppLocker. A collection with rules is enforced unless EnforcementMode is explicitly 0.
     $appLocker = $null
     $srpV2Path = "$root\Microsoft\Windows\SrpV2"
     if (Test-Path $srpV2Path) {
         $enforced = [System.Collections.Generic.List[string]]::new()
+        $audited = [System.Collections.Generic.List[string]]::new()
+        $withRules = [System.Collections.Generic.List[string]]::new()
         foreach ($collection in @(Get-ChildItem -Path $srpV2Path -ErrorAction SilentlyContinue)) {
+            $ruleCount = @(Get-ChildItem -Path $collection.PSPath -ErrorAction SilentlyContinue).Count
             $mode = (Get-ItemProperty -Path $collection.PSPath -ErrorAction SilentlyContinue).EnforcementMode
-            if ($null -ne $mode -and [int]$mode -eq 1) { [void]$enforced.Add($collection.PSChildName) }
+            switch (Get-AppLockerCollectionMode -RuleCount $ruleCount -EnforcementMode $mode) {
+                'Enforced' { [void]$enforced.Add($collection.PSChildName); [void]$withRules.Add($collection.PSChildName) }
+                'Audit' { [void]$audited.Add($collection.PSChildName); [void]$withRules.Add($collection.PSChildName) }
+            }
         }
         $appLocker = [PSCustomObject]@{
-            Collections = @(Get-ChildItem -Path $srpV2Path -ErrorAction SilentlyContinue | ForEach-Object { $_.PSChildName })
+            Collections = @($withRules)
             Enforced    = @($enforced)
+            Audited     = @($audited)
             Blocking    = ($enforced.Count -gt 0)
         }
     }
@@ -404,9 +501,12 @@ function Clear-PolicyFile {
     $changes = 0
 
     foreach ($folder in @($PolicyFile.Folders)) {
-        $newName = "$(Split-Path -Path $folder.Path -Leaf).bak-$Stamp"
+        $leaf = Split-Path -Path $folder.Path -Leaf
+        $newName = "$leaf.bak-$Stamp"
         $target = Join-Path -Path (Split-Path -Path $folder.Path -Parent) -ChildPath $newName
-        Add-OfflineRepairLog -Message "To undo: Rename-Item -LiteralPath '$target' -NewName '$(Split-Path -Path $folder.Path -Leaf)'"
+        $null = Assert-OfflineTarget -Path $folder.Path -Action 'rename aside'
+        Add-OfflineRepairLog -Message "To undo from this rescue VM: Rename-Item -LiteralPath '$target' -NewName '$leaf'"
+        Add-OfflineRepairLog -Message "To undo on the repaired VM itself: Rename-Item -LiteralPath (Join-Path `$env:SystemRoot '$($folder.Relative).bak-$Stamp') -NewName '$leaf'"
         try {
             Rename-Item -LiteralPath $folder.Path -NewName $newName -Force -ErrorAction Stop
             Add-OfflineRepairLog -Message "Renamed $($folder.Path) to $target ($($folder.FileCount) file(s))."
@@ -618,6 +718,7 @@ function Clear-PolicyRegistry {
 
     foreach ($relative in $KeyPaths) {
         if (-not (Test-Path -LiteralPath "HKLM:\BROKENSOFTWARE\Policies\$relative")) { continue }
+        $null = Assert-OfflineTarget -Path "HKLM\BROKENSOFTWARE\Policies\$relative" -Action 'delete'
 
         $survivors = [System.Collections.Generic.List[string]]::new()
         $branch = "SOFTWARE\Policies\$relative"
@@ -643,248 +744,347 @@ function Clear-PolicyRegistry {
     return $changes
 }
 
+function Confirm-PolicyHiveBackup {
+    <#
+    .SYNOPSIS
+        Proves a hive backup is a byte-for-byte copy of the hive file, and throws if it is not.
+
+    .DESCRIPTION
+        The backup is the only way back from the registry side, so nothing is renamed or removed
+        until it is proven. The copy must exist, match the source length and match its SHA256. A
+        hash match is a stronger proof than parsing the copy: the copy is taken without the hive's
+        transaction logs, so a hive that was not shut down cleanly could fail a parse that its
+        source, logs included, would pass.
+
+    .OUTPUTS
+        PSCustomObject with Path, Length and Sha256 of the verified backup.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()][string]$BackupPath,
+        [Parameter(Mandatory = $true)][string]$SourcePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BackupPath) -or -not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
+        throw "The SOFTWARE hive backup was not created$(if ($BackupPath) { " at $BackupPath" }), so nothing was changed."
+    }
+
+    $source = Get-Item -LiteralPath $SourcePath -Force -ErrorAction Stop
+    $copy = Get-Item -LiteralPath $BackupPath -Force -ErrorAction Stop
+    if ($copy.Length -ne $source.Length) {
+        throw "The SOFTWARE hive backup $BackupPath is $($copy.Length) bytes but the hive is $($source.Length) bytes, so it is incomplete and nothing was changed."
+    }
+
+    $sourceHash = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash
+    $copyHash = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($copyHash -ne $sourceHash) {
+        throw "The SOFTWARE hive backup $BackupPath does not match the hive (SHA256 differs), so nothing was changed."
+    }
+
+    return [PSCustomObject]@{
+        Path   = $BackupPath
+        Length = $copy.Length
+        Sha256 = $copyHash
+    }
+}
+
 "$scriptStartTime" | Out-File -FilePath $logFile -Append
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly, scope=$scope)" | Tee-Object -FilePath $logFile -Append
 
+$status = $STATUS_ERROR
 try {
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    . .\src\windows\common\helpers\OfflineRepairCommon.ps1
+    . .\src\windows\common\helpers\Get-OfflineWindowsDisk.ps1
+    . .\src\windows\common\helpers\Use-OfflineRegistryHive.ps1
 
-    Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
+    :Main do {
+        $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    $policyFile = Get-PolicyFileState -WindowsPath $offline.WindowsPath
-    $policyRegistry = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        return (Get-PolicyRegistryState)
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
 
-    # Report the current state before deciding anything.
-    if ($policyFile.HasContent) {
-        Log-Info "Local Group Policy files: $($policyFile.FileCount) file(s) across $(@($policyFile.Folders).Count) folder(s)." | Tee-Object -FilePath $logFile -Append
-        foreach ($folder in @($policyFile.Folders)) {
-            Log-Info "  $($folder.Relative): $($folder.FileCount) file(s)$(if ($folder.FileCount -gt 0) { " ($(@($folder.Files) -join ', '))" })" | Tee-Object -FilePath $logFile -Append
+        $policyFile = Get-PolicyFileState -WindowsPath $offline.WindowsPath
+        $policyRegistry = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            return (Get-PolicyRegistryState)
         }
-    }
-    else {
-        $emptyFolders = @($policyFile.Empty)
-        $emptyNote = ''
-        if ($emptyFolders.Count -gt 0) {
-            $emptyNote = if ($emptyFolders.Count -eq 1) {
-                " ($($emptyFolders[0]) exists but is empty, which is how Windows ships it, so it is left alone)"
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        # Report the current state before deciding anything.
+        if ($policyFile.HasContent) {
+            Log-Info "Local Group Policy files: $($policyFile.FileCount) file(s) across $(@($policyFile.Folders).Count) folder(s)." | Tee-Object -FilePath $logFile -Append
+            foreach ($folder in @($policyFile.Folders)) {
+                Log-Info "  $($folder.Relative): $($folder.FileCount) file(s)$(if ($folder.FileCount -gt 0) { " ($(@($folder.Files) -join ', '))" })" | Tee-Object -FilePath $logFile -Append
+            }
+        }
+        else {
+            $emptyFolders = @($policyFile.Empty)
+            $emptyNote = ''
+            if ($emptyFolders.Count -gt 0) {
+                $emptyNote = if ($emptyFolders.Count -eq 1) {
+                    " ($($emptyFolders[0]) exists but is empty, which is how Windows ships it, so it is left alone)"
+                }
+                else {
+                    " ($($emptyFolders -join ' and ') exist but are empty, which is how Windows ships them, so they are left alone)"
+                }
+            }
+            Log-Info "Local Group Policy files: nothing configured$emptyNote." | Tee-Object -FilePath $logFile -Append
+        }
+
+        if ($policyRegistry.HasContent) {
+            Log-Info "SOFTWARE\Policies holds policy in $(@($policyRegistry.Keys).Count) key(s): $(@($policyRegistry.Keys) -join ', ')." | Tee-Object -FilePath $logFile -Append
+        }
+        elseif (@($policyRegistry.EmptyKeys).Count -gt 0) {
+            Log-Info "SOFTWARE\Policies holds no policy. $(@($policyRegistry.EmptyKeys).Count) key(s) are present ($(@($policyRegistry.EmptyKeys) -join ', ')) but hold no values anywhere beneath them, so they enforce nothing." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Info 'SOFTWARE\Policies is empty.' | Tee-Object -FilePath $logFile -Append
+        }
+
+        # The three things that actually refuse a logon, called out so the operator can see whether
+        # this script is even aimed at the right problem.
+        $blockers = 0
+        if ($null -ne $policyRegistry.Safer) {
+            if ($policyRegistry.Safer.Blocking) {
+                Log-Warning "BLOCKING: Software Restriction Policies default level is Disallowed with $($policyRegistry.Safer.RuleCount) explicit rule(s). Every executable is denied unless a rule allows it, which includes userinit.exe and explorer.exe, so the logon cannot complete." | Tee-Object -FilePath $logFile -Append
+                $blockers++
             }
             else {
-                " ($($emptyFolders -join ' and ') exist but are empty, which is how Windows ships them, so they are left alone)"
+                Log-Info "Software Restriction Policies are configured, default level $($policyRegistry.Safer.LevelName), $($policyRegistry.Safer.RuleCount) rule(s). Not a lockout by itself." | Tee-Object -FilePath $logFile -Append
             }
         }
-        Log-Info "Local Group Policy files: nothing configured$emptyNote." | Tee-Object -FilePath $logFile -Append
-    }
 
-    if ($policyRegistry.HasContent) {
-        Log-Info "SOFTWARE\Policies holds policy in $(@($policyRegistry.Keys).Count) key(s): $(@($policyRegistry.Keys) -join ', ')." | Tee-Object -FilePath $logFile -Append
-    }
-    elseif (@($policyRegistry.EmptyKeys).Count -gt 0) {
-        Log-Info "SOFTWARE\Policies holds no policy. $(@($policyRegistry.EmptyKeys).Count) key(s) are present ($(@($policyRegistry.EmptyKeys) -join ', ')) but hold no values anywhere beneath them, so they enforce nothing." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Info 'SOFTWARE\Policies is empty.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    # The three things that actually refuse a logon, called out so the operator can see whether this
-    # script is even aimed at the right problem.
-    $blockers = 0
-    if ($null -ne $policyRegistry.Safer) {
-        if ($policyRegistry.Safer.Blocking) {
-            Log-Warning "BLOCKING: Software Restriction Policies default level is Disallowed with $($policyRegistry.Safer.RuleCount) explicit rule(s). Every executable is denied unless a rule allows it, which includes userinit.exe and explorer.exe, so the logon cannot complete." | Tee-Object -FilePath $logFile -Append
-            $blockers++
-        }
-        else {
-            Log-Info "Software Restriction Policies are configured, default level $($policyRegistry.Safer.LevelName), $($policyRegistry.Safer.RuleCount) rule(s). Not a lockout by itself." | Tee-Object -FilePath $logFile -Append
-        }
-    }
-
-    if ($null -ne $policyRegistry.AppLocker) {
-        if ($policyRegistry.AppLocker.Blocking) {
-            Log-Warning "BLOCKING: AppLocker is enforcing rules for $(@($policyRegistry.AppLocker.Enforced) -join ', '). If those rules do not permit the logon binaries, the logon is refused." | Tee-Object -FilePath $logFile -Append
-            $blockers++
-        }
-        else {
-            Log-Info "AppLocker rules exist for $(@($policyRegistry.AppLocker.Collections) -join ', ') but none are in enforce mode." | Tee-Object -FilePath $logFile -Append
-        }
-    }
-
-    if (@($policyFile.Scripts).Count -gt 0) {
-        Log-Warning "BLOCKING: $(@($policyFile.Scripts).Count) policy script definition(s) present ($(@($policyFile.Scripts) -join ', ')). Startup scripts run as SYSTEM before the logon UI and logon scripts run before the desktop, so one that hangs holds the boot or the logon open with no visible error." | Tee-Object -FilePath $logFile -Append
-        $blockers++
-    }
-
-    if ($blockers -eq 0 -and ($policyFile.HasContent -or $policyRegistry.HasContent)) {
-        Log-Info 'None of the policies that can refuse a logon on their own are set. Local policy is configured but is not an obvious cause, so confirm the symptom before clearing it.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    # In targeted mode the registry side acts only on what detection proved is blocking. In blanket
-    # mode it acts on every branch that holds a value.
-    $targetKeys = [System.Collections.Generic.List[string]]::new()
-    if ($isTargeted) {
-        if ($null -ne $policyRegistry.Safer -and $policyRegistry.Safer.Blocking) {
-            [void]$targetKeys.Add($script:TargetedPolicyKeys.Safer)
-        }
-        if ($null -ne $policyRegistry.AppLocker -and $policyRegistry.AppLocker.Blocking) {
-            [void]$targetKeys.Add($script:TargetedPolicyKeys.AppLocker)
-        }
-    }
-    else {
-        foreach ($branch in @($policyRegistry.Keys)) { [void]$targetKeys.Add($branch) }
-    }
-
-    # Targeted scope acts only on what detection proved, on both halves. The registry side is
-    # already gated on Blocking; the file side has to be too, or the default scope renames the
-    # local policy of a disk where nothing is refusing the logon. Windows ships gpt.ini and a
-    # Registry.pol, so "the folder has files in it" is not evidence of a fault. Scopes files and
-    # all stay blanket on purpose, and are the documented way to clear policy that detection
-    # cannot prove is blocking.
-    $filesToClear = if ($clearFiles -and (-not $isTargeted -or $blockers -gt 0)) { @($policyFile.Folders).Count } else { 0 }
-    $keysToClear = if ($clearRegistry) { @($targetKeys).Count } else { 0 }
-
-    if ($isDetectOnly) {
-        if ($isTargeted -and $filesToClear -eq 0 -and $keysToClear -eq 0) {
-            $note = if ($policyFile.HasContent -or $policyRegistry.HasContent) {
-                "Local Group Policy is configured ($($policyFile.FileCount) file(s), $(@($policyRegistry.Keys).Count) key(s) holding values), but none of it is a policy that refuses a logon by itself, so nothing would be changed."
+        if ($null -ne $policyRegistry.AppLocker) {
+            if ($policyRegistry.AppLocker.Blocking) {
+                Log-Warning "BLOCKING: AppLocker is enforcing rules for $(@($policyRegistry.AppLocker.Enforced) -join ', '). If those rules do not permit the logon binaries, the logon is refused." | Tee-Object -FilePath $logFile -Append
+                $blockers++
             }
-            else { 'No local Group Policy is configured on this disk, so nothing would be changed.' }
-            Log-Output "Detect only (scope 'targeted'): $note No changes were made." | Tee-Object -FilePath $logFile -Append
-        }
-        else {
-            $keyNote = if ($isTargeted) {
-                if ($keysToClear -gt 0) { "remove $keysToClear blocking key(s) ($(@($targetKeys) -join ', '))" }
-                else { 'remove no registry keys' }
+            elseif (@($policyRegistry.AppLocker.Audited).Count -gt 0) {
+                Log-Info "AppLocker rules exist for $(@($policyRegistry.AppLocker.Audited) -join ', '), all in audit-only mode, so they log but do not refuse anything." | Tee-Object -FilePath $logFile -Append
             }
             else {
-                "remove $keysToClear SOFTWARE\Policies key(s)"
+                Log-Info 'AppLocker has no rules in any collection, so it enforces nothing.' | Tee-Object -FilePath $logFile -Append
             }
-            Log-Output "Detect only (scope '$scope'): would rename $filesToClear policy folder(s) holding $($policyFile.FileCount) file(s) and $keyNote. No changes were made." | Tee-Object -FilePath $logFile -Append
         }
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
 
-    if ($filesToClear -eq 0 -and $keysToClear -eq 0) {
-        if ($isTargeted -and ($policyFile.HasContent -or $policyRegistry.HasContent)) {
-            Log-Output "Nothing to clear in scope 'targeted'. Local Group Policy is configured on this disk, but none of it is a policy that refuses a logon by itself, so a policy is not what is stopping the logon and nothing was changed. If a policy is still suspected, re-run with scope 'files' to set the policy files aside, or scope 'all' to clear SOFTWARE\Policies wholesale, and read the warning that comes with it." | Tee-Object -FilePath $logFile -Append
+        if (@($policyFile.Scripts).Count -gt 0) {
+            Log-Warning "BLOCKING: $(@($policyFile.Scripts).Count) policy startup or logon script(s) defined ($(@($policyFile.Scripts) -join '; ')). Startup scripts run as SYSTEM before the logon UI and logon scripts run before the desktop, so one that hangs holds the boot or the logon open with no visible error." | Tee-Object -FilePath $logFile -Append
+            $blockers++
+        }
+        if (@($policyFile.ScriptsInfo).Count -gt 0) {
+            Log-Info "Policy script definitions that cannot hold a logon open: $(@($policyFile.ScriptsInfo) -join '; '). Shutdown and logoff scripts run after the session, and an ini without a command line runs nothing." | Tee-Object -FilePath $logFile -Append
+        }
+
+        if ($blockers -eq 0 -and ($policyFile.HasContent -or $policyRegistry.HasContent)) {
+            Log-Info 'None of the policies that can refuse a logon on their own are set. Local policy is configured but is not an obvious cause, so confirm the symptom before clearing it.' | Tee-Object -FilePath $logFile -Append
+        }
+
+        # In targeted mode the registry side acts only on what detection proved is blocking. In
+        # blanket mode it acts on every branch that holds a value.
+        $targetKeys = [System.Collections.Generic.List[string]]::new()
+        if ($isTargeted) {
+            if ($null -ne $policyRegistry.Safer -and $policyRegistry.Safer.Blocking) {
+                [void]$targetKeys.Add($script:TargetedPolicyKeys.Safer)
+            }
+            if ($null -ne $policyRegistry.AppLocker -and $policyRegistry.AppLocker.Blocking) {
+                [void]$targetKeys.Add($script:TargetedPolicyKeys.AppLocker)
+            }
         }
         else {
-            Log-Output "Nothing to clear in scope '$scope'. No local Group Policy is configured on this disk, so a policy is not what is stopping the logon. No changes were made." | Tee-Object -FilePath $logFile -Append
+            foreach ($branch in @($policyRegistry.Keys)) { [void]$targetKeys.Add($branch) }
         }
+
+        # Targeted scope acts only on what detection proved, on both halves. The registry side is
+        # already gated on Blocking; the file side has to be too, or the default scope renames the
+        # local policy of a disk where nothing is refusing the logon. Windows ships gpt.ini and a
+        # Registry.pol, so "the folder has files in it" is not evidence of a fault. Scopes files and
+        # all stay blanket on purpose, and are the documented way to clear policy that detection
+        # cannot prove is blocking.
+        $filesToClear = if ($clearFiles -and (-not $isTargeted -or $blockers -gt 0)) { @($policyFile.Folders).Count } else { 0 }
+        $keysToClear = if ($clearRegistry) { @($targetKeys).Count } else { 0 }
+
+        if ($isDetectOnly) {
+            if ($isTargeted -and $filesToClear -eq 0 -and $keysToClear -eq 0) {
+                $note = if ($policyFile.HasContent -or $policyRegistry.HasContent) {
+                    "Local Group Policy is configured ($($policyFile.FileCount) file(s), $(@($policyRegistry.Keys).Count) key(s) holding values), but none of it is a policy that refuses a logon by itself, so nothing would be changed."
+                }
+                else { 'No local Group Policy is configured on this disk, so nothing would be changed.' }
+                Log-Output "Detect only (scope 'targeted'): $note No changes were made." | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                $keyNote = if ($isTargeted) {
+                    if ($keysToClear -gt 0) { "remove $keysToClear blocking key(s) ($(@($targetKeys) -join ', '))" }
+                    else { 'remove no registry keys' }
+                }
+                else {
+                    "remove $keysToClear SOFTWARE\Policies key(s)"
+                }
+                Log-Output "Detect only (scope '$scope'): would rename $filesToClear policy folder(s) holding $($policyFile.FileCount) file(s) and $keyNote. No changes were made." | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        if ($filesToClear -eq 0 -and $keysToClear -eq 0) {
+            if ($isTargeted -and ($policyFile.HasContent -or $policyRegistry.HasContent)) {
+                Log-Output "Nothing to clear in scope 'targeted'. Local Group Policy is configured on this disk, but none of it is a policy that refuses a logon by itself, so a policy is not what is stopping the logon and nothing was changed. If a policy is still suspected, re-run with scope 'files' to set the policy files aside, or scope 'all' to clear SOFTWARE\Policies wholesale, and read the warning that comes with it." | Tee-Object -FilePath $logFile -Append
+            }
+            else {
+                Log-Output "Nothing to clear in scope '$scope'. No local Group Policy is configured on this disk, so a policy is not what is stopping the logon. No changes were made." | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break Main
+        }
+
+        # Back up and verify the hive before anything is renamed or removed, so a backup that fails
+        # stops the run with nothing changed. Taken only when the registry side will be written.
+        if ($keysToClear -gt 0) {
+            $hiveFile = Get-OfflineHiveFilePath -WindowsPath $offline.WindowsPath -Hive 'SOFTWARE'
+            $backup = Backup-OfflineHiveFile -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+            $verified = Confirm-PolicyHiveBackup -BackupPath $backup -SourcePath $hiveFile
+            $windowsRoot = $offline.WindowsPath.TrimEnd('\') + '\'
+            $onVm = if ($verified.Path.StartsWith($windowsRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                " On the repaired VM it is %SystemRoot%\$($verified.Path.Substring($windowsRoot.Length))."
+            }
+            else { '' }
+            Log-Info "SOFTWARE hive backed up to $($verified.Path) and verified: $($verified.Length) bytes, SHA256 matches the hive.$onVm" | Tee-Object -FilePath $logFile -Append
+        }
+
+        if ($isTargeted) {
+            $fileNote = if ($filesToClear -gt 0) { "$filesToClear policy folder(s) are renamed aside" } else { 'no policy folder holds files, so none is renamed' }
+            $keyNote = if ($keysToClear -gt 0) { "only the key(s) that refuse a logon are removed: $(@($targetKeys) -join ', ')" } else { 'no registry key is blocking, so the registry is left untouched' }
+            Log-Info "Clearing local Group Policy, targeted: $fileNote, and $keyNote. The rest of SOFTWARE\Policies is left in place." | Tee-Object -FilePath $logFile -Append
+        }
+        elseif ($keysToClear -gt 0) {
+            Log-Warning 'Clearing local Group Policy. This is a blanket reset, not a targeted repair: every setting under SOFTWARE\Policies that holds a value goes, which on a real machine includes policy firewall rules, Remote Desktop settings, BITS and telemetry settings, not only the policy that is refusing the logon. A domain-joined VM re-applies all of it at the next policy refresh; a workgroup or MDM-managed VM does not, and the only way back is the hive backup taken above. Certificate and cryptography trust material is left alone. Scope "targeted" does the same repair without the collateral damage.' | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Info "Clearing local Group Policy files (scope '$scope'): $filesToClear policy folder(s) are renamed aside and the registry is not touched." | Tee-Object -FilePath $logFile -Append
+        }
+
+        $fileChanges = 0
+        if ($filesToClear -gt 0) {
+            $fileChanges = Clear-PolicyFile -PolicyFile $policyFile -Stamp $scriptStartTime
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        }
+
+        $registryChanges = 0
+        if ($keysToClear -gt 0) {
+            # Read inside the script block, which runs in a child scope, so this is set at script scope.
+            $script:KeyPathsToClear = @($targetKeys)
+            $registryChanges = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
+                return (Clear-PolicyRegistry -KeyPaths $script:KeyPathsToClear)
+            }
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+        }
+
+        # Verify against freshly read state rather than trusting the writes above.
+        $remainingFile = Get-PolicyFileState -WindowsPath $offline.WindowsPath
+        $script:KeyPathsToVerify = @($targetKeys)
+        $remainingRegistry = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
+            $state = Get-PolicyRegistryState
+            # Checked here because HKLM:\BROKENSOFTWARE only exists while the hive is mounted.
+            $stillThere = @($script:KeyPathsToVerify | Where-Object { Test-Path -LiteralPath "HKLM:\BROKENSOFTWARE\Policies\$_" })
+            return ($state | Add-Member -NotePropertyName TargetsStillPresent -NotePropertyValue $stillThere -PassThru)
+        }
+        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+        $stillPresent = @()
+        if ($filesToClear -gt 0 -and $remainingFile.HasContent) {
+            $stillPresent += "$(@($remainingFile.Folders).Count) policy folder(s)"
+        }
+        if ($clearRegistry -and $isTargeted) {
+            # Targeted mode leaves the rest of SOFTWARE\Policies standing on purpose, so the only
+            # question is whether the keys it aimed at are gone.
+            $notGone = @($remainingRegistry.TargetsStillPresent)
+            if ($notGone.Count -gt 0) {
+                $stillPresent += "$($notGone.Count) blocking key(s) ($($notGone -join ', '))"
+            }
+        }
+        elseif ($clearRegistry -and $remainingRegistry.HasContent) {
+            # A branch that only survives because the operating system protects a key inside it is an
+            # expected outcome, not a failure. Anything else genuinely did not clear.
+            $protectedKeys = @($script:ProtectedPolicyKeys)
+            $unexplained = @($remainingRegistry.Keys | Where-Object {
+                    $branch = "SOFTWARE\Policies\$_"
+                    -not @($protectedKeys | Where-Object { $_ -eq $branch -or $_ -like "$branch\*" })
+                })
+            if ($unexplained.Count -gt 0) {
+                $stillPresent += "$($unexplained.Count) SOFTWARE\Policies key(s) ($($unexplained -join ', '))"
+            }
+        }
+
+        $keyLabel = if ($isTargeted) { 'blocking' } else { 'SOFTWARE\Policies' }
+        $summary = "Renamed $fileChanges of $filesToClear policy folder(s) and removed $registryChanges of $keysToClear $keyLabel key(s)."
+
+        if ($stillPresent.Count -gt 0) {
+            Log-Error "$summary Still present: $($stillPresent -join ', ')." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break Main
+        }
+
+        Log-Output $summary | Tee-Object -FilePath $logFile -Append
+
+        if (@($script:PreservedPolicyKeys).Count -gt 0) {
+            Log-Info "Not cleared on purpose: $(@($script:PreservedPolicyKeys).Count) branch(es) holding trust material ($(@($script:PreservedPolicyKeys) -join ', ')). These carry the enterprise root and intermediate CAs, the store of certificates the organisation has distrusted, the EFS recovery agent certificate and the TLS cipher suite order. None of that can refuse a logon, and clearing it would weaken the machine rather than repair it." | Tee-Object -FilePath $logFile -Append
+        }
+
+        if (@($script:ProtectedPolicyKeys).Count -gt 0 -or @($script:RetainedParentKeys).Count -gt 0) {
+            $protected = @($script:ProtectedPolicyKeys)
+            $retained = @($script:RetainedParentKeys)
+            $detail = "Left in place: $($protected.Count + $retained.Count) empty key(s) that hold no policy."
+
+            if ($protected.Count -gt 0) {
+                $detail += " Windows refuses to delete $($protected.Count) of them ($($protected -join ', ')): they are owned by NT SERVICE\TrustedInstaller with a DACL that grants SYSTEM and Administrators everything except delete on the key itself. They ship with Windows, are not operator-authored policy, and hold nothing that can refuse a logon, so taking ownership to remove them would weaken a Windows protection for no benefit."
+            }
+            if ($retained.Count -gt 0) {
+                $detail += " The other $($retained.Count) ($($retained -join ', ')) are ordinary keys that remain only because they sit above one of those, and a key cannot be deleted while a child of it survives."
+            }
+
+            Log-Info $detail | Tee-Object -FilePath $logFile -Append
+        }
+        if ($fileChanges -gt 0) {
+            Log-Output "The renamed folders are still on the disk. Rename them back to undo this, using the commands recorded above." | Tee-Object -FilePath $logFile -Append
+        }
+        if ($registryChanges -gt 0) {
+            Log-Output "The removed keys are recoverable from the SOFTWARE hive backup taken above." | Tee-Object -FilePath $logFile -Append
+        }
+        Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($isTargeted) {
-        Log-Info "Clearing local Group Policy, targeted. The policy files are renamed aside and only the key(s) that refuse a logon are removed: $(if ($keysToClear -gt 0) { @($targetKeys) -join ', ' } else { 'none, so the registry is left untouched' }). The rest of SOFTWARE\Policies is left in place." | Tee-Object -FilePath $logFile -Append
-    }
-    else {
-        Log-Warning 'Clearing local Group Policy. This is a blanket reset, not a targeted repair: every setting under SOFTWARE\Policies that holds a value goes, which on a real machine includes policy firewall rules, Remote Desktop settings, BITS and telemetry settings, not only the policy that is refusing the logon. A domain-joined VM re-applies all of it at the next policy refresh; a workgroup or MDM-managed VM does not, and the only way back is the hive backup taken above. Certificate and cryptography trust material is left alone. Scope "targeted" does the same repair without the collateral damage.' | Tee-Object -FilePath $logFile -Append
-    }
-
-    # Back up the hive only when the registry side is actually going to be written.
-    if ($keysToClear -gt 0) {
-        $backup = Backup-OfflineHiveFile -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-        Log-Info "SOFTWARE hive backed up to $backup" | Tee-Object -FilePath $logFile -Append
-    }
-
-    $fileChanges = 0
-    if ($filesToClear -gt 0) {
-        $fileChanges = Clear-PolicyFile -PolicyFile $policyFile -Stamp $scriptStartTime
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-    }
-
-    $registryChanges = 0
-    if ($keysToClear -gt 0) {
-        # Read inside the script block, which runs in a child scope, so this is set at script scope.
-        $script:KeyPathsToClear = @($targetKeys)
-        $registryChanges = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-            return (Clear-PolicyRegistry -KeyPaths $script:KeyPathsToClear)
-        }
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-    }
-
-    # Verify against freshly read state rather than trusting the writes above.
-    $remainingFile = Get-PolicyFileState -WindowsPath $offline.WindowsPath
-    $script:KeyPathsToVerify = @($targetKeys)
-    $remainingRegistry = Invoke-WithHive -Hive 'SOFTWARE' -WindowsPath $offline.WindowsPath -ScriptBlock {
-        $state = Get-PolicyRegistryState
-        # Checked here because HKLM:\BROKENSOFTWARE only exists while the hive is mounted.
-        $stillThere = @($script:KeyPathsToVerify | Where-Object { Test-Path -LiteralPath "HKLM:\BROKENSOFTWARE\Policies\$_" })
-        return ($state | Add-Member -NotePropertyName TargetsStillPresent -NotePropertyValue $stillThere -PassThru)
-    }
-    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
-
-    $stillPresent = @()
-    if ($clearFiles -and $remainingFile.HasContent) {
-        $stillPresent += "$(@($remainingFile.Folders).Count) policy folder(s)"
-    }
-    if ($clearRegistry -and $isTargeted) {
-        # Targeted mode leaves the rest of SOFTWARE\Policies standing on purpose, so the only
-        # question is whether the keys it aimed at are gone.
-        $notGone = @($remainingRegistry.TargetsStillPresent)
-        if ($notGone.Count -gt 0) {
-            $stillPresent += "$($notGone.Count) blocking key(s) ($($notGone -join ', '))"
-        }
-    }
-    elseif ($clearRegistry -and $remainingRegistry.HasContent) {
-        # A branch that only survives because the operating system protects a key inside it is an
-        # expected outcome, not a failure. Anything else genuinely did not clear.
-        $protectedKeys = @($script:ProtectedPolicyKeys)
-        $unexplained = @($remainingRegistry.Keys | Where-Object {
-                $branch = "SOFTWARE\Policies\$_"
-                -not @($protectedKeys | Where-Object { $_ -eq $branch -or $_ -like "$branch\*" })
-            })
-        if ($unexplained.Count -gt 0) {
-            $stillPresent += "$($unexplained.Count) SOFTWARE\Policies key(s) ($($unexplained -join ', '))"
-        }
-    }
-
-    $keyLabel = if ($isTargeted) { 'blocking' } else { 'SOFTWARE\Policies' }
-    $summary = "Renamed $fileChanges of $filesToClear policy folder(s) and removed $registryChanges of $keysToClear $keyLabel key(s)."
-
-    if ($stillPresent.Count -gt 0) {
-        Log-Error "$summary Still present: $($stillPresent -join ', ')." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
-
-    Log-Output $summary | Tee-Object -FilePath $logFile -Append
-
-    if (@($script:PreservedPolicyKeys).Count -gt 0) {
-        Log-Info "Not cleared on purpose: $(@($script:PreservedPolicyKeys).Count) branch(es) holding trust material ($(@($script:PreservedPolicyKeys) -join ', ')). These carry the enterprise root and intermediate CAs, the store of certificates the organisation has distrusted, the EFS recovery agent certificate and the TLS cipher suite order. None of that can refuse a logon, and clearing it would weaken the machine rather than repair it." | Tee-Object -FilePath $logFile -Append
-    }
-
-    if (@($script:ProtectedPolicyKeys).Count -gt 0 -or @($script:RetainedParentKeys).Count -gt 0) {
-        $protected = @($script:ProtectedPolicyKeys)
-        $retained = @($script:RetainedParentKeys)
-        $detail = "Left in place: $($protected.Count + $retained.Count) empty key(s) that hold no policy."
-
-        if ($protected.Count -gt 0) {
-            $detail += " Windows refuses to delete $($protected.Count) of them ($($protected -join ', ')): they are owned by NT SERVICE\TrustedInstaller with a DACL that grants SYSTEM and Administrators everything except delete on the key itself. They ship with Windows, are not operator-authored policy, and hold nothing that can refuse a logon, so taking ownership to remove them would weaken a Windows protection for no benefit."
-        }
-        if ($retained.Count -gt 0) {
-            $detail += " The other $($retained.Count) ($($retained -join ', ')) are ordinary keys that remain only because they sit above one of those, and a key cannot be deleted while a child of it survives."
-        }
-
-        Log-Info $detail | Tee-Object -FilePath $logFile -Append
-    }
-    if ($fileChanges -gt 0) {
-        Log-Output "The renamed folders are still on the disk. Rename them back to undo this, using the commands recorded above." | Tee-Object -FilePath $logFile -Append
-    }
-    if ($registryChanges -gt 0) {
-        Log-Output "The removed keys are recoverable from the SOFTWARE hive backup taken above." | Tee-Object -FilePath $logFile -Append
-    }
-    Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+        $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
+    $status = $STATUS_ERROR
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
 }
+finally {
+    # A helper may have failed to load, or discovery may have failed partway, before these exist.
+    if (Get-Command Clear-OfflineDriveLetter -ErrorAction SilentlyContinue) {
+        try {
+            Clear-OfflineDriveLetter
+            if (@(Get-OfflineAssignedDriveLetter).Count -gt 0) {
+                $status = $STATUS_ERROR
+                Add-OfflineRepairLog -Level Error -Message "Temporary drive letter(s) could not be released: $(@(Get-OfflineAssignedDriveLetter) -join ', ')."
+            }
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Add-OfflineRepairLog -Level Error -Message "Releasing temporary drive letters failed: $($_.Exception.Message)"
+        }
+    }
+    if (Get-Command Write-OfflineRepairLog -ErrorAction SilentlyContinue) {
+        try {
+            Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append -ErrorAction Stop
+        }
+        catch {
+            $status = $STATUS_ERROR
+            Log-Error "Could not write the helper log: $($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
+        }
+    }
+}
+
+return $status
