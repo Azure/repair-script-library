@@ -77,7 +77,7 @@
 	{
 		"id" : "win-fix-ipsec-rdp-block",
 		"path" : "src/windows/win-fix-ipsec-rdp-block.ps1",
-		"description" : "Turns off an IPsec connection security rule that silently blocks Remote Desktop: the VM boots, reports Ready and listens for RDP, yet every connection times out because an active rule requires inbound IPsec on the RDP port, which a client with no matching IPsec policy cannot satisfy. Reads the local store in the offline SYSTEM hive (SharedAccess\\Parameters\\FirewallPolicy\\ConSecRules) and the Group Policy store in the offline SOFTWARE hive, reads the configured RDP port, and changes only a rule the disk shows applies to inbound TCP on that port, by setting Active=FALSE - the state Disable-NetIPsecRule leaves - so the rule is kept and can be re-enabled. Rules scoped by address or remote port, tunnel, malformed or ambiguous rules are reported for a decision, never changed, and local rules that Group Policy already ignores through AllowLocalIPsecPolicyMerge are left alone. A rule delivered by Group Policy returns at the next policy refresh unless the GPO is corrected. A healthy VM produces no findings and nothing is written. Pass detectOnly=true to report only. NOTE: use option --run-on-repair."
+		"description" : "Disables an IPsec connection security rule that makes RDP time out on a VM that boots and reports Ready, because it requires inbound IPsec on the RDP port. Only a local or Group Policy rule proven to cover inbound TCP on the configured RDP port is set to Active=FALSE (kept, can be re-enabled); scoped, tunnel or ambiguous rules are reported only. A Group Policy rule returns at the next refresh unless the GPO is fixed. detectOnly=true reports only. NOTE: use option --run-on-repair."
 	},
 	{
 		"id" : "win-fix-code-integrity",
