@@ -67,6 +67,13 @@
 #   The drive letter of the offline Windows volume, for example 'F:'. Leave it empty to find it
 #   automatically.
 #
+# .EXAMPLE
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-system-file --parameters "files=disk.sys,System32\drivers\ntfs.sys" --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-system-file --parameters files=disk.sys detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-system-file --parameters files=disk.sys allowDownload=false --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-system-file --parameters files=disk.sys windowsDrive=F --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-system-file --parameters revert=true --run-on-repair --verbose
+#
 # .NOTES
 #   Switch parameters are declared as ValidateSet strings on purpose. The extension turns
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
