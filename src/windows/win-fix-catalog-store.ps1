@@ -134,6 +134,17 @@
 #   Reference: "Driver Signing" and "Kernel-Mode Code Signing requirements"
 #   https://learn.microsoft.com/windows-hardware/drivers/install/driver-signing
 #
+# .EXAMPLE
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-catalog-store --parameters detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-catalog-store --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-catalog-store --parameters windowsDrive=F --run-on-repair --verbose
+#
+# .EXAMPLE
+#   # Only for a lost third-party boot-driver catalog: merge from a donor installation at the same
+#   # build and patch level, attached to the repair VM as G:.
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-catalog-store --parameters donorPath=G:\Windows --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-catalog-store --parameters donorPath=G:\Windows forceDonor=true --run-on-repair --verbose
+#
 #########################################################################################################
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
