@@ -61,6 +61,7 @@
 # .EXAMPLE
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-logon-subsystem --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-logon-subsystem --parameters detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-logon-subsystem --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
