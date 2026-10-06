@@ -152,7 +152,7 @@
 	{
 		"id": "win-fix-network-connectivity",
 		"path": "src/windows/win-fix-network-connectivity.ps1",
-		"description": "Restores network connectivity on a VM that boots but is unreachable - disabled networking services, a static address Azure did not allocate, an orphaned network provider that hangs logon, or an unreachable machine proxy. A machine-wide proxy and a statically configured DNS server are reported but not changed unless clearProxy=true or clearStaticDns=true is passed. Pass detectOnly=true to report only, or revert=true to undo a previous run. NOTE: use option --run-on-repair."
+		"description": "Re-enables disabled networking services, returns every interface with DHCP turned off to DHCP, and removes orphaned third-party network providers. Static DNS and the machine-wide proxy are only cleared with clearStaticDns=true or clearProxy=true. Run detectOnly=true first; revert=true undoes a previous run. NOTE: use option --run-on-repair."
 	},
 	{
 		"id": "win-fix-transaction-logs",
