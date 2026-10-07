@@ -38,6 +38,7 @@ Assert-Match 'GEN2_CONVERSION_APPLICABLE' 'Report success must have a stable sig
 Assert-Match 'GEN2_CONVERSION_COMPLETED' 'Conversion success must have a stable signature.'
 Assert-Match 'CONVERSION_VERIFICATION_FAILED' 'Post-conversion failures must have a stable signature.'
 Assert-Match 'Test-ConvertedBootLayout' 'Conversion must verify GPT, ESP, and EFI BCD.'
+Assert-Match 'bcdedit\.exe[\s\S]+/store \$BcdPath /enum all' 'EFI verification must enumerate the explicit BCD store.'
 Assert-Match 'assign letter=\$DriveLetter' 'EFI verification must assign its temporary drive letter with diskpart.'
 Assert-Match 'remove letter=\$DriveLetter' 'EFI cleanup must remove the same temporary drive letter with diskpart.'
 Assert-Match 'Wait-DriveRootReady' 'EFI verification must wait for the temporary drive root to become available.'
@@ -125,6 +126,20 @@ function Get-FunctionSource {
     function Get-DosDeviceTarget { return '' }
     if (Test-DriveLetterInUse -DriveLetter Z) {
         throw 'ASSERTION FAILED: an unused drive letter was treated as assigned.'
+    }
+}
+
+& {
+    Invoke-Expression (Get-FunctionSource -Name 'Assert-EfiBcdStoreReadable')
+
+    function Test-Path { return $true }
+    function Invoke-BcdStoreEnumeration { return 1 }
+    try {
+        Assert-EfiBcdStoreReadable -BcdPath 'Z:\EFI\Microsoft\Boot\BCD'
+        throw 'ASSERTION FAILED: an unreadable BCD store was accepted.'
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'could not be enumerated') { throw }
     }
 }
 

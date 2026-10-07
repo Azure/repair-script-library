@@ -184,6 +184,29 @@ function Test-DriveLetterInUse {
     return $false
 }
 
+function Invoke-BcdStoreEnumeration {
+    Param([Parameter(Mandatory = $true)][string]$BcdPath)
+
+    $bcdEditPath = Join-Path $env:SystemRoot 'System32\bcdedit.exe'
+    if (-not (Test-Path -LiteralPath $bcdEditPath -PathType Leaf)) {
+        throw "bcdedit.exe was not found at '$bcdEditPath'."
+    }
+
+    $null = & $bcdEditPath /store $BcdPath /enum all 2>&1
+    return $LASTEXITCODE
+}
+
+function Assert-EfiBcdStoreReadable {
+    Param([Parameter(Mandatory = $true)][string]$BcdPath)
+
+    if (-not (Test-Path -LiteralPath $BcdPath -PathType Leaf)) {
+        throw "The EFI BCD store was not found at '$BcdPath'."
+    }
+    if ((Invoke-BcdStoreEnumeration -BcdPath $BcdPath) -ne 0) {
+        throw "The EFI BCD store at '$BcdPath' could not be enumerated by bcdedit.exe."
+    }
+}
+
 function Test-ConvertedBootLayout {
     Param([Parameter(Mandatory = $true)][int]$DiskNumber)
 
@@ -212,9 +235,7 @@ function Test-ConvertedBootLayout {
         $assignmentAttempted = $true
         Add-EfiDriveLetter -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -DriveLetter $driveLetter
         $bcdPath = Join-Path $mountRoot 'EFI\Microsoft\Boot\BCD'
-        if (-not (Test-Path -LiteralPath $bcdPath -PathType Leaf)) {
-            throw "The EFI BCD store was not found at '$bcdPath'."
-        }
+        Assert-EfiBcdStoreReadable -BcdPath $bcdPath
     }
     finally {
         if ($assignmentAttempted) {
