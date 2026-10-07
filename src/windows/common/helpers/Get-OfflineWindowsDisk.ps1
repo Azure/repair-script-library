@@ -972,9 +972,11 @@ function Get-OfflineWindowsDisk {
             elseif ($_.Number -eq $systemDiskNumber) { "it is the rescue VM's own system disk" }
             elseif ($_.IsBoot -or $_.IsSystem) { 'it is a boot or system disk' }
             elseif ($DiskNumber -ge 0 -and $_.Number -ne $DiskNumber) { "-DiskNumber $DiskNumber was requested" }
+            # Before the online check: Set-OfflineDisksOnline deliberately leaves the resource disk
+            # alone, so testing online first would misreport it as "not confirmed online".
+            elseif (Test-TemporaryStorageDisk -Disk $_) { 'it is the Azure resource disk' }
             elseif ($_.Number -notin $onlineDiskNumbers) { 'it was not confirmed online and writable' }
             elseif ($_.IsOffline -or $_.IsReadOnly) { "it is offline or read-only (IsOffline=$($_.IsOffline), IsReadOnly=$($_.IsReadOnly))" }
-            elseif (Test-TemporaryStorageDisk -Disk $_) { 'it is the Azure resource disk' }
             if ($reason) { [void]$exclusions.Add("disk $($_.Number): $reason") }
             -not $reason
         })
