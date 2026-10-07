@@ -53,6 +53,9 @@
 #    11. Gen2 only: the EFI System Partition sits in a different GPT slot than the saved entry
 #        names. Windows rewrites the GPT entry array sorted by start LBA, so a partition recreated
 #        elsewhere on the disk, or a deleted and recreated neighbour, moves it to another slot.
+#        Causes 10 and 11 only matter once the VM has a saved "Windows Boot Manager" Boot####
+#        entry, for example after bcdboot ran inside the guest. A freshly deployed marketplace VM
+#        has none and boots through \EFI\Boot\bootx64.efi on whichever ESP the firmware finds.
 #
 #   Reported but never repaired here:
 #     - BPB TotalSectors is larger than the partition that contains it. The filesystem believes it
@@ -218,6 +221,10 @@ $script:Crc32Table = $null
 # only be put next to the other ones (and into the revert manifest) once it can.
 $script:SignatureRepair = $null
 $script:SignatureBackupPath = ''
+
+# The ESP's BCD store as it was before {bootmgr} was repointed, so revert can put it back along with
+# the GPT that gives the ESP its old GUID again.
+$script:BcdBackupPath = ''
 
 function New-Finding {
     <#
@@ -2242,6 +2249,18 @@ function Set-EspBootmgrDevice {
         return $false
     }
 
+    if (-not $script:BcdBackupPath -and $Offline.WindowsDrive) {
+        $bcdBackup = Join-OfflinePath -Root $Offline.WindowsDrive -ChildPath "$scriptName-backup-$scriptStartTime-BCD.bak"
+        try {
+            Copy-Item -LiteralPath $store -Destination $bcdBackup -Force -ErrorAction Stop
+            $script:BcdBackupPath = $bcdBackup
+            Add-OfflineRepairLog -Level Info -Message "Backed up $store to $bcdBackup before changing it."
+        }
+        catch {
+            Add-OfflineRepairLog -Level Warning -Message "Could not back up $store to ${bcdBackup}: $($_.Exception.Message). The store is still updated, but revert=true will not put it back."
+        }
+    }
+
     $ok = $true
     foreach ($id in @('{bootmgr}', '{memdiag}')) {
         $null = & bcdedit.exe /store $store /enum $id 2>&1
@@ -2836,6 +2855,7 @@ function Save-RevertManifest {
         GptBackupPath    = $Backup.GptBackupPath
         GptBackupOffset  = [string]$Backup.GptBackupOffset
         SignatureBackupPath = $script:SignatureBackupPath
+        BcdBackupPath    = $script:BcdBackupPath
         CreatedPartition = $CreatedPartition
     }
 
@@ -2894,7 +2914,8 @@ function Invoke-Revert {
 
     # The backups sit next to the manifest, but the recorded paths carry the drive letter of the run
     # that wrote them, and that letter is not stable between runs, so they are rebased onto this one.
-    foreach ($field in @('MbrBackupPath', 'VbrBackupPath', 'GptPrimaryPath', 'GptBackupPath', 'SignatureBackupPath')) {
+    foreach ($field in @('MbrBackupPath', 'VbrBackupPath', 'GptPrimaryPath', 'GptBackupPath', 'SignatureBackupPath', 'BcdBackupPath')) {
+        if (-not ($manifest.PSObject.Properties.Name -contains $field)) { continue }
         $recorded = "$($manifest.$field)"
         if (-not $recorded) { continue }
         $rebased = Join-OfflinePath -Root $Offline.WindowsDrive -ChildPath (Split-Path -Path $recorded -Leaf)
@@ -2950,6 +2971,15 @@ function Invoke-Revert {
         return $false
     }
 
+    # The pre-repair BCD names the ESP by its old GUID, so it only matches once both GPT copies are
+    # back. Read now for the same reason as the sector images.
+    $bcdBytes = $null
+    $bcdBackupPath = "$($manifest.BcdBackupPath)"
+    if ($bcdBackupPath -and (Test-OfflinePath $bcdBackupPath)) {
+        if ($gptRestore) { $bcdBytes = [System.IO.File]::ReadAllBytes($bcdBackupPath) }
+        else { Add-OfflineRepairLog -Level Warning -Message "$bcdBackupPath is not put back because no GPT backup is restored with it, and that store names the EFI System Partition by a GUID it would no longer have." }
+    }
+
     if ($manifest.CreatedPartition -gt 0) {
         if ($manifest.Generation -eq 2 -and $gptRestore) {
             Add-OfflineRepairLog -Level Warning -Message "This script created EFI System Partition $($manifest.CreatedPartition). Writing both GPT copies back restores the partition table as it was, which removes that partition's entry and returns the disk to its earlier unbootable state."
@@ -2980,6 +3010,33 @@ function Invoke-Revert {
     }
     finally {
         [void](Set-DiskOnlineState -DiskNumber $manifest.DiskNumber -Online $true)
+    }
+
+    if ($reverted -and $bcdBytes) {
+        $esp = @(Get-Partition -DiskNumber $manifest.DiskNumber -ErrorAction SilentlyContinue |
+                Where-Object { "$($_.GptType)" -eq $script:EspGptType }) | Select-Object -First 1
+        if (-not $esp) {
+            Add-OfflineRepairLog -Level Info -Message "The restored partition table has no EFI System Partition, so $bcdBackupPath was not put back."
+        }
+        else {
+            $letter = "$($esp.DriveLetter)"
+            if ([string]::IsNullOrWhiteSpace($letter) -or $letter -eq "`0") {
+                $letter = Add-PartitionDriveLetter -DiskNumber $manifest.DiskNumber -PartitionNumber $esp.PartitionNumber
+            }
+            $store = if ("$letter".Trim()) { Join-OfflinePath -Root "$("$letter".TrimEnd(':', '\')):" -ChildPath 'EFI\Microsoft\Boot\BCD' } else { '' }
+            if (-not $store) {
+                Add-OfflineRepairLog -Level Warning -Message "EFI System Partition $($esp.PartitionNumber) could not be given a drive letter, so $bcdBackupPath was not put back."
+            }
+            else {
+                try {
+                    [System.IO.File]::WriteAllBytes($store, $bcdBytes)
+                    Add-OfflineRepairLog -Level Info -Message "Restored $store from $bcdBackupPath."
+                }
+                catch {
+                    Add-OfflineRepairLog -Level Warning -Message "Could not restore $store from ${bcdBackupPath}: $($_.Exception.Message)"
+                }
+            }
+        }
     }
 
     return $reverted
