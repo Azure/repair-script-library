@@ -242,7 +242,7 @@ try {
             }
 
             $firmwareType = [string](Get-ComputerInfo -Property BiosFirmwareType -ErrorAction SilentlyContinue).BiosFirmwareType
-            if ($firmwareType -eq 'Legacy') {
+            if ($firmwareType -eq 'Bios') {
                 Write-ConversionResult -Signature 'NO_CHANGE_NEEDED' -Message "OS disk $($disk.Number) is already GPT with a verified EFI boot layout while the VM is using legacy BIOS firmware. Do not reboot. Deallocate the VM and update it to Trusted Launch."
             }
             else {

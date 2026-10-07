@@ -44,6 +44,7 @@ Assert-Match 'Wait-DriveRootReady' 'EFI verification must wait for the temporary
 Assert-Match 'Get-DosDeviceTarget' 'Temporary drive-letter selection must inspect hidden DOS-device mappings.'
 Assert-Match 'Test-DriveLetterInUse' 'EFI verification must reject every existing drive-letter mapping.'
 Assert-Match "if \(\`$disk\.PartitionStyle -eq 'GPT'\)[\s\S]+Test-ConvertedBootLayout[\s\S]+NO_CHANGE_NEEDED" 'An already-GPT disk must pass ESP and BCD verification before success.'
+Assert-Match "\`$firmwareType -eq 'Bios'" 'Legacy BIOS firmware must use the FirmwareType.Bios enum name.'
 Assert-Match 'Write-CurrentConversionResult' 'Stored refusal results must have an explicit emission path.'
 Assert-Match 'return \$status\s*$' 'The repair-library status token must be the final output.'
 Assert-NotMatch 'SupportsShouldProcess|ShouldProcess|\[switch\]\$BackupConfirmed|\[switch\]\$TrustedLaunchPrerequisitesConfirmed' 'Run Command must not depend on interactive or switch parameter binding.'
@@ -51,6 +52,7 @@ Assert-NotMatch 'Restart-Computer|Stop-Computer|shutdown\.exe|az vm update|Updat
 Assert-NotMatch 'Remove-PartitionAccessPath[^\r\n]+-PartitionNumber[^\r\n]+-DriveLetter' 'EFI cleanup must not combine incompatible parameter sets.'
 Assert-NotMatch 'Set-Partition[^\r\n]+-NewDriveLetter' 'Set-Partition cannot assign drive letters to EFI system partitions.'
 Assert-NotMatch 'Remove-PartitionAccessPath[^\r\n]+SilentlyContinue' 'EFI cleanup failures must not be suppressed.'
+Assert-NotMatch "\`$firmwareType -eq 'Legacy'" 'Legacy is not a valid FirmwareType enum name.'
 
 function Get-FunctionSource {
     Param([Parameter(Mandatory = $true)][string]$Name)
