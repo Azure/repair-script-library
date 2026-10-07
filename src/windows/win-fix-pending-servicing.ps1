@@ -85,6 +85,12 @@
 #   revert, marked RegistryNotReverted. A manifest that is malformed, written by another script, or
 #   points outside its own backup folders is refused and left in place.
 #
+#   What detectOnly reports after a revert depends on what the repair had moved. If it renamed
+#   pending.xml, the revert puts the file back and detectOnly reports the transaction again. If it
+#   only cleared registry markers and TxR logs, the TxR logs come back but the markers do not, so
+#   detectOnly reports nothing to fix and a normal run leaves the restored TxR logs alone. That is
+#   expected. It is not a sign that the revert failed.
+#
 # .PARAMETER windowsDrive
 #   Drive letter of the offline Windows installation, for example "F". Only needed when more than
 #   one Windows installation is attached and the automatically selected one is not the right one.
@@ -1002,6 +1008,7 @@ try {
             }
 
             $restored = 0
+            $pendingXmlRestored = $false
 
             # Each step removes what it restored from the manifest and checkpoints it, so a revert that
             # stops part-way can simply be run again and continues where it stopped.
@@ -1094,6 +1101,7 @@ try {
                 }
                 Log-Info "Renamed $pendingBackup back to pending.xml." | Tee-Object -FilePath $logFile -Append
                 $restored++
+                $pendingXmlRestored = $true
                 $manifest.PendingXmlRenamedTo = $null
                 Save-RevertManifest -Path $manifestPath -Manifest $manifest
                 Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
@@ -1107,7 +1115,13 @@ try {
 
             Log-Output "Restored $restored item(s). The manifest at $manifestPath was kept and lists the registry hive backups." | Tee-Object -FilePath $logFile -Append
             Log-Output "This revert is partial. The servicing registry markers this script cleared are deliberately not restored, because putting them back recreates the 'Undoing changes' boot loop, and the DISM /RevertPendingActions step cannot be undone. Restore a listed hive backup manually only if the original registry state is genuinely needed." | Tee-Object -FilePath $logFile -Append
-            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+                        if ($pendingXmlRestored) {
+                            Log-Output "pending.xml is back, so a detectOnly run will report the unfinished servicing transaction again." | Tee-Object -FilePath $logFile -Append
+                        }
+                        else {
+                            Log-Output "pending.xml was not part of this revert, so a detectOnly run will report nothing to fix: the restored TxR logs are acted on only when a servicing marker is present, and the markers stay cleared." | Tee-Object -FilePath $logFile -Append
+                        }
+                        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
             $status = $STATUS_SUCCESS
             break Main
         }
