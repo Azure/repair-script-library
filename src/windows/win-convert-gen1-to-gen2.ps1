@@ -158,6 +158,32 @@ exit
     }
 }
 
+function Get-DosDeviceTarget {
+    Param([Parameter(Mandatory = $true)][ValidatePattern('^[A-Z]:$')][string]$Name)
+
+    if (-not ('VmRepairGen1ToGen2.NativeDosDevice' -as [type])) {
+        Add-Type -Namespace VmRepairGen1ToGen2 -Name NativeDosDevice -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern uint QueryDosDeviceW(string lpDeviceName, System.Text.StringBuilder lpTargetPath, int ucchMax);
+'@ -ErrorAction Stop
+    }
+
+    $buffer = New-Object System.Text.StringBuilder 1024
+    $length = [VmRepairGen1ToGen2.NativeDosDevice]::QueryDosDeviceW($Name, $buffer, $buffer.Capacity)
+    if ($length -eq 0) { return '' }
+    return $buffer.ToString()
+}
+
+function Test-DriveLetterInUse {
+    Param([Parameter(Mandatory = $true)][ValidatePattern('^[A-Z]$')][string]$DriveLetter)
+
+    if (-not [string]::IsNullOrWhiteSpace((Get-DosDeviceTarget -Name "$DriveLetter`:"))) { return $true }
+    if (Test-Path -LiteralPath "$DriveLetter`:\") { return $true }
+    if (Get-PSDrive -Name $DriveLetter -PSProvider FileSystem -ErrorAction SilentlyContinue) { return $true }
+    if (Get-Partition -DriveLetter $DriveLetter -ErrorAction SilentlyContinue) { return $true }
+    return $false
+}
+
 function Test-ConvertedBootLayout {
     Param([Parameter(Mandatory = $true)][int]$DiskNumber)
 
@@ -175,8 +201,7 @@ function Test-ConvertedBootLayout {
         throw "Expected exactly one EFI system partition on disk $DiskNumber; found $($esp.Count)."
     }
 
-    $usedDriveLetters = @(Get-Volume | Where-Object DriveLetter | ForEach-Object { [string]$_.DriveLetter })
-    $driveLetter = @('Z', 'Y', 'X', 'W', 'V') | Where-Object { $_ -notin $usedDriveLetters } | Select-Object -First 1
+    $driveLetter = @('Z', 'Y', 'X', 'W', 'V') | Where-Object { -not (Test-DriveLetterInUse -DriveLetter $_) } | Select-Object -First 1
     if (-not $driveLetter) {
         throw 'No temporary drive letter is available to verify the EFI BCD store.'
     }

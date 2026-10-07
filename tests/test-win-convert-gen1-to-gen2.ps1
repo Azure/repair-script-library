@@ -41,6 +41,8 @@ Assert-Match 'Test-ConvertedBootLayout' 'Conversion must verify GPT, ESP, and EF
 Assert-Match 'assign letter=\$DriveLetter' 'EFI verification must assign its temporary drive letter with diskpart.'
 Assert-Match 'remove letter=\$DriveLetter' 'EFI cleanup must remove the same temporary drive letter with diskpart.'
 Assert-Match 'Wait-DriveRootReady' 'EFI verification must wait for the temporary drive root to become available.'
+Assert-Match 'Get-DosDeviceTarget' 'Temporary drive-letter selection must inspect hidden DOS-device mappings.'
+Assert-Match 'Test-DriveLetterInUse' 'EFI verification must reject every existing drive-letter mapping.'
 Assert-Match "if \(\`$disk\.PartitionStyle -eq 'GPT'\)[\s\S]+Test-ConvertedBootLayout[\s\S]+NO_CHANGE_NEEDED" 'An already-GPT disk must pass ESP and BCD verification before success.'
 Assert-Match 'Write-CurrentConversionResult' 'Stored refusal results must have an explicit emission path.'
 Assert-Match 'return \$status\s*$' 'The repair-library status token must be the final output.'
@@ -108,6 +110,23 @@ function Get-FunctionSource {
 }
 
 & {
+    Invoke-Expression (Get-FunctionSource -Name 'Test-DriveLetterInUse')
+
+    function Get-DosDeviceTarget { return '\Device\HarddiskVolume99' }
+    function Test-Path { return $false }
+    function Get-PSDrive { return $null }
+    function Get-Partition { return $null }
+    if (-not (Test-DriveLetterInUse -DriveLetter Z)) {
+        throw 'ASSERTION FAILED: a hidden DOS-device drive-letter assignment was treated as available.'
+    }
+
+    function Get-DosDeviceTarget { return '' }
+    if (Test-DriveLetterInUse -DriveLetter Z) {
+        throw 'ASSERTION FAILED: an unused drive letter was treated as assigned.'
+    }
+}
+
+& {
     Invoke-Expression (Get-FunctionSource -Name 'Write-CurrentConversionResult')
     Invoke-Expression (Get-FunctionSource -Name 'Invoke-Mbr2Gpt')
 
@@ -117,13 +136,15 @@ function Get-FunctionSource {
     function Log-Output { Param([string]$Message) $script:emittedOutput += $Message }
 
     $originalSystemRoot = $env:SystemRoot
+    $temporaryRoot = [System.IO.Path]::GetTempPath()
     try {
-        $env:SystemRoot = Join-Path $env:TEMP 'missing-system-root'
+        $env:SystemRoot = Join-Path $temporaryRoot 'missing-system-root'
         try {
-            $null = Invoke-Mbr2Gpt -Operation validate -DiskNumber 0 -Logs $env:TEMP
+            $null = Invoke-Mbr2Gpt -Operation validate -DiskNumber 0 -Logs $temporaryRoot
             throw 'ASSERTION FAILED: missing MBR2GPT.exe did not terminate execution.'
         }
         catch {
+            if ($_.Exception.Message -ne 'MBR2GPT.exe is unavailable.') { throw }
             if (-not $script:resultEmitted) { Write-CurrentConversionResult }
         }
     }
