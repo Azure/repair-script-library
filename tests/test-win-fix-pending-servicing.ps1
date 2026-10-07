@@ -45,7 +45,7 @@ $scriptText = $ast.Extent.Text
 $manifestFunction = @(
     'Get-RevertManifestPath', 'Read-RevertManifest', 'Test-RevertPathReparsePoint', 'Get-PathBelowRoot',
     'Get-TxRBackupBase', 'Resolve-PendingXmlBackupPath', 'Resolve-TxRBackupFolder',
-    'ConvertTo-ValidatedRevertManifest', 'New-RevertManifest', 'Test-RevertManifestHasUndo', 'Save-RevertManifest'
+    'ConvertTo-ValidatedRevertManifest', 'Get-EmptyRevertManifest', 'Test-RevertManifestHasUndo', 'Save-RevertManifest'
 )
 $definitions = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 foreach ($name in $manifestFunction) {
@@ -119,7 +119,7 @@ try {
     Assert-Equal 3 $valid.Services[0].OriginalStart 'A valid start type must be kept.'
     Assert-Equal 'SOFTWARE.bak-20260101120000' $valid.HiveBackups[0].Path 'A hive backup must be kept as a leaf.'
     Assert-True (Test-RevertManifestHasUndo -Manifest $valid) 'A manifest with backups has something to undo.'
-    Assert-True (-not (Test-RevertManifestHasUndo -Manifest (New-RevertManifest))) 'An empty manifest has nothing to undo.'
+    Assert-True (-not (Test-RevertManifestHasUndo -Manifest (Get-EmptyRevertManifest))) 'An empty manifest has nothing to undo.'
 
     # Rooted paths written while the disk was attached under another letter still resolve here.
     $rooted = Copy-Manifest (New-ValidManifest) @{

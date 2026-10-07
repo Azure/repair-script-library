@@ -879,7 +879,7 @@ function ConvertTo-ValidatedRevertManifest {
     }
 }
 
-function New-RevertManifest {
+function Get-EmptyRevertManifest {
     <#
     .SYNOPSIS
         An empty, normalised manifest for this run.
@@ -1261,7 +1261,7 @@ try {
             Log-Info "Carrying forward the revert manifest of an earlier run at $manifestPath." | Tee-Object -FilePath $logFile -Append
         }
         else {
-            $manifest = New-RevertManifest
+            $manifest = Get-EmptyRevertManifest
         }
         $changes = 0
         $txrRemoved = 0
@@ -1629,6 +1629,7 @@ try {
         }
         else {
             Log-Output 'No servicing pending markers remain on this disk.' | Tee-Object -FilePath $logFile -Append
+            Log-Output 'The first boot may take longer than usual and restart once while Windows finishes servicing. Let it complete before judging the repair.' | Tee-Object -FilePath $logFile -Append
         }
 
         if (@($manifest.Services).Count -gt 0) {
