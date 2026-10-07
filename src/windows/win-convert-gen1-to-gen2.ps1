@@ -23,12 +23,18 @@ Param(
 . .\src\windows\common\setup\init.ps1
 
 $status = $STATUS_ERROR
+$resultEmitted = $false
 $result = [ordered]@{
     mode       = $Mode
     signature  = 'UNSUPPORTED_CONFIGURATION'
     diskNumber = $null
     logPath    = $null
     message    = ''
+}
+
+function Write-CurrentConversionResult {
+    Log-Output "[GEN1-GEN2-RESULT] $($result | ConvertTo-Json -Compress)"
+    $script:resultEmitted = $true
 }
 
 function Write-ConversionResult {
@@ -39,7 +45,7 @@ function Write-ConversionResult {
 
     $result.signature = $Signature
     $result.message = $Message
-    Log-Output "[GEN1-GEN2-RESULT] $($result | ConvertTo-Json -Compress)"
+    Write-CurrentConversionResult
 }
 
 function Test-Administrator {
@@ -79,7 +85,8 @@ function Invoke-Mbr2Gpt {
 
     $mbr2gptPath = Join-Path $env:SystemRoot 'System32\MBR2GPT.exe'
     if (-not (Test-Path -LiteralPath $mbr2gptPath -PathType Leaf)) {
-        Write-ConversionResult -Signature 'MBR2GPT_UNAVAILABLE' -Message "MBR2GPT.exe was not found at '$mbr2gptPath'."
+        $result.signature = 'MBR2GPT_UNAVAILABLE'
+        $result.message = "MBR2GPT.exe was not found at '$mbr2gptPath'."
         throw 'MBR2GPT.exe is unavailable.'
     }
 
@@ -88,6 +95,67 @@ function Invoke-Mbr2Gpt {
     $exitCode = $LASTEXITCODE
     $output | Set-Content -LiteralPath (Join-Path $Logs "mbr2gpt-$Operation.console.log") -Encoding Utf8
     return [PSCustomObject]@{ ExitCode = $exitCode; Output = @($output) }
+}
+
+function Wait-DriveRootReady {
+    Param(
+        [Parameter(Mandatory = $true)][ValidatePattern('^[A-Z]$')][string]$DriveLetter,
+        [Parameter(Mandatory = $false)][ValidateSet('Present', 'Absent')][string]$State = 'Present',
+        [Parameter(Mandatory = $false)][int]$TimeoutSeconds = 10
+    )
+
+    $mountRoot = "$DriveLetter`:\"
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $exists = Test-Path -LiteralPath $mountRoot
+        if (($State -eq 'Present' -and $exists) -or ($State -eq 'Absent' -and -not $exists)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    $exists = Test-Path -LiteralPath $mountRoot
+    return ($State -eq 'Present' -and $exists) -or ($State -eq 'Absent' -and -not $exists)
+}
+
+function Add-EfiDriveLetter {
+    Param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[A-Z]$')][string]$DriveLetter
+    )
+
+    $diskpartScript = @"
+select disk $DiskNumber
+select partition $PartitionNumber
+assign letter=$DriveLetter
+exit
+"@
+    $output = $diskpartScript | diskpart.exe 2>&1
+    $exitCode = $LASTEXITCODE
+    if (-not (Wait-DriveRootReady -DriveLetter $DriveLetter)) {
+        throw "Could not mount the EFI system partition at $DriveLetter`: (diskpart exit $exitCode): $(($output | Out-String).Trim())"
+    }
+}
+
+function Remove-EfiDriveLetter {
+    Param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][int]$PartitionNumber,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[A-Z]$')][string]$DriveLetter
+    )
+
+    $diskpartScript = @"
+select disk $DiskNumber
+select partition $PartitionNumber
+remove letter=$DriveLetter
+exit
+"@
+    $output = $diskpartScript | diskpart.exe 2>&1
+    $exitCode = $LASTEXITCODE
+    if (-not (Wait-DriveRootReady -DriveLetter $DriveLetter -State Absent)) {
+        throw "Could not remove temporary EFI drive letter $DriveLetter`: (diskpart exit $exitCode): $(($output | Out-String).Trim())"
+    }
 }
 
 function Test-ConvertedBootLayout {
@@ -114,15 +182,19 @@ function Test-ConvertedBootLayout {
     }
 
     $mountRoot = "$driveLetter`:\"
+    $assignmentAttempted = $false
     try {
-        Set-Partition -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -NewDriveLetter $driveLetter -ErrorAction Stop
+        $assignmentAttempted = $true
+        Add-EfiDriveLetter -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -DriveLetter $driveLetter
         $bcdPath = Join-Path $mountRoot 'EFI\Microsoft\Boot\BCD'
         if (-not (Test-Path -LiteralPath $bcdPath -PathType Leaf)) {
             throw "The EFI BCD store was not found at '$bcdPath'."
         }
     }
     finally {
-        Remove-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -AccessPath $mountRoot -ErrorAction SilentlyContinue
+        if ($assignmentAttempted) {
+            Remove-EfiDriveLetter -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -DriveLetter $driveLetter
+        }
     }
 }
 
@@ -136,7 +208,21 @@ try {
         $result.diskNumber = $disk.Number
 
         if ($disk.PartitionStyle -eq 'GPT') {
-            Write-ConversionResult -Signature 'NO_CHANGE_NEEDED' -Message "OS disk $($disk.Number) is already GPT. No conversion was attempted."
+            try {
+                Test-ConvertedBootLayout -DiskNumber $disk.Number
+            }
+            catch {
+                Write-ConversionResult -Signature 'CONVERSION_VERIFICATION_FAILED' -Message "OS disk $($disk.Number) is already GPT, but ESP/BCD verification failed: $($_.Exception.Message) Do not reboot or change the VM security type. Preserve the full VM backup and recover from it if required."
+                break workflow
+            }
+
+            $firmwareType = [string](Get-ComputerInfo -Property BiosFirmwareType -ErrorAction SilentlyContinue).BiosFirmwareType
+            if ($firmwareType -eq 'Legacy') {
+                Write-ConversionResult -Signature 'NO_CHANGE_NEEDED' -Message "OS disk $($disk.Number) is already GPT with a verified EFI boot layout while the VM is using legacy BIOS firmware. Do not reboot. Deallocate the VM and update it to Trusted Launch."
+            }
+            else {
+                Write-ConversionResult -Signature 'NO_CHANGE_NEEDED' -Message "OS disk $($disk.Number) is already GPT with one EFI system partition and an EFI BCD store. No conversion was attempted."
+            }
             $status = $STATUS_SUCCESS
             break workflow
         }
@@ -198,6 +284,9 @@ try {
 catch {
     if ([string]::IsNullOrWhiteSpace($result.message)) {
         Write-ConversionResult -Signature 'UNSUPPORTED_CONFIGURATION' -Message $_.Exception.Message
+    }
+    elseif (-not $resultEmitted) {
+        Write-CurrentConversionResult
     }
     Log-Error $_.Exception.Message
 }
