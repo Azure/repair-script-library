@@ -374,26 +374,46 @@ function Test-TemporaryStorageDisk {
         'Temporary Storage' label or the language-independent DATALOSS_WARNING_README.txt
         at a volume root. Inspect existing access paths only; this check never mounts a disk.
 
+        The marker alone is not proof. On a rescue VM size without a resource disk, the
+        attached broken OS disk comes online during provisioning, one of its partitions
+        (typically System Reserved) receives D:, and provisioning writes the warning file
+        there. A resource disk never holds a Windows installation or Windows boot files, so
+        a disk that has either is never classified as the resource disk, whatever markers
+        it also carries.
+
     .OUTPUTS
-        $true when any volume on the disk has either resource-disk marker.
+        $true when a volume on the disk has a resource-disk marker and no volume on it holds
+        a Windows installation or Windows boot files.
     #>
     param(
         [Parameter(Mandatory = $true)]$Disk
     )
 
+    $marker = ''
+    $windowsEvidence = ''
     try {
         foreach ($partition in @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue)) {
             $volumes = @($partition | Get-Volume -ErrorAction SilentlyContinue)
             $labels = @($volumes | ForEach-Object { $_.FileSystemLabel })
-            if ($labels -contains 'Temporary Storage') { return $true }
+            if (-not $marker -and $labels -contains 'Temporary Storage') {
+                $marker = "volume label 'Temporary Storage' on partition $($partition.PartitionNumber)"
+            }
 
             $roots = @($partition.AccessPaths) + @($volumes | ForEach-Object {
                     $_.Path
                     if ($_.DriveLetter) { "$($_.DriveLetter):\" }
                 })
             foreach ($root in @($roots | Where-Object { $_ } | Select-Object -Unique)) {
-                $marker = Join-OfflinePath -Root $root -ChildPath 'DATALOSS_WARNING_README.txt'
-                if ($marker -and (Test-OfflinePath $marker)) { return $true }
+                if (-not $marker) {
+                    $markerFile = Join-OfflinePath -Root $root -ChildPath 'DATALOSS_WARNING_README.txt'
+                    if ($markerFile -and (Test-OfflinePath $markerFile)) { $marker = $markerFile }
+                }
+                if (-not $windowsEvidence) {
+                    foreach ($child in @('Windows\System32\config\SYSTEM', 'bootmgr', 'Boot\BCD', 'EFI\Microsoft\Boot\BCD')) {
+                        $candidate = Join-OfflinePath -Root $root -ChildPath $child
+                        if ($candidate -and (Test-OfflinePath $candidate)) { $windowsEvidence = $candidate; break }
+                    }
+                }
             }
         }
     }
@@ -401,7 +421,11 @@ function Test-TemporaryStorageDisk {
         Add-OfflineRepairLog -Level Warning -Message "Could not inspect resource-disk markers on disk $($Disk.Number): $($_.Exception.Message)"
     }
 
-    return $false
+    if ($marker -and $windowsEvidence) {
+        Add-OfflineRepairLog -Level Warning -Message "Disk $($Disk.Number) carries a resource-disk marker ($marker) but also holds Windows content ($windowsEvidence), so it is not treated as the resource disk. Provisioning writes the marker to whatever volume is D:, which on a VM size without a resource disk can be a partition of the attached OS disk."
+        return $false
+    }
+    return [bool]$marker
 }
 
 function Set-OfflineDisksOnline {
@@ -432,8 +456,13 @@ function Set-OfflineDisksOnline {
     $disks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
             $_.BusType -in @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual') -and
             $_.Number -notin $ExcludeDiskNumber -and
-            -not ($_.IsBoot -or $_.IsSystem) -and
-            -not (Test-TemporaryStorageDisk -Disk $_)
+            -not ($_.IsBoot -or $_.IsSystem)
+        } | Where-Object {
+            if (Test-TemporaryStorageDisk -Disk $_) {
+                Add-OfflineRepairLog -Level Info -Message "Disk $($_.Number) is the Azure resource disk and is left untouched."
+                return $false
+            }
+            $true
         })
 
     foreach ($disk in $disks) {
@@ -935,19 +964,28 @@ function Get-OfflineWindowsDisk {
     # Select by bus type, not model name: Azure NVMe disks report 'Microsoft NVMe Direct
     # Disk', which the old '*Virtual Disk*' match missed. The rescue VM's own system disk,
     # any boot/system disk, and the 'Temporary Storage' resource disk are all excluded so a
-    # broken precondition can never route the repair onto the live OS.
+    # broken precondition can never route the repair onto the live OS. Each exclusion is
+    # recorded with its reason, so a run that finds nothing says why.
+    $exclusions = [System.Collections.Generic.List[string]]::new()
     $disks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object {
-            $_.BusType -in @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual') -and
-            $_.Number -ne $systemDiskNumber -and
-            $_.Number -in $onlineDiskNumbers -and
-            -not ($_.IsOffline -or $_.IsReadOnly) -and
-            -not ($_.IsBoot -or $_.IsSystem) -and
-            -not (Test-TemporaryStorageDisk -Disk $_) -and
-            ($DiskNumber -lt 0 -or $_.Number -eq $DiskNumber)
+            $reason = if ($_.BusType -notin @('SCSI', 'SAS', 'RAID', 'NVMe', 'File Backed Virtual')) { "bus type '$($_.BusType)' is not a data-disk bus" }
+            elseif ($_.Number -eq $systemDiskNumber) { "it is the rescue VM's own system disk" }
+            elseif ($_.IsBoot -or $_.IsSystem) { 'it is a boot or system disk' }
+            elseif ($DiskNumber -ge 0 -and $_.Number -ne $DiskNumber) { "-DiskNumber $DiskNumber was requested" }
+            # Before the online check: Set-OfflineDisksOnline deliberately leaves the resource disk
+            # alone, so testing online first would misreport it as "not confirmed online".
+            elseif (Test-TemporaryStorageDisk -Disk $_) { 'it is the Azure resource disk' }
+            elseif ($_.Number -notin $onlineDiskNumbers) { 'it was not confirmed online and writable' }
+            elseif ($_.IsOffline -or $_.IsReadOnly) { "it is offline or read-only (IsOffline=$($_.IsOffline), IsReadOnly=$($_.IsReadOnly))" }
+            if ($reason) { [void]$exclusions.Add("disk $($_.Number): $reason") }
+            -not $reason
         })
 
+    if ($exclusions.Count -gt 0) {
+        Add-OfflineRepairLog -Level Info -Message "Disk(s) not considered as the broken OS disk: $($exclusions -join '; ')."
+    }
     if ($disks.Count -eq 0) {
-        throw 'No attached broken OS disk was found. Create the rescue VM with "az vm repair create" first.'
+        throw "No attached broken OS disk was found. Create the rescue VM with `"az vm repair create`" first. Excluded: $(if ($exclusions.Count -gt 0) { $exclusions -join '; ' } else { 'Get-Disk reported no disks' })."
     }
 
     # Give every partition a drive letter. EFI System and Recovery partitions have none

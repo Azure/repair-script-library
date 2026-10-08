@@ -165,6 +165,11 @@
 		"description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC000000F, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot. Pass detectOnly=true to report only, revert=true to restore the previous store, or rebuild=true to force a full bcdboot rebuild instead of a targeted repair. NOTE: use option --run-on-repair."
 	},
 	{
+		"id": "win-fix-boot-partition",
+		"path": "src/windows/win-fix-boot-partition.ps1",
+		"description": "Repairs the system partition itself, the layer below the BCD store - a deleted EFI System Partition or System Reserved partition, an unformatted ESP, a missing 0x55AA boot signature, zeroed or NTLDR era bootstrap code, no Active partition or more than one, and a stale BPB HiddenSectors field that gives 'A disk read error occurred' after a partition move or restore while chkdsk and sfc report nothing. On Generation 2 and Trusted Launch VMs it also gives the EFI System Partition back the GPT GUID and slot that the firmware's saved boot entry expects ('The boot loader did not load an operating system'). Pass detectOnly=true to report only, or revert=true to restore the sectors a previous run backed up; an EFI System Partition created for a Generation 2 VM is not removed by a revert. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
 		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the Hyper-V generation, stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Generation 1 installations return GEN1_TO_GEN2_CONVERSION_REQUIRED. Makes no changes. NOTE: use option --run-on-repair."
