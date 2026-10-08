@@ -848,6 +848,157 @@ function Get-AllFinding {
     return @($findings)
 }
 
+function Get-HiveRollbackFailure {
+    <#
+    .SYNOPSIS
+        Builds the exception raised when a failed hive replacement could not be undone.
+
+    .DESCRIPTION
+        The exception is tagged so a caller can tell it apart from an ordinary repair failure.
+        An ordinary failure leaves the original hive in place and the run may try another
+        source; a rollback failure leaves the disk in a state nobody verified, so the run must
+        stop and say exactly what is on disk.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $exception = [System.InvalidOperationException]::new($Message)
+    $exception.Data['HiveRollbackFailed'] = $true
+    return $exception
+}
+
+function Test-HiveRollbackFailure {
+    <#
+    .SYNOPSIS
+        Reports whether an exception is the tagged hive rollback failure.
+    #>
+    param(
+        [Parameter(Mandatory = $false)]$Exception
+    )
+
+    return [bool]($Exception -and $Exception.Data -and $Exception.Data['HiveRollbackFailed'])
+}
+
+function Move-HiveTransactionLog {
+    <#
+    .SYNOPSIS
+        Moves a hive's transaction logs aside, recording each move as it completes.
+
+    .DESCRIPTION
+        The .LOG, .LOG1 and .LOG2 files describe the hive they sit beside. Once that hive has
+        been replaced they would be replayed over the new file at the next load, so they are
+        moved to '<log>.bak-<stamp>'. A move that fails, or that leaves the log where it was,
+        throws. Each completed move is added to -Moved before the next one starts, so the
+        caller can put back exactly the logs that were moved even when a later one fails.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$HivePath,
+        [Parameter(Mandatory = $true)][string]$Stamp,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[PSCustomObject]]$Moved
+    )
+
+    foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
+        $source = "$HivePath$suffix"
+        if (-not (Test-OfflinePath $source)) { continue }
+        $destination = "$source.bak-$Stamp"
+        Move-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
+        if ((Test-OfflinePath $source) -or -not (Test-OfflinePath $destination)) {
+            throw "moving $source to $destination did not take effect."
+        }
+        [void]$Moved.Add([PSCustomObject]@{ Source = $source; Destination = $destination })
+    }
+}
+
+function Copy-HiveBackup {
+    <#
+    .SYNOPSIS
+        Saves a hive next to itself and proves the copy by hash before anything overwrites it.
+
+    .DESCRIPTION
+        Every rollback depends on this file, so a truncated or failed copy must stop the
+        replacement before the live hive changes rather than be discovered during a rollback.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Backup
+    )
+
+    Copy-Item -LiteralPath $Path -Destination $Backup -Force -ErrorAction Stop
+    $liveHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    $backupHash = (Get-FileHash -LiteralPath $Backup -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($liveHash -ne $backupHash) {
+        throw "the backup $Backup does not match $Path (SHA256 $backupHash, expected $liveHash), so the hive was not replaced."
+    }
+}
+
+function Restore-HiveFileFromBackup {
+    <#
+    .SYNOPSIS
+        Copies a saved hive back over the live file and proves the copy by hash.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Backup,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    Copy-Item -LiteralPath $Backup -Destination $Path -Force -ErrorAction Stop
+    $backupHash = (Get-FileHash -LiteralPath $Backup -Algorithm SHA256 -ErrorAction Stop).Hash
+    $liveHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($backupHash -ne $liveHash) {
+        throw "$Path does not match its backup $Backup after it was copied back (SHA256 $liveHash, expected $backupHash)."
+    }
+}
+
+function Undo-HiveReplacement {
+    <#
+    .SYNOPSIS
+        Puts a replaced hive and the logs moved with it back the way they were.
+
+    .DESCRIPTION
+        The hive comes back from -Backup and is hash verified. A hive that did not exist
+        before (no -Backup) is deleted again. Logs move back newest first. Every step is
+        attempted even when an earlier one fails, so as much as possible is restored.
+
+    .OUTPUTS
+        String array describing each step that failed. Empty when the rollback is complete.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$Backup,
+        [Parameter(Mandatory = $false)][AllowEmptyCollection()][System.Collections.Generic.List[PSCustomObject]]$MovedLog = [System.Collections.Generic.List[PSCustomObject]]::new()
+    )
+
+    $errors = [System.Collections.Generic.List[string]]::new()
+    try {
+        if ($Backup) {
+            Restore-HiveFileFromBackup -Backup $Backup -Path $Path
+        }
+        elseif (Test-OfflinePath $Path) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+            if (Test-OfflinePath $Path) { throw "$Path is still present after it was deleted." }
+        }
+    }
+    catch {
+        [void]$errors.Add("hive $Path`: $($_.Exception.Message)")
+    }
+
+    for ($i = $MovedLog.Count - 1; $i -ge 0; $i--) {
+        $log = $MovedLog[$i]
+        try {
+            Move-Item -LiteralPath $log.Destination -Destination $log.Source -Force -ErrorAction Stop
+            if (-not (Test-OfflinePath $log.Source) -or (Test-OfflinePath $log.Destination)) {
+                throw "moving it back from $($log.Destination) did not take effect."
+            }
+        }
+        catch {
+            [void]$errors.Add("log $($log.Source): $($_.Exception.Message)")
+        }
+    }
+
+    return @($errors)
+}
+
 function Repair-HiveInPlace {
     <#
     .SYNOPSIS
@@ -920,22 +1071,38 @@ function Repair-HiveInPlace {
         return $true
     }
 
-    $backup = "$path.bak-$(Get-Date -Format yyyyMMddHHmmss)"
-    Copy-Item -LiteralPath $path -Destination $backup -Force -ErrorAction Stop
-    Copy-Item -LiteralPath $repair.RepairedPath -Destination $path -Force -ErrorAction Stop
+    # Nothing on disk has changed until the verified backup exists, so a failure here needs no rollback.
+    $stamp = Get-Date -Format yyyyMMddHHmmss
+    $backup = "$path.bak-$stamp"
+    Copy-HiveBackup -Path $path -Backup $backup
 
-    $after = Test-OfflineHiveFile -Path $path
-    if (-not $after.IsValid) {
-        Copy-Item -LiteralPath $backup -Destination $path -Force -ErrorAction SilentlyContinue
-        Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): the replaced file did not validate on disk, so the original was put back from $backup."
-        return $false
-    }
-
-    # The logs describe the file that was just replaced and would be replayed over the repair.
-    foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
-        if (Test-OfflinePath "$path$suffix") {
-            Move-Item -LiteralPath "$path$suffix" -Destination "$path$suffix.bak-$(Get-Date -Format yyyyMMddHHmmss)" -Force -ErrorAction SilentlyContinue
+    # From here the hive and its logs change together or not at all. Any failure puts back the
+    # original hive and every log already moved, then proves the rollback; a rollback that
+    # cannot be completed stops the run instead of letting it carry on over an unknown hive.
+    $movedLogs = [System.Collections.Generic.List[PSCustomObject]]::new()
+    try {
+        Copy-Item -LiteralPath $repair.RepairedPath -Destination $path -Force -ErrorAction Stop
+        $repairedHash = (Get-FileHash -LiteralPath $repair.RepairedPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash -ne $repairedHash) {
+            throw 'the file on disk does not match the repaired copy after it was written'
         }
+
+        $after = Test-OfflineHiveFile -Path $path
+        if (-not $after.IsValid) {
+            throw "the replaced file did not validate on disk ($($after.Reason))"
+        }
+
+        # The logs describe the file that was just replaced and would be replayed over the repair.
+        Move-HiveTransactionLog -HivePath $path -Stamp $stamp -Moved $movedLogs
+    }
+    catch {
+        $failure = $_.Exception.Message
+        $rollbackErrors = @(Undo-HiveReplacement -Path $path -Backup $backup -MovedLog $movedLogs)
+        if ($rollbackErrors.Count -gt 0) {
+            throw (Get-HiveRollbackFailure -Message "$($Finding.Item): the repaired hive could not be installed ($failure), and putting the original back also failed: $($rollbackErrors -join '; '). The hive on disk is in an unverified state. The original hive is saved as $backup and any log that was moved has a .bak-$stamp suffix; copy them back by hand before booting the VM.")
+        }
+        Add-OfflineRepairLog -Level Warning -Message "$($Finding.Item): the repaired hive could not be installed ($failure), so the original hive$(if ($movedLogs.Count -gt 0) { ' and its logs were' } else { ' was' }) put back from $backup and verified."
+        return $false
     }
 
     Add-OfflineRepairLog -Message "$($Finding.Item): repaired with chkreg and verified. Original saved as $backup."
@@ -986,9 +1153,16 @@ function Restore-HiveFromRegBack {
             $backup = $null
             if (Test-OfflinePath $item.LivePath) {
                 $backup = "$($item.LivePath).bak-$stamp"
-                Copy-Item -LiteralPath $item.LivePath -Destination $backup -Force -ErrorAction Stop
+                Copy-HiveBackup -Path $item.LivePath -Backup $backup
             }
-            [void]$touched.Add([PSCustomObject]@{ LivePath = $item.LivePath; Backup = $backup })
+            # The entry is recorded before the live file changes, and the log list is filled in
+            # as each move completes, so a failure at any later step rolls back exactly what moved.
+            $entry = [PSCustomObject]@{
+                LivePath = $item.LivePath
+                Backup   = $backup
+                Logs     = [System.Collections.Generic.List[PSCustomObject]]::new()
+            }
+            [void]$touched.Add($entry)
 
             Copy-Item -LiteralPath $item.SourcePath -Destination $item.LivePath -Force -ErrorAction Stop
 
@@ -997,32 +1171,27 @@ function Restore-HiveFromRegBack {
             if ($sourceHash -ne $liveHash) { throw "the restored $($item.Name) hive does not match its RegBack source." }
 
             # Stale logs describe the hive that was just replaced and would undo the restore.
-            foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
-                if (Test-OfflinePath "$($item.LivePath)$suffix") {
-                    Move-Item -LiteralPath "$($item.LivePath)$suffix" -Destination "$($item.LivePath)$suffix.bak-$stamp" -Force -ErrorAction SilentlyContinue
-                }
-            }
+            Move-HiveTransactionLog -HivePath $item.LivePath -Stamp $stamp -Moved $entry.Logs
 
             [void]$restored.Add($item.Name)
             Add-OfflineRepairLog -Message "$($item.Name): restored from RegBack and hash verified."
         }
     }
     catch {
-        Add-OfflineRepairLog -Level Warning -Message "RegBack restore failed ($($_.Exception.Message)). Rolling back every hive that was touched."
+        $failure = $_.Exception.Message
+        Add-OfflineRepairLog -Level Warning -Message "RegBack restore failed ($failure). Rolling back every hive that was touched."
+        $rollbackErrors = [System.Collections.Generic.List[string]]::new()
         for ($i = $touched.Count - 1; $i -ge 0; $i--) {
             $entry = $touched[$i]
-            try {
-                if ($entry.Backup -and (Test-OfflinePath $entry.Backup)) {
-                    Copy-Item -LiteralPath $entry.Backup -Destination $entry.LivePath -Force -ErrorAction Stop
-                }
-                elseif (Test-OfflinePath $entry.LivePath) {
-                    Remove-Item -LiteralPath $entry.LivePath -Force -ErrorAction Stop
-                }
-            }
-            catch {
-                Add-OfflineRepairLog -Level Warning -Message "Rollback of $($entry.LivePath) failed: $($_.Exception.Message)"
+            foreach ($problem in @(Undo-HiveReplacement -Path $entry.LivePath -Backup $entry.Backup -MovedLog $entry.Logs)) {
+                [void]$rollbackErrors.Add($problem)
+                Add-OfflineRepairLog -Level Error -Message "Rollback failed for $problem"
             }
         }
+        if ($rollbackErrors.Count -gt 0) {
+            throw (Get-HiveRollbackFailure -Message "RegBack restore failed ($failure), and the rollback could not put every file back: $($rollbackErrors -join '; '). The registry on disk is in an unverified state. Each original hive is saved with a .bak-$stamp suffix and each moved log has the same suffix; copy them back by hand before booting the VM.")
+        }
+        Add-OfflineRepairLog -Level Warning -Message "Every hive and transaction log touched by the RegBack restore was put back and the hives were hash verified."
         throw
     }
 
@@ -1118,6 +1287,9 @@ try {
                 $inPlace = Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir
             }
             catch {
+                # A hive whose rollback failed is in an unverified state. Carrying on would build
+                # more changes, or a RegBack restore, on top of a file nobody has checked.
+                if (Test-HiveRollbackFailure $_.Exception) { throw }
                 Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): in place repair could not run ($($_.Exception.Message))."
             }
             if ($inPlace) {
