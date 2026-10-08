@@ -614,7 +614,7 @@ function Read-RevertManifest {
         return @($parsed)
     }
     catch {
-        Add-OfflineRepairLog -Level Warning -Message "The revert manifest $ManifestPath could not be read ($($_.Exception.Message))."
+        Add-OfflineRepairLog -Level Warning -Message "The revert manifest $ManifestPath could not be read ($($_.Exception.GetType().FullName): $($_.Exception.Message))."
         return @()
     }
 }
@@ -1052,8 +1052,8 @@ try {
                 }
             }
             catch {
-                [void]$errors.Add("$($finding.Item): $($_.Exception.Message)")
-                Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair failed ($($_.Exception.Message))."
+                [void]$errors.Add("$($finding.Item): $($_.Exception.GetType().FullName): $($_.Exception.Message)")
+                Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): repair failed ($($_.Exception.GetType().FullName): $($_.Exception.Message))."
             }
         }
 
@@ -1067,8 +1067,8 @@ try {
                 }
             }
             catch {
-                [void]$errors.Add("Driver Verifier: $($_.Exception.Message)")
-                Add-OfflineRepairLog -Level Warning -Message "Driver Verifier: could not be cleared ($($_.Exception.Message))."
+                [void]$errors.Add("Driver Verifier: $($_.Exception.GetType().FullName): $($_.Exception.Message)")
+                Add-OfflineRepairLog -Level Warning -Message "Driver Verifier: could not be cleared ($($_.Exception.GetType().FullName): $($_.Exception.Message))."
             }
         }
 
