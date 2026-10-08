@@ -651,6 +651,95 @@ function Write-RevertManifest {
     Add-OfflineRepairLog -Message "Revert manifest written to $ManifestPath ($($merged.Count) entry(s))."
 }
 
+function Write-RevertManifestOrRollback {
+    <#
+    .SYNOPSIS
+        Records this run's changes in the revert manifest, or undoes every one of them when it cannot.
+
+    .DESCRIPTION
+        The Start values are changed before the manifest is written, because each original value
+        is only known once the key has been re-read under the mounted hive. If the manifest then
+        cannot be written, the drivers would stay disabled with no revert record. So every change
+        made in this run is put back through Invoke-DriverRevert, and re-read to prove it, before
+        the caller reports the failure.
+
+        The SYSTEM hive backup taken before the run is never copied over the live hive here: the
+        transaction logs beside the hive have moved on since it was taken, so the caller names
+        the backup for the operator instead.
+
+    .OUTPUTS
+        PSCustomObject with Written, Error, RolledBack, Restored and RollbackErrors.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ManifestPath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Entries,
+        [Parameter(Mandatory = $true)][string]$WindowsPath
+    )
+
+    $result = [PSCustomObject]@{ Written = $false; Error = $null; RolledBack = $false; Restored = 0; RollbackErrors = @() }
+    if ($Entries.Count -eq 0) {
+        $result.Written = $true
+        return $result
+    }
+
+    try {
+        Write-RevertManifest -ManifestPath $ManifestPath -Entries $Entries
+        $result.Written = $true
+        return $result
+    }
+    catch {
+        $result.Error = "$($_.Exception.GetType().FullName): $($_.Exception.Message)"
+        Add-OfflineRepairLog -Level Warning -Message "The revert manifest $ManifestPath could not be written ($($result.Error)). Rolling back the $($Entries.Count) change(s) made in this run."
+    }
+
+    try {
+        $rollback = Invoke-WithHive -Hive 'SYSTEM' -WindowsPath $WindowsPath -ScriptBlock {
+            $systemRoot = Get-OfflineSystemRootPath -Strict
+            $revert = Invoke-DriverRevert -SystemRoot $systemRoot -Entries $Entries
+            $errors = [System.Collections.Generic.List[string]]::new()
+            foreach ($failure in @($revert.Errors)) { [void]$errors.Add($failure) }
+
+            # Prove each driver is back rather than trusting the writes.
+            foreach ($entry in $Entries) {
+                if ($entry.Kind -eq 'DriverVerifier') { continue }
+                $start = (Get-ItemProperty -LiteralPath "$systemRoot\Services\$($entry.Service)" -Name 'Start' -ErrorAction SilentlyContinue).Start
+                if ($start -ne $entry.OriginalStart) {
+                    [void]$errors.Add("$($entry.Service): still at Start=$start after the rollback, expected $($entry.OriginalStart).")
+                }
+            }
+            return [PSCustomObject]@{ Restored = $revert.Restored; Errors = @($errors | Select-Object -Unique) }
+        }
+        $result.Restored = $rollback.Restored
+        $result.RollbackErrors = @($rollback.Errors)
+    }
+    catch {
+        $result.RollbackErrors = @("Rollback: $($_.Exception.GetType().FullName): $($_.Exception.Message)")
+    }
+
+    $result.RolledBack = ($result.RollbackErrors.Count -eq 0)
+    return $result
+}
+
+function Clear-RevertManifest {
+    <#
+    .SYNOPSIS
+        Deletes the revert manifest after every entry in it was restored, and proves it is gone.
+
+    .DESCRIPTION
+        Throws when the file cannot be deleted or is still present afterwards. A manifest that
+        survives a revert is not harmless: Write-RevertManifest never overwrites an entry, so a
+        later repair would keep the stale value as the driver's original Start.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ManifestPath
+    )
+
+    Remove-Item -LiteralPath $ManifestPath -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $ManifestPath) {
+        throw "The revert manifest $ManifestPath is still present after it was deleted."
+    }
+}
+
 function Repair-Finding {
     <#
     .SYNOPSIS
@@ -941,7 +1030,14 @@ try {
             return $STATUS_ERROR
         }
 
-        Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+        try {
+            Clear-RevertManifest -ManifestPath $manifestPath
+        }
+        catch {
+            Log-Error "Restored $($revertOutcome.Restored) item(s), but the revert manifest $manifestPath could not be removed ($($_.Exception.GetType().FullName): $($_.Exception.Message)). It was kept. Delete it by hand before running this script on this disk again, or a later repair records its stale values as the original Start." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            return $STATUS_ERROR
+        }
         Log-Output "Restored $($revertOutcome.Restored) item(s) from the manifest and removed it." | Tee-Object -FilePath $logFile -Append
         Log-Output "Run 'az vm repair restore' to swap the disk back to the original VM." | Tee-Object -FilePath $logFile -Append
         Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
@@ -1076,9 +1172,19 @@ try {
     }
     Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
 
-    if ($repairOutcome.Entries.Count -gt 0) {
-        Write-RevertManifest -ManifestPath $manifestPath -Entries $repairOutcome.Entries
-        Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+    $manifestOutcome = Write-RevertManifestOrRollback -ManifestPath $manifestPath -Entries @($repairOutcome.Entries) -WindowsPath $offline.WindowsPath
+    Write-OfflineRepairLog | Tee-Object -FilePath $logFile -Append
+
+    if (-not $manifestOutcome.Written) {
+        foreach ($failure in $manifestOutcome.RollbackErrors) { Log-Warning $failure | Tee-Object -FilePath $logFile -Append }
+        if ($manifestOutcome.RolledBack) {
+            Log-Error "The revert manifest could not be written to $manifestPath ($($manifestOutcome.Error)). Every change made in this run was rolled back and re-read ($($manifestOutcome.Restored) item(s) restored), so no driver was left disabled. Fix the write failure and run the script again." | Tee-Object -FilePath $logFile -Append
+        }
+        else {
+            Log-Error "The revert manifest could not be written to $manifestPath ($($manifestOutcome.Error)) and the rollback did not complete, so some drivers may still be disabled with no revert record. The 'reg add' commands above put back each original Start value, and the SYSTEM hive as it was before this run is saved at $backup." | Tee-Object -FilePath $logFile -Append
+        }
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        return $STATUS_ERROR
     }
 
     # Verify against freshly read state rather than trusting the writes above.
