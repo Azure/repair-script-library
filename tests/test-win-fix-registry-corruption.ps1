@@ -42,7 +42,8 @@ function Invoke-Case {
 # The script runs a repair when it is loaded, so only the functions under test are taken from it.
 $wanted = @(
     'Get-HiveRollbackFailure', 'Test-HiveRollbackFailure', 'Move-HiveTransactionLog', 'Copy-HiveBackup',
-    'Restore-HiveFileFromBackup', 'Undo-HiveReplacement', 'Repair-HiveInPlace', 'Restore-HiveFromRegBack'
+    'Restore-HiveFileFromBackup', 'Undo-HiveReplacement', 'Repair-HiveInPlace', 'Restore-HiveFromRegBack',
+    'Invoke-ChkReg'
 )
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($sourceScript, [ref]$null, [ref]$parseErrors)
@@ -51,6 +52,13 @@ $definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automa
 foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
 $missing = @($wanted | Where-Object { $_ -notin @($definitions.Name) })
 if ($missing.Count -gt 0) { Write-Host "Not defined by the script under test: $($missing -join ', ')" }
+
+# A stub Invoke-ChkReg is defined further down to drive the hive-replacement tests, which would
+# otherwise shadow the real function under test. The genuine implementation is kept under its
+# own name so it can still be exercised directly.
+if ('Invoke-ChkReg' -in @($definitions.Name)) {
+    ${function:Invoke-ChkRegReal} = ${function:Invoke-ChkReg}
+}
 if ('Test-HiveRollbackFailure' -in $missing) {
     # Lets a run against an older revision report behaviour rather than a missing name.
     function Test-HiveRollbackFailure { Param($Exception) return $false }
@@ -182,7 +190,52 @@ function Invoke-InPlace {
     return Repair-HiveInPlace -Finding $finding -ChkRegPath 'chkreg.exe' -ScratchDir $global:RegFixture.Scratch -TestOnly:$TestOnly
 }
 
+function New-FakeChkReg {
+    # Stands in for chkreg.exe: it writes its own status text to stderr and exits 0, which is
+    # exactly how the real tool reports success. Used to prove that text is not mistaken for a
+    # terminating error.
+    Param([string]$StderrText = 'ChkpValidateHiveAndRecoverFromLog succeeded.', [int]$ExitCode = 0)
+    $path = Join-Path $global:RegFixture.Scratch "fake-chkreg-$([guid]::NewGuid()).cmd"
+    Set-Content -LiteralPath $path -Value @(
+        '@echo off'
+        "echo $StderrText 1>&2"
+        "exit /b $ExitCode"
+    ) -Encoding Ascii
+    return $path
+}
+
 try {
+    # ---- Invoke-ChkReg -------------------------------------------------------------------
+    # These cases call the genuine Invoke-ChkReg (captured as Invoke-ChkRegReal above), not the
+    # stub used by the rest of this file, and run with this file's own $ErrorActionPreference of
+    # 'Stop' still in effect - the exact caller condition the bot's fault injection used.
+
+    Invoke-Case 'Invoke-ChkReg: a status line on stderr during validation is not a terminating error' {
+        $hive = New-Hive SYSTEM
+        $chkReg = New-FakeChkReg
+        $result = Invoke-ChkRegReal -ChkRegPath $chkReg -HivePath $hive.LivePath -ScratchDir $global:RegFixture.Scratch -Repair $false
+        Assert-Equal 0 $result.ExitCode 'A success exit code is still reported.'
+        Assert-True (-not $result.FoundProblem) 'Success status text on stderr is not read as a found problem.'
+        Assert-True ($result.Output -match 'succeeded') 'The status text is captured as plain output.'
+    }
+
+    Invoke-Case 'Invoke-ChkReg: a status line on stderr during repair is not a terminating error' {
+        $hive = New-Hive SYSTEM
+        $chkReg = New-FakeChkReg
+        $result = Invoke-ChkRegReal -ChkRegPath $chkReg -HivePath $hive.LivePath -ScratchDir $global:RegFixture.Scratch -Repair $true
+        Assert-Equal 0 $result.ExitCode 'A success exit code is still reported.'
+        Assert-True (-not $result.FoundProblem) 'Success status text on stderr is not read as a found problem.'
+        Assert-True ([string]::IsNullOrEmpty($result.RepairedPath) -eq $false) 'The repaired scratch copy path is still returned.'
+    }
+
+    Invoke-Case 'Invoke-ChkReg: the caller error preference is restored after a stderr status line' {
+        $hive = New-Hive SYSTEM
+        $chkReg = New-FakeChkReg
+        $before = $ErrorActionPreference
+        [void](Invoke-ChkRegReal -ChkRegPath $chkReg -HivePath $hive.LivePath -ScratchDir $global:RegFixture.Scratch -Repair $false)
+        Assert-Equal $before $ErrorActionPreference 'The function does not leak its internal error preference back to the caller.'
+    }
+
     # ---- Repair-HiveInPlace -------------------------------------------------------------
 
     Invoke-Case 'in place: a clean install replaces the hive and moves every log aside' {

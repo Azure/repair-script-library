@@ -253,14 +253,28 @@ function Invoke-ChkReg {
     }
 
     # chkreg writes progress to stderr, so both streams are coerced to plain strings to keep
-    # PowerShell from turning ordinary output into NativeCommandError records.
-    if ($Repair) {
-        $raw = & $ChkRegPath /F "$working" /R 2>&1 | ForEach-Object { "$_" }
+    # PowerShell from turning ordinary output into NativeCommandError records. That coercion
+    # only works while the error action in effect is non-terminating: with an inherited
+    # $ErrorActionPreference of 'Stop', PowerShell promotes the stderr-merged record to a
+    # terminating exception the instant it is produced, before the pipeline ever reaches
+    # ForEach-Object - so chkreg's own "succeeded" status text can be mistaken for a fatal
+    # error and short-circuit the repair before the hive is even touched. The preference is
+    # pinned to 'Continue' for the duration of the call and restored afterward so this
+    # function behaves the same regardless of what the caller has set.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($Repair) {
+            $raw = & $ChkRegPath /F "$working" /R 2>&1 | ForEach-Object { "$_" }
+        }
+        else {
+            $raw = & $ChkRegPath /F "$working" 2>&1 | ForEach-Object { "$_" }
+        }
+        $exitCode = $LASTEXITCODE
     }
-    else {
-        $raw = & $ChkRegPath /F "$working" 2>&1 | ForEach-Object { "$_" }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
-    $exitCode = $LASTEXITCODE
 
     $result.Ran = $true
     $result.ExitCode = $exitCode
