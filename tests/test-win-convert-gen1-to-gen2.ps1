@@ -54,6 +54,15 @@ Assert-NotMatch 'Remove-PartitionAccessPath[^\r\n]+-PartitionNumber[^\r\n]+-Driv
 Assert-NotMatch 'Set-Partition[^\r\n]+-NewDriveLetter' 'Set-Partition cannot assign drive letters to EFI system partitions.'
 Assert-NotMatch 'Remove-PartitionAccessPath[^\r\n]+SilentlyContinue' 'EFI cleanup failures must not be suppressed.'
 Assert-NotMatch "\`$firmwareType -eq 'Legacy'" 'Legacy is not a valid FirmwareType enum name.'
+Assert-Match '\[GEN1-GEN2-RESULT\]' 'The structured result line must remain the authoritative output contract.'
+Assert-Match 'function Write-ConversionTelemetry' 'The script must have a structured telemetry helper.'
+Assert-Match 'function Write-ConversionCatchTelemetry' 'Caught errors must go through the catch telemetry helper.'
+Assert-NotMatch 'function Write-ConversionTelemetry[\s\S]{0,900}Log-Output' 'Telemetry must not use Log-Output, which carries the single structured result.'
+Assert-Match "CatchName 'AlreadyGptVerification'" 'The already-GPT verification catch must emit telemetry.'
+Assert-Match "CatchName 'ConvertedBootLayoutVerification'" 'The post-conversion verification catch must emit telemetry.'
+Assert-Match "CatchName 'WorkflowFailure'" 'The workflow catch must emit telemetry.'
+Assert-Match "CatchName 'EfiCleanupAfterVerificationFailure'" 'A cleanup failure that follows a verification failure must be recorded, not hidden.'
+Assert-Match "-Event Result[\s\S]+durationMs[\s\S]+return \`$status\s*$" 'Every run must end with a Result event that records the total duration.'
 
 function Get-FunctionSource {
     Param([Parameter(Mandatory = $true)][string]$Name)
@@ -170,6 +179,77 @@ function Get-FunctionSource {
     }
     if ($script:emittedOutput.Count -ne 1 -or $script:emittedOutput[0] -notmatch 'MBR2GPT_UNAVAILABLE') {
         throw "ASSERTION FAILED: the stored MBR2GPT_UNAVAILABLE result was not emitted exactly once. Signature='$($script:result.signature)'; count=$($script:emittedOutput.Count); output='$($script:emittedOutput -join ' | ')'."
+    }
+}
+
+& {
+    Invoke-Expression (Get-FunctionSource -Name 'Write-ConversionTelemetry')
+    Invoke-Expression (Get-FunctionSource -Name 'Write-ConversionCatchTelemetry')
+
+    $script:ScriptVersion = 'test'
+    $script:RunId = 'abcd1234'
+    $script:Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $Mode = 'Convert'
+    $script:infoLines = @()
+    $script:errorLines = @()
+    function Log-Info { Param([string]$Message) $script:infoLines += $Message }
+    function Log-Error { Param([string]$Message) $script:errorLines += $Message }
+
+    Write-ConversionTelemetry -Event Operation -Message 'probe' -Properties @{ exitCode = 0; durationMs = 12 }
+    if ($script:infoLines.Count -ne 1 -or $script:errorLines.Count -ne 0) {
+        throw 'ASSERTION FAILED: a non-error telemetry event must be emitted once through Log-Info only.'
+    }
+    $record = ($script:infoLines[0] -replace '^\[GEN1-GEN2-TELEMETRY\] ', '') | ConvertFrom-Json
+    if ($record.runId -ne 'abcd1234' -or $record.mode -ne 'Convert' -or $record.properties.durationMs -ne 12 -or $null -eq $record.elapsedMs) {
+        throw 'ASSERTION FAILED: telemetry did not carry the run id, mode, elapsed time, and properties.'
+    }
+
+    try { throw [System.InvalidOperationException]::new('boom') }
+    catch { Write-ConversionCatchTelemetry -CatchName 'Probe' -Stage 'ProbeStage' -ErrorRecord $_ }
+    if ($script:errorLines.Count -ne 1 -or $script:errorLines[0] -notmatch 'Probe' -or $script:errorLines[0] -notmatch 'ProbeStage' -or
+        $script:errorLines[0] -notmatch 'InvalidOperationException' -or $script:errorLines[0] -notmatch 'boom') {
+        throw 'ASSERTION FAILED: catch telemetry must record the catch name, stage, exception type, and message through Log-Error.'
+    }
+}
+
+& {
+    Invoke-Expression (Get-FunctionSource -Name 'Test-ConvertedBootLayout')
+
+    $script:errorLines = @()
+    function Write-ConversionCatchTelemetry { Param($CatchName, $Stage, $ErrorRecord) $script:errorLines += $CatchName }
+    function Update-HostStorageCache { }
+    function Get-Disk { [PSCustomObject]@{ PartitionStyle = 'GPT' } }
+    function Get-Partition {
+        [PSCustomObject]@{ PartitionNumber = 2; GptType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' }
+    }
+    function Test-DriveLetterInUse { return $false }
+    function Join-Path { return 'Z:\EFI\Microsoft\Boot\BCD' }
+    function Add-EfiDriveLetter { }
+    function Remove-EfiDriveLetter { throw 'cleanup failed' }
+
+    # Verification fails and cleanup also fails: the verification error is the one the operator must see.
+    function Assert-EfiBcdStoreReadable { throw 'BCD store could not be enumerated' }
+    try {
+        Test-ConvertedBootLayout -DiskNumber 3
+        throw 'ASSERTION FAILED: an unreadable BCD store was accepted.'
+    }
+    catch {
+        if ($_.Exception.Message -ne 'BCD store could not be enumerated') {
+            throw "ASSERTION FAILED: a cleanup failure replaced the original verification error with '$($_.Exception.Message)'."
+        }
+    }
+    if ($script:errorLines -notcontains 'EfiCleanupAfterVerificationFailure') {
+        throw 'ASSERTION FAILED: the cleanup failure that followed a verification failure was not recorded.'
+    }
+
+    # Verification passes but cleanup fails: still a failure, so conversion is not reported as completed.
+    function Assert-EfiBcdStoreReadable { }
+    try {
+        Test-ConvertedBootLayout -DiskNumber 3
+        throw 'ASSERTION FAILED: a leftover EFI drive letter after successful verification was accepted.'
+    }
+    catch {
+        if ($_.Exception.Message -ne 'cleanup failed') { throw }
     }
 }
 
