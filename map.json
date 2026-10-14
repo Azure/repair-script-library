@@ -150,6 +150,11 @@
 		"description": "Workaround for cvm machines stuck in boot loop due to corrupt crowdstrike falcon sensor 2024-07-19 by removing corrupt crowdstrike files"
 	},
 	{
+		"id": "win-fix-pending-servicing",
+		"path": "src/windows/win-fix-pending-servicing.ps1",
+		"description": "Clears an unfinished Windows Update transaction that leaves a VM looping on Undoing changes made to your computer. Pass detectOnly=true to report only, or revert=true to restore pending.xml, the TxR files and the service start types from a previous run. disableWindowsUpdate=true additionally leaves the Windows Update services disabled, which is never done by default. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-fix-catalog-store",
 		"path": "src/windows/win-fix-catalog-store.ps1",
 		"description": "Rebuilds a damaged catalog store (System32\\CatRoot) that stops boot with 0x5A CRITICAL_SERVICE_FAILED or 0xC0000428 INVALID_IMAGE_HASH. Adds missing catalogs and replaces unopenable ones from Windows\\servicing\\Packages, backing up replaced files first. Pass donorPath to use a machine of the same build and patch level, detectOnly=true to report only. NOTE: use option --run-on-repair."
@@ -165,6 +170,11 @@
 		"description": "Repairs a boot configuration that stops Windows starting (0xC000000E, 0xC000000F, 0xC0000225, 0xC0000034) - a BCD entry pointing at a partition that no longer exists after a disk swap, a wrong loader path or systemroot, a default entry that starts Windows Setup, an imcdevice value that bugchecks 0x67, or a missing store that has to be rebuilt with bcdboot. Pass detectOnly=true to report only, revert=true to restore the previous store, or rebuild=true to force a full bcdboot rebuild instead of a targeted repair. NOTE: use option --run-on-repair."
 	},
 	{
+		"id": "win-fix-boot-partition",
+		"path": "src/windows/win-fix-boot-partition.ps1",
+		"description": "Repairs the system partition itself, the layer below the BCD store - a deleted EFI System Partition or System Reserved partition, an unformatted ESP, a missing 0x55AA boot signature, zeroed or NTLDR era bootstrap code, no Active partition or more than one, and a stale BPB HiddenSectors field that gives 'A disk read error occurred' after a partition move or restore while chkdsk and sfc report nothing. On Generation 2 and Trusted Launch VMs it also gives the EFI System Partition back the GPT GUID and slot that the firmware's saved boot entry expects ('The boot loader did not load an operating system'). Pass detectOnly=true to report only, or revert=true to restore the sectors a previous run backed up; an EFI System Partition created for a Generation 2 VM is not removed by a revert. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-detect-nvme-readiness",
 		"path": "src/windows/win-detect-nvme-readiness.ps1",
 		"description": "Read-only check of whether a Windows OS disk can boot from an NVMe disk controller. Reports the Hyper-V generation, stornvme boot-start value, driver presence and CriticalDeviceDatabase entries, and writes an evidence bundle. Generation 1 installations return GEN1_TO_GEN2_CONVERSION_REQUIRED. Makes no changes. NOTE: use option --run-on-repair."
@@ -178,6 +188,11 @@
 		"id": "win-enable-nvme-boot-driver",
 		"path": "src/windows/win-enable-nvme-boot-driver.ps1",
 		"description": "Enables the Windows inbox stornvme boot-start driver on the offline OS disk of a VM that no longer boots after switching to an NVMe disk controller. Mode=Report (default) is read-only; Mode=Repair backs up, writes and verifies; Mode=Rollback restores the backup emitted by Repair. NOTE: use option --run-on-repair."
+	},
+	{
+		"id": "win-convert-gen1-to-gen2",
+		"path": "src/windows/win-convert-gen1-to-gen2.ps1",
+		"description": "Validates or converts the running source Windows VM OS disk from MBR/BIOS to GPT/UEFI before a Trusted Launch update. Mode=Report (default) is read-only. Mode=Convert requires explicit backup, prerequisite, and irreversible-operation acknowledgements. Run directly on the source VM; do not use --run-on-repair. After successful conversion, do not reboot while the VM is still Generation 1; deallocate it and update it to Trusted Launch."
 	},
 	{
 		"id" : "win-fix-inaccessible-boot-device",
