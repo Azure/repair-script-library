@@ -6,30 +6,32 @@
 # .DESCRIPTION
 #   Runs against the broken OS disk attached to a rescue VM by "az vm repair create". Every hive is
 #   validated, only the damaged ones are repaired, and the result is re-validated. A healthy disk
-#   produces no writes at all.
+#   produces no registry replacements. Discovery can prepare attached disks (online/read-write),
+#   stop an unmanaged nested ProblemVM and assign temporary drive letters. Logging and scratch
+#   checks write on the rescue VM, including in detect-only mode.
 #
 #   Detection, per hive:
 #     1. The hive file is missing.
 #     2. The hive file is 0 bytes.
 #     3. The hive file does not start with the 'regf' signature.
-#     4. Windows itself cannot parse the hive. This is the authoritative check: a scratch copy of
-#        the hive and its transaction logs is loaded with reg.exe, so a hive that is merely dirty
-#        is recovered by log replay and correctly reported as healthy, and the file on the offline
-#        disk is never modified by the check.
+#     4. The read-only offreg reader cannot open the hive. This does not mount it under HKLM or
+#        modify the source. Unreconciled hives can require recovery before they will open.
 #     5. chkreg.exe reports repairable structural damage in a hive that still loads.
 #     6. SAM or SECURITY is structurally sound but has lost the keys the account database cannot
 #        start without, such as SAM\Domains\Builtin or Policy\PolEKList. Windows stops at boot
 #        with 0xC00002E3 STATUS_SAM_INIT_FAILURE, and chkreg cannot bring the keys back.
 #
 #   Repair escalates only as far as it needs to, per hive:
-#     a. chkreg.exe /R /C on a scratch copy. The result must load, pass a fresh chkreg check and,
+#     a. chkreg.exe /R on a private scratch copy with every present recovery log. The result must
+#        load, pass a fresh chkreg check and,
 #        for SAM and SECURITY, still hold the keys listed in item 6 before it is allowed anywhere
 #        near the disk, so a failed or lossy repair can never replace a working hive.
 #     b. Restore from Windows\System32\Config\RegBack, only for the hives chkreg could not repair
 #        and only when allowRegBack=true is passed. The RegBack set is validated first: every
 #        candidate must load and pass the same content check, SYSTEM and SOFTWARE must both be
-#        present, SAM and SECURITY are restored only as a pair, and any hive whose timestamp is
-#        out of step with the core set is excluded rather than mixed in.
+#        present with timestamps within 24 hours, SAM and SECURITY are restored only as a pair
+#        within the same time bound, and out-of-step candidates are excluded. These checks do
+#        not independently establish semantic consistency or guest bootability.
 #
 #   The original file is copied next to itself before any replacement, and a restore that fails
 #   part way through rolls every hive it touched back to the file it started with.
@@ -41,7 +43,8 @@
 #   truncated hive behind.
 #
 # .PARAMETER detectOnly
-#   "true" to report what would be changed and make no writes at all. Defaults to "false".
+#   "true" to report findings without replacing registry hives. Discovery preparation and
+#   rescue-side logging/scratch writes still occur as described above. Defaults to "false".
 #
 # .PARAMETER allowRegBack
 #   "true" to allow a RegBack restore for the hives chkreg could not repair in place. Defaults
@@ -92,7 +95,7 @@
 #   restored its partner is restored from the same backup. When that happens, local account
 #   passwords revert to their state at backup time, and on a domain joined VM the machine
 #   account password reverts with them, so the domain trust may need repairing after boot.
-#   Every file the script replaces is copied to <name>.bak-<timestamp> first.
+#   Every file the script replaces is copied to <name>.bak-<timestamp>-<unique-id> first.
 #
 #   After recovery, consider re-enabling the periodic RegBack backup on the repaired VM with
 #   HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Configuration Manager
@@ -158,15 +161,13 @@ function Write-OperatorLog {
     }
 }
 
-# SYSTEM and SOFTWARE are required for the OS to start at all, so a problem with either is an
-# error. The rest degrade the installation without stopping the boot, so they are reported as
-# warnings and repaired opportunistically.
+# Required installed-image hives are distinct from the SYSTEM/SOFTWARE RegBack core set.
 function Get-OfflineHiveSpec {
     @(
         [PSCustomObject]@{ Name = 'SYSTEM'; Required = $true; Description = 'machine configuration, drivers and services' }
         [PSCustomObject]@{ Name = 'SOFTWARE'; Required = $true; Description = 'installed software and OS settings' }
-        [PSCustomObject]@{ Name = 'SAM'; Required = $false; Description = 'local accounts' }
-        [PSCustomObject]@{ Name = 'SECURITY'; Required = $false; Description = 'local security policy' }
+        [PSCustomObject]@{ Name = 'SAM'; Required = $true; Description = 'local accounts' }
+        [PSCustomObject]@{ Name = 'SECURITY'; Required = $true; Description = 'local security policy' }
         [PSCustomObject]@{ Name = 'DEFAULT'; Required = $false; Description = 'default user profile' }
         [PSCustomObject]@{ Name = 'COMPONENTS'; Required = $false; Description = 'servicing component store' }
     )
@@ -202,6 +203,73 @@ function Get-ChkRegPath {
 
     Add-OfflineRepairLog -Level Warning -Message "chkreg.exe was not found at $candidate. Structural repair is unavailable and only RegBack restore can be used."
     return ''
+}
+
+function New-PrivateScratchDirectory {
+    param([Parameter(Mandatory = $true)][string]$Parent)
+
+    $directory = Get-Item -LiteralPath $Parent -Force -ErrorAction Stop
+    if ($directory -isnot [System.IO.DirectoryInfo]) { throw "Scratch parent $Parent is not a filesystem directory." }
+    for ($ancestor = $directory; $null -ne $ancestor; $ancestor = $ancestor.Parent) {
+        if ($ancestor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "Scratch parent $($ancestor.FullName) is a reparse point."
+        }
+    }
+
+    if (-not ('RslRegistryScratch.NativeDirectory' -as [type])) {
+        # CreateDirectoryW applies the private DACL at creation and refuses existing paths;
+        # create-then-SetAcl would expose a window with inherited TEMP permissions.
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace RslRegistryScratch {
+    public static class NativeDirectory {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes {
+            public int Length;
+            public IntPtr Descriptor;
+            [MarshalAs(UnmanagedType.Bool)] public bool Inherit;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateDirectoryW(string path, ref SecurityAttributes attributes);
+        public static void Create(string path, byte[] descriptor) {
+            IntPtr buffer = Marshal.AllocHGlobal(descriptor.Length);
+            try {
+                Marshal.Copy(descriptor, 0, buffer, descriptor.Length);
+                SecurityAttributes attributes = new SecurityAttributes {
+                    Length = Marshal.SizeOf(typeof(SecurityAttributes)), Descriptor = buffer, Inherit = false
+                };
+                if (!CreateDirectoryW(path, ref attributes))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Creating private scratch directory '" + path + "'");
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+    }
+}
+'@ -ErrorAction Stop
+    }
+
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    try { $owner = $identity.User }
+    finally { $identity.Dispose() }
+    $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner($owner)
+    foreach ($sid in @($owner.Value, 'S-1-5-18', 'S-1-5-32-544') | Sort-Object -Unique) {
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            [System.Security.Principal.SecurityIdentifier]::new($sid),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $acl.AddAccessRule($rule)
+    }
+    $path = Join-Path $directory.FullName ("rsl-chkreg-{0}" -f [guid]::NewGuid().ToString('N'))
+    [RslRegistryScratch.NativeDirectory]::Create($path, $acl.GetSecurityDescriptorBinaryForm())
+    return $path
 }
 
 function Invoke-ChkReg {
@@ -243,12 +311,12 @@ function Invoke-ChkReg {
         Output       = ''
     }
 
-    $working = Join-Path $ScratchDir (Split-Path -Path $HivePath -Leaf)
-    if (-not (Test-OfflinePath $ScratchDir)) { New-Item -Path $ScratchDir -ItemType Directory -Force | Out-Null }
+    $snapshot = New-PrivateScratchDirectory -Parent $ScratchDir
+    $working = Join-Path $snapshot (Split-Path -Path $HivePath -Leaf)
     Copy-Item -LiteralPath $HivePath -Destination $working -Force -ErrorAction Stop
     foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
         if (Test-OfflinePath "$HivePath$suffix") {
-            Copy-Item -LiteralPath "$HivePath$suffix" -Destination "$working$suffix" -Force -ErrorAction SilentlyContinue
+            Copy-Item -LiteralPath "$HivePath$suffix" -Destination "$working$suffix" -Force -ErrorAction Stop
         }
     }
 
@@ -516,7 +584,7 @@ function Resolve-RegBackSource {
 
         # Opening with offreg is not a full structural check, so a backup must also pass
         # chkreg before it is treated as a usable source.
-        $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-check') -Repair $false
+        $check = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir $ScratchDir -Repair $false
         if (-not $check.FoundProblem) {
             # Recovering a structurally sound backup with chkreg cannot bring lost keys back.
             $loss = Get-HiveContentLossText -HiveName $hiveName -Path $SourcePath
@@ -535,7 +603,7 @@ function Resolve-RegBackSource {
 
     if (-not $canUseChkReg) { return $result }
 
-    $fix = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-fix') -Repair $true
+    $fix = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $SourcePath -ScratchDir $ScratchDir -Repair $true
     if (-not $fix.RepairedPath) {
         $result.Reason = "$($result.Reason) chkreg could not recover it (exit $($fix.ExitCode))."
         return $result
@@ -547,7 +615,7 @@ function Resolve-RegBackSource {
         return $result
     }
 
-    $verify = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $fix.RepairedPath -ScratchDir (Join-OfflinePath -Root $ScratchDir -ChildPath 'regback-verify') -Repair $false
+    $verify = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $fix.RepairedPath -ScratchDir $ScratchDir -Repair $false
     if ($verify.FoundProblem) {
         $result.Reason = "$($result.Reason) The recovered copy still fails chkreg (exit $($verify.ExitCode))."
         return $result
@@ -621,7 +689,7 @@ function Get-RegBackPlan {
         }
     }
 
-    $core = @($usable | Where-Object { $_.Required })
+    $core = @($usable | Where-Object { $_.Name -in @('SYSTEM', 'SOFTWARE') })
     $missingCore = @(@('SYSTEM', 'SOFTWARE') | Where-Object { $_ -notin @($core.Name) })
     if ($missingCore.Count -gt 0) {
         return [PSCustomObject]@{
@@ -633,8 +701,18 @@ function Get-RegBackPlan {
     }
 
     $newestCore = (@($core.WrittenUtc) | Sort-Object -Descending | Select-Object -First 1)
+    $oldestCore = (@($core.WrittenUtc) | Sort-Object | Select-Object -First 1)
+    $coreSkew = $newestCore - $oldestCore
+    if ($coreSkew -gt $MaximumSkew) {
+        return [PSCustomObject]@{
+            CanRestore = $false
+            Hives      = @()
+            Excluded   = @($excluded)
+            Reason     = "RegBack SYSTEM and SOFTWARE were written $([math]::Round($coreSkew.TotalHours, 1)) hours apart, beyond the allowed $($MaximumSkew.TotalHours) hours."
+        }
+    }
     $selected = @($core)
-    foreach ($candidate in @($usable | Where-Object { -not $_.Required })) {
+    foreach ($candidate in @($usable | Where-Object { $_.Name -notin @('SYSTEM', 'SOFTWARE') })) {
         $skew = [timespan]::FromTicks([math]::Abs(($candidate.WrittenUtc - $newestCore).Ticks))
         if ($skew -gt $MaximumSkew) {
             $excluded += [PSCustomObject]@{ Name = $candidate.Name; Reason = "Written $([math]::Round($skew.TotalHours, 1)) hours away from the core set." }
@@ -649,6 +727,15 @@ function Get-RegBackPlan {
     if ($hasSam -ne $hasSecurity) {
         $selected = @($selected | Where-Object { $_.Name -notin @('SAM', 'SECURITY') })
         $excluded += [PSCustomObject]@{ Name = 'SAM/SECURITY'; Reason = 'The identity hives must be restored as a pair and only one of them is usable.' }
+    }
+    elseif ($hasSam -and $hasSecurity) {
+        $samTime = ($selected | Where-Object { $_.Name -eq 'SAM' }).WrittenUtc
+        $securityTime = ($selected | Where-Object { $_.Name -eq 'SECURITY' }).WrittenUtc
+        $identitySkew = [timespan]::FromTicks([math]::Abs(($samTime - $securityTime).Ticks))
+        if ($identitySkew -gt $MaximumSkew) {
+            $selected = @($selected | Where-Object { $_.Name -notin @('SAM', 'SECURITY') })
+            $excluded += [PSCustomObject]@{ Name = 'SAM/SECURITY'; Reason = "The identity hives were written $([math]::Round($identitySkew.TotalHours, 1)) hours apart." }
+        }
     }
 
     return [PSCustomObject]@{ CanRestore = $true; Hives = @($selected); Excluded = @($excluded); Reason = '' }
@@ -667,8 +754,8 @@ function Test-RegBackMaintained {
         leftover from before the upgrade and can be years old, so it is precisely the backup
         that must not be offered as a repair.
 
-        SYSTEM is read from a scratch copy and never mounted from the offline disk, so a
-        detectOnly run keeps its promise to make no writes at all.
+        SYSTEM is opened through the read-only offreg reader, without an HKLM mount or
+        scratch copies. Reader cleanup failures propagate to the caller.
 
         Anything that stops the value being read counts as not maintained: with no way to
         confirm the backup was being refreshed, the conservative answer is to leave RegBack be.
@@ -680,40 +767,23 @@ function Test-RegBackMaintained {
     $systemHive = Join-OfflinePath -Root $ConfigPath -ChildPath 'SYSTEM'
     if (-not (Test-OfflinePath $systemHive)) { return $false }
 
-    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("rsl-regback-{0}" -f [guid]::NewGuid().ToString('N'))
-    $mountKey = "RSLREGBACK$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $mounted = $false
+    $reader = $null
     try {
-        Copy-Item -LiteralPath $systemHive -Destination $scratch -Force -ErrorAction Stop
-        foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) {
-            if (Test-OfflinePath "$systemHive$suffix") {
-                Copy-Item -LiteralPath "$systemHive$suffix" -Destination "$scratch$suffix" -Force -ErrorAction SilentlyContinue
-            }
+        $reader = Open-OfflineRegistryReader -Path $systemHive
+        $current = $reader.ReadDword('Select', 'Current')
+        if ($null -eq $current -or $current -lt 1 -or $current -gt 999) {
+            throw 'SYSTEM Select\Current is missing or does not identify a supported control set.'
         }
-
-        $null = & reg.exe load "HKLM\$mountKey" $scratch 2>&1
-        if ($LASTEXITCODE -ne 0) { return $false }
-        $mounted = $true
-
-        $current = (Get-ItemProperty -Path "HKLM:\$mountKey\Select" -ErrorAction SilentlyContinue).Current
-        $controlSet = if ($current) { 'ControlSet{0:d3}' -f [int]$current } else { 'ControlSet001' }
-        $value = (Get-ItemProperty -Path "HKLM:\$mountKey\$controlSet\Control\Session Manager\Configuration Manager" -ErrorAction SilentlyContinue).EnablePeriodicBackup
-        if ($null -eq $value) { return $false }
-        return ([int]$value -eq 1)
+        $controlSet = 'ControlSet{0:d3}' -f [int]$current
+        $value = $reader.ReadDword("$controlSet\Control\Session Manager\Configuration Manager", 'EnablePeriodicBackup')
+        return ($null -ne $value -and $value -eq 1)
     }
     catch {
         Add-OfflineRepairLog -Message "The periodic backup setting could not be read from SYSTEM ($($_.Exception.Message)), so RegBack is treated as not maintained."
         return $false
     }
     finally {
-        if ($mounted) {
-            [gc]::Collect()
-            [gc]::WaitForPendingFinalizers()
-            & reg.exe unload "HKLM\$mountKey" 2>&1 | Out-Null
-        }
-        foreach ($suffix in @('', '.LOG', '.LOG1', '.LOG2')) {
-            if (Test-Path -LiteralPath "$scratch$suffix") { Remove-Item -LiteralPath "$scratch$suffix" -Force -ErrorAction SilentlyContinue }
-        }
+        if ($reader) { $reader.Dispose() }
     }
 }
 
@@ -847,7 +917,7 @@ function Get-AllFinding {
                     }
                 }
                 catch {
-                    Add-OfflineRepairLog -Message "$($spec.Name): the required-content check could not run ($($_.Exception.Message)), so it was skipped."
+                    throw [System.IO.InvalidDataException]::new("$($spec.Name): the required-content check failed ($($_.Exception.GetType().FullName): $($_.Exception.Message)). Hive integrity is indeterminate; no replacement is authorized.", $_.Exception)
                 }
             }
             continue
@@ -938,7 +1008,7 @@ function Copy-HiveBackup {
         [Parameter(Mandatory = $true)][string]$Backup
     )
 
-    Copy-Item -LiteralPath $Path -Destination $Backup -Force -ErrorAction Stop
+    [System.IO.File]::Copy($Path, $Backup, $false)
     $liveHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
     $backupHash = (Get-FileHash -LiteralPath $Backup -Algorithm SHA256 -ErrorAction Stop).Hash
     if ($liveHash -ne $backupHash) {
@@ -1065,7 +1135,7 @@ function Repair-HiveInPlace {
         return $false
     }
 
-    $recheck = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $repair.RepairedPath -ScratchDir (Join-Path $ScratchDir 'verify') -Repair $false
+    $recheck = Invoke-ChkReg -ChkRegPath $ChkRegPath -HivePath $repair.RepairedPath -ScratchDir $ScratchDir -Repair $false
     if ($recheck.FoundProblem) {
         Add-OfflineRepairLog -Level $failLevel -Message "$($Finding.Item): the chkreg output still fails validation (exit $($recheck.ExitCode)), so the file on disk was left alone."
         return $false
@@ -1086,7 +1156,7 @@ function Repair-HiveInPlace {
     }
 
     # Nothing on disk has changed until the verified backup exists, so a failure here needs no rollback.
-    $stamp = Get-Date -Format yyyyMMddHHmmss
+    $stamp = '{0}-{1}' -f (Get-Date -Format yyyyMMddHHmmss), [guid]::NewGuid().ToString('N')
     $backup = "$path.bak-$stamp"
     Copy-HiveBackup -Path $path -Backup $backup
 
@@ -1158,7 +1228,7 @@ function Restore-HiveFromRegBack {
         Add-OfflineRepairLog -Level Warning -Message 'The account hives are being replaced with older copies. Local account passwords revert to their state at backup time, and on a domain joined VM the machine account password reverts too, so the domain trust may need to be repaired after the VM boots.'
     }
 
-    $stamp = Get-Date -Format yyyyMMddHHmmss
+    $stamp = '{0}-{1}' -f (Get-Date -Format yyyyMMddHHmmss), [guid]::NewGuid().ToString('N')
     $touched = [System.Collections.Generic.List[PSCustomObject]]::new()
     $restored = [System.Collections.Generic.List[string]]::new()
 
@@ -1214,199 +1284,211 @@ function Restore-HiveFromRegBack {
 
 Log-Output "START: Running script $scriptName (detectOnly=$isDetectOnly, allowRegBack=$isRegBackAllowed, hive=$hive)" | Tee-Object -FilePath $logFile -Append
 
-$scratchDir = Join-Path $env:TEMP "rsl-chkreg-$scriptStartTime"
+$scratchDir = $null
+$status = $STATUS_ERROR
 
 try {
-    $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
-    Write-OperatorLog
+    :main do {
+        $offline = Get-OfflineWindowsDisk -WindowsDrive $windowsDrive
+        Write-OperatorLog
 
-    Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
+        Log-Info "Offline Windows installation: $($offline.WindowsPath) on disk $($offline.DiskNumber) ($($offline.ProductName) build $($offline.BuildNumber))" | Tee-Object -FilePath $logFile -Append
 
-    $configPath = Join-OfflinePath -Root $offline.WindowsPath -ChildPath 'System32\Config'
-    if (-not (Test-OfflinePath $configPath)) {
-        throw "The registry directory was not found at $configPath."
-    }
+        $configPath = Join-OfflinePath -Root $offline.WindowsPath -ChildPath 'System32\Config'
+        if (-not (Test-OfflinePath $configPath)) {
+            throw "The registry directory was not found at $configPath."
+        }
 
-    New-Item -Path $scratchDir -ItemType Directory -Force | Out-Null
-    $chkRegPath = Get-ChkRegPath
-    Write-OperatorLog
-    if ($chkRegPath) { Log-Info "Using chkreg.exe from $chkRegPath" | Tee-Object -FilePath $logFile -Append }
+        $scratchDir = New-PrivateScratchDirectory -Parent $env:TEMP
+        $chkRegPath = Get-ChkRegPath
+        Write-OperatorLog
+        if ($chkRegPath) { Log-Info "Using chkreg.exe from $chkRegPath" | Tee-Object -FilePath $logFile -Append }
 
-    $findings = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
-    Write-OperatorLog
+        $findings = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
+        Write-OperatorLog
 
-    # chkreg works on structure, so it has nothing to offer a missing file or a hive whose
-    # structure is sound but whose required keys are gone.
-    $notRepairableInPlace = @('HiveMissing', 'HiveContentLost')
-    # Per finding detail goes to the detail log; the repair narration below would push it
-    # out of the returned log's 4096 character tail anyway. The authoritative list is
-    # printed next to the final summary.
-    foreach ($finding in $findings) {
-        "[Info $(Get-Date)]FOUND [$($finding.Cause)] $($finding.Message)" | Out-File -FilePath $logFile -Append -ErrorAction SilentlyContinue
-    }
-
-    if ($findings.Count -eq 0) {
-        Log-Output "No registry hive corruption was found in $configPath. No changes were made." | Tee-Object -FilePath $logFile -Append
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    if ($isDetectOnly) {
-        # Every label is the outcome of a real chkreg repair on a scratch copy, never an
-        # assumption. Measured 2026-09-02: with RegBack empty, a hardcoded [FIXABLE] promised
-        # three repairs where the repair run could only deliver one, so the label is now earned.
+        # chkreg works on structure, so it has nothing to offer a missing file or a hive whose
+        # structure is sound but whose required keys are gone.
+        $notRepairableInPlace = @('HiveMissing', 'HiveContentLost')
+        # Per finding detail goes to the detail log; the repair narration below would push it
+        # out of the returned log's 4096 character tail anyway. The authoritative list is
+        # printed next to the final summary.
         foreach ($finding in $findings) {
-            $finding.Repairable = $false
+            "[Info $(Get-Date)]FOUND [$($finding.Cause)] $($finding.Message)" | Out-File -FilePath $logFile -Append -ErrorAction SilentlyContinue
+        }
+
+        if ($findings.Count -eq 0) {
+            Log-Output "No registry hive corruption was found in $configPath. No registry hives were replaced." | Tee-Object -FilePath $logFile -Append
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break main
+        }
+
+        if ($isDetectOnly) {
+            # Every label is the outcome of a real chkreg repair on a scratch copy, never an
+            # assumption. Measured 2026-09-02: with RegBack empty, a hardcoded [FIXABLE] promised
+            # three repairs where the repair run could only deliver one, so the label is now earned.
+            foreach ($finding in $findings) {
+                $finding.Repairable = $false
+                if ($chkRegPath -and $finding.Cause -notin $notRepairableInPlace) {
+                    try {
+                        $finding.Repairable = Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir -TestOnly
+                    }
+                    catch {
+                        Add-OfflineRepairLog -Message "$($finding.Item): the in place repair could not be tested ($($_.Exception.Message))."
+                    }
+                }
+            }
+
+            $manual = @($findings | Where-Object { -not $_.Repairable })
+            $suggestion = Get-RegBackSuggestion -ConfigPath $configPath -Wanted ([string[]]@($manual | ForEach-Object { $_.Item })) -ChkRegPath $chkRegPath -ScratchDir $scratchDir
+            Write-OperatorLog
+
+            # Count last: the returned log keeps only its tail, so a summary printed ahead of
+            # its own evidence is what survives when the list behind it is truncated away.
+            foreach ($finding in $findings) {
+                $label = if ($finding.Repairable) { '[FIXABLE]' } else { '[MANUAL]' }
+                Log-Output "  $label $($finding.Message)" | Tee-Object -FilePath $logFile -Append
+            }
+            $fixableCount = @($findings | Where-Object { $_.Repairable }).Count
+            Log-Output "Detect only: found $($findings.Count) damaged hive(s), $fixableCount repairable in place. No registry hives were replaced." | Tee-Object -FilePath $logFile -Append
+            if ($manual.Count -gt 0 -and -not $suggestion.Available) {
+                Log-Output "$($manual.Count) hive(s) cannot be repaired from what is on this disk and need a source image or a disk level repair." | Tee-Object -FilePath $logFile -Append
+            }
+            if ($suggestion.Available) {
+                Log-Output (Get-RegBackOfferText -Suggestion $suggestion) | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_SUCCESS
+            break main
+        }
+
+        $repairedInPlace = [System.Collections.Generic.List[string]]::new()
+        $needRegBack = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($finding in $findings) {
             if ($chkRegPath -and $finding.Cause -notin $notRepairableInPlace) {
+                # A failure repairing one hive must not abandon the others: it falls through to the
+                # RegBack path for this hive and the run carries on.
+                $inPlace = $false
                 try {
-                    $finding.Repairable = Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir -TestOnly
+                    $inPlace = Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir
                 }
                 catch {
-                    Add-OfflineRepairLog -Message "$($finding.Item): the in place repair could not be tested ($($_.Exception.Message))."
+                    # A hive whose rollback failed is in an unverified state. Carrying on would build
+                    # more changes, or a RegBack restore, on top of a file nobody has checked.
+                    if (Test-HiveRollbackFailure $_.Exception) { throw }
+                    Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): in place repair could not run ($($_.Exception.Message))."
+                }
+                if ($inPlace) {
+                    $finding.Repaired = $true
+                    [void]$repairedInPlace.Add($finding.Item)
+                    Write-OperatorLog
+                    continue
                 }
             }
+            Write-OperatorLog
+            [void]$needRegBack.Add($finding.Item)
         }
 
-        $manual = @($findings | Where-Object { -not $_.Repairable })
-        $suggestion = Get-RegBackSuggestion -ConfigPath $configPath -Wanted ([string[]]@($manual | ForEach-Object { $_.Item })) -ChkRegPath $chkRegPath -ScratchDir $scratchDir
-        Write-OperatorLog
-
-        # Count last: the returned log keeps only its tail, so a summary printed ahead of
-        # its own evidence is what survives when the list behind it is truncated away.
-        foreach ($finding in $findings) {
-            $label = if ($finding.Repairable) { '[FIXABLE]' } else { '[MANUAL]' }
-            Log-Output "  $label $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-        }
-        $fixableCount = @($findings | Where-Object { $_.Repairable }).Count
-        Log-Output "Detect only: found $($findings.Count) damaged hive(s), $fixableCount repairable in place. No changes were made." | Tee-Object -FilePath $logFile -Append
-        if ($manual.Count -gt 0 -and -not $suggestion.Available) {
-            Log-Output "$($manual.Count) hive(s) cannot be repaired from what is on this disk and need a source image or a disk level repair." | Tee-Object -FilePath $logFile -Append
-        }
-        if ($suggestion.Available) {
-            Log-Output (Get-RegBackOfferText -Suggestion $suggestion) | Tee-Object -FilePath $logFile -Append
-        }
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_SUCCESS
-    }
-
-    $repairedInPlace = [System.Collections.Generic.List[string]]::new()
-    $needRegBack = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($finding in $findings) {
-        if ($chkRegPath -and $finding.Cause -notin $notRepairableInPlace) {
-            # A failure repairing one hive must not abandon the others: it falls through to the
-            # RegBack path for this hive and the run carries on.
-            $inPlace = $false
-            try {
-                $inPlace = Repair-HiveInPlace -Finding $finding -ChkRegPath $chkRegPath -ScratchDir $scratchDir
-            }
-            catch {
-                # A hive whose rollback failed is in an unverified state. Carrying on would build
-                # more changes, or a RegBack restore, on top of a file nobody has checked.
-                if (Test-HiveRollbackFailure $_.Exception) { throw }
-                Add-OfflineRepairLog -Level Warning -Message "$($finding.Item): in place repair could not run ($($_.Exception.Message))."
-            }
-            if ($inPlace) {
-                $finding.Repaired = $true
-                [void]$repairedInPlace.Add($finding.Item)
+        $restored = @()
+        $suggestion = [PSCustomObject]@{ Available = $false; Hives = @(); WrittenUtc = $null }
+        if ($needRegBack.Count -gt 0) {
+            if (-not $isRegBackAllowed) {
+                # RegBack is a last resort the operator opts into, so the run stops at the in place
+                # repair and only raises RegBack when it would genuinely help. On a stock disk the
+                # directory holds nothing but 0 byte files, and reporting that as a failed fallback
+                # would spend the operator's attention on the normal state of every modern install.
+                $suggestion = Get-RegBackSuggestion -ConfigPath $configPath -Wanted ([string[]]@($needRegBack)) -ChkRegPath $chkRegPath -ScratchDir $scratchDir
                 Write-OperatorLog
-                continue
-            }
-        }
-        Write-OperatorLog
-        [void]$needRegBack.Add($finding.Item)
-    }
-
-    $restored = @()
-    $suggestion = [PSCustomObject]@{ Available = $false; Hives = @(); WrittenUtc = $null }
-    if ($needRegBack.Count -gt 0) {
-        if (-not $isRegBackAllowed) {
-            # RegBack is a last resort the operator opts into, so the run stops at the in place
-            # repair and only raises RegBack when it would genuinely help. On a stock disk the
-            # directory holds nothing but 0 byte files, and reporting that as a failed fallback
-            # would spend the operator's attention on the normal state of every modern install.
-            $suggestion = Get-RegBackSuggestion -ConfigPath $configPath -Wanted ([string[]]@($needRegBack)) -ChkRegPath $chkRegPath -ScratchDir $scratchDir
-            Write-OperatorLog
-        }
-        else {
-            # The operator opted in, so a set left over from before the periodic backup was
-            # disabled is still used if it validates, but they are told it was not being refreshed.
-            $isRegBackMaintained = Test-RegBackMaintained -ConfigPath $configPath
-            $plan = Get-RegBackPlan -ConfigPath $configPath -ChkRegPath $chkRegPath -ScratchDir $scratchDir
-
-            foreach ($item in @($plan.Excluded)) {
-                Add-OfflineRepairLog -Message "RegBack excluded $($item.Name): $($item.Reason)"
-            }
-            Write-OperatorLog
-
-            if (-not $isRegBackMaintained) {
-                $staleNote = 'The periodic registry backup (EnablePeriodicBackup) was not enabled on this installation, so RegBack was not being refreshed.'
-                if ($plan.CanRestore) {
-                    $newest = (@($plan.Hives.WrittenUtc) | Sort-Object -Descending | Select-Object -First 1)
-                    $staleNote += " The usable set was written $($newest.ToString('yyyy-MM-dd HH:mm')) UTC and is restored because allowRegBack=true was passed."
-                }
-                Log-Warning $staleNote | Tee-Object -FilePath $logFile -Append
-            }
-
-            if (-not $plan.CanRestore) {
-                Log-Warning "RegBack cannot be used: $($plan.Reason)" | Tee-Object -FilePath $logFile -Append
             }
             else {
-                $restored = @(Restore-HiveFromRegBack -Plan $plan -Wanted ([string[]]@($needRegBack)))
+                # The operator opted in, so a set left over from before the periodic backup was
+                # disabled is still used if it validates, but they are told it was not being refreshed.
+                $isRegBackMaintained = Test-RegBackMaintained -ConfigPath $configPath
+                $plan = Get-RegBackPlan -ConfigPath $configPath -ChkRegPath $chkRegPath -ScratchDir $scratchDir
+
+                foreach ($item in @($plan.Excluded)) {
+                    Add-OfflineRepairLog -Message "RegBack excluded $($item.Name): $($item.Reason)"
+                }
                 Write-OperatorLog
-                foreach ($finding in $findings) {
-                    if ($finding.Item -in $restored) { $finding.Repaired = $true }
+
+                if (-not $isRegBackMaintained) {
+                    $staleNote = 'The periodic registry backup (EnablePeriodicBackup) was not enabled on this installation, so RegBack was not being refreshed.'
+                    if ($plan.CanRestore) {
+                        $newest = (@($plan.Hives.WrittenUtc) | Sort-Object -Descending | Select-Object -First 1)
+                        $staleNote += " The usable set was written $($newest.ToString('yyyy-MM-dd HH:mm')) UTC and is restored because allowRegBack=true was passed."
+                    }
+                    Log-Warning $staleNote | Tee-Object -FilePath $logFile -Append
                 }
 
-                # A hive dragged in by the identity pair rule has had its in place repair
-                # overwritten by the older backup, so reporting it as repaired in place would
-                # misdescribe what is now on disk.
-                foreach ($name in @($repairedInPlace | Where-Object { $_ -in $restored })) {
-                    [void]$repairedInPlace.Remove($name)
-                    Log-Warning "$($name) was repaired in place, but has been replaced from RegBack to stay matched with its partner hive. The in place repair no longer applies." | Tee-Object -FilePath $logFile -Append
+                if (-not $plan.CanRestore) {
+                    Log-Warning "RegBack cannot be used: $($plan.Reason)" | Tee-Object -FilePath $logFile -Append
+                }
+                else {
+                    $restored = @(Restore-HiveFromRegBack -Plan $plan -Wanted ([string[]]@($needRegBack)))
+                    Write-OperatorLog
+                    foreach ($finding in $findings) {
+                        if ($finding.Item -in $restored) { $finding.Repaired = $true }
+                    }
+
+                    # A hive dragged in by the identity pair rule has had its in place repair
+                    # overwritten by the older backup, so reporting it as repaired in place would
+                    # misdescribe what is now on disk.
+                    foreach ($name in @($repairedInPlace | Where-Object { $_ -in $restored })) {
+                        [void]$repairedInPlace.Remove($name)
+                        Log-Warning "$($name) was repaired in place, but has been replaced from RegBack to stay matched with its partner hive. The in place repair no longer applies." | Tee-Object -FilePath $logFile -Append
+                    }
                 }
             }
         }
-    }
 
-    # Verify against freshly read files rather than trusting the writes above.
-    $remaining = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
-    Write-OperatorLog
+        # Verify against freshly read files rather than trusting the writes above.
+        $remaining = @(Get-AllFinding -ConfigPath $configPath -HiveFilter $hiveFilter -ChkRegPath $chkRegPath -ScratchDir $scratchDir)
+        Write-OperatorLog
 
-    foreach ($finding in $remaining) {
-        Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
-    }
-
-    $repairedCount = @($findings | Where-Object { $_.Repaired }).Count
-    $summary = "Repaired $repairedCount of $($findings.Count) damaged hive(s) in $configPath."
-    if ($repairedInPlace.Count -gt 0) { $summary += " Repaired in place: $($repairedInPlace -join ', ')." }
-    if ($restored.Count -gt 0) { $summary += " Restored from RegBack: $($restored -join ', ')." }
-
-    if ($remaining.Count -gt 0) {
-        Log-Error "$summary $($remaining.Count) hive(s) are still damaged and need a source image or a disk level repair." | Tee-Object -FilePath $logFile -Append
-        if ($suggestion.Available) {
-            Log-Output (Get-RegBackOfferText -Suggestion $suggestion) | Tee-Object -FilePath $logFile -Append
+        foreach ($finding in $remaining) {
+            Log-Warning "STILL PRESENT [$($finding.Cause)] $($finding.Message)" | Tee-Object -FilePath $logFile -Append
         }
-        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-        return $STATUS_ERROR
-    }
 
-    Log-Output $summary | Tee-Object -FilePath $logFile -Append
-    Log-Output "Every replaced hive was saved next to itself with a .bak-<timestamp> suffix." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
-    Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_SUCCESS
+        $repairedCount = @($findings | Where-Object { $_.Repaired }).Count
+        $summary = "Repaired $repairedCount of $($findings.Count) damaged hive(s) in $configPath."
+        if ($repairedInPlace.Count -gt 0) { $summary += " Repaired in place: $($repairedInPlace -join ', ')." }
+        if ($restored.Count -gt 0) { $summary += " Restored from RegBack: $($restored -join ', ')." }
+
+        if ($remaining.Count -gt 0) {
+            Log-Error "$summary $($remaining.Count) hive(s) are still damaged and need a source image or a disk level repair." | Tee-Object -FilePath $logFile -Append
+            if ($suggestion.Available) {
+                Log-Output (Get-RegBackOfferText -Suggestion $suggestion) | Tee-Object -FilePath $logFile -Append
+            }
+            Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+            $status = $STATUS_ERROR
+            break main
+        }
+
+        Log-Output $summary | Tee-Object -FilePath $logFile -Append
+        Log-Output "Every replaced hive was saved next to itself with a .bak-<timestamp>-<unique-id> suffix." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Run 'az vm repair restore' to swap the repaired disk back to the original VM." | Tee-Object -FilePath $logFile -Append
+        Log-Output "Detail log: $logFile" | Tee-Object -FilePath $logFile -Append
+        $status = $STATUS_SUCCESS
+    } while ($false)
 }
 catch {
     Write-OperatorLog
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
-    return $STATUS_ERROR
+    $status = $STATUS_ERROR
 }
 finally {
-    Write-OperatorLog
     if ($scratchDir -and (Test-Path -LiteralPath $scratchDir)) {
-        Remove-Item -LiteralPath $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
+        try { Remove-Item -LiteralPath $scratchDir -Recurse -Force -ErrorAction Stop }
+        catch {
+            Add-OfflineRepairLog -Level Error -Message "Private scratch cleanup failed at $scratchDir ($($_.Exception.Message)). Credential-bearing hive copies may remain; remove this directory before retiring the rescue VM."
+            $status = $STATUS_ERROR
+        }
     }
+    Clear-OfflineDriveLetter
+    Write-OperatorLog
     "$(Get-Date -f yyyyMMddHHmmss)" | Out-File -FilePath $logFile -Append
 }
+return $status

@@ -1,10 +1,11 @@
-# Standalone fixture tests for the hive replacement and rollback paths in
+# Standalone fixture tests for detection, final status, hive replacement and rollback in
 # win-fix-registry-corruption.ps1. Every write is made to real files in a temp folder, and
-# Copy-Item / Move-Item failures are injected by path so each rollback branch is exercised.
+# Copy/move/hash failures are injected by path; backup-copy failures use a real file lock.
 # Run from the repository root:
 #   pwsh -NoProfile -File ./tests/test-win-fix-registry-corruption.ps1
 
 $ErrorActionPreference = 'Stop'
+$null = Get-Command Microsoft.PowerShell.Utility\Get-FileHash -ErrorAction Stop
 $repositoryRoot = Split-Path $PSScriptRoot -Parent
 $sourceScript = Join-Path $repositoryRoot 'src/windows/win-fix-registry-corruption.ps1'
 $commonHelper = Join-Path $repositoryRoot 'src/windows/common/helpers/OfflineRepairCommon.ps1'
@@ -43,11 +44,15 @@ function Invoke-Case {
 $wanted = @(
     'Get-HiveRollbackFailure', 'Test-HiveRollbackFailure', 'Move-HiveTransactionLog', 'Copy-HiveBackup',
     'Restore-HiveFileFromBackup', 'Undo-HiveReplacement', 'Repair-HiveInPlace', 'Restore-HiveFromRegBack',
-    'Invoke-ChkReg'
+    'Invoke-ChkReg', 'Get-OfflineHiveSpec', 'New-Finding', 'Get-AllFinding', 'Write-OperatorLog',
+    'Get-RegBackPlan', 'Test-RegBackMaintained', 'New-PrivateScratchDirectory'
 )
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($sourceScript, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count -gt 0) { throw "The script under test does not parse: $($parseErrors[0].Message)" }
+$mainTry = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] })
+if ($mainTry.Count -ne 1) { throw 'Expected one top-level repair try/catch/finally.' }
+$script:MainUnderTest = [scriptblock]::Create($mainTry[0].Extent.Text + "`nreturn `$status")
 $definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted }, $false))
 foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
 $missing = @($wanted | Where-Object { $_ -notin @($definitions.Name) })
@@ -58,6 +63,14 @@ if ($missing.Count -gt 0) { Write-Host "Not defined by the script under test: $(
 # own name so it can still be exercised directly.
 if ('Invoke-ChkReg' -in @($definitions.Name)) {
     ${function:Invoke-ChkRegReal} = ${function:Invoke-ChkReg}
+}
+if ('New-PrivateScratchDirectory' -in @($definitions.Name)) {
+    ${function:New-PrivateScratchDirectoryReal} = ${function:New-PrivateScratchDirectory}
+    function New-PrivateScratchDirectory {
+        Param([string]$Parent)
+        if ($Parent -eq $env:TEMP) { $Parent = $global:RegFixture.Scratch }
+        New-PrivateScratchDirectoryReal -Parent $Parent
+    }
 }
 if ('Test-HiveRollbackFailure' -in $missing) {
     # Lets a run against an older revision report behaviour rather than a missing name.
@@ -77,12 +90,84 @@ function Invoke-ChkReg {
 
 function Test-OfflineHiveFile {
     Param([string]$Path)
-    $onDisk = -not $Path.StartsWith($global:RegFixture.Scratch, [System.StringComparison]::OrdinalIgnoreCase)
-    if ($onDisk -and $global:RegFixture.InvalidOnDisk) {
-        return [PSCustomObject]@{ IsValid = $false; Reason = 'FIXTURE: does not load' }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [PSCustomObject]@{ Exists = $false; IsValid = $false; Size = 0; Reason = 'not present' }
     }
-    return [PSCustomObject]@{ IsValid = $true; Reason = '' }
+    $size = (Get-Item -LiteralPath $Path).Length
+    $onDisk = -not $Path.StartsWith($global:RegFixture.Scratch, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($onDisk -and ($global:RegFixture.InvalidOnDisk -or (Split-Path $Path -Leaf) -eq $global:RegFixture.DamagedHive)) {
+        return [PSCustomObject]@{ Exists = $true; IsValid = $false; Size = $size; Reason = 'FIXTURE: does not load' }
+    }
+    return [PSCustomObject]@{ Exists = $true; IsValid = $true; Size = $size; Reason = '' }
 }
+
+function Test-HiveContentIntact {
+    Param([string]$HiveName, [string]$Path)
+    if ($HiveName -eq $global:RegFixture.ProbeFailure) {
+        throw [System.InvalidOperationException]::new("FIXTURE: $HiveName probe unavailable")
+    }
+    return [PSCustomObject]@{ IsIntact = $true; Missing = @() }
+}
+
+function Get-OfflineWindowsDisk {
+    Param([string]$WindowsDrive)
+    if ($global:RegFixture.DiscoveryFailure) { throw 'FIXTURE: discovery failed after assigning a drive letter' }
+    return [PSCustomObject]@{ WindowsPath = $global:RegFixture.Windows; DiskNumber = -1; ProductName = 'fixture'; BuildNumber = 'fixture' }
+}
+
+function Get-ChkRegPath { return 'fixture-chkreg.exe' }
+
+function Get-RegBackSuggestion {
+    Param([string]$ConfigPath, [string[]]$Wanted, [string]$ChkRegPath, [string]$ScratchDir)
+    return [PSCustomObject]@{ Available = $false; Hives = @(); WrittenUtc = $null }
+}
+
+function Resolve-RegBackSource {
+    Param([string]$SourcePath, [string]$ChkRegPath, [string]$ScratchDir)
+    return [PSCustomObject]@{ IsUsable = $true; Path = $SourcePath; Reconciled = $false; Reason = '' }
+}
+
+function Clear-OfflineDriveLetter {
+    $global:RegFixture.DriveLettersCleared = $true
+    if ($global:RegFixture.CleanupWarning) { Add-OfflineRepairLog -Level Warning -Message 'FIXTURE: a temporary drive letter could not be removed.' }
+}
+
+function Open-OfflineRegistryReader {
+    Param([string]$Path)
+    $global:RegFixture.ReaderPath = $Path
+    $reader = [pscustomobject]@{}
+    $reader | Add-Member -MemberType ScriptMethod -Name ReadDword -Value {
+        Param([string]$Key, [string]$Name)
+        if ($global:RegFixture.ReaderReadFailure) { throw 'FIXTURE: metadata read failed' }
+        if ($Key -eq 'Select' -and $Name -eq 'Current') { return 2 }
+        if ($Key -eq 'ControlSet002\Control\Session Manager\Configuration Manager' -and $Name -eq 'EnablePeriodicBackup') {
+            return $global:RegFixture.PeriodicBackup
+        }
+        throw "Unexpected reader request: $Key\$Name"
+    }
+    $reader | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+        $global:RegFixture.ReaderDisposed = $true
+        if ($global:RegFixture.ReaderCloseFailure) { throw 'FIXTURE: reader close failed' }
+    }
+    return $reader
+}
+
+function Get-Date {
+    Param([string]$Format)
+    if ($Format -eq 'yyyyMMddHHmmss' -and $global:RegFixture.FixedStamp) { return $global:RegFixture.FixedStamp }
+    if ($Format) { return Microsoft.PowerShell.Utility\Get-Date -Format $Format }
+    return Microsoft.PowerShell.Utility\Get-Date
+}
+
+function Log-Output {
+    Param([string]$Message)
+    [void]$global:RegFixture.OperatorLog.Add($Message)
+    return $Message
+}
+
+function Log-Info { Param([string]$Message) Log-Output $Message }
+function Log-Warning { Param([string]$Message) Log-Output $Message }
+function Log-Error { Param([string]$Message) Log-Output $Message }
 
 function Get-HiveContentLossText {
     Param([string]$HiveName, [string]$Path)
@@ -131,19 +216,51 @@ function Move-Item {
     Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force -ErrorAction Stop
 }
 
+function Remove-Item {
+    [CmdletBinding()]
+    Param([string]$LiteralPath, [switch]$Recurse, [switch]$Force)
+    $fault = Get-Fault -Command 'Remove-Item' -Source $LiteralPath -Destination ''
+    if ($fault) { Write-Error "FIXTURE: deleting $LiteralPath failed."; return }
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Recurse:$Recurse -Force:$Force -ErrorAction Stop
+}
+
+function Get-FileHash {
+    [CmdletBinding()]
+    Param([string]$LiteralPath, [string]$Algorithm = 'SHA256')
+    $fault = Get-Fault -Command 'Get-FileHash' -Source $LiteralPath -Destination ''
+    if ($fault -and $fault.Mode -eq 'Corrupt') {
+        Microsoft.PowerShell.Management\Set-Content -LiteralPath $LiteralPath -Value 'TORN' -NoNewline
+    }
+    Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm -ErrorAction Stop
+}
+
 # ---- fixture ------------------------------------------------------------------------------
 
 function Reset-Fixture {
     if (Test-Path -LiteralPath $fixtureRoot) { Microsoft.PowerShell.Management\Remove-Item -LiteralPath $fixtureRoot -Recurse -Force }
-    $config = Join-Path $fixtureRoot 'Config'
+    $windows = Join-Path $fixtureRoot 'Windows'
+    $config = Join-Path $windows 'System32\Config'
     $regBack = Join-Path $config 'RegBack'
     $scratch = Join-Path $fixtureRoot 'scratch'
     New-Item -ItemType Directory -Path $regBack, $scratch -Force | Out-Null
     $global:RegFixture = @{
         Config = $config
+        Windows = $windows
         RegBack = $regBack
         Scratch = $scratch
         InvalidOnDisk = $false
+        DamagedHive = ''
+        ProbeFailure = ''
+        FixedStamp = ''
+        DriveLettersCleared = $false
+        DiscoveryFailure = $false
+        CleanupWarning = $false
+        PeriodicBackup = 1
+        ReaderReadFailure = $false
+        ReaderCloseFailure = $false
+        ReaderDisposed = $false
+        ReaderPath = ''
+        OperatorLog = [System.Collections.Generic.List[string]]::new()
         Faults = [System.Collections.Generic.List[PSCustomObject]]::new()
     }
     Clear-OfflineRepairLog
@@ -184,6 +301,26 @@ function Get-LogText {
     return (@(Get-OfflineRepairLog | Where-Object { -not $Level -or $_.Level -eq $Level } | ForEach-Object { $_.Message }) -join "`n")
 }
 
+function Get-ConfigManifest {
+    return (@(Get-ChildItem -LiteralPath $global:RegFixture.Config -File -Recurse |
+                Sort-Object FullName | ForEach-Object {
+                    "$($_.FullName):$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+                }) -join "`n")
+}
+
+function Invoke-FixtureMain {
+    $STATUS_SUCCESS = 'fixture-success'
+    $STATUS_ERROR = 'fixture-error'
+    $windowsDrive = ''
+    $isDetectOnly = $false
+    $isRegBackAllowed = $false
+    $hiveFilter = $null
+    $scratchDir = $global:RegFixture.Scratch
+    $logFile = Join-Path $fixtureRoot 'operator.log'
+    $result = @(& $script:MainUnderTest)
+    return $result[-1]
+}
+
 function Invoke-InPlace {
     Param([string]$Name, [switch]$TestOnly)
     $finding = [PSCustomObject]@{ Item = $Name; Data = [PSCustomObject]@{ Path = (Join-Path $global:RegFixture.Config $Name) } }
@@ -205,6 +342,207 @@ function New-FakeChkReg {
 }
 
 try {
+    foreach ($missingHive in @('SAM', 'SECURITY')) {
+        Invoke-Case "detection: missing $missingHive is actionable and cannot report a successful repair" {
+            foreach ($name in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) { [void](New-Hive $name) }
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath (Join-Path $global:RegFixture.Config $missingHive) -Force
+            $before = Get-ConfigManifest
+            $findings = @(Get-AllFinding -ConfigPath $global:RegFixture.Config -ChkRegPath 'fixture' -ScratchDir $global:RegFixture.Scratch)
+            Assert-Equal 1 $findings.Count 'Only the absent identity hive is reported.'
+            Assert-Equal $missingHive $findings[0].Item 'The finding names the missing hive.'
+            Assert-Equal 'HiveMissing' $findings[0].Cause 'The finding identifies an absent required file.'
+            Assert-Equal 'fixture-error' (Invoke-FixtureMain) 'Default repair returns the error status with no recovery source.'
+            Assert-True (($global:RegFixture.OperatorLog -join "`n") -match "STILL PRESENT \[HiveMissing\].*$missingHive") 'The operator sees the unresolved missing hive.'
+            Assert-Equal $before (Get-ConfigManifest) 'All unrelated hives, transaction logs and backups remain unchanged.'
+        }
+    }
+
+    foreach ($failedHive in @('SAM', 'SECURITY')) {
+        Invoke-Case "detection: a $failedHive content-probe exception aborts before any replacement" {
+            foreach ($name in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) { [void](New-Hive $name) }
+            $global:RegFixture.ProbeFailure = $failedHive
+            $global:RegFixture.DamagedHive = 'SYSTEM'
+            $before = Get-ConfigManifest
+            $caught = $null
+            try { [void](Get-AllFinding -ConfigPath $global:RegFixture.Config -ChkRegPath 'fixture' -ScratchDir $global:RegFixture.Scratch) }
+            catch { $caught = $_.Exception }
+            Assert-True ($null -ne $caught) 'An indeterminate integrity check cannot return an empty finding list.'
+            Assert-True ($caught.Message -match "$failedHive.*required-content") 'The error identifies the hive and required-content check.'
+            Assert-True ($caught.Message -match 'InvalidOperationException.*probe unavailable') 'The original exception context is preserved.'
+            Assert-Equal 'fixture-error' (Invoke-FixtureMain) 'The actual main handler returns the error status.'
+            Assert-True (($global:RegFixture.OperatorLog -join "`n") -match "$failedHive.*required-content") 'The operator sees the failed integrity check.'
+            Assert-Equal $before (Get-ConfigManifest) 'Detection failure performs no hive, log or backup mutation.'
+        }
+    }
+
+    Invoke-Case 'detection: healthy required hives and absent optional hives remain a no-write success' {
+        foreach ($name in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) { [void](New-Hive $name) }
+        $before = Get-ConfigManifest
+        Assert-Equal 0 @(Get-AllFinding -ConfigPath $global:RegFixture.Config -ChkRegPath 'fixture' -ScratchDir $global:RegFixture.Scratch).Count 'Absent DEFAULT and COMPONENTS are still optional.'
+        Assert-Equal 'fixture-success' (Invoke-FixtureMain) 'Healthy hives retain the success status.'
+        Assert-True $global:RegFixture.DriveLettersCleared 'The main finally releases discovery-assigned drive letters.'
+        Assert-Equal $before (Get-ConfigManifest) 'A healthy installation produces zero hive writes.'
+    }
+
+    Invoke-Case 'RegBack plan: missing identity backups do not redefine the SYSTEM/SOFTWARE core set' {
+        [void](New-Hive SYSTEM)
+        [void](New-Hive SOFTWARE)
+        $plan = Get-RegBackPlan -ConfigPath $global:RegFixture.Config -ScratchDir $global:RegFixture.Scratch
+        Assert-True $plan.CanRestore 'Core backups remain usable when identity backups are absent.'
+        Assert-Equal 'SOFTWARE,SYSTEM' (($plan.Hives.Name | Sort-Object) -join ',') 'Only the original core set is selected.'
+    }
+
+    Invoke-Case 'RegBack plan: core backups written more than a day apart are rejected' {
+        $system = New-Hive SYSTEM
+        [void](New-Hive SOFTWARE)
+        (Get-Item -LiteralPath $system.SourcePath).LastWriteTimeUtc = [datetime]::UtcNow.AddDays(-3)
+        $plan = Get-RegBackPlan -ConfigPath $global:RegFixture.Config -ScratchDir $global:RegFixture.Scratch
+        Assert-True (-not $plan.CanRestore) 'Individually valid but mismatched core backups are not a consistent restore set.'
+        Assert-Equal 0 $plan.Hives.Count 'No replacement is authorized.'
+        Assert-True ($plan.Reason -match 'SYSTEM.*SOFTWARE.*hours') 'The reason names the mismatched core hives and their time gap.'
+    }
+
+    Invoke-Case 'RegBack plan: stale identity backups remain excluded from the core set' {
+        foreach ($name in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) {
+            $hiveFile = New-Hive $name
+            if ($name -in @('SAM', 'SECURITY')) { (Get-Item -LiteralPath $hiveFile.SourcePath).LastWriteTimeUtc = [datetime]::UtcNow.AddDays(-3) }
+        }
+        $plan = Get-RegBackPlan -ConfigPath $global:RegFixture.Config -ScratchDir $global:RegFixture.Scratch
+        Assert-True $plan.CanRestore 'The matched SYSTEM/SOFTWARE backups are still usable.'
+        Assert-Equal 'SOFTWARE,SYSTEM' (($plan.Hives.Name | Sort-Object) -join ',') 'Stale identity backups cannot bypass the timestamp gate.'
+    }
+
+    Invoke-Case 'RegBack plan: an identity pair more than a day apart is excluded together' {
+        $time = [datetime]::UtcNow
+        foreach ($name in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) {
+            $hiveFile = New-Hive $name
+            $written = $time
+            if ($name -eq 'SAM') { $written = $time.AddHours(-23) }
+            if ($name -eq 'SECURITY') { $written = $time.AddHours(23) }
+            (Get-Item -LiteralPath $hiveFile.SourcePath).LastWriteTimeUtc = $written
+        }
+        $plan = Get-RegBackPlan -ConfigPath $global:RegFixture.Config -ScratchDir $global:RegFixture.Scratch
+        Assert-True $plan.CanRestore 'The consistent core remains available.'
+        Assert-Equal 'SOFTWARE,SYSTEM' (($plan.Hives.Name | Sort-Object) -join ',') 'Individually near-core but mutually mismatched identity hives are excluded together.'
+    }
+
+    Invoke-Case 'scratch: private directories have unique names and a restricted inheritable DACL' {
+        $first = New-PrivateScratchDirectory -Parent $global:RegFixture.Scratch
+        $second = New-PrivateScratchDirectory -Parent $global:RegFixture.Scratch
+        Assert-True ($first -ne $second) 'Two operations cannot reuse a scratch directory.'
+        $acl = Get-Acl -LiteralPath $first
+        Assert-True $acl.AreAccessRulesProtected 'The directory does not inherit broad TEMP access.'
+        $sids = @($acl.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } | Sort-Object)
+        $ownerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $expectedSids = @('S-1-5-18', 'S-1-5-32-544', $ownerSid) | Sort-Object -Unique
+        Assert-Equal ($expectedSids -join ',') ($sids -join ',') 'Only the repair identity, SYSTEM and Administrators receive access.'
+        Assert-True (@($acl.Access | Where-Object { $_.AccessControlType -ne 'Allow' -or $_.FileSystemRights -ne 'FullControl' }).Count -eq 0) 'The private directory remains usable by its repair identity.'
+        Assert-True (@($acl.Access | Where-Object { $_.InheritanceFlags -ne 'ContainerInherit, ObjectInherit' }).Count -eq 0) 'Copies and subdirectories inherit the same restriction.'
+    }
+
+    Invoke-Case 'scratch: a reparse-point parent is rejected before copying any hive' {
+        $target = Join-Path $fixtureRoot 'junction-target'
+        $link = Join-Path $global:RegFixture.Scratch 'junction-parent'
+        New-Item -ItemType Directory -Path $target | Out-Null
+        New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+        try {
+            $caught = $null
+            try { [void](New-PrivateScratchDirectory -Parent $link) } catch { $caught = $_.Exception }
+            Assert-True ($null -ne $caught -and $caught.Message -match 'reparse') 'An untrusted parent is not followed.'
+            Assert-Equal 0 @(Get-ChildItem -LiteralPath $target).Count 'No scratch files reach the linked target.'
+        }
+        finally { [System.IO.Directory]::Delete($link) }
+    }
+
+    Invoke-Case 'main: cleanup warnings precede the final status' {
+        foreach ($name in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) { [void](New-Hive $name) }
+        $global:RegFixture.CleanupWarning = $true
+        Assert-Equal 'fixture-success' (Invoke-FixtureMain) 'A warning does not displace the final result.'
+        Assert-True (($global:RegFixture.OperatorLog -join "`n") -match 'temporary drive letter') 'The helper cleanup warning is surfaced.'
+    }
+
+    Invoke-Case 'main: drive letters are released after partial discovery fails' {
+        $global:RegFixture.DiscoveryFailure = $true
+        Assert-Equal 'fixture-error' (Invoke-FixtureMain) 'Discovery failure retains the error status.'
+        Assert-True $global:RegFixture.DriveLettersCleared 'Cleanup runs even before discovery returns an offline object.'
+    }
+
+    Invoke-Case 'main: failed scratch deletion is visible and cannot report success' {
+        foreach ($name in @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY')) { [void](New-Hive $name) }
+        Add-Fault -Command 'Remove-Item' -Source "$($global:RegFixture.Scratch)\*" -Destination ''
+        Assert-Equal 'fixture-error' (Invoke-FixtureMain) 'Credential-bearing scratch cleanup failure changes the final status.'
+        Assert-True (($global:RegFixture.OperatorLog -join "`n") -match 'scratch.*FIXTURE') 'The retained scratch path and failure are operator-visible.'
+        Assert-True $global:RegFixture.DriveLettersCleared 'Drive-letter cleanup still runs after scratch cleanup fails.'
+    }
+
+    Invoke-Case 'RegBack maintenance: the selected control set is read without registry mounts' {
+        $hiveFile = New-Hive SYSTEM
+        $before = Get-ConfigManifest
+        Assert-True (Test-RegBackMaintained -ConfigPath $global:RegFixture.Config) 'The enabled setting is detected.'
+        Assert-Equal $hiveFile.LivePath $global:RegFixture.ReaderPath 'SYSTEM is opened read-only in place.'
+        Assert-True $global:RegFixture.ReaderDisposed 'The reader is closed.'
+        Assert-Equal $before (Get-ConfigManifest) 'Metadata reads do not copy or mutate hives or logs.'
+        $global:RegFixture.PeriodicBackup = $null
+        Assert-True (-not (Test-RegBackMaintained -ConfigPath $global:RegFixture.Config)) 'An absent setting is conservatively treated as disabled.'
+    }
+
+    Invoke-Case 'RegBack maintenance: read failures are logged and the reader is closed' {
+        [void](New-Hive SYSTEM)
+        $global:RegFixture.ReaderReadFailure = $true
+        Assert-True (-not (Test-RegBackMaintained -ConfigPath $global:RegFixture.Config)) 'An unverified backup is not offered.'
+        Assert-True $global:RegFixture.ReaderDisposed 'A failed read still disposes the reader.'
+        Assert-True ((Get-LogText) -match 'metadata read failed') 'The read failure is recorded explicitly.'
+    }
+
+    Invoke-Case 'RegBack maintenance: a reader close failure is not swallowed' {
+        [void](New-Hive SYSTEM)
+        $global:RegFixture.ReaderCloseFailure = $true
+        $caught = $null
+        try { [void](Test-RegBackMaintained -ConfigPath $global:RegFixture.Config) } catch { $caught = $_.Exception }
+        Assert-True ($null -ne $caught -and $caught.Message -match 'reader close failed') 'Failed resource cleanup aborts instead of reporting a verified setting.'
+    }
+
+    Invoke-Case 'scratch: a failed recovery-log copy prevents chkreg from running' {
+        $hiveFile = New-Hive SYSTEM
+        Add-Fault -Command 'Copy-Item' -Source "$($hiveFile.LivePath).LOG1"
+        $caught = $null
+        try { [void](Invoke-ChkRegReal -ChkRegPath (New-FakeChkReg) -HivePath $hiveFile.LivePath -ScratchDir $global:RegFixture.Scratch) }
+        catch { $caught = $_.Exception }
+        Assert-True ($null -ne $caught) 'A present log that could not be copied is not silently omitted.'
+        Assert-True ($caught.Message -match 'SYSTEM.LOG1') 'The error identifies the unreadable recovery log.'
+    }
+
+    Invoke-Case 'scratch: validation after log retirement cannot reuse stale scratch logs' {
+        $hiveFile = New-Hive SYSTEM
+        $tool = New-FakeChkReg
+        $first = Invoke-ChkRegReal -ChkRegPath $tool -HivePath $hiveFile.LivePath -ScratchDir $global:RegFixture.Scratch -Repair $true
+        foreach ($suffix in @('.LOG', '.LOG1', '.LOG2')) { Microsoft.PowerShell.Management\Remove-Item -LiteralPath "$($hiveFile.LivePath)$suffix" -Force }
+        $second = Invoke-ChkRegReal -ChkRegPath $tool -HivePath $hiveFile.LivePath -ScratchDir $global:RegFixture.Scratch -Repair $true
+        Assert-True ($first.RepairedPath -ne $second.RepairedPath) 'Every check uses its own snapshot.'
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath (Split-Path $second.RepairedPath -Parent) -Filter 'SYSTEM.LOG*').Count 'No earlier transaction log is carried into the fresh snapshot.'
+    }
+
+    Invoke-Case 'backup: in-place and paired RegBack replacement in the same second preserve the first original' {
+        $sam = New-Hive SAM
+        $security = New-Hive SECURITY
+        $global:RegFixture.FixedStamp = '20261014000000'
+        Assert-True (Invoke-InPlace SAM) 'The first replacement succeeds.'
+        [void](Restore-HiveFromRegBack -Plan ([PSCustomObject]@{ Hives = @($sam, $security) }) -Wanted @('SECURITY'))
+        $backups = @(Get-ChildItem -LiteralPath $global:RegFixture.Config -Filter 'SAM.bak-*')
+        Assert-Equal 2 $backups.Count 'The intermediate replacement receives a different backup identity.'
+        Assert-True (@($backups | Where-Object { (Get-Text $_.FullName) -eq 'ORIGINAL-SAM' }).Count -eq 1) 'The first original remains available for manual recovery.'
+    }
+
+    Invoke-Case 'backup: an existing recovery copy is never overwritten' {
+        $hiveFile = New-Hive SYSTEM
+        $backup = "$($hiveFile.LivePath).bak-existing"
+        Set-Content -LiteralPath $backup -Value 'FIRST-RECOVERY-COPY' -NoNewline
+        $caught = $null
+        try { Copy-HiveBackup -Path $hiveFile.LivePath -Backup $backup } catch { $caught = $_.Exception }
+        Assert-True ($null -ne $caught) 'A colliding backup path stops the replacement.'
+        Assert-Equal 'FIRST-RECOVERY-COPY' (Get-Text $backup) 'The pre-existing recovery copy remains intact.'
+    }
+
     # ---- Invoke-ChkReg -------------------------------------------------------------------
     # These cases call the genuine Invoke-ChkReg (captured as Invoke-ChkRegReal above), not the
     # stub used by the rest of this file, and run with this file's own $ErrorActionPreference of
@@ -262,16 +600,19 @@ try {
 
     Invoke-Case 'in place: a backup copy that fails leaves the hive untouched' {
         $hive = New-Hive SYSTEM
-        Add-Fault -Command 'Copy-Item' -Source $hive.LivePath -Destination '*.bak-*'
+        $lock = [System.IO.File]::Open($hive.LivePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         $threw = $false
-        try { [void](Invoke-InPlace SYSTEM) } catch { $threw = $true }
+        try {
+            try { [void](Invoke-InPlace SYSTEM) } catch { $threw = $true }
+        }
+        finally { $lock.Dispose() }
         Assert-True $threw 'A failed backup stops the replacement.'
         Assert-HiveOriginal $hive.LivePath SYSTEM 'Failed backup:'
     }
 
     Invoke-Case 'in place: a torn backup is caught before the hive is overwritten' {
         $hive = New-Hive SYSTEM
-        Add-Fault -Command 'Copy-Item' -Source $hive.LivePath -Destination '*.bak-*' -Mode Corrupt
+        Add-Fault -Command 'Get-FileHash' -Source '*.bak-*' -Mode Corrupt
         $threw = $false
         try { [void](Invoke-InPlace SYSTEM) } catch { $threw = $true; $message = $_.Exception.Message }
         Assert-True $threw 'A backup that does not match the hive stops the replacement.'

@@ -17,3 +17,18 @@ pwsh -NoProfile -File ./tests/test-win-enable-nvme-boot-driver.ps1
 Do not merge an affected change when any gate fails or when the pull request does not include the
 results. These tests are static and fixture-based; they do not replace the live validation required
 for changes that modify a repair script's write behavior.
+
+## Registry corruption regressions
+
+Run the focused fixture suite on Windows using both PowerShell 7 and Windows PowerShell 5.1:
+
+```powershell
+pwsh -NoProfile -File ./tests/test-win-fix-registry-corruption.ps1
+powershell.exe -NoProfile -File ./tests/test-win-fix-registry-corruption.ps1
+```
+
+It covers missing required hives, indeterminate content checks, RegBack timestamp bounds,
+exclusive private scratch directories, recovery-log copy failures, backup collisions, verified
+rollback, and final cleanup/status ordering. Writes are confined to temporary fixtures; native
+stderr handling uses a small command fixture. It does not establish native hive recovery or guest
+bootability: record separate guarded repair/restore/boot validation against a disposable VM.
