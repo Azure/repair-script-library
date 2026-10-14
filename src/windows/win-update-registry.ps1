@@ -1,27 +1,30 @@
 <#
 .SYNOPSIS
-    Modifies a registry value on an OS disk attached to a Rescue VM as a data disk.
+    Safely updates a registry value on a validated Windows OS disk attached to a repair VM.
 
 .DESCRIPTION
     This script runs from a rescue VM to modify registry values on attached faulty OS disks.
     It performs the following steps:
     1. Stops any nested guest VM to ensure the attached disk is not in use.
-    2. Brings the attached disk online and enumerates its partitions via Get-Disk-Partitions.
-    3. Locates the Windows partition by checking for the registry config path (skips the rescue VM's own OS drive).
-    4. Loads the specified registry hive from the attached disk (skips the partition if load fails).
-    5. Determines the active ControlSet (if using the SYSTEM hive) from the Select key.
-    6. Reads the current value of the specified registry property (if it exists).
-    7. Creates the registry path if it does not exist, then sets the specified property value.
-    8. Unloads the registry hive cleanly.
+    2. Identifies attached repair targets while excluding the repair VM's protected disks.
+    3. Validates a Windows partition by requiring both an OS loader and the requested hive.
+    4. For Gen2 targets, validates the offline BCD loader mapping and repairs only
+         device/osdevice values that BCDEdit reports as unknown.
+    5. Creates a binary hive backup, then loads the requested hive (skips the partition if load fails).
+    6. Determines the active ControlSet (if using the SYSTEM hive) from the Select key.
+    7. Reads the current value of the specified registry property (if it exists).
+    8. Updates and verifies the specified property, creating a missing path only when explicitly requested.
+    9. Unloads the registry hive cleanly.
 
     This resolves non-boot issues caused by registry misconfiguration (e.g., enabling RDP,
     changing service startup type, disabling problematic drivers).
 
 .PARAMETER rootKey
-    Root registry hive for offline mount. Valid values: HKLM, HKCC, HKCR, HKCU, HKU.
+    Root registry hive for offline mount. Valid values: HKLM and HKU.
 
 .PARAMETER hive
-    Offline hive file name under Windows\System32\config (for example: SYSTEM, SOFTWARE).
+    Standard offline hive file name under Windows\System32\config. Valid values:
+    SYSTEM, SOFTWARE, SAM, SECURITY, DEFAULT, COMPONENTS, and DRIVERS.
 
 .PARAMETER controlSet
     Optional control set number for SYSTEM hive updates. Valid values: 1 or 2.
@@ -34,18 +37,45 @@
     Registry property name to create or update.
 
 .PARAMETER propertyValue
-    Registry property value to write.
+    Registry property value to write. Empty values are accepted only for string-based types.
 
 .PARAMETER propertyType
     Registry value type. Valid values: String, ExpandString, Binary, DWord, MultiString, Qword, Unknown.
     If omitted, defaults to DWord.
 
+.PARAMETER createPathIfMissing
+    Optional Boolean. Defaults to false. Set to true only when the registry path is expected
+    to be absent and should be created; this prevents path typos from silently creating keys.
+
 .NOTES
     Name:    win-update-registry.ps1
+    Version: 1.3.1
     Author:  Tony Mocanu / Tony.Mocanu@Microsoft.com
+    Platform: Windows Server 2016 and later; Windows PowerShell 5.1.
+    Execution: Azure VMRepair repair VM with an attached Windows OS disk.
+    Telemetry: Emits structured lifecycle and error events through the local VMRepair logger.
+               No telemetry network requests are made by this script.
 
 .VERSION
-    v1.2: [Jul 2026] - Updated the script (current)
+    v1.3.1: [September 2026] - Added the boot-safety preflight proven by
+                               win-sac-onLatest and win-chkdsk-fs-corruption.
+                               - Locates the generation-appropriate BCD store.
+                               - Repairs only unknown loader device/osdevice mappings.
+                               - Backs up, verifies, and automatically rolls back the BCD.
+                               - Verifies winload path and loader mapping before registry writes.
+    v1.3: [August 2026] - Restricted offline hive mounts to HKLM and HKU.
+                          - Added an explicit param block for VMRepair driver named-argument delivery.
+                          - Dual-writes plain-text logs to the desktop and VMRepair collection path.
+                          - Uses native command exit codes as the authoritative load/unload result.
+                          - Creates the hive backup before loading and rolls back failed writes.
+                                                - Requires explicit opt-in before creating a missing registry path.
+                          - Aligns repair-host disk exclusion and Windows target validation with
+                            win-sac-onLatest, win-LKGC, GA_offlinefixer, and win-chkdsk-fs-corruption.
+                                                    - Verifies temporary mounts by access path and cleans up failed assignments.
+                                                    - Uses typed temporary-mount records for Windows PowerShell 5.1 compatibility.
+                                                      - Resolves the active ControlSet independently for each attached Windows disk.
+                                                      - Reads back and verifies the requested registry value before reporting success.
+        v1.2: [Jul 2026] - Updated the script
                        - Fixed DEP-01: Added Get-PSCallStack fallback when PSScriptRoot is empty
                          (e.g. when az vm repair run delivers the script as a ScriptBlock).
                          Emits a clear diagnostic and returns before constructing any helper paths.
@@ -87,11 +117,22 @@ Get-ChildItem "$([Environment]::GetFolderPath('Desktop'))\update-registry_*.log"
 reg load HKLM\VERIFY F:\Windows\System32\config\SYSTEM
 Get-ItemProperty -Path "HKLM:\VERIFY\ControlSet001\Control\Terminal Server" -Name fDenyTSConnections
 reg unload HKLM\VERIFY
-    3. For local testing, uncomment the DEBUG variables block below the init section,
-    set them to the desired test values, run the script, then re-comment before deploying.
 #>
 
-# Initialization (no Param() block to avoid ParserErrors and argument transformation failures)
+[CmdletBinding()]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '', Justification = 'Unbound parameters intentionally fall back to legacy VMRepair test variables; named arguments remain authoritative.')]
+param(
+    [string]$rootKey = $global:rootKey,
+    [string]$hive = $global:hive,
+    [string]$controlSet = $global:controlSet,
+    [string]$relativePath = $global:relativePath,
+    [string]$propertyName = $global:propertyName,
+    [string]$propertyValue = $global:propertyValue,
+    [string]$propertyType = $global:propertyType,
+    [string]$createPathIfMissing = $global:createPathIfMissing
+)
+
+# Initialization
 
 # ==============================================================================
 # 1. DEPENDENCY PATH VALIDATION & INITIALIZATION (DEP-01)
@@ -124,23 +165,40 @@ if (-not (Test-Path -Path $partitionsHelperPath -PathType Leaf)) {
 
 . $partitionsHelperPath
 
-# DEBUG: Uncomment below to test locally without --parameters
-# $rootKey = 'HKLM'
-# $hive = 'System'
-# $controlSet = '1'
-# $relativePath = 'Control\Terminal Server'
-# $propertyName = 'fDenyTSConnections'
-# $propertyValue = '1'
-# $propertyType = 'dword'
+if (-not (Get-Command -Name Get-Disk-Partitions -CommandType Function -ErrorAction SilentlyContinue)) {
+    Log-Error "Dependency did not define the required Get-Disk-Partitions function: $partitionsHelperPath"
+    return $STATUS_ERROR
+}
 
 # Parameter Validation (variables injected by az vm repair run --parameters)
 if (-not $rootKey) { $rootKey = "HKLM" }
 if (-not $hive) { $hive = "System" }
 if (-not $propertyType) { $propertyType = "" }
 
-$validRootKeys = @("HKLM", "HKCC", "HKCR", "HKCU", "HKU")
+$createPathIfMissingText = if ($null -eq $createPathIfMissing) { '' } else { ([string]$createPathIfMissing).Trim() }
+if ([string]::IsNullOrEmpty($createPathIfMissingText)) {
+    $createPathIfMissing = $false
+}
+elseif ($createPathIfMissingText -match '^(?i:true|1)$') {
+    $createPathIfMissing = $true
+}
+elseif ($createPathIfMissingText -match '^(?i:false|0)$') {
+    $createPathIfMissing = $false
+}
+else {
+    Log-Error "Invalid createPathIfMissing '$createPathIfMissingText'. Valid values: true, false, 1, 0."
+    return $STATUS_ERROR
+}
+
+$validRootKeys = @("HKLM", "HKU")
 if ($rootKey -notin $validRootKeys) {
     Log-Error "Invalid rootKey '$rootKey'. Valid values: $($validRootKeys -join ', ')"
+    return $STATUS_ERROR
+}
+
+$validHives = @('SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'COMPONENTS', 'DRIVERS')
+if ($hive -notin $validHives) {
+    Log-Error "Invalid hive '$hive'. Valid values: $($validHives -join ', ')"
     return $STATUS_ERROR
 }
 
@@ -155,8 +213,11 @@ if ($controlSet) {
         Log-Error "Invalid controlSet '$controlSet'. Valid values: 1, 2"
         return $STATUS_ERROR
     }
+    if ($hive -ine 'SYSTEM') {
+        Log-Error "controlSet is valid only when hive is SYSTEM."
+        return $STATUS_ERROR
+    }
 }
-
 if ([string]::IsNullOrEmpty($relativePath)) {
     Log-Error "relativePath parameter is required."
     return $STATUS_ERROR
@@ -171,6 +232,18 @@ if ($null -eq $propertyValue) {
     Log-Error "propertyValue parameter is required."
     return $STATUS_ERROR
 }
+if ([string]::IsNullOrEmpty([string]$propertyValue) -and
+    $propertyType -notin @('String', 'ExpandString', 'MultiString')) {
+    Log-Error "An empty propertyValue requires propertyType String, ExpandString, or MultiString."
+    return $STATUS_ERROR
+}
+
+$registryProviderRoot = if ($rootKey -eq 'HKLM') {
+    'Registry::HKEY_LOCAL_MACHINE'
+}
+else {
+    'Registry::HKEY_USERS'
+}
 
 # Log Configuration
 $logDir = [Environment]::GetFolderPath('Desktop')
@@ -182,8 +255,23 @@ if ([string]::IsNullOrWhiteSpace($logDir) -or -not (Test-Path -LiteralPath $logD
 }
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$logDir\update-registry_$timestamp.log"
+$collectedLogsBaseDir = Join-Path -Path $resolvedScriptRoot -ChildPath 'logs'
+if ($resolvedScriptRoot -match '^(.*?\\repair-files-\d{14})(\\|$)') {
+    $collectedLogsBaseDir = Join-Path -Path $Matches[1] -ChildPath 'plugin-logs'
+}
+$collectedLogDir = Join-Path -Path $collectedLogsBaseDir -ChildPath "win-update-registry-run-$timestamp"
+$collectedLogFile = Join-Path -Path $collectedLogDir -ChildPath "update-registry_$timestamp.log"
+$script:LogFilePaths = @($logFile)
 
-function Write-DesktopLog {
+try {
+    $null = New-Item -ItemType Directory -Path $collectedLogDir -Force -ErrorAction Stop
+    $script:LogFilePaths += $collectedLogFile
+}
+catch {
+    Log-Warning "Could not initialize VMRepair-collected log directory '$collectedLogDir': $($_.Exception.Message)"
+}
+
+function Write-PlainTextLog {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Level,
@@ -194,40 +282,542 @@ function Write-DesktopLog {
 
     $text = if ($null -eq $Message) { '' } else { ($Message | Out-String).TrimEnd() }
     $line = "$(Get-Date -Format o) [$Level] $text"
-    Add-Content -Path $logFile -Value $line
+    foreach ($path in $script:LogFilePaths) {
+        try {
+            Add-Content -Path $path -Value $line -Encoding UTF8 -ErrorAction Stop
+        }
+        catch {
+            Log-Warning "Could not append to plain-text log '$path': $($_.Exception.Message)"
+        }
+    }
 }
 
 function Write-InfoLog {
     param([string]$Message)
     Log-Info $Message
-    Write-DesktopLog -Level 'INFO' -Message $Message
+    Write-PlainTextLog -Level 'INFO' -Message $Message
 }
 
 function Write-WarningLog {
     param([string]$Message)
     Log-Warning $Message
-    Write-DesktopLog -Level 'WARN' -Message $Message
+    Write-PlainTextLog -Level 'WARN' -Message $Message
 }
 
 function Write-ErrorLog {
     param([string]$Message)
     Log-Error $Message
-    Write-DesktopLog -Level 'ERROR' -Message $Message
+    Write-PlainTextLog -Level 'ERROR' -Message $Message
 }
 
 function Write-OutputLog {
     param([AllowNull()]$Message)
     Log-Output $Message
-    Write-DesktopLog -Level 'OUTPUT' -Message $Message
+    Write-PlainTextLog -Level 'OUTPUT' -Message $Message
+}
+
+$script:RepairScriptVersion = '1.3.1'
+$script:ExecutionStarted = Get-Date
+
+function Write-UpdateRegistryTelemetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Start', 'Operation', 'Success', 'Error')]
+        [string]$Event,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [hashtable]$Properties = @{}
+    )
+
+    $payload = [ordered]@{
+        Event = $Event
+        Message = $Message
+        TimestampUtc = (Get-Date).ToUniversalTime().ToString('o')
+        RepairScriptVersion = $script:RepairScriptVersion
+        Properties = $Properties
+    }
+    $json = $payload | ConvertTo-Json -Compress -Depth 8
+    if ($Event -eq 'Error') {
+        Write-ErrorLog "[Telemetry] $json"
+    }
+    else {
+        Write-InfoLog "[Telemetry] $json"
+    }
+}
+
+function Write-UpdateRegistryCatchTelemetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$CatchName,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory = $true)][string]$RootCause,
+        [string]$DiskNumber = '',
+        [string]$TargetDrive = ''
+    )
+
+    Write-UpdateRegistryTelemetry -Event Error -Message "Catch block: $CatchName" -Properties @{
+        CoverageCategory = 'CatchBlock'
+        CatchName = $CatchName
+        Stage = $Stage
+        RootCause = $RootCause
+        DiskNumber = $DiskNumber
+        TargetDrive = $TargetDrive
+        ExceptionType = $ErrorRecord.Exception.GetType().FullName
+        Error = $ErrorRecord.Exception.Message
+    }
+}
+
+function Get-UpdateRegistryFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = $null
+    $sha256 = $null
+    try {
+        $stream = [System.IO.File]::Open($LiteralPath, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    }
+    finally {
+        if ($sha256) { $sha256.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Test-UpdateRegistryValue {
+    param(
+        [AllowNull()]$ActualValue,
+        [AllowNull()]$ExpectedValue,
+        [Parameter(Mandatory = $true)][string]$Type
+    )
+
+    switch -Regex ($Type) {
+        '^(?i:DWord|Qword)$' {
+            try { return [decimal]$ActualValue -eq [decimal]$ExpectedValue }
+            catch {
+                Write-UpdateRegistryCatchTelemetry -CatchName 'NumericValueComparison' -Stage 'PostWriteVerification' -RootCause 'ValueConversionFailure' -ErrorRecord $_
+                return $false
+            }
+        }
+        '^(?i:Binary)$' {
+            $actualItems = @($ActualValue)
+            $expectedItems = @($ExpectedValue)
+            if ($actualItems.Count -ne $expectedItems.Count) { return $false }
+            for ($index = 0; $index -lt $actualItems.Count; $index++) {
+                try {
+                    if ([byte]$actualItems[$index] -ne [byte]$expectedItems[$index]) { return $false }
+                }
+                catch {
+                    Write-UpdateRegistryCatchTelemetry -CatchName 'BinaryValueComparison' -Stage 'PostWriteVerification' -RootCause 'ValueConversionFailure' -ErrorRecord $_
+                    return $false
+                }
+            }
+            return $true
+        }
+        '^(?i:MultiString)$' {
+            $actualItems = @($ActualValue)
+            $expectedItems = @($ExpectedValue)
+            if ($actualItems.Count -ne $expectedItems.Count) { return $false }
+            for ($index = 0; $index -lt $actualItems.Count; $index++) {
+                if ([string]$actualItems[$index] -cne [string]$expectedItems[$index]) { return $false }
+            }
+            return $true
+        }
+        default {
+            return [string]$ActualValue -ceq [string]$ExpectedValue
+        }
+    }
+}
+
+function Get-UpdateRegistryAvailableDriveLetter {
+    $usedLetters = @(Get-Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveLetter } |
+        Select-Object -ExpandProperty DriveLetter)
+    foreach ($candidateLetter in @('Z','Y','X','W','V','U','T','S','R','Q')) {
+        if ($candidateLetter -notin $usedLetters -and -not (Test-Path -LiteralPath "${candidateLetter}:\")) {
+            return $candidateLetter
+        }
+    }
+
+    return $null
+}
+
+function Test-UpdateRegistryDataPartition {
+    param([Parameter(Mandatory = $true)][object]$Partition)
+
+    if ($Partition.IsHidden) { return $false }
+
+    $gptType = ([string]$Partition.GptType).Trim().Trim('{', '}')
+    if ($gptType) {
+        return $gptType -ieq 'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7'
+    }
+
+    return ([string]$Partition.Type) -notmatch 'Reserved|System'
+}
+
+function Invoke-UpdateRegistryDiskPart {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Commands,
+        [Parameter(Mandatory = $true)][string]$Operation
+    )
+
+    $output = $Commands | diskpart.exe 2>&1
+    foreach ($line in @($output)) {
+        if ($line) { Write-InfoLog "[diskpart][$Operation] $line" }
+    }
+}
+
+function Invoke-UpdateRegistryBcdEdit {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Operation
+    )
+
+    $output = & bcdedit.exe @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in @($output)) {
+        if ($line) { Write-InfoLog "[bcdedit][$Operation] $line" }
+    }
+    Write-UpdateRegistryTelemetry -Event Operation -Message "bcdedit $Operation" -Properties @{
+        CoverageCategory = 'BootSafety'
+        Operation = $Operation
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
+    }
+
+    return [pscustomobject]@{
+        Output = @($output)
+        ExitCode = $exitCode
+        Success = ($exitCode -eq 0)
+    }
+}
+
+function Repair-UpdateRegistryUnknownBcdMapping {
+    param(
+        [Parameter(Mandatory = $true)][int]$DiskNumber,
+        [Parameter(Mandatory = $true)][object[]]$DiskPartitions,
+        [Parameter(Mandatory = $true)][string]$WindowsDrive
+    )
+
+    $efiGptType = 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b'
+    $efiPartitions = @($DiskPartitions | Where-Object {
+        ([string]$_.GptType).Trim().Trim('{', '}') -ieq $efiGptType
+    })
+    $isGen2Disk = $efiPartitions.Count -gt 0
+    $bcdPath = $null
+
+    if ($isGen2Disk) {
+        foreach ($efiPartition in $efiPartitions) {
+            $efiLetter = [string]$efiPartition.DriveLetter
+            $letterAssignedByScript = $false
+            if (-not $efiLetter -or $efiLetter -eq [char]0) {
+                $efiLetter = Get-UpdateRegistryAvailableDriveLetter
+                if (-not $efiLetter) {
+                    throw "No temporary drive letter is available for the EFI partition on Disk $DiskNumber."
+                }
+                Invoke-UpdateRegistryDiskPart -Operation 'bcd-efi-assign' -Commands @(
+                    "select disk $DiskNumber"
+                    "select partition $($efiPartition.PartitionNumber)"
+                    "assign letter=$efiLetter"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+                if (-not (Test-Path -LiteralPath "${efiLetter}:\" -PathType Container)) {
+                    throw "EFI mount ${efiLetter}: failed for Disk $DiskNumber Partition $($efiPartition.PartitionNumber)."
+                }
+                $letterAssignedByScript = $true
+                $script:temporaryMounts += [pscustomobject]@{
+                    DiskNumber = $DiskNumber
+                    PartitionNumber = [int]$efiPartition.PartitionNumber
+                    DriveLetter = $efiLetter
+                }
+            }
+
+            $candidateBcdPath = "${efiLetter}:\EFI\Microsoft\Boot\BCD"
+            if (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf) {
+                $bcdPath = $candidateBcdPath
+                break
+            }
+
+            if ($letterAssignedByScript) {
+                Invoke-UpdateRegistryDiskPart -Operation 'bcd-efi-remove-unused' -Commands @(
+                    "select disk $DiskNumber"
+                    "select partition $($efiPartition.PartitionNumber)"
+                    "remove letter=$efiLetter noerr"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                $script:temporaryMounts = @($script:temporaryMounts | Where-Object {
+                    -not ($_.DiskNumber -eq $DiskNumber -and
+                        $_.PartitionNumber -eq [int]$efiPartition.PartitionNumber -and
+                        $_.DriveLetter -ieq $efiLetter)
+                })
+            }
+        }
+    }
+    else {
+        foreach ($partition in @($DiskPartitions | Where-Object {
+            $_.DriveLetter -and $_.DriveLetter -ne [char]0
+        })) {
+            $candidateBcdPath = "$($partition.DriveLetter):\Boot\BCD"
+            if (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf) {
+                $bcdPath = $candidateBcdPath
+                break
+            }
+        }
+        if (-not $bcdPath) {
+            $candidateBcdPath = "${WindowsDrive}:\Boot\BCD"
+            if (Test-Path -LiteralPath $candidateBcdPath -PathType Leaf) {
+                $bcdPath = $candidateBcdPath
+            }
+        }
+    }
+
+    if (-not $bcdPath) {
+        throw "Disk $DiskNumber has no generation-appropriate BCD store."
+    }
+
+    $bootManagerQuery = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/enum', 'bootmgr', '/v') -Operation 'query-bootmgr'
+    if (-not $bootManagerQuery.Success) {
+        throw "Could not enumerate boot manager from $bcdPath."
+    }
+    $defaultLine = $bootManagerQuery.Output | Select-String -Pattern '^\s*default\s+' | Select-Object -First 1
+    if (-not $defaultLine -or $defaultLine -notmatch '\{([^}]+)\}') {
+        throw "Could not identify the default Windows loader in $bcdPath."
+    }
+    $defaultLoaderId = $matches[0]
+    if ($defaultLoaderId -notmatch '^(?i)\{[0-9a-f\-]{36}\}$') {
+        throw "Default BCD loader identifier '$defaultLoaderId' is invalid."
+    }
+
+    $loaderQuery = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'validate-loader'
+    $loaderText = $loaderQuery.Output -join "`n"
+    $loaderPathMatch = [regex]::Match($loaderText, '(?im)^\s*path\s+(.+?)\s*$')
+    $loaderDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*device\s+(.+?)\s*$')
+    $loaderOsDeviceMatch = [regex]::Match($loaderText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+    $loaderSystemRootMatch = [regex]::Match($loaderText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+    if (-not $loaderQuery.Success -or -not $loaderPathMatch.Success -or
+        -not $loaderDeviceMatch.Success -or -not $loaderOsDeviceMatch.Success -or
+        -not $loaderSystemRootMatch.Success) {
+        throw "Default loader $defaultLoaderId is missing required mapping elements."
+    }
+
+    $originalLoaderPath = $loaderPathMatch.Groups[1].Value.Trim()
+    $originalSystemRoot = $loaderSystemRootMatch.Groups[1].Value.Trim()
+    if ($originalLoaderPath -notmatch '(?i)^\\Windows\\System32\\winload\.(exe|efi)$') {
+        throw "Default loader $defaultLoaderId references unsupported path '$originalLoaderPath'."
+    }
+    $resolvedLoaderFile = Join-Path -Path "${WindowsDrive}:\" -ChildPath $originalLoaderPath.TrimStart('\')
+    if (-not (Test-Path -LiteralPath $resolvedLoaderFile -PathType Leaf)) {
+        throw "Default loader references '$originalLoaderPath', but '$resolvedLoaderFile' does not exist."
+    }
+
+    $repairLoaderDevice = $loaderDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$'
+    $repairLoaderOsDevice = $loaderOsDeviceMatch.Groups[1].Value.Trim() -match '(?i)^unknown$'
+    if (-not $repairLoaderDevice -and -not $repairLoaderOsDevice) {
+        Write-UpdateRegistryTelemetry -Event Success -Message 'BCD loader mapping validated without changes' -Properties @{
+            CoverageCategory = 'BootSafety'
+            DiskNumber = [string]$DiskNumber
+            VMGeneration = if ($isGen2Disk) { 'V2' } else { 'V1' }
+            BcdPath = $bcdPath
+            LoaderGuid = $defaultLoaderId
+        }
+        return
+    }
+
+    $bcdBackup = $bcdPath + '.update-registry.bak.' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $bcdWriteStarted = $false
+    try {
+        $originalBcdItem = Get-Item -LiteralPath $bcdPath -Force -ErrorAction Stop
+        $originalBcdHash = Get-UpdateRegistryFileSha256 -LiteralPath $bcdPath
+        Copy-Item -LiteralPath $bcdPath -Destination $bcdBackup -Force -ErrorAction Stop
+        $backupBcdItem = Get-Item -LiteralPath $bcdBackup -Force -ErrorAction Stop
+        $backupBcdHash = Get-UpdateRegistryFileSha256 -LiteralPath $bcdBackup
+        if ($backupBcdItem.Length -ne $originalBcdItem.Length -or
+            $backupBcdHash -ine $originalBcdHash) {
+            throw "BCD backup verification failed for '$bcdBackup'."
+        }
+
+        $validatedWindowsPartition = "partition=${WindowsDrive}:"
+        $bcdWriteStarted = $true
+        if ($repairLoaderDevice) {
+            $setDeviceResult = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'device', $validatedWindowsPartition) -Operation 'repair-loader-device'
+            if (-not $setDeviceResult.Success) {
+                throw "Could not repair device for loader $defaultLoaderId."
+            }
+        }
+        if ($repairLoaderOsDevice) {
+            $setOsDeviceResult = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/set', $defaultLoaderId, 'osdevice', $validatedWindowsPartition) -Operation 'repair-loader-osdevice'
+            if (-not $setOsDeviceResult.Success) {
+                throw "Could not repair osdevice for loader $defaultLoaderId."
+            }
+        }
+
+        $verifyLoader = Invoke-UpdateRegistryBcdEdit -Arguments @('/store', $bcdPath, '/enum', $defaultLoaderId, '/v') -Operation 'verify-loader-mapping'
+        $verifyText = $verifyLoader.Output -join "`n"
+        $verifyPath = [regex]::Match($verifyText, '(?im)^\s*path\s+(.+?)\s*$')
+        $verifyDevice = [regex]::Match($verifyText, '(?im)^\s*device\s+(.+?)\s*$')
+        $verifyOsDevice = [regex]::Match($verifyText, '(?im)^\s*osdevice\s+(.+?)\s*$')
+        $verifySystemRoot = [regex]::Match($verifyText, '(?im)^\s*systemroot\s+(.+?)\s*$')
+        if (-not $verifyLoader.Success -or -not $verifyPath.Success -or
+            -not $verifyDevice.Success -or -not $verifyOsDevice.Success -or
+            -not $verifySystemRoot.Success -or
+            $verifyDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+            $verifyOsDevice.Groups[1].Value.Trim() -match '(?i)^unknown$' -or
+            $verifyPath.Groups[1].Value.Trim() -ine $originalLoaderPath -or
+            $verifySystemRoot.Groups[1].Value.Trim() -ine $originalSystemRoot) {
+            throw "Loader mapping repair verification failed for $defaultLoaderId."
+        }
+
+        Write-UpdateRegistryTelemetry -Event Success -Message 'Unknown BCD loader mapping repaired and verified' -Properties @{
+            CoverageCategory = 'BootSafety'
+            DiskNumber = [string]$DiskNumber
+            VMGeneration = if ($isGen2Disk) { 'V2' } else { 'V1' }
+            BcdPath = $bcdPath
+            LoaderGuid = $defaultLoaderId
+            BackupPath = $bcdBackup
+            DeviceRepaired = $repairLoaderDevice
+            OsDeviceRepaired = $repairLoaderOsDevice
+        }
+    }
+    catch {
+        $repairError = $_.Exception.Message
+        Write-UpdateRegistryCatchTelemetry -CatchName 'BcdMappingPreflight' -Stage 'BootSafety' -RootCause 'BcdMappingFailure' -DiskNumber "$DiskNumber" -TargetDrive "${WindowsDrive}:" -ErrorRecord $_
+        if ($bcdWriteStarted -and (Test-Path -LiteralPath $bcdBackup -PathType Leaf)) {
+            Copy-Item -LiteralPath $bcdBackup -Destination $bcdPath -Force -ErrorAction Stop
+            $restoredBcdHash = Get-UpdateRegistryFileSha256 -LiteralPath $bcdPath
+            if ($restoredBcdHash -ine $backupBcdHash) {
+                throw "BCD repair failed and rollback hash verification failed. Original error: $repairError"
+            }
+            Write-UpdateRegistryTelemetry -Event Error -Message 'BCD loader mapping repair rolled back' -Properties @{
+                CoverageCategory = 'BootSafety'
+                DiskNumber = [string]$DiskNumber
+                BcdPath = $bcdPath
+                BackupPath = $bcdBackup
+                Error = $repairError
+            }
+        }
+        throw "BCD loader mapping preflight failed: $repairError"
+    }
+}
+
+function Get-UpdateRegistryDiskIdentity {
+    param([Parameter(Mandatory = $true)][int]$DiskNumber)
+
+    $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
+    if ([string]$disk.PartitionStyle -eq 'MBR') {
+        $signature = [uint32]$disk.Signature
+        return [pscustomobject]@{
+            PartitionStyle = 'MBR'
+            Value = $signature.ToString('X8')
+            DiskPartValue = $signature.ToString('X8')
+        }
+    }
+    if ([string]$disk.PartitionStyle -eq 'GPT') {
+        $diskGuid = ([guid]$disk.Guid).ToString('D')
+        return [pscustomobject]@{
+            PartitionStyle = 'GPT'
+            Value = $diskGuid
+            DiskPartValue = $diskGuid
+        }
+    }
+
+    throw "Disk $DiskNumber has unsupported partition style '$($disk.PartitionStyle)'."
+}
+
+function Set-UpdateRegistryTemporarySourceIdentity {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Internal noninteractive repair primitive; the caller owns transaction safety and restoration.')]
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    if ($Record.PartitionStyle -ne 'MBR') {
+        throw 'Temporary source disk identities are permitted only for MBR disks.'
+    }
+    Invoke-UpdateRegistryDiskPart -Operation 'collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+        'online disk'
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw "Disk $($Record.DiskNumber) could not be brought online with its verified temporary identity."
+    }
+}
+
+function Restore-UpdateRegistrySourceIdentity {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    Invoke-UpdateRegistryDiskPart -Operation 'collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        'offline disk'
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if (-not $restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw "Disk $($Record.DiskNumber) did not return to its original offline identity."
+    }
+}
+
+function Set-UpdateRegistryTemporaryRepairIdentity {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Internal noninteractive repair primitive; the caller owns transaction safety and restoration.')]
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    Invoke-UpdateRegistryDiskPart -Operation 'repair-host-collision-prepare' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.TemporaryDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $currentIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $Record.DiskNumber
+    $currentDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($currentDisk.IsOffline -or $currentIdentity.Value -ine $Record.TemporaryValue) {
+        throw 'The repair VM OS disk did not retain a verified temporary GPT identity.'
+    }
+}
+
+function Restore-UpdateRegistryRepairIdentity {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Record)
+
+    Invoke-UpdateRegistryDiskPart -Operation 'repair-host-collision-restore' -Commands @(
+        "select disk $($Record.DiskNumber)"
+        "uniqueid disk id=$($Record.OriginalDiskPartValue)"
+    )
+    Update-HostStorageCache -ErrorAction SilentlyContinue
+
+    $restoredIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $Record.DiskNumber
+    $restoredDisk = Get-Disk -Number $Record.DiskNumber -ErrorAction Stop
+    if ($restoredDisk.IsOffline -or $restoredIdentity.Value -ine $Record.OriginalValue) {
+        throw 'The repair VM OS disk did not return to its original GPT identity.'
+    }
 }
 
 # Status Tracking
 $script_final_status = $STATUS_ERROR
+$script:temporaryMounts = @()
+$collisionDiskRecords = @()
+$gptCollisionDiskNumbers = @()
+$repairDiskIdentityRecord = $null
 
 try {
     Write-InfoLog "START: Running script win-update-registry.ps1"
     Write-InfoLog "Log file path: $logFile"
-    Write-InfoLog "Parameters: rootKey=$rootKey, hive=$hive, controlSet=$controlSet, relativePath=$relativePath, propertyName=$propertyName, propertyValue=$propertyValue, propertyType=$propertyType"
+    Write-InfoLog "Collected log file path: $collectedLogFile"
+    Write-InfoLog "Parameters: rootKey=$rootKey, hive=$hive, controlSet=$controlSet, relativePath=$relativePath, propertyName=$propertyName, propertyValue=$propertyValue, propertyType=$propertyType, createPathIfMissing=$createPathIfMissing"
+    Write-UpdateRegistryTelemetry -Event Start -Message 'Starting offline registry update' -Properties @{
+        ScriptName = 'win-update-registry.ps1'
+        ScriptVersion = $script:RepairScriptVersion
+        ExecutionMode = 'REPAIR_VM_ONLY'
+        RootKey = $rootKey
+        Hive = $hive
+        PropertyType = $propertyType
+        CreatePathIfMissing = [bool]$createPathIfMissing
+    }
 
     $processedCount = 0
     $skippedCount = 0
@@ -248,6 +838,7 @@ try {
                     }
                     catch {
                         Write-WarningLog "Failed to stop nested guest VM $guestHyperVVirtualMachineName, will continue but may have limited success"
+                        Write-UpdateRegistryCatchTelemetry -CatchName 'NestedVmStop' -Stage 'Preflight' -RootCause 'NestedVmControlFailure' -TargetDrive $env:SystemDrive -ErrorRecord $_
                     }
                 }
             }
@@ -261,30 +852,214 @@ try {
     }
     catch {
         Write-WarningLog "Nested VM check encountered an error but will be skipped: $($_.Exception.Message)"
+        Write-UpdateRegistryCatchTelemetry -CatchName 'NestedVmDiscovery' -Stage 'Preflight' -RootCause 'NestedVmDiscoveryFailure' -TargetDrive $env:SystemDrive -ErrorRecord $_
     }
 
-    # Step 2 - Bring the attached disk online and enumerate partitions via Get-Disk-Partitions
-    $partitionlist = Get-Disk-Partitions
-
-    if ($null -eq $partitionlist -or $partitionlist.Count -eq 0) {
-        Write-ErrorLog "No partitions found on attached disk."
-        $script_final_status = $STATUS_ERROR
+    # Step 2 - Identify every repair-host disk before touching attached disks.
+    $rescueDrive = $env:SystemDrive -replace ':', ''
+    $rescueOsPartition = Get-Partition -DriveLetter $rescueDrive -ErrorAction Stop | Select-Object -First 1
+    if ($null -eq $rescueOsPartition -or $null -eq $rescueOsPartition.DiskNumber) {
+        throw "CRITICAL SAFETY CHECK FAILED: Could not identify the repair VM OS disk from $($env:SystemDrive)."
     }
-    else {
-        # Step 3 - Locate the Windows partition by checking for the registry config path
-        Write-InfoLog "Scanning partitions for Windows registry hives"
+    $rescueDiskNumber = [int]$rescueOsPartition.DiskNumber
+    $repairDiskIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $rescueDiskNumber
 
-        foreach ($partition in $partitionlist) {
+    $protectedDiskNumbers = @($rescueDiskNumber)
+    $protectedDiskNumbers += @(Get-Disk -ErrorAction Stop |
+        Where-Object { $_.IsBoot -or $_.IsSystem } |
+        Select-Object -ExpandProperty Number)
+    $pageFileDriveLetters = @(Get-CimInstance -ClassName Win32_PageFileUsage -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            if ([string]$_.Name -match '^([A-Za-z]):\\') { $matches[1] }
+        } | Select-Object -Unique)
+    foreach ($pageFileDriveLetter in $pageFileDriveLetters) {
+        $pageFilePartition = Get-Partition -DriveLetter $pageFileDriveLetter -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($pageFilePartition) { $protectedDiskNumbers += [int]$pageFilePartition.DiskNumber }
+    }
+    $protectedDiskNumbers = @($protectedDiskNumbers | Sort-Object -Unique)
+    Write-InfoLog "Protected repair-host disk numbers: $($protectedDiskNumbers -join ', ')"
+
+    $azureVirtualDiskNumbers = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop |
+        Where-Object { $_.Model -like 'Microsoft Virtual Disk*' } |
+        ForEach-Object { [int]$_.Index })
+    $attachedDisks = @(Get-Disk -ErrorAction Stop | Where-Object {
+        $_.Number -in $azureVirtualDiskNumbers -and $_.Number -notin $protectedDiskNumbers
+    })
+    if ($attachedDisks.Count -eq 0) {
+        throw 'REPAIR-ONLY SCRIPT: No attached Microsoft virtual disk was found.'
+    }
+
+    # Preserve source identities when an attached clone collides with the repair disk.
+    foreach ($collisionDisk in @($attachedDisks | Where-Object {
+        $_.IsOffline -and [string]$_.OfflineReason -eq 'Collision'
+    })) {
+        $originalIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $collisionDisk.Number
+        if ($originalIdentity.PartitionStyle -eq 'GPT') {
+            if ($repairDiskIdentity.PartitionStyle -ne 'GPT' -or
+                $repairDiskIdentity.Value -ine $originalIdentity.Value) {
+                throw "Disk $($collisionDisk.Number) has an unverified GPT identity collision."
+            }
+            if (-not $repairDiskIdentityRecord) {
+                $temporaryRepairGuid = ([guid]::NewGuid()).ToString('D')
+                $repairDiskIdentityRecord = [pscustomobject]@{
+                    DiskNumber = $rescueDiskNumber
+                    PartitionStyle = 'GPT'
+                    OriginalValue = $repairDiskIdentity.Value
+                    OriginalDiskPartValue = $repairDiskIdentity.DiskPartValue
+                    TemporaryValue = $temporaryRepairGuid
+                    TemporaryDiskPartValue = $temporaryRepairGuid
+                }
+                Write-WarningLog 'Temporarily changing only the repair VM OS disk GPT identity; the source identity remains unchanged.'
+                Set-UpdateRegistryTemporaryRepairIdentity -Record $repairDiskIdentityRecord
+            }
+
+            $gptCollisionDiskNumbers += [int]$collisionDisk.Number
+            Invoke-UpdateRegistryDiskPart -Operation 'source-gpt-online' -Commands @(
+                "select disk $($collisionDisk.Number)"
+                'online disk'
+            )
+            Update-HostStorageCache -ErrorAction SilentlyContinue
+            $releasedDisk = Get-Disk -Number $collisionDisk.Number -ErrorAction Stop
+            $releasedIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $collisionDisk.Number
+            if ($releasedDisk.IsOffline -or $releasedIdentity.Value -ine $originalIdentity.Value) {
+                throw "Disk $($collisionDisk.Number) could not be onlined with its original GPT identity unchanged."
+            }
+            continue
+        }
+
+        do {
+            $temporaryValue = ([Convert]::ToUInt32(([guid]::NewGuid().ToString('N').Substring(0, 8)), 16)).ToString('X8')
+        } while ($temporaryValue -eq '00000000' -or $temporaryValue -ieq $originalIdentity.Value)
+        $identityRecord = [pscustomobject]@{
+            DiskNumber = [int]$collisionDisk.Number
+            PartitionStyle = 'MBR'
+            OriginalValue = $originalIdentity.Value
+            OriginalDiskPartValue = $originalIdentity.DiskPartValue
+            TemporaryValue = $temporaryValue
+            TemporaryDiskPartValue = $temporaryValue
+        }
+        $collisionDiskRecords += $identityRecord
+        Set-UpdateRegistryTemporarySourceIdentity -Record $identityRecord
+    }
+
+    $attachedDiskNumbers = @($attachedDisks | Select-Object -ExpandProperty Number)
+    $partitionList = @(Get-Disk-Partitions)
+    $discoveredDiskNumbers = @($partitionList | Select-Object -ExpandProperty DiskNumber -Unique)
+    Write-InfoLog "Post-collision partition discovery returned disk numbers: $($discoveredDiskNumbers -join ', ')"
+    $targetDiskGroups = @($partitionList |
+        Where-Object {
+            [int]$_.DiskNumber -in $attachedDiskNumbers -and
+            [int]$_.DiskNumber -notin $protectedDiskNumbers
+        } |
+        Group-Object DiskNumber)
+    if ($targetDiskGroups.Count -eq 0) {
+        throw 'The partition helper returned no partitions from an attached repair disk.'
+    }
+
+    # Step 3 - Validate exactly one Windows partition per attached physical disk.
+    $validatedPartitions = @()
+    foreach ($targetDiskGroup in $targetDiskGroups) {
+        $diskNumber = [int]$targetDiskGroup.Name
+        $diskPartitions = @(Get-Partition -DiskNumber $diskNumber -ErrorAction Stop)
+        $targetPartition = $null
+        $targetDriveLetter = $null
+
+        foreach ($candidatePartition in @($diskPartitions | Sort-Object Size -Descending)) {
+            if (-not (Test-UpdateRegistryDataPartition -Partition $candidatePartition)) { continue }
+
+            $candidateLetter = [string]$candidatePartition.DriveLetter
+            if (-not $candidateLetter -or $candidateLetter -eq [char]0) {
+                $candidateLetter = Get-UpdateRegistryAvailableDriveLetter
+                if (-not $candidateLetter) {
+                    throw "No temporary drive letter is available to inspect Disk $diskNumber."
+                }
+                $mountTracked = $false
+                try {
+                    Invoke-UpdateRegistryDiskPart -Operation 'os-probe-assign' -Commands @(
+                        "select disk $diskNumber"
+                        "select partition $($candidatePartition.PartitionNumber)"
+                        "assign letter=$candidateLetter"
+                    )
+                    Update-HostStorageCache -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 2
+                    if (-not (Test-Path -LiteralPath "${candidateLetter}:\" -PathType Container)) {
+                        throw "Temporary mount ${candidateLetter}: failed for Disk $diskNumber Partition $($candidatePartition.PartitionNumber)."
+                    }
+                    $temporaryMounts += [pscustomobject]@{
+                        DiskNumber = [int]$diskNumber
+                        PartitionNumber = [int]$candidatePartition.PartitionNumber
+                        DriveLetter = [string]$candidateLetter
+                    }
+                    $mountTracked = $true
+                }
+                catch {
+                    Write-UpdateRegistryCatchTelemetry -CatchName 'TemporaryOsMount' -Stage 'TargetValidation' -RootCause 'TemporaryMountFailure' -DiskNumber "$diskNumber" -TargetDrive "${candidateLetter}:" -ErrorRecord $_
+                    if (-not $mountTracked) {
+                        Invoke-UpdateRegistryDiskPart -Operation 'failed-os-probe-cleanup' -Commands @(
+                            "select disk $diskNumber"
+                            "select partition $($candidatePartition.PartitionNumber)"
+                            "remove letter=$candidateLetter noerr"
+                        )
+                        Update-HostStorageCache -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 1
+                        if (Test-Path -LiteralPath "${candidateLetter}:\" -PathType Container) {
+                            throw "Failed temporary mount ${candidateLetter}: could not be removed from Disk $diskNumber Partition $($candidatePartition.PartitionNumber)."
+                        }
+                    }
+                    throw
+                }
+            }
+
+            $requestedHivePath = "${candidateLetter}:\Windows\System32\config\$hive"
+            $winloadExe = "${candidateLetter}:\Windows\System32\winload.exe"
+            $winloadEfi = "${candidateLetter}:\Windows\System32\winload.efi"
+            if ((Test-Path -LiteralPath $requestedHivePath -PathType Leaf) -and
+                ((Test-Path -LiteralPath $winloadExe -PathType Leaf) -or
+                 (Test-Path -LiteralPath $winloadEfi -PathType Leaf))) {
+                $targetPartition = $candidatePartition
+                $targetDriveLetter = $candidateLetter
+                break
+            }
+        }
+
+        if (-not $targetPartition) {
+            Write-WarningLog "Skipping Disk $diskNumber because no Windows loader and requested hive '$hive' were found."
+            $skippedCount++
+            continue
+        }
+        $validatedPartitions += [pscustomobject]@{
+            DiskNumber = $diskNumber
+            PartitionNumber = [int]$targetPartition.PartitionNumber
+            DriveLetter = $targetDriveLetter
+            DiskPartitions = $diskPartitions
+        }
+        Write-InfoLog "Validated Windows target on Disk $diskNumber Partition $($targetPartition.PartitionNumber) at ${targetDriveLetter}:"
+    }
+
+    if ($validatedPartitions.Count -eq 0) {
+        throw 'No attached Windows OS disk passed loader and requested-hive validation.'
+    }
+
+    Write-InfoLog 'Scanning validated Windows partitions for requested registry updates'
+
+    foreach ($partition in $validatedPartitions) {
             if (-not $partition -or -not $partition.DriveLetter) { continue }
 
             $drive = $partition.DriveLetter
             $processedCount++
 
-            # Skip the rescue VM's own OS drive (its hives are locked by the running OS)
-            $rescueDrive = $env:SystemDrive -replace ':', ''
-            if ($drive -eq $rescueDrive) {
-                Write-InfoLog "Skipping rescue VM system drive $drive (own OS)"
-                $skippedCount++
+            # Windows Server 2022 Gen2 can expose the offline loader's device or
+            # osdevice as unknown after a clone collision is released. Repair the
+            # mapping while the source GPT identity is still unchanged, before
+            # touching the registry hive. This prevents winload.efi 0xc0000225.
+            try {
+                Repair-UpdateRegistryUnknownBcdMapping -DiskNumber $partition.DiskNumber `
+                    -DiskPartitions @($partition.DiskPartitions) -WindowsDrive $drive
+            }
+            catch {
+                Write-ErrorLog "Boot-safety preflight failed for Disk $($partition.DiskNumber): $($_.Exception.Message)"
+                $failedCount++
                 continue
             }
 
@@ -295,9 +1070,45 @@ try {
                 continue
             }
 
+            $hiveSourcePath = "$($drive):\Windows\System32\config\$($hive)"
+            $backupFile = Join-Path $logDir "backup-$hive-$drive-$timestamp.hiv"
+            try {
+                if (-not (Test-Path -LiteralPath $hiveSourcePath -PathType Leaf)) {
+                    throw "Hive file not found for backup: $hiveSourcePath"
+                }
+                $sourceHash = Get-UpdateRegistryFileSha256 -LiteralPath $hiveSourcePath
+                Copy-Item -LiteralPath $hiveSourcePath -Destination $backupFile -Force -ErrorAction Stop
+                $backupHash = Get-UpdateRegistryFileSha256 -LiteralPath $backupFile
+                if ($backupHash -ine $sourceHash) {
+                    throw "Hive backup hash mismatch for drive $drive."
+                }
+                Write-InfoLog "Created hive backup before load: $backupFile"
+            }
+            catch {
+                Write-ErrorLog "Failed to create a hive backup for drive ${drive}: $($_.Exception.Message)"
+                Write-UpdateRegistryCatchTelemetry -CatchName 'HiveBackupCreate' -Stage 'Backup' -RootCause 'BackupFailure' -DiskNumber "$($partition.DiskNumber)" -TargetDrive "${drive}:" -ErrorRecord $_
+                $failedCount++
+                continue
+            }
+
             # Step 4 - Load requested registry hive from attached disk
+            $mountName = "broken$($hive)$($drive)"
+            $nativeMountPath = "$rootKey\$mountName"
+            $providerMountPath = "$registryProviderRoot\$mountName"
+            if (Test-Path -LiteralPath $providerMountPath) {
+                Write-WarningLog "Removing stale repair hive mount: $nativeMountPath"
+                $preUnloadResult = & reg.exe unload $nativeMountPath 2>&1 | Out-String
+                $preUnloadExitCode = $LASTEXITCODE
+                Write-OutputLog "stale reg unload exit code: $preUnloadExitCode"
+                Write-OutputLog "stale reg unload output: $preUnloadResult"
+                if ($preUnloadExitCode -ne 0) {
+                    Write-ErrorLog "Failed to remove stale hive mount '$nativeMountPath'. Skipping drive $drive."
+                    $failedCount++
+                    continue
+                }
+            }
             Write-InfoLog "Loading $hive hive from $($drive):"
-            $loadResult = & reg.exe load "$($rootKey)\broken$($hive)$($drive)" "$($drive):\Windows\System32\config\$($hive)" 2>&1 | Out-String
+            $loadResult = & reg.exe load $nativeMountPath $hiveSourcePath 2>&1 | Out-String
             $loadExitCode = $LASTEXITCODE
             Write-OutputLog "reg load exit code: $loadExitCode"
             Write-OutputLog "reg load output: $loadResult"
@@ -309,25 +1120,21 @@ try {
                 continue
             }
 
-            $hiveSourcePath = "$($drive):\Windows\System32\config\$($hive)"
-            $backupFile = Join-Path $logDir "backup-$hive-$drive-$timestamp.hiv"
             $restoreRequired = $false
+            $writeAttempted = $false
 
             try {
-                if (-not (Test-Path -LiteralPath $hiveSourcePath)) {
-                    throw "Hive file not found for backup: $hiveSourcePath"
-                }
-                Copy-Item -LiteralPath $hiveSourcePath -Destination $backupFile -Force -ErrorAction Stop
-                Write-InfoLog "Created hive backup before modification: $backupFile"
-
                 # Step 5 - Determine the active ControlSet if using the SYSTEM hive
                 if ($hive -eq "system") {
                     Write-InfoLog "Using a SYSTEM hive, determining Control Set"
-                    $controlSetText = "ControlSet00"
-                    if (-not $controlSet -or $controlSet -eq "") {
-                        $controlSet = (Get-ItemProperty -Path "$($rootKey):\broken$($hive)$($drive)\Select" -Name Current).Current
+                    $effectiveControlSet = $controlSet
+                    if (-not $effectiveControlSet -or $effectiveControlSet -eq "") {
+                        $effectiveControlSet = (Get-ItemProperty -Path "$providerMountPath\Select" -Name Current -ErrorAction Stop).Current
                     }
-                    $controlSetText += $controlSet
+                    if ([int]$effectiveControlSet -lt 1) {
+                        throw "SYSTEM hive Select contains an invalid Current control-set reference: $effectiveControlSet."
+                    }
+                    $controlSetText = 'ControlSet{0:D3}' -f [int]$effectiveControlSet
                     Write-InfoLog "Using $controlSetText"
                     $controlSetText += "\"
                 }
@@ -337,7 +1144,7 @@ try {
                 }
 
                 # Step 6 - Read current value of the specified property
-                $propPath = "$($rootKey):\broken$($hive)$($drive)\$($controlSetText)$($relativePath)"
+                $propPath = "$providerMountPath\$($controlSetText)$($relativePath)"
                 Write-InfoLog "Target registry path: $propPath"
                 $currentValue = Get-ItemProperty -Path $propPath -Name $propertyName -ErrorAction SilentlyContinue
                 if ($currentValue) {
@@ -349,25 +1156,25 @@ try {
 
                 # Step 7 - Create path if needed, then set the property value
                 if ($propertyType -eq "") { $propertyType = "dword" }
+                $writeAttempted = $true
 
-                if (Test-Path $propPath) {
-                    if (($propertyType -ne "") -and ($propertyType -ne "dword")) {
-                        try {
-                            $propertyType = (Get-Item -Path $propPath).getValueKind($propertyName)
-                        }
-                        catch {
-                            Write-WarningLog "Unable to detect existing property type, using '$propertyType': $($_.Exception.Message)"
-                        }
+                if (-not (Test-Path $propPath)) {
+                    if (-not $createPathIfMissing) {
+                        throw "Registry path does not exist: $propPath. Set createPathIfMissing=true only if creation is intended."
                     }
-                }
-                else {
                     Write-InfoLog "Registry path does not exist, creating: $propPath"
                     New-Item -Path $propPath -Force -ErrorAction Stop | Out-Null
                 }
 
                 $modifiedKey = Set-ItemProperty -Path $propPath -Name $propertyName -Type $propertyType -Value $propertyValue -Force -ErrorAction Stop -PassThru
+                $verifiedProperty = Get-ItemProperty -Path $propPath -Name $propertyName -ErrorAction Stop
+                $verifiedValue = $verifiedProperty.$propertyName
+                if (-not (Test-UpdateRegistryValue -ActualValue $verifiedValue -ExpectedValue $propertyValue -Type $propertyType)) {
+                    throw "Post-write verification failed for '$propertyName' at '$propPath'."
+                }
                 Write-OutputLog "Successfully modified registry key"
                 Write-OutputLog "Updated '$propertyName' to '$propertyValue' (type '$propertyType') at '$propPath'"
+                Write-OutputLog "Verified '$propertyName' persisted as '$verifiedValue'"
                 Write-OutputLog $modifiedKey
 
                 $script_final_status = $STATUS_SUCCESS
@@ -376,9 +1183,10 @@ try {
             catch {
                 Write-ErrorLog "Failed to modify registry hive on $($drive): $($_.Exception.Message)"
                 Write-ErrorLog "Will attempt rollback from backup after unloading hive."
+                Write-UpdateRegistryCatchTelemetry -CatchName 'RegistryMutation' -Stage 'RegistryWrite' -RootCause 'RegistryWriteFailure' -DiskNumber "$($partition.DiskNumber)" -TargetDrive "${drive}:" -ErrorRecord $_
                 $script_final_status = $STATUS_ERROR
                 $failedCount++
-                $restoreRequired = $true
+                $restoreRequired = $writeAttempted
             }
             finally {
                 # Step 8 - Unload the registry hive cleanly
@@ -386,7 +1194,8 @@ try {
                 $unloadSuccess = $false
                 for ($attempt = 1; $attempt -le 3; $attempt++) {
                     [gc]::Collect()
-                    $unloadResult = & reg.exe unload "$($rootKey)\broken$($hive)$($drive)" 2>&1 | Out-String
+                    [gc]::WaitForPendingFinalizers()
+                    $unloadResult = & reg.exe unload $nativeMountPath 2>&1 | Out-String
                     $unloadExitCode = $LASTEXITCODE
                     Write-OutputLog "reg unload attempt $attempt exit code: $unloadExitCode"
                     Write-OutputLog "reg unload attempt $attempt output: $unloadResult"
@@ -411,10 +1220,15 @@ try {
                     if ($unloadSuccess) {
                         try {
                             Copy-Item -LiteralPath $backupFile -Destination $hiveSourcePath -Force -ErrorAction Stop
+                            $restoredHash = Get-UpdateRegistryFileSha256 -LiteralPath $hiveSourcePath
+                            if ($restoredHash -ine $backupHash) {
+                                throw "Restored hive hash does not match the verified backup."
+                            }
                             Write-WarningLog "Rollback applied from backup: $backupFile"
                         }
                         catch {
                             Write-ErrorLog "Rollback failed for drive $drive using backup '$backupFile': $($_.Exception.Message)"
+                            Write-UpdateRegistryCatchTelemetry -CatchName 'HiveRollback' -Stage 'Rollback' -RootCause 'BackupFailure' -DiskNumber "$($partition.DiskNumber)" -TargetDrive "${drive}:" -ErrorRecord $_
                             $script_final_status = $STATUS_ERROR
                         }
                     }
@@ -425,21 +1239,112 @@ try {
             }
         }
 
-        Write-InfoLog "Summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
+    Write-InfoLog "Summary: processed=$processedCount skipped=$skippedCount failed=$failedCount changed=$changedCount"
 
-        if ($script_final_status -ne $STATUS_SUCCESS) {
-            Write-ErrorLog "No registry modification was applied on any partition"
-        }
+    if ($changedCount -gt 0 -and $failedCount -eq 0) {
+        $script_final_status = $STATUS_SUCCESS
+    }
+    else {
+        $script_final_status = $STATUS_ERROR
+        Write-ErrorLog "Registry update did not complete successfully on every validated target."
     }
 }
 catch {
     Write-ErrorLog "An unexpected error occurred: $($_.Exception.Message)"
+    Write-UpdateRegistryCatchTelemetry -CatchName 'UnhandledExecution' -Stage 'Main' -RootCause 'UnexpectedError' -ErrorRecord $_
     $script_final_status = $STATUS_ERROR
 }
 finally {
+    foreach ($mount in @($temporaryMounts | Sort-Object DiskNumber, PartitionNumber -Unique)) {
+        try {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                Invoke-UpdateRegistryDiskPart -Operation "mount-cleanup-attempt-$attempt" -Commands @(
+                    "select disk $($mount.DiskNumber)"
+                    "select partition $($mount.PartitionNumber)"
+                    "remove letter=$($mount.DriveLetter) noerr"
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+                if (-not (Test-Path -LiteralPath "$($mount.DriveLetter):\" -PathType Container)) {
+                    break
+                }
+                if ($attempt -lt 3) {
+                    Write-WarningLog "Temporary letter $($mount.DriveLetter): remains mounted after cleanup attempt $attempt; retrying."
+                }
+            }
+            if (Test-Path -LiteralPath "$($mount.DriveLetter):\" -PathType Container) {
+                throw 'Temporary drive letter removal could not be verified after three attempts.'
+            }
+        }
+        catch {
+            Write-ErrorLog "Failed to remove temporary letter $($mount.DriveLetter): $($_.Exception.Message)"
+            Write-UpdateRegistryCatchTelemetry -CatchName 'TemporaryMountCleanup' -Stage 'Cleanup' -RootCause 'CleanupFailure' -DiskNumber "$($mount.DiskNumber)" -TargetDrive "$($mount.DriveLetter):" -ErrorRecord $_
+            $script_final_status = $STATUS_ERROR
+        }
+    }
+
+    $identityRestorationFailed = $false
+    if ($repairDiskIdentityRecord) {
+        foreach ($diskNumber in @($gptCollisionDiskNumbers | Sort-Object -Unique)) {
+            try {
+                Invoke-UpdateRegistryDiskPart -Operation 'source-before-repair-host-restore' -Commands @(
+                    "select disk $diskNumber"
+                    'offline disk'
+                )
+                Update-HostStorageCache -ErrorAction SilentlyContinue
+                $sourceDisk = Get-Disk -Number $diskNumber -ErrorAction Stop
+                $sourceIdentity = Get-UpdateRegistryDiskIdentity -DiskNumber $diskNumber
+                if (-not $sourceDisk.IsOffline -or
+                    $sourceIdentity.Value -ine $repairDiskIdentityRecord.OriginalValue) {
+                    throw "Source Disk $diskNumber was not offline with its unchanged original GPT identity."
+                }
+            }
+            catch {
+                $identityRestorationFailed = $true
+                Write-ErrorLog "CRITICAL: Could not safely offline source Disk ${diskNumber}: $($_.Exception.Message)"
+                Write-UpdateRegistryCatchTelemetry -CatchName 'SourceGptOffline' -Stage 'IdentityRestore' -RootCause 'DiskIdentityRestoreFailure' -DiskNumber "$diskNumber" -ErrorRecord $_
+            }
+        }
+        if (-not $identityRestorationFailed) {
+            try {
+                Restore-UpdateRegistryRepairIdentity -Record $repairDiskIdentityRecord
+                Write-InfoLog 'Repair VM OS disk GPT identity restored and verified.'
+            }
+            catch {
+                $identityRestorationFailed = $true
+                Write-ErrorLog "CRITICAL: Failed to restore the repair VM OS disk identity: $($_.Exception.Message)"
+                Write-UpdateRegistryCatchTelemetry -CatchName 'RepairDiskIdentityRestore' -Stage 'IdentityRestore' -RootCause 'DiskIdentityRestoreFailure' -DiskNumber "$($repairDiskIdentityRecord.DiskNumber)" -ErrorRecord $_
+            }
+        }
+    }
+
+    foreach ($identityRecord in @($collisionDiskRecords | Sort-Object DiskNumber -Descending)) {
+        try {
+            Restore-UpdateRegistrySourceIdentity -Record $identityRecord
+            Write-InfoLog "Disk $($identityRecord.DiskNumber) original MBR identity restored and verified."
+        }
+        catch {
+            $identityRestorationFailed = $true
+            Write-ErrorLog "CRITICAL: Failed to restore Disk $($identityRecord.DiskNumber) identity: $($_.Exception.Message)"
+            Write-UpdateRegistryCatchTelemetry -CatchName 'SourceMbrIdentityRestore' -Stage 'IdentityRestore' -RootCause 'DiskIdentityRestoreFailure' -DiskNumber "$($identityRecord.DiskNumber)" -ErrorRecord $_
+        }
+    }
+    if ($identityRestorationFailed) { $script_final_status = $STATUS_ERROR }
+
     Write-InfoLog "Final status: $script_final_status"
+    $completionEvent = if ($script_final_status -eq $STATUS_SUCCESS) { 'Success' } else { 'Error' }
+    Write-UpdateRegistryTelemetry -Event $completionEvent -Message 'Offline registry update completed' -Properties @{
+        CoverageCategory = 'ScriptOutcome'
+        Status = [string]$script_final_status
+        Processed = $processedCount
+        Skipped = $skippedCount
+        Changed = $changedCount
+        Failed = $failedCount
+        DurationMilliseconds = [int64]((Get-Date) - $script:ExecutionStarted).TotalMilliseconds
+    }
     Write-InfoLog "Script ended at $(Get-Date)"
     Write-InfoLog "Log file path: $logFile"
+    Write-InfoLog "Collected log file path: $collectedLogFile"
 }
 
 return $script_final_status

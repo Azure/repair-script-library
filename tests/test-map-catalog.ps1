@@ -53,4 +53,21 @@ foreach ($detector in 'win-detect-nvme-readiness', 'linux-detect-nvme-readiness'
     Assert-True (@($catalog | Where-Object id -eq $detector).Count -eq 1) "$detector must stay registered."
 }
 
+$windowsDetector = @($catalog | Where-Object id -eq 'win-detect-nvme-readiness')
+Assert-True ($windowsDetector[0].description -match 'Hyper-V generation') `
+    'The Windows detector description must say that it reports the Hyper-V generation.'
+Assert-True ($windowsDetector[0].description -match 'GEN1_TO_GEN2_CONVERSION_REQUIRED') `
+    'The Windows detector description must document the Generation 1 result.'
+
+$gen1Conversion = @($catalog | Where-Object id -eq 'win-convert-gen1-to-gen2')
+Assert-True ($gen1Conversion.Count -eq 1) 'win-convert-gen1-to-gen2 must be registered exactly once.'
+Assert-True ($gen1Conversion[0].path -eq 'src/windows/win-convert-gen1-to-gen2.ps1') `
+    'win-convert-gen1-to-gen2 must point at the Windows source-VM conversion script.'
+Assert-True ($gen1Conversion[0].description -match 'source VM') `
+    'The conversion description must say that it runs directly on the source VM.'
+Assert-True ($gen1Conversion[0].description -match 'do not use --run-on-repair') `
+    'The conversion description must explicitly prohibit --run-on-repair.'
+Assert-True ($gen1Conversion[0].description -match 'do not reboot') `
+    'The conversion description must prohibit reboot before the Trusted Launch update.'
+
 Write-Host "PASS: map.json catalogue — $($catalog.Count) entries, unique ids, existing paths, OS/extension agreement, NVMe run ids registered."
