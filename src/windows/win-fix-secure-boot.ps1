@@ -63,6 +63,12 @@
 # .PARAMETER windowsDrive
 #   Skips discovery and uses this drive letter as the offline Windows volume.
 #
+# .EXAMPLE
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-secure-boot --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-secure-boot --parameters detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-secure-boot --parameters revert=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-secure-boot --parameters windowsDrive=F --run-on-repair --verbose
+#
 # .NOTES
 #   Switch parameters are declared as ValidateSet strings on purpose. The extension turns
 #   "--parameters name=value" into "-name value", and passing a value to a real [switch] also binds
