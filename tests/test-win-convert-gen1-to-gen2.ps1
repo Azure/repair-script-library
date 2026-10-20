@@ -63,6 +63,7 @@ Assert-Match "CatchName 'ConvertedBootLayoutVerification'" 'The post-conversion 
 Assert-Match "CatchName 'WorkflowFailure'" 'The workflow catch must emit telemetry.'
 Assert-Match "CatchName 'EfiCleanupAfterVerificationFailure'" 'A cleanup failure that follows a verification failure must be recorded, not hidden.'
 Assert-Match "-Event Result[\s\S]+durationMs[\s\S]+return \`$status\s*$" 'Every run must end with a Result event that records the total duration.'
+Assert-Match 'function Write-ConversionTelemetry[\s\S]+?try \{[\s\S]+?\}\s*catch \{[\s\S]+?Log-Warning' 'The telemetry helper must be fail-safe and fall back to a plain-text warning.'
 
 function Get-FunctionSource {
     Param([Parameter(Mandatory = $true)][string]$Name)
@@ -209,6 +210,48 @@ function Get-FunctionSource {
     if ($script:errorLines.Count -ne 1 -or $script:errorLines[0] -notmatch 'Probe' -or $script:errorLines[0] -notmatch 'ProbeStage' -or
         $script:errorLines[0] -notmatch 'InvalidOperationException' -or $script:errorLines[0] -notmatch 'boom') {
         throw 'ASSERTION FAILED: catch telemetry must record the catch name, stage, exception type, and message through Log-Error.'
+    }
+}
+
+& {
+    Invoke-Expression (Get-FunctionSource -Name 'Write-ConversionTelemetry')
+    Invoke-Expression (Get-FunctionSource -Name 'Write-ConversionCatchTelemetry')
+
+    $script:ScriptVersion = 'test'
+    $script:RunId = 'abcd1234'
+    $script:Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $Mode = 'Convert'
+    $script:warnings = @()
+    function Log-Info { Param([string]$Message) }
+    function Log-Error { Param([string]$Message) }
+    function Log-Warning { Param([string]$Message) $script:warnings += $Message }
+
+    # A failing serializer must not terminate the run: it would drop the result line and status token.
+    function ConvertTo-Json { throw 'serializer failed' }
+    $probeRecord = $null
+    try { throw 'x' } catch { $probeRecord = $_ }
+    try {
+        Write-ConversionTelemetry -Event Operation -Message 'probe' -Properties @{ exitCode = 0 }
+        Write-ConversionCatchTelemetry -CatchName 'Probe' -Stage 'ProbeStage' -ErrorRecord $probeRecord
+    }
+    catch {
+        throw "ASSERTION FAILED: a telemetry serialization failure escaped the helper and would end the run: $($_.Exception.Message)"
+    }
+    if ($script:warnings.Count -lt 2 -or ($script:warnings -join ' ') -notmatch 'could not be emitted') {
+        throw 'ASSERTION FAILED: a telemetry failure must leave a plain-text warning so it is not silent.'
+    }
+    if (($script:warnings -join ' ') -match 'serializer failed|abcd1234') {
+        throw 'ASSERTION FAILED: the telemetry failure warning must be fixed text, not derived from the failing payload.'
+    }
+    Remove-Item Function:\ConvertTo-Json
+
+    # A failing logger must be contained the same way.
+    $script:warnings = @()
+    function Log-Info { Param([string]$Message) throw 'logger failed' }
+    try { Write-ConversionTelemetry -Event Decision -Message 'probe' }
+    catch { throw "ASSERTION FAILED: a logger failure escaped the telemetry helper: $($_.Exception.Message)" }
+    if ($script:warnings.Count -ne 1) {
+        throw 'ASSERTION FAILED: a logger failure must produce exactly one fallback warning.'
     }
 }
 

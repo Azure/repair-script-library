@@ -1,7 +1,7 @@
 #########################################################################################################
 #
 # .SYNOPSIS
-#   Validate or convert the running Windows source VM OS disk from MBR/BIOS to GPT/UEFI. v1.0.1
+#   Validate or convert the running Windows source VM OS disk from MBR/BIOS to GPT/UEFI. v1.0.2
 #
 # .DESCRIPTION
 #   Runs inside the healthy source VM. Report mode is the read-only default. Convert mode requires
@@ -61,12 +61,14 @@ $result = [ordered]@{
     message    = ''
 }
 
-$script:ScriptVersion = '1.0.1'
+$script:ScriptVersion = '1.0.2'
 $script:RunId = [guid]::NewGuid().ToString('N').Substring(0, 8)
 $script:Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Diagnostics only. Emitted through Log-Info/Log-Error so it reaches the same pipeline as every other
 # message. Never call this from a function whose output is captured as a return value.
+# Fail-safe: a telemetry failure must never stop the run, because that would drop the structured result,
+# the status token, and the no-reboot guidance after an irreversible conversion.
 function Write-ConversionTelemetry {
     Param(
         [Parameter(Mandatory = $true)][ValidateSet('Start', 'Decision', 'Operation', 'Result', 'Error')][string]$Event,
@@ -74,17 +76,23 @@ function Write-ConversionTelemetry {
         [Parameter(Mandatory = $false)][hashtable]$Properties = @{}
     )
 
-    $payload = [ordered]@{
-        event         = $Event
-        message       = $Message
-        runId         = $script:RunId
-        scriptVersion = $script:ScriptVersion
-        mode          = $Mode
-        elapsedMs     = $script:Stopwatch.ElapsedMilliseconds
-        properties    = $Properties
+    try {
+        $payload = [ordered]@{
+            event         = $Event
+            message       = $Message
+            runId         = $script:RunId
+            scriptVersion = $script:ScriptVersion
+            mode          = $Mode
+            elapsedMs     = $script:Stopwatch.ElapsedMilliseconds
+            properties    = $Properties
+        }
+        $line = "[GEN1-GEN2-TELEMETRY] $($payload | ConvertTo-Json -Compress -Depth 5)"
+        if ($Event -eq 'Error') { Log-Error $line } else { Log-Info $line }
     }
-    $line = "[GEN1-GEN2-TELEMETRY] $($payload | ConvertTo-Json -Compress -Depth 5)"
-    if ($Event -eq 'Error') { Log-Error $line } else { Log-Info $line }
+    catch {
+        # Plain text only: the JSON path is what just failed.
+        Log-Warning "[GEN1-GEN2-TELEMETRY] A '$Event' telemetry event could not be emitted. The conversion result is unaffected."
+    }
 }
 
 function Write-ConversionCatchTelemetry {
@@ -94,11 +102,16 @@ function Write-ConversionCatchTelemetry {
         [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    Write-ConversionTelemetry -Event Error -Message "Catch block: $CatchName" -Properties @{
-        catchName     = $CatchName
-        stage         = $Stage
-        exceptionType = $ErrorRecord.Exception.GetType().FullName
-        error         = $ErrorRecord.Exception.Message
+    try {
+        Write-ConversionTelemetry -Event Error -Message "Catch block: $CatchName" -Properties @{
+            catchName     = $CatchName
+            stage         = $Stage
+            exceptionType = $ErrorRecord.Exception.GetType().FullName
+            error         = $ErrorRecord.Exception.Message
+        }
+    }
+    catch {
+        Log-Warning "[GEN1-GEN2-TELEMETRY] Error details for catch '$CatchName' could not be recorded. The conversion result is unaffected."
     }
 }
 
