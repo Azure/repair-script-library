@@ -1,7 +1,7 @@
 #########################################################################################################
 #
 # .SYNOPSIS
-#   Validate or convert the running Windows source VM OS disk from MBR/BIOS to GPT/UEFI. v1.0.0
+#   Validate or convert the running Windows source VM OS disk from MBR/BIOS to GPT/UEFI. v1.0.2
 #
 # .DESCRIPTION
 #   Runs inside the healthy source VM. Report mode is the read-only default. Convert mode requires
@@ -10,6 +10,35 @@
 #
 #   Invoke this run-id without --run-on-repair. After successful conversion, do not reboot the VM
 #   while it is still Generation 1. Deallocate it and update it to Trusted Launch through Azure.
+#
+# .PARAMETER Mode
+#   "Report" (default) validates eligibility and changes nothing. "Convert" runs MBR2GPT.
+#
+# .PARAMETER BackupConfirmed
+#   "true" confirms a recoverable full VM backup exists. Required for Convert. Defaults to "false".
+#
+# .PARAMETER TrustedLaunchPrerequisitesConfirmed
+#   "true" confirms the Trusted Launch prerequisites were reviewed. Required for Convert.
+#   Defaults to "false".
+#
+# .PARAMETER ConversionAcknowledgement
+#   Must equal CONVERT_TO_GEN2_TRUSTED_LAUNCH, exactly, for Convert.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRG -n MyWinVM --run-id win-convert-gen1-to-gen2 --verbose
+#   Report mode. Read-only; returns GEN2_CONVERSION_APPLICABLE when the disk can be converted.
+#
+# .EXAMPLE
+#   az vm repair run -g MyRG -n MyWinVM --run-id win-convert-gen1-to-gen2 --verbose --parameters Mode=Convert BackupConfirmed=true TrustedLaunchPrerequisitesConfirmed=true ConversionAcknowledgement=CONVERT_TO_GEN2_TRUSTED_LAUNCH
+#   Convert mode. Irreversible in place; restore from the full VM backup to roll back.
+#
+# .NOTES
+#   Output contract:
+#     [GEN1-GEN2-RESULT]    One JSON line with the signature and message. Unchanged and authoritative.
+#     [GEN1-GEN2-TELEMETRY] JSON lines for diagnostics only: runId, stage, elapsedMs, decisions, and
+#                           every caught error. The runId is also the suffix of the log directory
+#                           under ProgramData\VmRepair\Gen1ToGen2. Never contains credentials.
+#   The final output is the repair-library status token. Run directly on the source VM.
 #
 #########################################################################################################
 
@@ -30,6 +59,60 @@ $result = [ordered]@{
     diskNumber = $null
     logPath    = $null
     message    = ''
+}
+
+$script:ScriptVersion = '1.0.2'
+$script:RunId = [guid]::NewGuid().ToString('N').Substring(0, 8)
+$script:Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+# Diagnostics only. Emitted through Log-Info/Log-Error so it reaches the same pipeline as every other
+# message. Never call this from a function whose output is captured as a return value.
+# Fail-safe: a telemetry failure must never stop the run, because that would drop the structured result,
+# the status token, and the no-reboot guidance after an irreversible conversion.
+function Write-ConversionTelemetry {
+    Param(
+        [Parameter(Mandatory = $true)][ValidateSet('Start', 'Decision', 'Operation', 'Result', 'Error')][string]$Event,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $false)][hashtable]$Properties = @{}
+    )
+
+    try {
+        $payload = [ordered]@{
+            event         = $Event
+            message       = $Message
+            runId         = $script:RunId
+            scriptVersion = $script:ScriptVersion
+            mode          = $Mode
+            elapsedMs     = $script:Stopwatch.ElapsedMilliseconds
+            properties    = $Properties
+        }
+        $line = "[GEN1-GEN2-TELEMETRY] $($payload | ConvertTo-Json -Compress -Depth 5)"
+        if ($Event -eq 'Error') { Log-Error $line } else { Log-Info $line }
+    }
+    catch {
+        # Plain text only: the JSON path is what just failed.
+        Log-Warning "[GEN1-GEN2-TELEMETRY] A '$Event' telemetry event could not be emitted. The conversion result is unaffected."
+    }
+}
+
+function Write-ConversionCatchTelemetry {
+    Param(
+        [Parameter(Mandatory = $true)][string]$CatchName,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    try {
+        Write-ConversionTelemetry -Event Error -Message "Catch block: $CatchName" -Properties @{
+            catchName     = $CatchName
+            stage         = $Stage
+            exceptionType = $ErrorRecord.Exception.GetType().FullName
+            error         = $ErrorRecord.Exception.Message
+        }
+    }
+    catch {
+        Log-Warning "[GEN1-GEN2-TELEMETRY] Error details for catch '$CatchName' could not be recorded. The conversion result is unaffected."
+    }
 }
 
 function Write-CurrentConversionResult {
@@ -231,38 +314,62 @@ function Test-ConvertedBootLayout {
 
     $mountRoot = "$driveLetter`:\"
     $assignmentAttempted = $false
+    $verified = $false
     try {
         $assignmentAttempted = $true
         Add-EfiDriveLetter -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -DriveLetter $driveLetter
         $bcdPath = Join-Path $mountRoot 'EFI\Microsoft\Boot\BCD'
         Assert-EfiBcdStoreReadable -BcdPath $bcdPath
+        $verified = $true
     }
     finally {
         if ($assignmentAttempted) {
-            Remove-EfiDriveLetter -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -DriveLetter $driveLetter
+            try {
+                Remove-EfiDriveLetter -DiskNumber $DiskNumber -PartitionNumber $esp[0].PartitionNumber -DriveLetter $driveLetter
+            }
+            catch {
+                # After a successful verification a leftover drive letter must still fail the run. After a
+                # failed verification, throwing here would replace the real cause, so record it and keep it.
+                if ($verified) { throw }
+                Write-ConversionCatchTelemetry -CatchName 'EfiCleanupAfterVerificationFailure' -Stage 'VerifyBootLayout' -ErrorRecord $_
+            }
         }
     }
 }
 
 try {
     :workflow do {
+        $stage = 'Initialize'
+        Write-ConversionTelemetry -Event Start -Message 'Gen1 to Gen2 conversion script started' -Properties @{
+            backupConfirmed                     = ($BackupConfirmed -eq 'true')
+            trustedLaunchPrerequisitesConfirmed = ($TrustedLaunchPrerequisitesConfirmed -eq 'true')
+            acknowledgementProvided             = (-not [string]::IsNullOrEmpty($ConversionAcknowledgement))
+        }
         if (-not (Test-Administrator)) {
             throw 'This script must run elevated inside the source Windows VM.'
         }
 
+        $stage = 'DetectSystemDisk'
         $disk = Get-SystemDisk
         $result.diskNumber = $disk.Number
+        Write-ConversionTelemetry -Event Decision -Message 'System disk detected' -Properties @{
+            diskNumber     = $disk.Number
+            partitionStyle = [string]$disk.PartitionStyle
+        }
 
         if ($disk.PartitionStyle -eq 'GPT') {
+            $stage = 'AlreadyGptVerification'
             try {
                 Test-ConvertedBootLayout -DiskNumber $disk.Number
             }
             catch {
+                Write-ConversionCatchTelemetry -CatchName 'AlreadyGptVerification' -Stage $stage -ErrorRecord $_
                 Write-ConversionResult -Signature 'CONVERSION_VERIFICATION_FAILED' -Message "OS disk $($disk.Number) is already GPT, but ESP/BCD verification failed: $($_.Exception.Message) Do not reboot or change the VM security type. Preserve the full VM backup and recover from it if required."
                 break workflow
             }
 
             $firmwareType = [string](Get-ComputerInfo -Property BiosFirmwareType -ErrorAction SilentlyContinue).BiosFirmwareType
+            Write-ConversionTelemetry -Event Decision -Message 'Disk is already GPT and its boot layout verified' -Properties @{ firmwareType = $firmwareType }
             if ($firmwareType -eq 'Bios') {
                 Write-ConversionResult -Signature 'NO_CHANGE_NEEDED' -Message "OS disk $($disk.Number) is already GPT with a verified EFI boot layout while the VM is using legacy BIOS firmware. Do not reboot. Deallocate the VM and update it to Trusted Launch."
             }
@@ -276,18 +383,27 @@ try {
             throw "OS disk $($disk.Number) uses unsupported partition style '$($disk.PartitionStyle)'."
         }
 
+        $stage = 'CheckPartitionCount'
         $partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)
         if ($partitions.Count -gt 3) {
+            Write-ConversionTelemetry -Event Decision -Message 'Refused: too many MBR partitions' -Properties @{ partitionCount = $partitions.Count }
             Write-ConversionResult -Signature 'TOO_MANY_PRIMARY_PARTITIONS' -Message "OS disk $($disk.Number) has $($partitions.Count) partitions; MBR2GPT supports at most three MBR primary partitions."
             break workflow
         }
 
+        $stage = 'CheckEncryption'
         Assert-OsVolumeNotEncrypted
-        $logDirectory = Join-Path $env:ProgramData "VmRepair\Gen1ToGen2\$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        $logDirectory = Join-Path $env:ProgramData "VmRepair\Gen1ToGen2\$(Get-Date -Format 'yyyyMMdd-HHmmss')-$($script:RunId)"
         $result.logPath = $logDirectory
         New-Item -Path $logDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
 
+        $stage = 'Mbr2GptValidate'
+        $operationTimer = [System.Diagnostics.Stopwatch]::StartNew()
         $validation = Invoke-Mbr2Gpt -Operation validate -DiskNumber $disk.Number -Logs $logDirectory
+        Write-ConversionTelemetry -Event Operation -Message 'MBR2GPT validate finished' -Properties @{
+            exitCode   = $validation.ExitCode
+            durationMs = $operationTimer.ElapsedMilliseconds
+        }
         if ($validation.ExitCode -ne 0) {
             Write-ConversionResult -Signature 'UNSUPPORTED_CONFIGURATION' -Message "MBR2GPT validation failed with exit code $($validation.ExitCode). Review '$logDirectory'. No conversion was attempted."
             break workflow
@@ -299,6 +415,7 @@ try {
             break workflow
         }
 
+        $stage = 'ConvertGuards'
         if ($BackupConfirmed -ne 'true') {
             throw 'Convert mode requires BackupConfirmed=true. There is no in-place Generation 1 rollback.'
         }
@@ -309,16 +426,25 @@ try {
             throw 'Convert mode requires ConversionAcknowledgement=CONVERT_TO_GEN2_TRUSTED_LAUNCH.'
         }
 
+        $stage = 'Mbr2GptConvert'
+        Write-ConversionTelemetry -Event Decision -Message 'All Convert gates passed; starting irreversible MBR2GPT conversion'
+        $operationTimer = [System.Diagnostics.Stopwatch]::StartNew()
         $conversion = Invoke-Mbr2Gpt -Operation convert -DiskNumber $disk.Number -Logs $logDirectory
+        Write-ConversionTelemetry -Event Operation -Message 'MBR2GPT convert finished' -Properties @{
+            exitCode   = $conversion.ExitCode
+            durationMs = $operationTimer.ElapsedMilliseconds
+        }
         if ($conversion.ExitCode -ne 0) {
             Write-ConversionResult -Signature 'CONVERSION_VERIFICATION_FAILED' -Message "MBR2GPT conversion returned exit code $($conversion.ExitCode). Do not reboot or change the VM security type. Preserve '$logDirectory' and recover from backup if required."
             break workflow
         }
 
+        $stage = 'VerifyBootLayout'
         try {
             Test-ConvertedBootLayout -DiskNumber $disk.Number
         }
         catch {
+            Write-ConversionCatchTelemetry -CatchName 'ConvertedBootLayoutVerification' -Stage $stage -ErrorRecord $_
             Write-ConversionResult -Signature 'CONVERSION_VERIFICATION_FAILED' -Message "MBR2GPT returned success, but GPT/ESP/BCD verification failed: $($_.Exception.Message) Do not reboot or change the VM security type."
             break workflow
         }
@@ -328,6 +454,7 @@ try {
     } while ($false)
 }
 catch {
+    Write-ConversionCatchTelemetry -CatchName 'WorkflowFailure' -Stage $stage -ErrorRecord $_
     if ([string]::IsNullOrWhiteSpace($result.message)) {
         Write-ConversionResult -Signature 'UNSUPPORTED_CONFIGURATION' -Message $_.Exception.Message
     }
@@ -335,6 +462,14 @@ catch {
         Write-CurrentConversionResult
     }
     Log-Error $_.Exception.Message
+}
+
+Write-ConversionTelemetry -Event Result -Message 'Gen1 to Gen2 conversion script finished' -Properties @{
+    signature  = $result.signature
+    succeeded  = ($status -eq $STATUS_SUCCESS)
+    diskNumber = $result.diskNumber
+    stage      = $stage
+    durationMs = $script:Stopwatch.ElapsedMilliseconds
 }
 
 return $status
