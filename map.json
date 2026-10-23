@@ -85,6 +85,11 @@
 		"description" : "Repairs the signed EFI boot chain a Generation 2 VM starts through, for a loader failure such as 0xc0430001 that leaves no event log because nothing got far enough to write one. Integrity is decided by each file's digital signature, the same evidence the firmware and the boot manager themselves use, and never by comparing it against the component store. Repairs a boot manager that is missing from the EFI System Partition or whose signature no longer verifies, and a corrupt boot chain file with a targeted sfc against that one file. A newer boot manager installed by Secure Boot servicing is not treated as stale. A file the rescue VM merely does not trust is reported and left alone. Pass detectOnly=true to report only, revert=true to put back every file a previous run replaced, or windowsDrive to skip discovery. Never runs a full scan and never takes a file from another build. Gen2 only. NOTE: use option --run-on-repair."
 	},
 	{
+		"id" : "win-fix-system-file",
+		"path" : "src/windows/win-fix-system-file.ps1",
+		"description" : "Repairs the specific system files named with files=<name>[,<name>...] (for example files=win32kbase.sys), instead of a whole-installation DISM and sfc pass. Each file is checked against its embedded signature or the guest's own catalogs, and only a missing, empty or hash-mismatched file is changed. The replacement must match the guest's installed build exactly. It comes from an intact copy already on the disk (WinSxS, WinSxS\\Backup, DriverStore), is rebuilt from the guest's own servicing deltas, is taken from the guest's cumulative update downloaded from the Microsoft Update Catalog (disable with allowDownload=false), or as a last resort comes from a targeted offline sfc /SCANFILE. Every replaced file is verified again after the write and backed up first; pass revert=true to restore the originals, or detectOnly=true to only report. NOTE: use option --run-on-repair."
+	},
+	{
 		"id" : "win-toggle-safe-mode",
 		"path" : "src/windows/win-toggle-safe-mode.ps1",
 		"description" : "Disable Safe Mode if your Windows VM is booting in Safe Mode. Also activates Safe Mode if you require it (e.g. to uninstall certain software)."
