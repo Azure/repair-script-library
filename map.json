@@ -193,5 +193,10 @@
 		"id" : "win-fix-inaccessible-boot-device",
 		"path" : "src/windows/win-fix-inaccessible-boot-device.ps1",
 		"description" : "Repairs the offline registry causes of stop error 0x7B INACCESSIBLE_BOOT_DEVICE: boot storage driver Start and StartOverride values, missing boot storage service keys, dangling or third-party storage class filters, boot-critical PCI/VMBus device instance filters, missing Hyper-V ACPI enumeration keys, and a SAN policy that keeps the disk offline. Detects all causes and changes only what is actually wrong. Pass detectOnly=true to report only, or strictFilters=true to also remove Microsoft-signed class filters that are not part of the default set; by default only dangling and third-party entries are removed. NOTE: use option --run-on-repair."
+	},
+	{
+		"id" : "win-fix-registry-corruption",
+		"path" : "src/windows/win-fix-registry-corruption.ps1",
+		"description" : "Repairs missing, corrupted, empty or unloadable registry hives behind stop error 0xC0000218 STATUS_CANNOT_LOAD_REGISTRY_FILE and stop error 0x74 BAD_SYSTEM_CONFIG_INFO. Opens hives through read-only offreg, checks structural damage with chkreg.exe on private scratch copies, and refuses an indeterminate required-content check. RegBack restore is performed only when allowRegBack=true; backups must pass validation and timestamp bounds, which do not alone prove cross-hive consistency or guest bootability. RegBack is usually empty or stale on Windows 10 1803 and later, and restoring identity hives reverts local account passwords and a domain-joined machine account password to backup time. Preserves unique backups of replaced files. Pass detectOnly=true to report without registry replacement, or hive to scope the run. Discovery may prepare disks and temporary drive letters; logging and scratch checks write on the rescue VM. NOTE: use option --run-on-repair."
 	}
 ]
