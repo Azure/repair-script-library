@@ -114,6 +114,11 @@
 #   The drive letter of the attached offline Windows installation. Detected automatically when not
 #   supplied.
 #
+# .EXAMPLE
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-firewall-service --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-firewall-service --parameters detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-firewall-service --parameters windowsDrive=F --run-on-repair --verbose
+#
 # .NOTES
 #   This fault can also be repaired online, without detaching the disk: the guest agent stays Ready
 #   throughout, and removing the value through Run Command brings mpssvc back within about thirty
