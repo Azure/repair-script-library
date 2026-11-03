@@ -50,6 +50,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-inaccessible-boot-device --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-inaccessible-boot-device --parameters detectOnly=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-inaccessible-boot-device --parameters strictFilters=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-inaccessible-boot-device --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira
