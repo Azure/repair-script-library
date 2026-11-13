@@ -79,6 +79,7 @@
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-bcd --parameters detectOnly=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-bcd --parameters rebuild=true --run-on-repair --verbose
 #   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-bcd --parameters revert=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-bcd --parameters windowsDrive=F --run-on-repair --verbose
 #
 # .NOTES
 #   Author: Marcus Ferreira

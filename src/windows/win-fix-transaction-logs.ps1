@@ -74,6 +74,14 @@
 # .PARAMETER windowsDrive
 #   Drive letter of the attached Windows volume, e.g. "F:". Detected automatically when omitted.
 #
+# .EXAMPLE
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-transaction-logs --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-transaction-logs --parameters detectOnly=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-transaction-logs --parameters scope=All --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-transaction-logs --parameters force=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-transaction-logs --parameters revert=true --run-on-repair --verbose
+#   az vm repair run -g sourceRG -n sourceVM --run-id win-fix-transaction-logs --parameters windowsDrive=F --run-on-repair --verbose
+#
 # .NOTES
 #   Transaction logs are present and healthy on every running Windows installation. Their presence
 #   is not evidence of anything, so this script does not treat it as evidence: with no sign of
