@@ -18,6 +18,20 @@ Do not merge an affected change when any gate fails or when the pull request doe
 results. These tests are static and fixture-based; they do not replace the live validation required
 for changes that modify a repair script's write behavior.
 
+## MANA readiness merge gates
+
+Changes to `linux-detect-mana-readiness.sh` or its `map.json` entry must pass both tests from the
+repository root. The second test needs root on Linux or WSL because it builds disk images and
+attaches them as loop devices; it also verifies that the detector writes nothing to the disk.
+
+```powershell
+pwsh -NoProfile -File ./tests/test-map-catalog.ps1
+```
+
+```bash
+sudo bash ./tests/test-linux-detect-mana-readiness.sh .
+```
+
 ## Generation 1 to Generation 2 conversion merge gates
 
 Changes to `win-convert-gen1-to-gen2.ps1` or its `map.json` entry must pass both tests from the
