@@ -7,8 +7,8 @@
 # .DESCRIPTION
 #   Runs on the repair VM against the source VM's OS disk attached as a data disk. NOTE: use the option
 #   --run-on-repair. Inspecting the disk offline works even when the source VM has no network connectivity.
-#   Marks the attached root partition read-only at the block-device level, mounts it read-only without journal
-#   replay, and reports:
+#   Write-protects the attached root partition at the block-device level and mounts it read-only through a
+#   temporary device-mapper snapshot, then reports:
 #     - for every installed kernel, whether the MANA Ethernet driver (mana) and the synthetic NIC driver
 #       (hv_netvsc) are built in, available as modules, missing, or could not be determined
 #     - modprobe blacklist/install rules and kernel command-line options that disable mana or hv_netvsc
@@ -17,9 +17,11 @@
 #     - informational only: whether the newest initramfs image contains the mana module
 #     - distro identity
 #
-#   Makes NO changes. The block device stays write-protected while mounted, so the kernel cannot delete orphan
-#   inodes or replay a log on a disk copied from a running VM; its original write state is restored and the
-#   filesystem unmounted before exit. A result that could not be
+#   Makes NO changes to the attached disk. Journal (ext4) or log (XFS) replay and orphan cleanup, which a disk
+#   copied from a running VM needs for a current view, are written to a temporary copy-on-write file in /tmp, not
+#   to the disk. If no snapshot can be created, the disk is mounted with replay disabled and the evidence reports
+#   mountMode "no-replay", because recently written changes may then be missing. The disk's original write state
+#   is restored and everything is unmounted before exit. A result that could not be
 #   established is reported as "unknown", never as missing.
 #
 #   Emits one machine-readable JSON line prefixed with [MANA-EVIDENCE-JSON].
@@ -54,17 +56,24 @@ Log-Output "START: Running script linux-detect-mana-readiness (read-only)"
 Log-Output "Evidence directory: $EVIDENCE_DIR"
 
 cleanup() {
-    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null || true
-    fi
-    restore_device_write_state
+    release_mount
 }
 
 trap cleanup EXIT
 
-# A read-only mount alone is not enough: ext4 still deletes orphan inodes (and XFS may replay its log) on a
-# disk copied from a running VM. Marking the block device itself read-only makes the kernel skip all of that.
+# The attached disk is usually a copy of a VM that was running, so its journal (ext4) or log (XFS) holds
+# changes that are not yet in place. Mounting it directly would either replay that journal onto the disk or,
+# with replay disabled, show a stale view that can miss recently installed kernels. Instead the disk is
+# write-protected and mounted through a non-persistent device-mapper snapshot: replay and orphan cleanup go to
+# a temporary copy-on-write file, the disk is never written, and the view is current. If a snapshot cannot be
+# created, the disk is mounted with replay disabled and the evidence records mountMode "no-replay".
 PROTECTED_DEVICE=""
+SNAPSHOT_NAME="mana-detect-${TIMESTAMP}-$$"
+SNAPSHOT_DEVICE=""
+COW_FILE=""
+COW_LOOP=""
+MOUNT_MODE="none"
+
 protect_device() {
     local part="$1" was_ro
     was_ro=$(blockdev --getro "$part" 2>/dev/null || echo "unknown")
@@ -83,6 +92,48 @@ restore_device_write_state() {
     fi
 }
 
+close_snapshot() {
+    if [ -n "$SNAPSHOT_DEVICE" ]; then
+        dmsetup remove "$SNAPSHOT_NAME" 2>/dev/null || dmsetup remove --retry "$SNAPSHOT_NAME" 2>/dev/null || true
+        SNAPSHOT_DEVICE=""
+    fi
+    if [ -n "$COW_LOOP" ]; then
+        losetup -d "$COW_LOOP" 2>/dev/null || true
+        COW_LOOP=""
+    fi
+    if [ -n "$COW_FILE" ]; then
+        rm -f "$COW_FILE" 2>/dev/null || true
+        COW_FILE=""
+    fi
+}
+
+open_snapshot() {
+    local part="$1" sectors
+    command -v dmsetup >/dev/null 2>&1 || return 1
+    modprobe dm_snapshot 2>/dev/null || true
+    sectors=$(blockdev --getsz "$part" 2>/dev/null) || return 1
+    # Sparse: only blocks rewritten by journal replay consume space.
+    COW_FILE=$(mktemp "/tmp/mana-detect-cow-${TIMESTAMP}.XXXXXX" 2>/dev/null) || { COW_FILE=""; return 1; }
+    truncate -s 1G "$COW_FILE" 2>/dev/null || { close_snapshot; return 1; }
+    COW_LOOP=$(losetup -f --show "$COW_FILE" 2>/dev/null) || { COW_LOOP=""; close_snapshot; return 1; }
+    if ! echo "0 $sectors snapshot $part $COW_LOOP N 8" | dmsetup create "$SNAPSHOT_NAME" 2>/dev/null; then
+        close_snapshot
+        return 1
+    fi
+    SNAPSHOT_DEVICE="/dev/mapper/$SNAPSHOT_NAME"
+    udevadm settle 2>/dev/null || true
+    [ -b "$SNAPSHOT_DEVICE" ] || { close_snapshot; return 1; }
+}
+
+release_mount() {
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        umount "$MOUNT_POINT" 2>/dev/null || umount -l "$MOUNT_POINT" 2>/dev/null || true
+    fi
+    close_snapshot
+    restore_device_write_state
+    MOUNT_MODE="none"
+}
+
 json_escape() {
     local value="$1"
     value=${value//\\/\\\\}
@@ -93,21 +144,33 @@ json_escape() {
     printf '%s' "$value"
 }
 
-# Mount without replaying a journal, so inspecting a disk that was not shut down cleanly cannot modify it.
 # nouuid lets XFS mount when the repair VM's own root filesystem has the same UUID.
 mount_read_only() {
-    local part="$1" fstype="$2" status
+    local part="$1" fstype="$2" xfs_opts=""
     if ! protect_device "$part"; then
         Log-Warning "Could not mark $part read-only at the block level; skipping it rather than risking a write."
         return 1
     fi
+    [ "$fstype" = "xfs" ] && xfs_opts=",nouuid"
+
+    if open_snapshot "$part"; then
+        if mount -t "$fstype" -o "ro${xfs_opts}" "$SNAPSHOT_DEVICE" "$MOUNT_POINT" 2>/dev/null; then
+            MOUNT_MODE="snapshot-replayed"
+            return 0
+        fi
+        close_snapshot
+    fi
+
     case "$fstype" in
-        ext3|ext4) mount -t "$fstype" -o ro,noload "$part" "$MOUNT_POINT" 2>/dev/null && status=0 || status=$? ;;
-        xfs)       mount -t xfs -o ro,norecovery,nouuid "$part" "$MOUNT_POINT" 2>/dev/null && status=0 || status=$? ;;
-        *)         mount -t "$fstype" -o ro "$part" "$MOUNT_POINT" 2>/dev/null && status=0 || status=$? ;;
+        ext3|ext4) mount -t "$fstype" -o ro,noload "$part" "$MOUNT_POINT" 2>/dev/null && MOUNT_MODE="no-replay" ;;
+        xfs)       mount -t xfs -o ro,norecovery,nouuid "$part" "$MOUNT_POINT" 2>/dev/null && MOUNT_MODE="no-replay" ;;
+        *)         mount -t "$fstype" -o ro "$part" "$MOUNT_POINT" 2>/dev/null && MOUNT_MODE="no-replay" ;;
     esac
-    [ "$status" -eq 0 ] || restore_device_write_state
-    return "$status"
+    if [ "$MOUNT_MODE" = "no-replay" ]; then
+        return 0
+    fi
+    restore_device_write_state
+    return 1
 }
 
 # Prints present-builtin, present-module, missing, or unknown for one module in one kernel's module tree.
@@ -170,11 +233,13 @@ for part in $CANDIDATES; do
     if mount_read_only "$part" "$fstype"; then
         if [ -d "$MOUNT_POINT/etc" ] && { [ -d "$MOUNT_POINT/lib/modules" ] || [ -d "$MOUNT_POINT/usr/lib/modules" ]; }; then
             OS_PARTITION="$part"
-            Log-Output "Found attached root filesystem on $part (mounted read-only)"
+            Log-Output "Found attached root filesystem on $part (mounted read-only, mode: $MOUNT_MODE)"
+            if [ "$MOUNT_MODE" = "no-replay" ]; then
+                Log-Warning "A device-mapper snapshot could not be created, so the journal was not replayed. Changes written shortly before the VM stopped, such as a newly installed kernel, may not be visible."
+            fi
             break
         fi
-        umount "$MOUNT_POINT" 2>/dev/null || true
-        restore_device_write_state
+        release_mount
     fi
 done
 
@@ -317,7 +382,7 @@ $PINNED_FILES
 EOF
 
 cat > "$EVIDENCE_DIR/evidence.json" <<EOF
-{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
+{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","mountMode":"$MOUNT_MODE","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
 EOF
 
 Log-Output "[MANA-EVIDENCE-JSON]$(cat "$EVIDENCE_DIR/evidence.json")"

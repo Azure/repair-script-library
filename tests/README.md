@@ -22,7 +22,9 @@ for changes that modify a repair script's write behavior.
 
 Changes to `linux-detect-mana-readiness.sh` or its `map.json` entry must pass both tests from the
 repository root. The second test needs root on Linux or WSL because it builds disk images and
-attaches them as loop devices; it also verifies that the detector writes nothing to the disk.
+attaches them as loop devices; it also verifies that the detector writes nothing to the disk and
+leaves no mount, snapshot, or loop device behind. Install `xfsprogs` first (it provides `mkfs.xfs`
+and `xfs_io`); without it, the XFS and crash-consistent cases are skipped.
 
 ```powershell
 pwsh -NoProfile -File ./tests/test-map-catalog.ps1

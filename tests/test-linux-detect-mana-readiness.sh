@@ -19,7 +19,8 @@ fail=0
 
 new_image() {   # $1=name $2=fstype -> prints loop device; root filesystem mounted at $WORK/$1.mnt
     local name=$1 fstype=$2 img="$WORK/$1.img" loop
-    truncate -s 300M "$img"
+    # mkfs.xfs refuses filesystems smaller than 300 MB.
+    if [ "$fstype" = xfs ]; then truncate -s 400M "$img"; else truncate -s 300M "$img"; fi
     echo 'label: gpt
 ,,L' | sfdisk -q "$img" >/dev/null
     loop=$(losetup -fP --show "$img")
@@ -52,7 +53,7 @@ run_case() {    # $1=name $2=loop $3..=jq-free expectations as key=value substri
     shift 2
     umount "$WORK/$name.mnt"; sync
     before=$(sha256sum "$WORK/$name.img" | cut -d' ' -f1)
-    out=$(bash -e "$DETECTOR" "$loop" 2>&1); status=$?
+    out=$(PATH="${RUN_PATH_PREFIX:-}$PATH" bash -e "$DETECTOR" "$loop" 2>&1); status=$?
     sync
     after=$(sha256sum "$WORK/$name.img" | cut -d' ' -f1)
     json=$(printf '%s\n' "$out" | sed -n 's/.*\[MANA-EVIDENCE-JSON\]//p')
@@ -62,6 +63,9 @@ run_case() {    # $1=name $2=loop $3..=jq-free expectations as key=value substri
     [ -n "$json" ] || { ok=0; reason="$reason no-json"; }
     findmnt -rn -S "${loop}p1" >/dev/null 2>&1 && { ok=0; reason="$reason left-mounted"; }
     [ "$(blockdev --getro "${loop}p1" 2>/dev/null)" = "0" ] || { ok=0; reason="$reason left-read-only"; }
+    dmsetup ls 2>/dev/null | grep -q '^mana-detect-' && { ok=0; reason="$reason left-snapshot"; }
+    ls /tmp/mana-detect-cow-* >/dev/null 2>&1 && { ok=0; reason="$reason left-cow-file"; }
+    losetup -a 2>/dev/null | grep -q 'mana-detect-cow-' && { ok=0; reason="$reason left-cow-loop"; }
     for expect in "$@"; do
         printf '%s' "$json" | grep -qF "$expect" || { ok=0; reason="$reason missing[$expect]"; }
     done
@@ -70,9 +74,20 @@ run_case() {    # $1=name $2=loop $3..=jq-free expectations as key=value substri
     losetup -d "$loop"
 }
 
+# Simulates a VM that was running when its disk was copied: one kernel is fully on disk, and a second kernel
+# installed just before the copy exists only in the filesystem journal/log.
+crash_after_kernel_install() {   # $1=root $2=loop $3=fstype $4=on-disk kernel $5=journal-only kernel
+    kernel "$1" "$4" module module yes
+    umount "$1"
+    mount -t "$3" "${2}p1" "$1"
+    kernel "$1" "$5" module module yes
+    sync
+    xfs_io -x -c 'shutdown -f' "$1"
+}
+
 L=$(new_image ready ext4); R="$WORK/ready.mnt"
 kernel "$R" 6.8.0-1073-azure module module yes
-run_case ready "$L" '"verdict":"READY"' '"newestKernelMana":"present-module"' '"newestKernelHvNetvsc":"present-module"' '"problems":""'
+run_case ready "$L" '"verdict":"READY"' '"newestKernelMana":"present-module"' '"newestKernelHvNetvsc":"present-module"' '"problems":""' '"mountMode":"snapshot-replayed"'
 
 L=$(new_image builtin ext4); R="$WORK/builtin.mnt"
 kernel "$R" 6.8.0-1073-azure builtin builtin yes
@@ -145,9 +160,34 @@ run_case injection-names "$L" '"newestKernel":"6.8.0-azure\";x=\"1"' '"verdict":
 if command -v mkfs.xfs >/dev/null 2>&1; then
     L=$(new_image xfs-root xfs); R="$WORK/xfs-root.mnt"
     kernel "$R" 4.18.0-553.el8_10.x86_64 module module yes
-    run_case xfs-root "$L" '"verdict":"READY"'
+    run_case xfs-root "$L" '"verdict":"READY"' '"mountMode":"snapshot-replayed"'
 else
     echo "SKIP xfs-root (mkfs.xfs not installed)"
+fi
+
+if command -v xfs_io >/dev/null 2>&1; then
+    # ext4 on a disk shut down without unmounting: the snapshot path must mount it and see the newest kernel.
+    L=$(new_image ext4-crash-consistent ext4); R="$WORK/ext4-crash-consistent.mnt"
+    kernel "$R" 6.8.0-1073-azure module module yes
+    umount "$R"; mount "${L}p1" "$R"
+    kernel "$R" 6.9.0-custom none module yes
+    sync; xfs_io -x -c 'shutdown -f' "$R"
+    run_case ext4-crash-consistent "$L" '"newestKernel":"6.9.0-custom"' '"verdict":"NOT_READY"' '"mountMode":"snapshot-replayed"'
+
+    if command -v mkfs.xfs >/dev/null 2>&1; then
+        # The newest kernel exists only in the unreplayed XFS log; a no-replay mount would report the older one.
+        L=$(new_image xfs-crash-consistent xfs); R="$WORK/xfs-crash-consistent.mnt"
+        crash_after_kernel_install "$R" "$L" xfs 4.18.0-553.el8_10.x86_64 5.14.0-427.el9.x86_64
+        run_case xfs-crash-consistent "$L" '"newestKernel":"5.14.0-427.el9.x86_64"' '"verdict":"READY"' '"mountMode":"snapshot-replayed"'
+
+        # Without device-mapper the detector must still not write, and must say its view may be stale.
+        FAKE_BIN="$WORK/no-dmsetup"; mkdir -p "$FAKE_BIN"; printf '#!/bin/sh\nexit 1\n' > "$FAKE_BIN/dmsetup"; chmod +x "$FAKE_BIN/dmsetup"
+        L=$(new_image xfs-no-snapshot xfs); R="$WORK/xfs-no-snapshot.mnt"
+        crash_after_kernel_install "$R" "$L" xfs 4.18.0-553.el8_10.x86_64 5.14.0-427.el9.x86_64
+        RUN_PATH_PREFIX="$FAKE_BIN:" run_case xfs-no-snapshot "$L" '"mountMode":"no-replay"' '"newestKernel":"4.18.0-553.el8_10.x86_64"'
+    fi
+else
+    echo "SKIP crash-consistent cases (xfs_io not installed)"
 fi
 
 # No Linux root filesystem on the device: the detector must fail cleanly with STATUS_ERROR.
