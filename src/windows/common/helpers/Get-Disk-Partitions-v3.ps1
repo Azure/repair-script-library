@@ -1,11 +1,11 @@
 #########################################################################################################
 #
 # .SYNOPSIS
-#   NVMe-aware disk discovery for attached OS disks. v3.0.0
+#   NVMe-aware disk discovery for attached OS disks. v3.1.0
 #
 # .DESCRIPTION
 #   Returns the partitions of every OS/data disk attached to this repair VM, bringing each disk online
-#   and read-write first. Selects disks by BusType, so it works whether the repair VM was created with
+#   and read-write first (or, with -ReadOnly, online and read-only for detection-only callers). Selects disks by BusType, so it works whether the repair VM was created with
 #   the SCSI or the NVMe disk controller.
 #
 #   Get-Disk-Partitions.ps1 (v1) and Get-Disk-Partitions-v2.ps1 select with:
@@ -89,7 +89,13 @@ function Get-Disk-Partitions-v3 {
 
         [Parameter(Mandatory = $false)]
         [ValidateRange(0, 300)]
-        [int]$DriveLetterTimeoutSeconds = 60
+        [int]$DriveLetterTimeoutSeconds = 60,
+
+        # For detection-only callers. An offline disk is marked read-only before it is brought online,
+        # so NTFS never mounts it writable and cannot replay its log onto the source disk. Read-only is
+        # never cleared. A disk that was already online is left exactly as it was found.
+        [Parameter(Mandatory = $false)]
+        [switch]$ReadOnly
     )
 
     $busTypes = switch ($BusTypeFilter) {
@@ -116,11 +122,28 @@ function Get-Disk-Partitions-v3 {
 
         $wasOffline = [bool]$disk.IsOffline
 
-        if ($disk.IsOffline) {
-            $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
+        if ($ReadOnly) {
+            if ($disk.IsOffline) {
+                if (-not $disk.IsReadOnly) {
+                    $disk | Set-Disk -IsReadOnly $true -ErrorAction SilentlyContinue
+                }
+                # Onlining a disk whose read-only flag did not stick would mount it writable, which is
+                # the exact write this mode exists to prevent. Leave it offline instead.
+                $offlineState = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
+                if (-not $offlineState -or -not $offlineState.IsReadOnly) {
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be marked read-only while offline, so it was left offline. Skipping."
+                    continue
+                }
+                $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
+            }
         }
-        if ($disk.IsReadOnly) {
-            $disk | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue
+        else {
+            if ($disk.IsOffline) {
+                $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
+            }
+            if ($disk.IsReadOnly) {
+                $disk | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue
+            }
         }
 
         # Read the state back. Without this a disk that stayed offline is skipped further down as
@@ -130,7 +153,11 @@ function Get-Disk-Partitions-v3 {
             Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be re-read after being brought online, skipping."
             continue
         }
-        if ($diskState.IsOffline -or $diskState.IsReadOnly) {
+        if ($ReadOnly -and $diskState.IsOffline) {
+            Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) is still offline after a read-only online attempt. Skipping."
+            continue
+        }
+        if (-not $ReadOnly -and ($diskState.IsOffline -or $diskState.IsReadOnly)) {
             Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) is still Offline=$($diskState.IsOffline) ReadOnly=$($diskState.IsReadOnly) after Set-Disk, so it cannot be repaired. Skipping."
             continue
         }
@@ -199,12 +226,15 @@ function Get-Windows-OsDrives-v3 {
 
         [Parameter(Mandatory = $false)]
         [ValidateRange(0, 300)]
-        [int]$DriveLetterTimeoutSeconds = 60
+        [int]$DriveLetterTimeoutSeconds = 60,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$ReadOnly
     )
 
     $osDrives = @()
 
-    ForEach ($partition in (Get-Disk-Partitions-v3 -BusTypeFilter $BusTypeFilter -DriveLetterTimeoutSeconds $DriveLetterTimeoutSeconds)) {
+    ForEach ($partition in (Get-Disk-Partitions-v3 -BusTypeFilter $BusTypeFilter -DriveLetterTimeoutSeconds $DriveLetterTimeoutSeconds -ReadOnly:$ReadOnly)) {
         if ([string]::IsNullOrWhiteSpace($partition.DriveLetter)) { continue }
         if ($partition.DriveLetter -eq "`0") { continue }
 

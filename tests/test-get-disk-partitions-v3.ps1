@@ -76,3 +76,57 @@ if ($result[0].DiskNumber -ne 2 -or $result[0].DriveLetter -ne 'F') {
 }
 
 Write-Host 'PASS: SAS resource disk with a scalar partition result is excluded; OS disk remains.'
+
+# -ReadOnly: detection-only callers must never make the attached OS disk writable.
+$script:setDiskCalls = @()
+$script:readOnlyFlagSticks = $true
+
+function Set-Disk {
+    [CmdletBinding()]
+    Param([Nullable[bool]]$IsOffline, [Nullable[bool]]$IsReadOnly, [Parameter(ValueFromPipeline = $true)]$InputObject)
+    Process {
+        if ($PSBoundParameters.ContainsKey('IsReadOnly')) {
+            $script:setDiskCalls += "disk$($InputObject.Number):IsReadOnly=$IsReadOnly"
+            if ($script:readOnlyFlagSticks) { $InputObject.IsReadOnly = $IsReadOnly }
+        }
+        if ($PSBoundParameters.ContainsKey('IsOffline')) {
+            $script:setDiskCalls += "disk$($InputObject.Number):IsOffline=$IsOffline"
+            $InputObject.IsOffline = $IsOffline
+        }
+    }
+}
+
+function Reset-OfflineOsDisk {
+    $osDisk.IsOffline = $true
+    $osDisk.IsReadOnly = $false
+    $script:setDiskCalls = @()
+}
+
+Reset-OfflineOsDisk
+$result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0 -ReadOnly)
+if ($result.Count -ne 1 -or $result[0].DriveLetter -ne 'F') {
+    throw "ReadOnly: expected OS partition F: to be returned; found $($result | ConvertTo-Json -Compress)."
+}
+$expectedCalls = 'disk2:IsReadOnly=True,disk2:IsOffline=False'
+if (($script:setDiskCalls -join ',') -ne $expectedCalls) {
+    throw "ReadOnly: the disk must be marked read-only before it is onlined. Expected '$expectedCalls', got '$($script:setDiskCalls -join ',')'."
+}
+if (-not $osDisk.IsReadOnly) { throw 'ReadOnly: the OS disk must remain read-only.' }
+Write-Host 'PASS: -ReadOnly marks an offline disk read-only before onlining it and never clears read-only.'
+
+Reset-OfflineOsDisk
+$script:readOnlyFlagSticks = $false
+$result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0 -ReadOnly)
+$script:readOnlyFlagSticks = $true
+if ($result.Count -ne 0) { throw 'ReadOnly: a disk whose read-only flag did not stick must be skipped.' }
+if ($script:setDiskCalls -contains 'disk2:IsOffline=False') { throw 'ReadOnly: a disk that is not read-only must never be brought online.' }
+if (-not $osDisk.IsOffline) { throw 'ReadOnly: the disk must stay offline.' }
+Write-Host 'PASS: -ReadOnly leaves a disk offline when it cannot be made read-only.'
+
+Reset-OfflineOsDisk
+$osDisk.IsReadOnly = $true
+$result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0)
+if ($script:setDiskCalls -notcontains 'disk2:IsReadOnly=False' -or $result.Count -ne 1) {
+    throw "Default mode must keep bringing disks online read-write; calls were '$($script:setDiskCalls -join ',')'."
+}
+Write-Host 'PASS: default mode still brings an offline, read-only disk online read-write.'

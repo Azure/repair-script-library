@@ -1,0 +1,168 @@
+# Fixture tests for win-detect-mana-readiness.ps1.
+# Run from the repository root (works in Windows PowerShell 5.1 and PowerShell 7):
+#   pwsh -NoProfile -File ./tests/test-win-detect-mana-readiness.ps1
+#
+# The detector's functions are extracted with the PowerShell parser and exercised against a temporary
+# driver store and an in-memory stand-in for the offreg reader. Creating real hive files needs
+# SeBackupPrivilege, and the reader itself is covered by OfflineRepairCommon's own consumers.
+
+$ErrorActionPreference = 'Stop'
+$repositoryRoot = Split-Path $PSScriptRoot -Parent
+$sourceScript = Join-Path $repositoryRoot 'src/windows/win-detect-mana-readiness.ps1'
+$sourceText = Get-Content -LiteralPath $sourceScript -Raw
+
+function Assert-True {
+    Param([bool]$Condition, [string]$Message)
+    if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
+}
+
+function Assert-Equal {
+    Param($Expected, $Actual, [string]$Message)
+    if ("$Expected" -ne "$Actual") { throw "ASSERTION FAILED: $Message (expected '$Expected', got '$Actual')" }
+}
+
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($sourceText, [ref]$tokens, [ref]$parseErrors)
+Assert-True ($parseErrors.Count -eq 0) "The detector must parse cleanly: $($parseErrors | Out-String)"
+$functions = $ast.FindAll({ Param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
+ForEach ($fn in $functions) { . ([scriptblock]::Create($fn.Extent.Text)) }
+ForEach ($name in 'Get-InfDriverFact', 'Get-OfflineDriverPackage', 'Resolve-OfflineImagePath', 'Get-OfflineServiceState', 'Get-ManaDriveAssessment', 'Get-OverallVerdict') {
+    Assert-True ([bool](Get-Command $name -ErrorAction SilentlyContinue)) "The detector must define $name."
+}
+
+# --- INF parsing --------------------------------------------------------------------------------
+# Synthetic INF: exercises the syntax the parser must survive, not a copy of a real MANA INF.
+$inf = @(
+    '; a comment line',
+    '[Version]',
+    'Signature   = "$WINDOWS NT$"',
+    'DriverVer   = 01/02/2026,2.0.18.52 ; trailing comment',
+    '[Example.Services]',
+    'AddService = %ServiceName%, 0x00000002, Example_Service_Inst',
+    'AddService = , 0x00000002   ; null service installs nothing',
+    'addservice = "quoted;svc", 2, Other_Inst',
+    '[Example_Service_Inst]',
+    'ServiceBinary = %13%\example.sys',
+    '[Strings]',
+    'ServiceName = "examplesvc"'
+)
+$facts = Get-InfDriverFact -Lines $inf
+Assert-Equal '01/02/2026,2.0.18.52' $facts.driverVer 'DriverVer must be read from [Version] with the comment stripped.'
+Assert-Equal 'examplesvc,quoted;svc' ($facts.services -join ',') 'AddService names must expand [Strings] tokens, keep quoted semicolons, and skip the null service.'
+Assert-Equal 'example.sys' ($facts.serviceBinaries -join ',') 'ServiceBinary must resolve to the binary file name.'
+Assert-Equal 0 @((Get-InfDriverFact -Lines @()).services).Count 'An empty INF must yield no services.'
+Write-Host 'PASS: INF parsing (DriverVer, AddService with [Strings] expansion, null service, quoted semicolons, ServiceBinary).'
+
+# --- Driver store discovery ---------------------------------------------------------------------
+$fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mana-win-fixture-" + [guid]::NewGuid().ToString('N'))
+try {
+    $windowsRoot = Join-Path $fixtureRoot 'Windows'
+    $store = Join-Path $windowsRoot 'System32\DriverStore\FileRepository'
+    $manaPkg = Join-Path $store 'manavf.inf_amd64_0123456789abcdef'
+    $mlxPkg = Join-Path $store 'mlx5.inf_amd64_fedcba9876543210'
+    $emptyPkg = Join-Path $store 'mana_bus_vf.inf_amd64_00000000'
+    $otherPkg = Join-Path $store 'netvsc.inf_amd64_11111111'
+    $drivers = Join-Path $windowsRoot 'System32\drivers'
+    ForEach ($dir in $manaPkg, $mlxPkg, $emptyPkg, $otherPkg, $drivers) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -LiteralPath (Join-Path $manaPkg 'manavf.inf') -Value $inf
+    Set-Content -LiteralPath (Join-Path $mlxPkg 'mlx5.inf') -Value @('[Version]', 'DriverVer = 01/01/2024,1.0.0.0', '[S]', 'AddService = mlxsvc, 2, I')
+    Set-Content -LiteralPath (Join-Path $otherPkg 'netvsc.inf') -Value @('[S]', 'AddService = netvsc, 2, I')
+    Set-Content -LiteralPath (Join-Path $drivers 'netvsc.sys') -Value 'x'
+
+    $mana = Get-OfflineDriverPackage -WindowsRoot $windowsRoot -InfPrefix 'mana'
+    Assert-True $mana.repositoryFound 'The driver store must be found.'
+    Assert-Equal 'manavf.inf_amd64_0123456789abcdef' (@($mana.packages).package -join ',') 'Only MANA packages with an INF present are returned; a directory without its INF is skipped.'
+    Assert-Equal 'examplesvc,quoted;svc' (@($mana.packages)[0].services -join ',') 'Package services come from the INF.'
+    Assert-Equal 'mlx5.inf_amd64_fedcba9876543210' (@((Get-OfflineDriverPackage -WindowsRoot $windowsRoot -InfPrefix 'mlx').packages).package -join ',') 'Mellanox packages are found with their own prefix.'
+
+    $missingStore = Get-OfflineDriverPackage -WindowsRoot (Join-Path $fixtureRoot 'NoWindows') -InfPrefix 'mana'
+    Assert-True (-not $missingStore.repositoryFound) 'A missing driver store must be reported as not found, not as no packages.'
+    Write-Host 'PASS: driver store discovery (MANA, Mellanox, INF-less directory, missing store).'
+
+    # --- ImagePath mapping --------------------------------------------------------------------------
+    Assert-Equal "$windowsRoot\System32\drivers\netvsc.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'netvsc' -ImagePath '\SystemRoot\System32\drivers\netvsc.sys') '\SystemRoot must map to the attached disk.'
+    Assert-Equal "$windowsRoot\System32\drivers\a.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'a' -ImagePath 'System32\drivers\a.sys') 'A System32-relative path must map to the attached disk.'
+    Assert-Equal "$windowsRoot\System32\drivers\b.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'b' -ImagePath '\??\C:\Windows\System32\drivers\b.sys') 'An absolute C:\Windows path must map to the attached disk, never the repair VM.'
+    Assert-Equal "$windowsRoot\System32\drivers\c.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'c' -ImagePath $null) 'A missing ImagePath defaults to System32\drivers\<service>.sys.'
+    Assert-Equal '' "$(Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'd' -ImagePath 'D:\Vendor\d.sys')" 'An unmappable path must not be guessed.'
+    Write-Host 'PASS: ImagePath mapping never resolves to the repair VM.'
+
+    # --- Service state through an offreg stand-in ---------------------------------------------------
+    function New-FakeReader {
+        Param([hashtable]$Values)
+        $reader = [pscustomobject]@{ Values = $Values }
+        $read = {
+            Param($key, $name)
+            $id = "$key|$name"
+            if (-not $this.Values.ContainsKey($id)) { return $null }
+            $value = $this.Values[$id]
+            if ($value -is [System.Exception]) { throw $value }
+            return $value
+        }
+        $reader | Add-Member -MemberType ScriptMethod -Name ReadDword -Value $read
+        $reader | Add-Member -MemberType ScriptMethod -Name ReadString -Value $read
+        return $reader
+    }
+    $reader = New-FakeReader @{
+        'ControlSet001\Services\netvsc|Start'      = [uint32]3
+        'ControlSet001\Services\netvsc|Type'       = [uint32]1
+        'ControlSet001\Services\netvsc|ImagePath'  = '\SystemRoot\System32\drivers\netvsc.sys'
+        'ControlSet001\Services\gone|Start'        = [uint32]3
+        'ControlSet001\Services\gone|ImagePath'    = 'System32\drivers\gone.sys'
+        'ControlSet001\Services\corrupt|Start'     = [System.IO.InvalidDataException]::new('not a registry DWORD')
+    }
+    $netvsc = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'netvsc' -WindowsRoot $windowsRoot
+    Assert-True ($netvsc.present -and $netvsc.start -eq 3 -and $netvsc.binaryPresent) 'A healthy service must be present with its binary.'
+    $gone = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'gone' -WindowsRoot $windowsRoot
+    Assert-True ($gone.present -and $gone.binaryPresent -eq $false) 'A service whose binary is missing must say so.'
+    $absent = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'absent' -WindowsRoot $windowsRoot
+    Assert-True ($absent.present -eq $false -and $null -eq $absent.binaryPresent) 'An absent service key must be reported as not present.'
+    $corrupt = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'corrupt' -WindowsRoot $windowsRoot
+    Assert-True ($corrupt.readError -and $null -eq $corrupt.present) 'A read failure must be unknown, never absent.'
+    Write-Host 'PASS: service state (healthy, missing binary, absent key, read failure).'
+}
+finally {
+    Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- Verdicts -------------------------------------------------------------------------------------
+function New-Finding {
+    Param($Netvsc, [bool]$StoreFound = $true, [object[]]$Packages = @([pscustomobject]@{ package = 'manavf.inf_x' }), [object[]]$Services = @())
+    [ordered]@{ netvsc = $Netvsc; driverStoreFound = $StoreFound; manaPackages = $Packages; manaServices = $Services }
+}
+$okNetvsc = @{ present = $true; start = 3; binaryPresent = $true; readError = $null }
+
+$cases = @(
+    @{ Name = 'ready'; Finding = (New-Finding $okNetvsc); Verdict = 'READY'; Problems = '' },
+    @{ Name = 'MANA service not installed yet'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; present = $false })); Verdict = 'READY'; Problems = '' },
+    @{ Name = 'netvsc disabled'; Finding = (New-Finding @{ present = $true; start = 4; binaryPresent = $true }); Verdict = 'NOT_READY'; Problems = 'synthetic-nic-driver-disabled' },
+    @{ Name = 'netvsc missing'; Finding = (New-Finding @{ present = $false }); Verdict = 'NOT_READY'; Problems = 'synthetic-nic-driver-missing' },
+    @{ Name = 'netvsc binary missing'; Finding = (New-Finding @{ present = $true; start = 3; binaryPresent = $false }); Verdict = 'NOT_READY'; Problems = 'synthetic-nic-driver-binary-missing' },
+    @{ Name = 'MANA package missing'; Finding = (New-Finding $okNetvsc -Packages @()); Verdict = 'NOT_READY'; Problems = 'mana-driver-missing' },
+    @{ Name = 'MANA service disabled'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; present = $true; start = 4; binaryPresent = $true })); Verdict = 'NOT_READY'; Problems = 'mana-driver-disabled:m' },
+    @{ Name = 'SYSTEM hive unreadable'; Finding = (New-Finding $null); Verdict = 'UNKNOWN'; Problems = '' },
+    @{ Name = 'driver store unreadable'; Finding = (New-Finding $okNetvsc -StoreFound $false -Packages @()); Verdict = 'UNKNOWN'; Problems = '' },
+    @{ Name = 'MANA service read failure'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; readError = 'x' })); Verdict = 'UNKNOWN'; Problems = '' }
+)
+ForEach ($case in $cases) {
+    $result = Get-ManaDriveAssessment -Finding $case.Finding
+    Assert-Equal $case.Verdict $result.verdict "Verdict for '$($case.Name)'."
+    Assert-Equal $case.Problems ($result.problems -join ';') "Problems for '$($case.Name)'."
+}
+Assert-Equal 'NOT_READY' (Get-OverallVerdict -Verdicts @('READY', 'UNKNOWN', 'NOT_READY')) 'Any NOT_READY installation makes the disk NOT_READY.'
+Assert-Equal 'UNKNOWN' (Get-OverallVerdict -Verdicts @('READY', 'UNKNOWN')) 'An unknown installation blocks a READY claim.'
+Assert-Equal 'READY' (Get-OverallVerdict -Verdicts @('READY', 'READY')) 'All ready is READY.'
+Assert-Equal 'UNKNOWN' (Get-OverallVerdict -Verdicts @()) 'No installations inspected is UNKNOWN.'
+Write-Host "PASS: $($cases.Count) verdict cases and the overall verdict precedence."
+
+# --- Read-only contract against the script text ---------------------------------------------------
+ForEach ($forbidden in 'reg(\.exe)?\s+(load|unload|add|delete|import|restore|save)', 'Set-ItemProperty', 'New-ItemProperty', 'Remove-ItemProperty', 'Set-Disk', 'bcdedit', 'Remove-Item') {
+    Assert-True ($sourceText -notmatch $forbidden) "The detector must not contain a write primitive matching '$forbidden'."
+}
+Assert-True ($sourceText -match 'Get-Windows-OsDrives-v3 -ReadOnly') 'Discovery must bring an offline disk online read-only.'
+Assert-True ($sourceText -match 'Open-OfflineRegistryReader') 'Hives must be read with the in-memory offreg reader.'
+Assert-True ($sourceText -match '\[MANA-EVIDENCE-JSON\]') 'The detector must emit the shared MANA evidence marker.'
+Assert-True ($sourceText -match "scenario\s*=\s*'mana-readiness'") 'The scenario must match linux-detect-mana-readiness.'
+Assert-True ($sourceText -match '(?s)\.Dispose\(\).*\.Dispose\(\)') 'Each reader must be disposed.'
+Write-Host 'PASS: read-only contract (no hive mounts, registry writes or disk changes) and the evidence contract.'
