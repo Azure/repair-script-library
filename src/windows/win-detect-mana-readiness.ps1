@@ -14,8 +14,11 @@
 #
 #   Makes NO changes to the attached OS disk. Hives are read with the Offline Registry Library
 #   (offreg.dll) in memory: nothing is mounted under HKLM, no hive or log is written, and reg.exe is
-#   never used. A disk that is offline is brought online read-only. A disk that Windows had already
-#   onlined writable before this script ran is reported in riskIndicators, not changed.
+#   never used. A disk that is offline is brought online read-only and returned to offline and writable
+#   when the check ends, so a later repair script finds it exactly as attached. A disk that is offline
+#   because its disk ID collides with the repair VM's own disk is left untouched and reported. A disk
+#   that Windows had already onlined writable before this script ran is reported in riskIndicators,
+#   not changed.
 #
 #   A missing MANA driver loses accelerated networking but, as long as netvsc is healthy, the VM still
 #   reaches the network through the synthetic adapter. problems tells the two cases apart.
@@ -239,6 +242,10 @@ try {
     }
 
     if ($osDrives.Count -eq 0) {
+        $collided = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.IsOffline -and "$($_.OfflineReason)" -eq 'Collision' })
+        if ($collided.Count) {
+            throw "Disk $(($collided | ForEach-Object { $_.Number }) -join ', ') is offline because its disk ID matches another disk on this repair VM, so it cannot be read without rewriting its disk ID. Recreate the repair VM from a different image (az vm repair create chooses one to avoid this) and run the check again."
+        }
         throw "No Windows installation found on any attached data disk. Confirm the source OS disk is attached with 'Get-Disk | Select Number,BusType,IsBoot,IsSystem,IsOffline,IsReadOnly'."
     }
 
@@ -359,6 +366,14 @@ catch {
     $overallStatus = $STATUS_ERROR
     Log-Error "$($_.Exception.Message)" | Tee-Object -FilePath $logFile -Append
     Log-Error "$($_.ScriptStackTrace)" | Tee-Object -FilePath $logFile -Append
+}
+finally {
+    # Leave every disk exactly as attached, so a later repair script can bring it online writable.
+    $notRestored = @(Restore-Disk-Partitions-v3)
+    if ($notRestored.Count) {
+        $overallStatus = $STATUS_ERROR
+        Log-Error "Disk $($notRestored -join ', ') could not be returned to offline and writable. Before running a repair script, run diskpart: select disk <n>, offline disk, attributes disk clear readonly." | Tee-Object -FilePath $logFile -Append
+    }
 }
 
 return $overallStatus

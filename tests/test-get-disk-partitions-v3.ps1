@@ -91,15 +91,22 @@ function Set-Disk {
         }
         if ($PSBoundParameters.ContainsKey('IsOffline')) {
             $script:setDiskCalls += "disk$($InputObject.Number):IsOffline=$IsOffline"
-            $InputObject.IsOffline = $IsOffline
+            if ($script:onlineSticks -or $IsOffline) { $InputObject.IsOffline = $IsOffline }
         }
     }
 }
+$script:onlineSticks = $true
+$osDisk | Add-Member -NotePropertyName Guid -NotePropertyValue '{os-copy}'
+$osDisk | Add-Member -NotePropertyName OfflineReason -NotePropertyValue ''
+$resourceDisk | Add-Member -NotePropertyName Guid -NotePropertyValue '{resource}'
 
 function Reset-OfflineOsDisk {
     $osDisk.IsOffline = $true
     $osDisk.IsReadOnly = $false
+    $osDisk.Guid = '{os-copy}'
+    $osDisk.OfflineReason = ''
     $script:setDiskCalls = @()
+    $global:DiskPartitionsV3ReadOnlyChanges = @()
 }
 
 Reset-OfflineOsDisk
@@ -112,7 +119,35 @@ if (($script:setDiskCalls -join ',') -ne $expectedCalls) {
     throw "ReadOnly: the disk must be marked read-only before it is onlined. Expected '$expectedCalls', got '$($script:setDiskCalls -join ',')'."
 }
 if (-not $osDisk.IsReadOnly) { throw 'ReadOnly: the OS disk must remain read-only.' }
-Write-Host 'PASS: -ReadOnly marks an offline disk read-only before onlining it and never clears read-only.'
+Write-Host 'PASS: -ReadOnly marks an offline disk read-only before onlining it.'
+
+$script:setDiskCalls = @()
+$failed = @(Restore-Disk-Partitions-v3)
+if (($script:setDiskCalls -join ',') -ne 'disk2:IsOffline=True,disk2:IsReadOnly=False') {
+    throw "Restore: the disk must go offline before read-only is cleared; calls were '$($script:setDiskCalls -join ',')'."
+}
+if ($failed.Count -or -not $osDisk.IsOffline -or $osDisk.IsReadOnly) { throw 'Restore: the disk must end offline and writable, as it was attached.' }
+if (@($global:DiskPartitionsV3ReadOnlyChanges).Count) { throw 'Restore: the change list must be cleared.' }
+Write-Host 'PASS: Restore-Disk-Partitions-v3 returns the disk offline first, then clears read-only.'
+
+foreach ($collision in @('reason', 'same-id')) {
+    Reset-OfflineOsDisk
+    if ($collision -eq 'reason') { $osDisk.OfflineReason = 'Collision' } else { $osDisk.Guid = '{resource}' }
+    $result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0 -ReadOnly 3>$null)
+    if ($result.Count -ne 0 -or $script:setDiskCalls.Count -ne 0) {
+        throw "ReadOnly ($collision): a disk-ID collision must be skipped without any Set-Disk call; calls were '$($script:setDiskCalls -join ',')'."
+    }
+}
+Write-Host 'PASS: -ReadOnly leaves a disk with a disk-ID collision untouched (OfflineReason and matching GUID).'
+
+Reset-OfflineOsDisk
+$script:onlineSticks = $false
+$result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0 -ReadOnly 3>$null)
+$script:onlineSticks = $true
+if ($result.Count -ne 0 -or $osDisk.IsReadOnly -or @($global:DiskPartitionsV3ReadOnlyChanges).Count) {
+    throw "ReadOnly: a disk that does not come online must get its read-only flag back; calls were '$($script:setDiskCalls -join ',')'."
+}
+Write-Host 'PASS: -ReadOnly reverts its read-only flag when the disk does not come online.'
 
 Reset-OfflineOsDisk
 $script:readOnlyFlagSticks = $false

@@ -161,6 +161,7 @@ ForEach ($forbidden in 'reg(\.exe)?\s+(load|unload|add|delete|import|restore|sav
     Assert-True ($sourceText -notmatch $forbidden) "The detector must not contain a write primitive matching '$forbidden'."
 }
 Assert-True ($sourceText -match 'Get-Windows-OsDrives-v3 -ReadOnly') 'Discovery must bring an offline disk online read-only.'
+Assert-True ($sourceText -match '(?s)finally \{.*Restore-Disk-Partitions-v3') 'Disks must be returned to their attached state in a finally block.'
 Assert-True ($sourceText -match 'Open-OfflineRegistryReader') 'Hives must be read with the in-memory offreg reader.'
 Assert-True ($sourceText -match '\[MANA-EVIDENCE-JSON\]') 'The detector must emit the shared MANA evidence marker.'
 Assert-True ($sourceText -match "scenario\s*=\s*'mana-readiness'") 'The scenario must match linux-detect-mana-readiness.'
