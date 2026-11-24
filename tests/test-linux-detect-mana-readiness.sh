@@ -35,7 +35,7 @@ new_image() {   # $1=name $2=fstype -> prints loop device; root filesystem mount
 }
 
 kernel() {      # $1=root $2=kernel version $3=mana: module|builtin|none $4=netvsc: module|builtin|none $5=modules.builtin: yes|no
-    local dir="$1/lib/modules/$2"
+    local dir="$1/lib/modules/$2" root="${1%/usr}"
     mkdir -p "$dir/kernel/drivers/net/ethernet/microsoft/mana" "$dir/kernel/drivers/net/hyperv"
     [ "$5" = yes ] && : > "$dir/modules.builtin"
     case "$3" in
@@ -46,6 +46,9 @@ kernel() {      # $1=root $2=kernel version $3=mana: module|builtin|none $4=netv
         module)  : > "$dir/kernel/drivers/net/hyperv/hv_netvsc.ko.zst" ;;
         builtin) echo 'kernel/drivers/net/hyperv/hv_netvsc.ko' >> "$dir/modules.builtin" ;;
     esac
+    # The generated grub.cfg entry that boots this kernel, as update-grub writes it.
+    mkdir -p "$root/boot/grub"
+    printf '\tlinux\t/boot/vmlinuz-%s root=UUID=0000 ro console=ttyS0 %s\n' "$2" "${GRUB_EXTRA:-}" >> "$root/boot/grub/grub.cfg"
 }
 
 run_case() {    # $1=name $2=loop $3..=jq-free expectations as key=value substrings of the evidence JSON
@@ -62,6 +65,11 @@ run_case() {    # $1=name $2=loop $3..=jq-free expectations as key=value substri
     [ "$before" = "$after" ] || { ok=0; reason="$reason image-modified"; }
     [ -n "$json" ] || { ok=0; reason="$reason no-json"; }
     findmnt -rn -S "${loop}p1" >/dev/null 2>&1 && { ok=0; reason="$reason left-mounted"; }
+    for p in "${loop}"p*; do
+        findmnt -rn -S "$p" >/dev/null 2>&1 && { ok=0; reason="$reason left-mounted:$p"; }
+        [ "$(blockdev --getro "$p" 2>/dev/null)" = "0" ] || { ok=0; reason="$reason left-read-only:$p"; }
+    done
+    ls -d /tmp/mana-detect-root-* /tmp/mana-detect-boot-* >/dev/null 2>&1 && { ok=0; reason="$reason left-mount-dir"; }
     [ "$(blockdev --getro "${loop}p1" 2>/dev/null)" = "0" ] || { ok=0; reason="$reason left-read-only"; }
     dmsetup ls 2>/dev/null | grep -q '^mana-detect-' && { ok=0; reason="$reason left-snapshot"; }
     ls /tmp/mana-detect-cow-* >/dev/null 2>&1 && { ok=0; reason="$reason left-cow-file"; }
@@ -156,6 +164,133 @@ run_case merged-usr-absolute "$L" '"newestKernel":"7.9.9-disk-only"' '"verdict":
 L=$(new_image injection-names ext4); R="$WORK/injection-names.mnt"
 kernel "$R" '6.8.0-azure";x="1' module module yes
 run_case injection-names "$L" '"newestKernel":"6.8.0-azure\";x=\"1"' '"verdict":"READY"'
+
+# --- PR #182 review regressions ---------------------------------------------------------------------
+# modprobe treats hv-netvsc and hv_netvsc as the same module.
+L=$(new_image blacklist-hyphen ext4); R="$WORK/blacklist-hyphen.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+echo 'blacklist hv-netvsc' > "$R/etc/modprobe.d/x.conf"
+run_case blacklist-hyphen "$L" '"verdict":"NOT_READY"' 'synthetic-driver-disabled;'
+
+# The usual loading wrapper is not a disable rule.
+L=$(new_image install-wrapper ext4); R="$WORK/install-wrapper.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+echo 'install mana /sbin/modprobe --ignore-install mana && /bin/echo loaded' > "$R/etc/modprobe.d/x.conf"
+run_case install-wrapper "$L" '"verdict":"READY"' '"manaRule":"none"'
+
+# An arbitrary install command cannot be judged offline: unknown, not disabled.
+L=$(new_image install-unknown ext4); R="$WORK/install-unknown.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+echo 'install mana /usr/local/sbin/net-policy mana' > "$R/etc/modprobe.d/x.conf"
+run_case install-unknown "$L" '"verdict":"UNKNOWN"' '"manaRule":"unknown"' 'mana-rule-effect-unknown;'
+
+# An /etc file replaces the vendor file with the same name, even when it is empty.
+L=$(new_image modprobe-shadowed ext4); R="$WORK/modprobe-shadowed.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+mkdir -p "$R/usr/lib/modprobe.d"
+echo 'blacklist mana' > "$R/usr/lib/modprobe.d/vendor.conf"
+: > "$R/etc/modprobe.d/vendor.conf"
+run_case modprobe-shadowed "$L" '"verdict":"READY"' '"manaDisabledByRule":false'
+
+# Leftover or renamed module files and directories are not loadable modules.
+L=$(new_image module-leftovers ext4); R="$WORK/module-leftovers.mnt"
+kernel "$R" 6.8.0-1073-azure none module yes
+: > "$R/lib/modules/6.8.0-1073-azure/kernel/drivers/net/ethernet/microsoft/mana/mana.ko.bak"
+: > "$R/lib/modules/6.8.0-1073-azure/kernel/drivers/net/ethernet/microsoft/mana/mana.ko.disabled"
+mkdir -p "$R/lib/modules/6.8.0-1073-azure/kernel/drivers/net/ethernet/microsoft/mana/mana.ko"
+run_case module-leftovers "$L" '"verdict":"NOT_READY"' '"newestKernelMana":"missing"'
+
+# A module symlink counts only if it resolves to a file on the attached disk, not on the repair VM.
+L=$(new_image module-symlink ext4); R="$WORK/module-symlink.mnt"
+kernel "$R" 6.8.0-1073-azure none module yes
+mkdir -p "$R/opt/drivers"; : > "$R/opt/drivers/mana.ko.zst"
+ln -s /opt/drivers/mana.ko.zst "$R/lib/modules/6.8.0-1073-azure/kernel/drivers/net/ethernet/microsoft/mana/mana.ko.zst"
+ln -s /etc/hostname "$R/lib/modules/6.8.0-1073-azure/kernel/drivers/net/hyperv/hv_netvsc.ko"
+rm -f "$R/lib/modules/6.8.0-1073-azure/kernel/drivers/net/hyperv/hv_netvsc.ko.zst"
+run_case module-symlink "$L" '"newestKernelMana":"present-module"' '"newestKernelHvNetvsc":"missing"' '"verdict":"NOT_READY"'
+
+# Absolute symlinks resolve inside the disk: os-release and modprobe.d must not be read from the repair VM. A
+# blacklist planted on this machine's /usr/lib/modprobe.d proves the disk's own (empty) configuration is read.
+HOST_PLANT=/usr/lib/modprobe.d/zz-mana-detector-fixture.conf
+mkdir -p /usr/lib/modprobe.d; echo 'blacklist mana' > "$HOST_PLANT"
+L=$(new_image absolute-links ext4); R="$WORK/absolute-links.mnt"
+mkdir -p "$R/usr/lib/modules"; ln -s /usr/lib "$R/lib"
+kernel "$R/usr" 6.8.0-1073-azure module module yes
+rm -f "$R/etc/os-release"; printf 'ID=fixtureos\nVERSION_ID="9.9"\n' > "$R/usr/lib/os-release"; ln -s /usr/lib/os-release "$R/etc/os-release"
+run_case absolute-links "$L" '"distro":"fixtureos"' '"verdict":"READY"' '"manaDisabledByRule":false'
+rm -f "$HOST_PLANT"
+
+# The generated grub.cfg carries the effective command line even when /etc/default/grub does not.
+L=$(new_image grub-cfg-only ext4); R="$WORK/grub-cfg-only.mnt"
+GRUB_EXTRA='module_blacklist=mana' kernel "$R" 6.8.0-1073-azure module module yes
+run_case grub-cfg-only "$L" '"verdict":"NOT_READY"' 'mana-driver-disabled;' '"kernelCommandLine":"established"'
+
+# module_blacklist= is an exact kernel match, so hv-netvsc there does nothing...
+L=$(new_image module-blacklist-exact ext4); R="$WORK/module-blacklist-exact.mnt"
+GRUB_EXTRA='module_blacklist=hv-netvsc' kernel "$R" 6.8.0-1073-azure module module yes
+run_case module-blacklist-exact "$L" '"verdict":"READY"' '"hvNetvscDisabledByRule":false'
+
+# ...while modprobe.blacklist= is read by modprobe, which treats hyphens and underscores alike.
+L=$(new_image modprobe-blacklist-hyphen ext4); R="$WORK/modprobe-blacklist-hyphen.mnt"
+GRUB_EXTRA='modprobe.blacklist=floppy,hv-netvsc' kernel "$R" 6.8.0-1073-azure module module yes
+run_case modprobe-blacklist-hyphen "$L" '"verdict":"NOT_READY"' '"problems":"synthetic-driver-disabled;"'
+
+# No boot entry for the newest kernel: the command line cannot be established, so it cannot be READY.
+L=$(new_image no-boot-entry ext4); R="$WORK/no-boot-entry.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+rm -f "$R/boot/grub/grub.cfg"
+run_case no-boot-entry "$L" '"verdict":"UNKNOWN"' 'kernel-command-line-unknown;'
+
+# Module rules cannot disable a driver compiled into the kernel; the rule is kept as evidence only.
+L=$(new_image builtin-blacklisted ext4); R="$WORK/builtin-blacklisted.mnt"
+GRUB_EXTRA='module_blacklist=hv_netvsc' kernel "$R" 6.8.0-1073-azure builtin builtin yes
+echo 'blacklist mana' > "$R/etc/modprobe.d/x.conf"
+run_case builtin-blacklisted "$L" '"verdict":"READY"' '"manaDisabledByRule":true' '"hvNetvscDisabledByRule":true' '"problems":""'
+
+# RHEL layout: separate /boot partition, BLS entry whose options expand grubenv's kernelopts.
+img="$WORK/separate-boot.img"; truncate -s 400M "$img"
+printf 'label: gpt\n,100M,L\n,,L\n' | sfdisk -q "$img" >/dev/null
+L=$(losetup -fP --show "$img"); udevadm settle 2>/dev/null || true
+mkfs.ext4 -q -F "${L}p1"; mkfs.ext4 -q -F "${L}p2"; udevadm trigger "${L}p1" "${L}p2" 2>/dev/null; udevadm settle 2>/dev/null || true
+R="$WORK/separate-boot.mnt"; B="$WORK/separate-boot-boot.mnt"; mkdir -p "$R" "$B"
+mount "${L}p2" "$R"; mount "${L}p1" "$B"
+mkdir -p "$R/etc/modprobe.d" "$R/etc/default"; printf 'ID=rhel\nVERSION_ID="9.4"\n' > "$R/etc/os-release"
+kernel "$R" 5.14.0-427.el9.x86_64 module module yes; rm -rf "$R/boot/grub"
+printf 'UUID=%s / ext4 defaults 0 1\nUUID=%s /boot ext4 defaults 0 2\n' "$(blkid -s UUID -o value "${L}p2")" "$(blkid -s UUID -o value "${L}p1")" > "$R/etc/fstab"
+mkdir -p "$B/loader/entries" "$B/grub2"
+printf 'title RHEL\nversion 5.14.0-427.el9.x86_64\nlinux /vmlinuz-5.14.0-427.el9.x86_64\noptions $kernelopts\n' > "$B/loader/entries/abc-5.14.0-427.el9.x86_64.conf"
+printf '# GRUB Environment Block\nkernelopts=root=UUID=0000 ro console=ttyS0 module_blacklist=hv_netvsc\n' > "$B/grub2/grubenv"
+umount "$B"
+run_case separate-boot "$L" '"verdict":"NOT_READY"' 'synthetic-driver-disabled;' '"bootMountMode":"no-replay"' '"kernelCommandLineSources":"/boot/loader/entries/'
+
+# Without a device override the detector must exclude the repair VM's own disks (here: this machine's) and fail
+# closed, leaving every disk's write state as it was. findmnt is wrapped to report a Btrfs-style root source.
+ro_before=$(for d in $(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}'); do echo "$d=$(blockdev --getro "/dev/$d" 2>/dev/null)"; done)
+real_root=$(findmnt -n -o SOURCE /)
+FAKE_FINDMNT="$WORK/btrfs-findmnt"; mkdir -p "$FAKE_FINDMNT"
+cat > "$FAKE_FINDMNT/findmnt" <<EOF
+#!/bin/bash
+if [ "\$*" = "-n -o SOURCE /" ]; then echo "${real_root}[/@]"; exit 0; fi
+if [ "\$*" = "-n -o MAJ:MIN /" ]; then echo "0:99"; exit 0; fi
+exec $(command -v findmnt) "\$@"
+EOF
+chmod +x "$FAKE_FINDMNT/findmnt"
+out=$(PATH="$FAKE_FINDMNT:$PATH" bash -e "$DETECTOR" 2>&1); status=$?
+ro_after=$(for d in $(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}'); do echo "$d=$(blockdev --getro "/dev/$d" 2>/dev/null)"; done)
+if [ "$status" -ne 0 ] && [ "$ro_before" = "$ro_after" ] && printf '%s' "$out" | grep -q "resolved: ${real_root}; disks: [a-z]" \
+    && ! ls -d /tmp/mana-detect-root-* >/dev/null 2>&1; then
+    echo "PASS auto-discovery-excludes-repair-disks"; pass=$((pass + 1))
+else
+    echo "FAIL auto-discovery-excludes-repair-disks: exit=$status"; printf '%s\n' "$out" | grep -E 'root device|Skipping|Error' | sed 's/^/     /'; fail=$((fail + 1))
+fi
+
+# The working directories are created with mktemp -d, never at a predictable path.
+if grep -qE 'mktemp -d "/tmp/mana-evidence-' "$DETECTOR" && grep -qE 'mktemp -d "/tmp/mana-detect-root-' "$DETECTOR" \
+    && ! grep -qE 'mkdir -p "\$EVIDENCE_DIR"' "$DETECTOR"; then
+    echo "PASS private-temp-directories"; pass=$((pass + 1))
+else
+    echo "FAIL private-temp-directories"; fail=$((fail + 1))
+fi
 
 if command -v mkfs.xfs >/dev/null 2>&1; then
     L=$(new_image xfs-root xfs); R="$WORK/xfs-root.mnt"

@@ -24,7 +24,9 @@ Changes to `linux-detect-mana-readiness.sh` or its `map.json` entry must pass bo
 repository root. The second test needs root on Linux or WSL because it builds disk images and
 attaches them as loop devices; it also verifies that the detector writes nothing to the disk and
 leaves no mount, snapshot, or loop device behind. Install `xfsprogs` first (it provides `mkfs.xfs`
-and `xfs_io`); without it, the XFS and crash-consistent cases are skipped.
+and `xfs_io`); without it, the XFS and crash-consistent cases are skipped. One case temporarily writes
+`/usr/lib/modprobe.d/zz-mana-detector-fixture.conf` on the test machine, to prove the detector never reads the
+repair VM's own modprobe configuration, and removes it afterwards.
 
 ```powershell
 pwsh -NoProfile -File ./tests/test-map-catalog.ps1
