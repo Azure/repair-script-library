@@ -17,6 +17,17 @@ DETECTOR=src/linux/linux-detect-mana-readiness.sh
 pass=0
 fail=0
 
+# One case plants a blacklist in this machine's modprobe configuration. It must never outlive the run, even if the
+# run is interrupted, and must never replace a file that was already there.
+HOST_PLANT=/usr/lib/modprobe.d/zz-mana-detector-fixture.conf
+HOST_PLANT_OWNED=0
+cleanup_fixtures() {
+    [ "$HOST_PLANT_OWNED" -eq 1 ] && rm -f "$HOST_PLANT"
+    HOST_PLANT_OWNED=0
+}
+trap cleanup_fixtures EXIT
+trap 'cleanup_fixtures; exit 130' INT TERM HUP
+
 new_image() {   # $1=name $2=fstype -> prints loop device; root filesystem mounted at $WORK/$1.mnt
     local name=$1 fstype=$2 img="$WORK/$1.img" loop
     # mkfs.xfs refuses filesystems smaller than 300 MB.
@@ -136,7 +147,7 @@ echo 'install hv_netvsc /bin/false' > "$R/etc/modprobe.d/x.conf"
 run_case install-false "$L" '"verdict":"NOT_READY"' 'synthetic-driver-disabled;' '"hvNetvscDisabledByRule":true'
 
 L=$(new_image grub-cmdline ext4); R="$WORK/grub-cmdline.mnt"
-kernel "$R" 6.8.0-1073-azure module module yes
+GRUB_EXTRA='module_blacklist=floppy,mana' kernel "$R" 6.8.0-1073-azure module module yes
 echo 'GRUB_CMDLINE_LINUX="console=ttyS0 module_blacklist=floppy,mana"' > "$R/etc/default/grub"
 run_case grub-cmdline "$L" '"verdict":"NOT_READY"' 'mana-driver-disabled;'
 
@@ -211,14 +222,17 @@ run_case module-symlink "$L" '"newestKernelMana":"present-module"' '"newestKerne
 
 # Absolute symlinks resolve inside the disk: os-release and modprobe.d must not be read from the repair VM. A
 # blacklist planted on this machine's /usr/lib/modprobe.d proves the disk's own (empty) configuration is read.
-HOST_PLANT=/usr/lib/modprobe.d/zz-mana-detector-fixture.conf
-mkdir -p /usr/lib/modprobe.d; echo 'blacklist mana' > "$HOST_PLANT"
+if [ -e "$HOST_PLANT" ] || [ -L "$HOST_PLANT" ]; then
+    echo "FAIL absolute-links: $HOST_PLANT already exists on this machine; refusing to overwrite it"; fail=$((fail + 1))
+else
+mkdir -p /usr/lib/modprobe.d; HOST_PLANT_OWNED=1; echo 'blacklist mana' > "$HOST_PLANT"
 L=$(new_image absolute-links ext4); R="$WORK/absolute-links.mnt"
 mkdir -p "$R/usr/lib/modules"; ln -s /usr/lib "$R/lib"
 kernel "$R/usr" 6.8.0-1073-azure module module yes
 rm -f "$R/etc/os-release"; printf 'ID=fixtureos\nVERSION_ID="9.9"\n' > "$R/usr/lib/os-release"; ln -s /usr/lib/os-release "$R/etc/os-release"
 run_case absolute-links "$L" '"distro":"fixtureos"' '"verdict":"READY"' '"manaDisabledByRule":false'
-rm -f "$HOST_PLANT"
+cleanup_fixtures
+fi
 
 # The generated grub.cfg carries the effective command line even when /etc/default/grub does not.
 L=$(new_image grub-cfg-only ext4); R="$WORK/grub-cfg-only.mnt"
@@ -262,6 +276,101 @@ printf 'title RHEL\nversion 5.14.0-427.el9.x86_64\nlinux /vmlinuz-5.14.0-427.el9
 printf '# GRUB Environment Block\nkernelopts=root=UUID=0000 ro console=ttyS0 module_blacklist=hv_netvsc\n' > "$B/grub2/grubenv"
 umount "$B"
 run_case separate-boot "$L" '"verdict":"NOT_READY"' 'synthetic-driver-disabled;' '"bootMountMode":"no-replay"' '"kernelCommandLineSources":"/boot/loader/entries/'
+
+# --- PR #182 second review --------------------------------------------------------------------------
+# Separate /boot whose grubenv is an absolute symlink inside that partition: it must resolve to the guest's /boot,
+# not to this machine's, or $kernelopts silently expands to nothing and the blacklist is missed.
+img="$WORK/boot-absolute-symlink.img"; truncate -s 400M "$img"
+printf 'label: gpt\n,100M,L\n,,L\n' | sfdisk -q "$img" >/dev/null
+L=$(losetup -fP --show "$img"); udevadm settle 2>/dev/null || true
+mkfs.ext4 -q -F "${L}p1"; mkfs.ext4 -q -F "${L}p2"; udevadm trigger "${L}p1" "${L}p2" 2>/dev/null; udevadm settle 2>/dev/null || true
+R="$WORK/boot-absolute-symlink.mnt"; B="$WORK/boot-absolute-symlink-boot.mnt"; mkdir -p "$R" "$B"
+mount "${L}p2" "$R"; mount "${L}p1" "$B"
+mkdir -p "$R/etc/modprobe.d" "$R/etc/default"; printf 'ID=rhel\nVERSION_ID="9.4"\n' > "$R/etc/os-release"
+kernel "$R" 5.14.0-427.el9.x86_64 module module yes; rm -rf "$R/boot/grub"
+printf 'UUID=%s / ext4 defaults 0 1\nUUID=%s /boot ext4 defaults 0 2\n' "$(blkid -s UUID -o value "${L}p2")" "$(blkid -s UUID -o value "${L}p1")" > "$R/etc/fstab"
+mkdir -p "$B/loader/entries" "$B/grub2"
+printf 'linux /vmlinuz-5.14.0-427.el9.x86_64\noptions $kernelopts\n' > "$B/loader/entries/abc-5.14.0-427.el9.x86_64.conf"
+printf 'kernelopts=root=UUID=0000 ro module_blacklist=hv_netvsc\n' > "$B/grub2/grubenv.real"
+ln -s /boot/grub2/grubenv.real "$B/grub2/grubenv"
+umount "$B"
+run_case boot-absolute-symlink "$L" '"verdict":"NOT_READY"' 'synthetic-driver-disabled;' '"kernelCommandLine":"established"'
+
+# A BLS entry whose $kernelopts is defined nowhere has unchecked arguments: unknown, not READY.
+L=$(new_image bls-unresolved ext4); R="$WORK/bls-unresolved.mnt"
+kernel "$R" 5.14.0-427.el9.x86_64 module module yes; rm -f "$R/boot/grub/grub.cfg"
+mkdir -p "$R/boot/loader/entries"
+printf 'linux /vmlinuz-5.14.0-427.el9.x86_64\noptions $kernelopts\n' > "$R/boot/loader/entries/abc.conf"
+run_case bls-unresolved "$L" '"verdict":"UNKNOWN"' 'kernel-command-line-unknown;' '"kernelCommandLineUnresolved":"/boot/loader/entries/abc.conf:$kernelopts;"'
+
+# An absolute modules.builtin symlink must not read this machine's list (which would claim mana is built in).
+printf 'kernel/drivers/net/ethernet/microsoft/mana/mana.ko\n' > "$WORK/host-modules.builtin"
+L=$(new_image builtin-list-symlink ext4); R="$WORK/builtin-list-symlink.mnt"
+kernel "$R" 6.8.0-1073-azure none module no
+ln -s "$WORK/host-modules.builtin" "$R/lib/modules/6.8.0-1073-azure/modules.builtin"
+run_case builtin-list-symlink "$L" '"verdict":"UNKNOWN"' '"newestKernelMana":"unknown"'
+
+# /etc/default/grub is only applied at the next grub-mkconfig: a blacklist there is pending, reported as a risk,
+# and does not override the generated boot entry...
+L=$(new_image grub-default-pending ext4); R="$WORK/grub-default-pending.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+echo 'GRUB_CMDLINE_LINUX="console=ttyS0 module_blacklist=mana"' > "$R/etc/default/grub"
+run_case grub-default-pending "$L" '"verdict":"READY"' '"riskIndicators":"pending-boot-config-disables-mana;"' 'pending at next grub-mkconfig: module_blacklist=mana;'
+
+# ...and a later grub.d assignment replaces an earlier one, as grub-mkconfig sources them.
+L=$(new_image grub-default-overridden ext4); R="$WORK/grub-default-overridden.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+echo 'GRUB_CMDLINE_LINUX="module_blacklist=mana"' > "$R/etc/default/grub"
+mkdir -p "$R/etc/default/grub.d"; echo 'GRUB_CMDLINE_LINUX="console=ttyS0"' > "$R/etc/default/grub.d/90-override.cfg"
+run_case grub-default-overridden "$L" '"verdict":"READY"' '"riskIndicators":""'
+
+# A grub.d snippet that is an absolute symlink inside the guest must be read from the guest.
+L=$(new_image grub-d-absolute-symlink ext4); R="$WORK/grub-d-absolute-symlink.mnt"
+kernel "$R" 5.4.0-1109-azure none module yes
+kernel "$R" 6.8.0-1073-azure module module yes
+mkdir -p "$R/etc/default/grub.d" "$R/etc/pinning"
+echo 'GRUB_DEFAULT="Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced"' > "$R/etc/pinning/pin.cfg"
+ln -s /etc/pinning/pin.cfg "$R/etc/default/grub.d/50-pin.cfg"
+run_case grub-d-absolute-symlink "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-not-newest;' '"bootDefaultKernel":"5.4.0-1109-azure"'
+
+# A numeric submenu default such as 1>2 can select an older kernel; it cannot be resolved offline, so unknown.
+L=$(new_image grub-default-submenu ext4); R="$WORK/grub-default-submenu.mnt"
+kernel "$R" 5.4.0-1109-azure none module yes
+kernel "$R" 6.8.0-1073-azure module module yes
+printf 'GRUB_DEFAULT="1>2"\n' > "$R/etc/default/grub"
+run_case grub-default-submenu "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-unknown;' '"bootDefaultStatus":"unknown"'
+
+# A separate /boot already mounted on this machine (device override while an operator has it open) is left alone:
+# not write-protected, not remounted. The command line is then unknown.
+img="$WORK/boot-in-use.img"; truncate -s 400M "$img"
+printf 'label: gpt\n,100M,L\n,,L\n' | sfdisk -q "$img" >/dev/null
+L=$(losetup -fP --show "$img"); udevadm settle 2>/dev/null || true
+mkfs.ext4 -q -F "${L}p1"; mkfs.ext4 -q -F "${L}p2"; udevadm trigger "${L}p1" "${L}p2" 2>/dev/null; udevadm settle 2>/dev/null || true
+R="$WORK/boot-in-use.mnt"; B="$WORK/boot-in-use-boot.mnt"; mkdir -p "$R" "$B"
+mount "${L}p2" "$R"; mount "${L}p1" "$B"
+mkdir -p "$R/etc/modprobe.d" "$R/etc/default"; printf 'ID=rhel\nVERSION_ID="9.4"\n' > "$R/etc/os-release"
+kernel "$R" 5.14.0-427.el9.x86_64 module module yes; rm -rf "$R/boot/grub"
+printf 'UUID=%s / ext4 defaults 0 1\nUUID=%s /boot ext4 defaults 0 2\n' "$(blkid -s UUID -o value "${L}p2")" "$(blkid -s UUID -o value "${L}p1")" > "$R/etc/fstab"
+umount "$R"
+FAKE_BLOCKDEV="$WORK/blockdev-log"; mkdir -p "$FAKE_BLOCKDEV"
+cat > "$FAKE_BLOCKDEV/blockdev" <<EOF
+#!/bin/bash
+echo "\$*" >> "$WORK/blockdev-calls.log"
+exec $(command -v blockdev) "\$@"
+EOF
+chmod +x "$FAKE_BLOCKDEV/blockdev"; : > "$WORK/blockdev-calls.log"
+out=$(PATH="$FAKE_BLOCKDEV:$PATH" bash -e "$DETECTOR" "$L" 2>&1); status=$?
+touched=$(grep -c -- "--setro ${L}p1\$" "$WORK/blockdev-calls.log" || true)
+boot_ro=$(blockdev --getro "${L}p1" 2>/dev/null)
+still_mounted=$(findmnt -rn -S "${L}p1" -o TARGET 2>/dev/null)
+json=$(printf '%s\n' "$out" | sed -n 's/.*\[MANA-EVIDENCE-JSON\]//p')
+if [ "$status" -eq 0 ] && [ "$touched" = "0" ] && [ "$boot_ro" = "0" ] && [ "$still_mounted" = "$B" ] \
+    && printf '%s' "$json" | grep -qF '"bootMountMode":"not-mounted"' && printf '%s' "$json" | grep -qF '"verdict":"UNKNOWN"'; then
+    echo "PASS boot-already-mounted"; pass=$((pass + 1))
+else
+    echo "FAIL boot-already-mounted: exit=$status setro-calls=$touched ro=$boot_ro mounted=$still_mounted"; printf '%s\n' "$out" | tail -n 4 | sed 's/^/     /'; fail=$((fail + 1))
+fi
+umount "$B"; losetup -d "$L"
 
 # Without a device override the detector must exclude the repair VM's own disks (here: this machine's) and fail
 # closed, leaving every disk's write state as it was. findmnt is wrapped to report a Btrfs-style root source.

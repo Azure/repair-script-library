@@ -66,7 +66,7 @@ if [ -z "$EVIDENCE_DIR" ] || [ -z "$MOUNT_POINT" ]; then
     Log-Error "Could not create private working directories under /tmp."
     [ -n "$EVIDENCE_DIR" ] && rmdir "$EVIDENCE_DIR" 2>/dev/null
     [ -n "$MOUNT_POINT" ] && rmdir "$MOUNT_POINT" 2>/dev/null
-    exit $STATUS_ERROR
+    exit "$STATUS_ERROR"
 fi
 
 Log-Output "START: Running script linux-detect-mana-readiness (read-only)"
@@ -195,8 +195,21 @@ mount_read_only() {
 # Prints the repair-VM path for $1, an absolute path inside the attached filesystem. Symlinks are followed within
 # the attached filesystem only: an absolute link target such as /lib -> /usr/lib is re-rooted at $MOUNT_POINT
 # instead of resolving against the repair VM's own /. The last component is resolved too.
+# Prints the repair-VM path of a resolved guest path. Once a separate /boot partition is mounted, the guest's /boot
+# lives there rather than under the root filesystem.
+guest_to_host() {
+    local p="${1:-/}"
+    if [ -n "${BOOT_MOUNT:-}" ]; then
+        case "$p" in
+            /boot) printf '%s\n' "$BOOT_MOUNT"; return ;;
+            /boot/*) printf '%s%s\n' "$BOOT_MOUNT" "${p#/boot}"; return ;;
+        esac
+    fi
+    printf '%s%s\n' "$MOUNT_POINT" "$p"
+}
+
 resolve_in_root() {
-    local rest="${1#/}" resolved="" part target hops=0
+    local rest="${1#/}" resolved="" part target hops=0 host
     while [ -n "$rest" ]; do
         part="${rest%%/*}"
         if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
@@ -204,17 +217,18 @@ resolve_in_root() {
             ''|.) continue ;;
             ..) resolved="${resolved%/*}"; continue ;;
         esac
-        if [ -L "$MOUNT_POINT$resolved/$part" ]; then
+        host=$(guest_to_host "$resolved/$part")
+        if [ -L "$host" ]; then
             hops=$((hops + 1))
             [ "$hops" -le 40 ] || return 1
-            target=$(readlink "$MOUNT_POINT$resolved/$part") || return 1
+            target=$(readlink "$host") || return 1
             case "$target" in /*) resolved="" ;; esac
             if [ -n "$rest" ]; then rest="${target#/}/$rest"; else rest="${target#/}"; fi
         else
             resolved="$resolved/$part"
         fi
     done
-    printf '%s%s\n' "$MOUNT_POINT" "${resolved:-/}"
+    guest_to_host "${resolved:-/}"
 }
 
 # A separate /boot partition holds grub.cfg or the BLS entries that carry the effective kernel command line.
@@ -245,6 +259,10 @@ mount_boot_read_only() {
         xfs) opts="ro,norecovery,nouuid" ;;
         *) return 1 ;;
     esac
+    # A partition already mounted on this machine is left alone: changing its write state would disturb that mount.
+    if findmnt -rn -S "$part" >/dev/null 2>&1; then
+        return 1
+    fi
     was_ro=$(blockdev --getro "$part" 2>/dev/null || echo "unknown")
     if [ "$was_ro" = "0" ]; then
         blockdev --setro "$part" 2>/dev/null || return 1
@@ -260,13 +278,10 @@ mount_boot_read_only() {
     BOOT_MOUNT_MODE="no-replay"
 }
 
-# Prints the repair-VM path of $1, a path relative to the guest's /boot.
+# Prints the repair-VM path of $1, a path relative to the guest's /boot. Symlinks are followed inside the guest,
+# with /boot mapped to the separate partition when there is one.
 boot_path() {
-    if [ -n "$BOOT_MOUNT" ]; then
-        printf '%s/%s\n' "$BOOT_MOUNT" "$1"
-    else
-        resolve_in_root "/boot/$1"
-    fi
+    resolve_in_root "/boot/$1"
 }
 
 # Prints present-builtin, present-module, missing, or unknown for one module in one kernel's module tree.
@@ -274,8 +289,14 @@ boot_path() {
 # directories, do not. A symlinked module counts only if it resolves to a regular file inside the attached disk.
 # "missing" requires both the built-in list and the module tree to have been read without error.
 module_status() {
-    local kernel_dir="$1" module="$2" builtin_status files find_status f real
-    grep -q "/${module}\.ko" "$kernel_dir/modules.builtin" 2>/dev/null && builtin_status=0 || builtin_status=$?
+    local kernel_dir="$1" module="$2" builtin_status builtin_list files find_status f real
+    # An absolute symlink for modules.builtin must not resolve to the repair VM's own list.
+    builtin_list=$(resolve_in_root "${kernel_dir#"$MOUNT_POINT"}/modules.builtin" || echo "")
+    if [ -n "$builtin_list" ]; then
+        grep -q "/${module}\.ko" "$builtin_list" 2>/dev/null && builtin_status=0 || builtin_status=$?
+    else
+        builtin_status=2
+    fi
     if [ "$builtin_status" -eq 0 ]; then
         echo "present-builtin"
         return
@@ -307,8 +328,9 @@ EOF
 classify_install() {
     local module="$1" first word saw_modprobe=0 saw_ignore=0 saw_module=0
     first=$(printf '%s' "$2" | sed -E 's/[[:space:]]*(;|&&|\|\||\|).*$//')
-    # shellcheck disable=SC2086
-    set -f; set -- $first; set +f
+    local -a words
+    read -r -a words <<< "$first"
+    set -- "${words[@]}"
     case "${1:-}" in
         /bin/false|/usr/bin/false|false|/bin/true|/usr/bin/true|true|:|exit) echo "blocks"; return ;;
     esac
@@ -365,7 +387,7 @@ if [ -n "$DEVICE_OVERRIDE" ]; then
 else
     if [ -z "$ROOT_DISKS" ]; then
         Log-Error "Could not identify the repair VM's own disk, so no disk can be inspected safely. Pass the attached disk explicitly with --parameters ++/dev/sdc"
-        exit $STATUS_ERROR
+        exit "$STATUS_ERROR"
     fi
     for d in $(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
         case " $ROOT_DISKS " in *" $d "*) continue ;; esac
@@ -389,6 +411,7 @@ for part in $CANDIDATES; do
         ext2|ext3|ext4|xfs|btrfs) ;;
         LVM2_member)
             Log-Warning "$part is an LVM physical volume. LVM layouts are out of scope for this detector."
+            SKIPPED_LVM="true"
             continue
             ;;
         crypto_LUKS)
@@ -412,8 +435,12 @@ for part in $CANDIDATES; do
 done
 
 if [ -z "$OS_PARTITION" ]; then
-    Log-Error "No attached Linux root filesystem found. Pass a device explicitly with --parameters ++/dev/sdc"
-    exit $STATUS_ERROR
+    if [ "${SKIPPED_LVM:-false}" = "true" ]; then
+        Log-Error "The attached disk uses LVM for its root filesystem, which this detector does not support yet. No verdict was produced."
+    else
+        Log-Error "No attached Linux root filesystem found. Pass a device explicitly with --parameters ++/dev/sdc"
+    fi
+    exit "$STATUS_ERROR"
 fi
 
 # --- Distro identity -------------------------------------------------------------------------------
@@ -433,7 +460,7 @@ Log-Output "Attached OS: ${DISTRO_ID:-unknown} ${DISTRO_VER:-}"
 MODULES_ROOT=$(resolve_in_root /lib/modules || echo "")
 [ -d "$MODULES_ROOT" ] || MODULES_ROOT=$(resolve_in_root /usr/lib/modules || echo "")
 
-KERNELS=$(ls -1 "$MODULES_ROOT" 2>/dev/null | sort -V || true)
+KERNELS=$(find "$MODULES_ROOT" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -V || true)
 NEWEST_KERNEL=$(printf '%s\n' "$KERNELS" | grep -v '^$' | tail -n1 || true)
 KERNELS_JSON=""
 NEWEST_MANA="unknown"
@@ -548,119 +575,194 @@ fi
 BOOT_ARGS=""
 BOOT_ARGS_SOURCES=""
 BOOT_ENTRY_FOUND="false"
+BOOT_ARGS_UNRESOLVED=""
+
+# Prints "guest-path<TAB>repair-VM-path" for each regular file matching glob $2 in guest directory $1. Every file is
+# resolved inside the guest, so an absolute symlink never reads the repair VM's own file.
+guest_files() {
+    local dir="$1" pattern="$2" host_dir f name real
+    host_dir=$(resolve_in_root "$dir" || echo "")
+    [ -d "$host_dir" ] || return 0
+    for f in "$host_dir"/$pattern; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        name=$(basename "$f")
+        real=$(resolve_in_root "$dir/$name" || echo "")
+        [ -f "$real" ] || continue
+        printf '%s\t%s\n' "$dir/$name" "$real"
+    done
+}
+
+GRUB_CFG_FILES=""
+for cfg in grub/grub.cfg grub2/grub.cfg; do
+    file=$(boot_path "$cfg" || echo "")
+    [ -f "$file" ] && GRUB_CFG_FILES="${GRUB_CFG_FILES}${file}"$'\n'
+done
+GRUBENV=""
+for env in grub2/grubenv grub/grubenv; do
+    file=$(boot_path "$env" || echo "")
+    if [ -f "$file" ]; then GRUBENV="$file"; break; fi
+done
+
+# Prints the value GRUB gives variable $1 when it boots: grubenv first, then a "set" in the generated grub.cfg.
+# Returns 1 when the variable is not defined anywhere, which is different from defined and empty.
+grub_variable() {
+    local name="$1" cfg
+    if [ -n "$GRUBENV" ] && grep -q "^${name}=" "$GRUBENV" 2>/dev/null; then
+        sed -n "s/^${name}=//p" "$GRUBENV" 2>/dev/null | head -n1
+        return 0
+    fi
+    while IFS= read -r cfg; do
+        [ -n "$cfg" ] || continue
+        if grep -qE "^[[:space:]]*set[[:space:]]+${name}=" "$cfg" 2>/dev/null; then
+            sed -nE "s/^[[:space:]]*set[[:space:]]+${name}=[\"']?([^\"']*).*/\1/p" "$cfg" 2>/dev/null | tail -n1
+            return 0
+        fi
+    done <<EOF
+$GRUB_CFG_FILES
+EOF
+    return 1
+}
+
 if [ "$BOOT_MOUNT_MODE" != "not-mounted" ] && [ -n "$NEWEST_KERNEL" ]; then
-    for cfg in grub/grub.cfg grub2/grub.cfg; do
-        file=$(boot_path "$cfg" || echo "")
-        [ -f "$file" ] || continue
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
         args=$(K="vmlinuz-$NEWEST_KERNEL" awk '$1 ~ /^linux(efi|16)?$/ && index($2, ENVIRON["K"]) { $1 = ""; $2 = ""; print }' "$file" 2>/dev/null || echo "")
         if [ -n "$args" ]; then
             BOOT_ARGS="$BOOT_ARGS $args"
-            BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}/boot/$cfg;"
+            BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}/boot${file#"$(guest_to_host /boot)"};"
             BOOT_ENTRY_FOUND="true"
         fi
-    done
-    kernelopts=""
-    for env in grub2/grubenv grub/grubenv; do
-        file=$(boot_path "$env" || echo "")
-        [ -f "$file" ] && kernelopts=$(sed -n 's/^kernelopts=//p' "$file" 2>/dev/null | head -n1 || echo "")
-        [ -n "$kernelopts" ] && break
-    done
-    entries=$(boot_path loader/entries || echo "")
-    for entry in "$entries"/*.conf; do
-        [ -f "$entry" ] || continue
+    done <<EOF
+$GRUB_CFG_FILES
+EOF
+    # BLS entries reference variables such as $kernelopts. An entry whose variables cannot all be resolved has not
+    # had its arguments checked, so it makes the command line unknown rather than silently dropping them.
+    while IFS=$'\t' read -r guest entry; do
+        [ -n "$entry" ] || continue
         K="$NEWEST_KERNEL" awk '$1 == "linux" && index($2, ENVIRON["K"]) { found = 1 } END { exit !found }' "$entry" 2>/dev/null || continue
         options=$(sed -n 's/^options[[:space:]]\{1,\}//p' "$entry" 2>/dev/null | head -n1 || echo "")
-        options=${options//\$kernelopts/$kernelopts}
+        # Longest names first, so $kernelopts is replaced before a shorter $kernel could match its prefix.
+        for var in $(printf '%s' "$options" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' | sort -ru || true); do
+            name="${var#\$}"; name="${name#\{}"; name="${name%\}}"
+            if value=$(grub_variable "$name"); then
+                options=${options//"$var"/$value}
+            else
+                BOOT_ARGS_UNRESOLVED="${BOOT_ARGS_UNRESOLVED}${guest}:${var};"
+                options=${options//"$var"/}
+            fi
+        done
         BOOT_ARGS="$BOOT_ARGS $options"
-        BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}/boot/loader/entries/$(basename "$entry");"
+        BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}${guest};"
         BOOT_ENTRY_FOUND="true"
-    done
+    done < <(guest_files /boot/loader/entries '*.conf')
 fi
-# The grub defaults are applied to every entry the next time grub-mkconfig runs, which a kernel update does.
-grub_default_args() {
-    sed -nE 's/^[[:space:]]*GRUB_CMDLINE_LINUX(_DEFAULT)?=["'"'"']?([^"'"'"']*).*/\2/p' "$1" 2>/dev/null | tr '\n' ' ' || true
+
+# /etc/default/grub and /etc/default/grub.d/*.cfg are only inputs to grub-mkconfig. They take effect the next time it
+# runs (a kernel update does), so they are evaluated the way grub-mkconfig sources them - in order, later assignments
+# replacing earlier ones and $VAR references expanded - and reported as pending, never as the current boot state.
+declare -A GRUB_SETTING=([GRUB_CMDLINE_LINUX_DEFAULT]="" [GRUB_CMDLINE_LINUX]="" [GRUB_DEFAULT]="")
+GRUB_DEFAULT_SOURCES=""
+read_grub_defaults() {
+    local line name value v quoted='^"([^"]*)"' single="^'([^']*)'"
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*(GRUB_CMDLINE_LINUX_DEFAULT|GRUB_CMDLINE_LINUX|GRUB_DEFAULT)=(.*)$ ]] || continue
+        name="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        if [[ "$value" =~ $quoted ]] || [[ "$value" =~ $single ]]; then
+            value="${BASH_REMATCH[1]}"
+        else
+            value="${value%%[[:space:]]*}"
+        fi
+        for v in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX GRUB_DEFAULT; do
+            value="${value//"\${$v}"/${GRUB_SETTING[$v]}}"
+            value="${value//"\$$v"/${GRUB_SETTING[$v]}}"
+        done
+        GRUB_SETTING[$name]="$value"
+    done < "$1"
 }
 file=$(resolve_in_root /etc/default/grub || echo "")
 if [ -f "$file" ]; then
-    args=$(grub_default_args "$file")
-    if [ -n "${args// /}" ]; then
-        BOOT_ARGS="$BOOT_ARGS $args"
-        BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}/etc/default/grub;"
-    fi
+    read_grub_defaults "$file"
+    GRUB_DEFAULT_SOURCES="/etc/default/grub;"
 fi
-grub_d=$(resolve_in_root /etc/default/grub.d || echo "")
-if [ -d "$grub_d" ]; then
-    for defaults in "$grub_d"/*.cfg; do
-        [ -f "$defaults" ] || continue
-        args=$(grub_default_args "$defaults")
-        if [ -n "${args// /}" ]; then
-            BOOT_ARGS="$BOOT_ARGS $args"
-            BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}/etc/default/grub.d/$(basename "$defaults");"
-        fi
-    done
-fi
+while IFS=$'\t' read -r guest defaults; do
+    [ -n "$defaults" ] || continue
+    read_grub_defaults "$defaults"
+    GRUB_DEFAULT_SOURCES="${GRUB_DEFAULT_SOURCES}${guest};"
+done < <(guest_files /etc/default/grub.d '*.cfg')
+PENDING_ARGS="${GRUB_SETTING[GRUB_CMDLINE_LINUX]} ${GRUB_SETTING[GRUB_CMDLINE_LINUX_DEFAULT]}"
 
+# Prints "<module> <token>" for each kernel argument in $1 that stops mana or hv_netvsc from loading.
 # module_blacklist= is matched by the kernel against the exact module name; modprobe.blacklist= is read by modprobe,
 # which treats hyphens and underscores alike. Globbing is off so an argument such as * cannot expand.
-set -f
-for token in $BOOT_ARGS; do
-    token="${token//\"/}"
-    case "$token" in
-        module_blacklist=*) list="${token#module_blacklist=}"; normalize=0 ;;
-        modprobe.blacklist=*) list="${token#modprobe.blacklist=}"; normalize=1 ;;
-        *) continue ;;
-    esac
-    for module in ${list//,/ }; do
-        [ "$normalize" -eq 1 ] && module="${module//-/_}"
-        case "$module" in mana|hv_netvsc) note_rule "$module" blocks "kernel command line: $token" ;; esac
+cmdline_blocks() {
+    local token list normalize module
+    set -f
+    for token in $1; do
+        token="${token//\"/}"
+        case "$token" in
+            module_blacklist=*) list="${token#module_blacklist=}"; normalize=0 ;;
+            modprobe.blacklist=*) list="${token#modprobe.blacklist=}"; normalize=1 ;;
+            *) continue ;;
+        esac
+        for module in ${list//,/ }; do
+            [ "$normalize" -eq 1 ] && module="${module//-/_}"
+            case "$module" in mana|hv_netvsc) printf '%s %s\n' "$module" "$token" ;; esac
+        done
     done
-done
-set +f
+    set +f
+}
+
+while read -r module token; do
+    [ -n "$module" ] && note_rule "$module" blocks "kernel command line: $token"
+done < <(cmdline_blocks "$BOOT_ARGS")
+PENDING_BLOCKS=""
+while read -r module token; do
+    [ -n "$module" ] || continue
+    PENDING_BLOCKS="${PENDING_BLOCKS}${module};"
+    RULE_EVIDENCE="${RULE_EVIDENCE}pending at next grub-mkconfig: $token;"
+done < <(cmdline_blocks "$PENDING_ARGS")
+
 BOOT_ARGS_STATUS="unknown"
-[ "$BOOT_ENTRY_FOUND" = "true" ] && BOOT_ARGS_STATUS="established"
-[ "$BOOT_ARGS_STATUS" = "unknown" ] && Log-Warning "No boot entry for kernel ${NEWEST_KERNEL:-none} was found, so the effective kernel command line could not be checked."
+if [ "$BOOT_ENTRY_FOUND" = "true" ] && [ -z "$BOOT_ARGS_UNRESOLVED" ]; then
+    BOOT_ARGS_STATUS="established"
+fi
+if [ "$BOOT_ENTRY_FOUND" != "true" ]; then
+    Log-Warning "No boot entry for kernel ${NEWEST_KERNEL:-none} was found, so the effective kernel command line could not be checked."
+elif [ -n "$BOOT_ARGS_UNRESOLVED" ]; then
+    Log-Warning "Boot entry variables could not be resolved (${BOOT_ARGS_UNRESOLVED}), so the effective kernel command line could not be checked."
+fi
 
 # --- Boot default ----------------------------------------------------------------------------------
-# The verdict describes the newest installed kernel. GRUB can be pinned to a different one through GRUB_DEFAULT or,
-# with GRUB_DEFAULT=saved, through saved_entry in grubenv; the kernel that boots is then not the one assessed. A
-# default that names another installed kernel makes the result unknown instead of READY for the wrong kernel. A
-# numeric or title default that names no kernel version is left alone, because it normally selects the newest.
-grub_default_value() {
-    sed -nE 's/^[[:space:]]*GRUB_DEFAULT=["'"'"']?([^"'"'"']*).*/\1/p' "$1" 2>/dev/null | tail -n1 || true
-}
-GRUB_DEFAULT_SETTING=""
-file=$(resolve_in_root /etc/default/grub || echo "")
-[ -f "$file" ] && GRUB_DEFAULT_SETTING=$(grub_default_value "$file")
-if [ -d "$grub_d" ]; then
-    for defaults in "$grub_d"/*.cfg; do
-        [ -f "$defaults" ] || continue
-        value=$(grub_default_value "$defaults")
-        [ -n "$value" ] && GRUB_DEFAULT_SETTING="$value"
-    done
-fi
+# The verdict describes the newest installed kernel, which is GRUB's first menu entry. GRUB can be pinned to another
+# entry through GRUB_DEFAULT or, with GRUB_DEFAULT=saved, through saved_entry in grubenv. A default that names another
+# installed kernel makes the result unknown and is reported. Any other default except the first entry (empty or 0) -
+# a numeric submenu path such as 1>2, or a title without a version - may select an older kernel and cannot be
+# resolved reliably offline, so it also makes the result unknown instead of READY for a kernel that may not boot.
+GRUB_DEFAULT_SETTING="${GRUB_SETTING[GRUB_DEFAULT]}"
 BOOT_DEFAULT_TARGET="$GRUB_DEFAULT_SETTING"
 if [ "$GRUB_DEFAULT_SETTING" = "saved" ]; then
-    BOOT_DEFAULT_TARGET=""
-    for env in grub2/grubenv grub/grubenv; do
-        file=$(boot_path "$env" || echo "")
-        [ -f "$file" ] && BOOT_DEFAULT_TARGET=$(sed -n 's/^saved_entry=//p' "$file" 2>/dev/null | head -n1 || echo "")
-        [ -n "$BOOT_DEFAULT_TARGET" ] && break
-    done
+    BOOT_DEFAULT_TARGET=$(grub_variable saved_entry 2>/dev/null || echo "")
 fi
 BOOT_DEFAULT_KERNEL=""
-if [ -n "$BOOT_DEFAULT_TARGET" ] && [ -n "$NEWEST_KERNEL" ]; then
+BOOT_DEFAULT_STATUS="newest"
+if [ -n "$NEWEST_KERNEL" ]; then
     case "$BOOT_DEFAULT_TARGET" in
+        ''|0) ;;
         *"$NEWEST_KERNEL"*) ;;
         *)
+            BOOT_DEFAULT_STATUS="unknown"
             for kernel in $KERNELS; do
                 [ "$kernel" = "$NEWEST_KERNEL" ] && continue
-                case "$BOOT_DEFAULT_TARGET" in *"$kernel"*) BOOT_DEFAULT_KERNEL="$kernel"; break ;; esac
+                case "$BOOT_DEFAULT_TARGET" in *"$kernel"*) BOOT_DEFAULT_KERNEL="$kernel"; BOOT_DEFAULT_STATUS="older"; break ;; esac
             done
             ;;
     esac
 fi
 if [ -n "$BOOT_DEFAULT_KERNEL" ]; then
     Log-Warning "GRUB is set to boot kernel $BOOT_DEFAULT_KERNEL, not the newest installed kernel ${NEWEST_KERNEL}; the readiness of the kernel that boots was not assessed."
+elif [ "$BOOT_DEFAULT_STATUS" = "unknown" ]; then
+    Log-Warning "GRUB's default boot entry ($BOOT_DEFAULT_TARGET) could not be matched to an installed kernel, so the kernel that boots may not be the newest one."
 fi
 
 MANA_DISABLED="false"
@@ -702,8 +804,10 @@ fi
 INITRAMFS_HAS_MANA="not-checked"
 INITRAMFS_METHOD="none"
 NEWEST_IMAGE=""
-boot_dir=$(boot_path . || echo "")
-[ -d "$boot_dir" ] && NEWEST_IMAGE=$(ls -1t "$boot_dir"/init* 2>/dev/null | head -n1 || true)
+while IFS=$'\t' read -r _guest image; do
+    [ -n "$image" ] || continue
+    if [ -z "$NEWEST_IMAGE" ] || [ "$image" -nt "$NEWEST_IMAGE" ]; then NEWEST_IMAGE="$image"; fi
+done < <(guest_files /boot 'init*')
 if [ -n "$NEWEST_IMAGE" ]; then
     if command -v lsinitrd >/dev/null 2>&1; then
         INITRAMFS_METHOD="lsinitrd"
@@ -745,9 +849,13 @@ fi
 [ "$NEWEST_NETVSC" = "unknown" ] && UNKNOWNS="${UNKNOWNS}hv-netvsc-driver-unknown;"
 [ "$BOOT_ARGS_STATUS" = "unknown" ] && UNKNOWNS="${UNKNOWNS}kernel-command-line-unknown;"
 [ -n "$BOOT_DEFAULT_KERNEL" ] && UNKNOWNS="${UNKNOWNS}boot-default-kernel-not-newest;"
+[ "$BOOT_DEFAULT_STATUS" = "unknown" ] && UNKNOWNS="${UNKNOWNS}boot-default-kernel-unknown;"
 # Report-only: a reference is a risk indicator, not proof that networking is bound to the virtual function.
 RISK_INDICATORS=""
 [ "${PINNED_COUNT:-0}" -gt 0 ] && RISK_INDICATORS="network-config-references-vf;"
+# A pending grub default only matters for a driver that is a module; a built-in driver cannot be blacklisted.
+case "$PENDING_BLOCKS" in *mana\;*) [ "$NEWEST_MANA" != "present-builtin" ] && RISK_INDICATORS="${RISK_INDICATORS}pending-boot-config-disables-mana;" ;; esac
+case "$PENDING_BLOCKS" in *hv_netvsc\;*) [ "$NEWEST_NETVSC" != "present-builtin" ] && RISK_INDICATORS="${RISK_INDICATORS}pending-boot-config-disables-hv-netvsc;" ;; esac
 
 if [ -n "$PROBLEMS" ]; then
     VERDICT="NOT_READY"
@@ -773,7 +881,7 @@ $PINNED_FILES
 EOF
 
 cat > "$EVIDENCE_DIR/evidence.json" <<EOF
-{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","unknowns":"$UNKNOWNS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","mountMode":"$MOUNT_MODE","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"manaRule":"$MANA_RULE","hvNetvscRule":"$NETVSC_RULE","ruleEvidence":"$(json_escape "$RULE_EVIDENCE")","kernelCommandLine":"$BOOT_ARGS_STATUS","kernelCommandLineSources":"$(json_escape "$BOOT_ARGS_SOURCES")","bootDefaultKernel":"$(json_escape "$BOOT_DEFAULT_KERNEL")","bootMountMode":"$BOOT_MOUNT_MODE","vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
+{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","unknowns":"$UNKNOWNS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","mountMode":"$MOUNT_MODE","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"manaRule":"$MANA_RULE","hvNetvscRule":"$NETVSC_RULE","ruleEvidence":"$(json_escape "$RULE_EVIDENCE")","kernelCommandLine":"$BOOT_ARGS_STATUS","kernelCommandLineSources":"$(json_escape "$BOOT_ARGS_SOURCES")","bootDefaultKernel":"$(json_escape "$BOOT_DEFAULT_KERNEL")","bootMountMode":"$BOOT_MOUNT_MODE","kernelCommandLineUnresolved":"$(json_escape "$BOOT_ARGS_UNRESOLVED")","pendingBootConfigSources":"$(json_escape "$GRUB_DEFAULT_SOURCES")","bootDefaultStatus":"$BOOT_DEFAULT_STATUS","vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
 EOF
 
 Log-Output "[MANA-EVIDENCE-JSON]$(cat "$EVIDENCE_DIR/evidence.json")"
@@ -781,4 +889,4 @@ Log-Output "[MANA-EVIDENCE-JSON]$(cat "$EVIDENCE_DIR/evidence.json")"
 trap - EXIT
 cleanup
 Log-Output "END: Detection complete. Evidence at $EVIDENCE_DIR"
-exit $STATUS
+exit "$STATUS"
