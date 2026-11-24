@@ -60,6 +60,7 @@
           mounting hives in the rescue VM's registry or replaying logs onto the source.
     v1.3: Shared writable-hive lifecycle and default-drive state across dot-source scopes.
           Added numeric, read-only native queries for mounted keys and DWORD metadata.
+    v1.4: The offreg reader can list a key's subkeys (GetSubKeyNames).
 #>
 
 function Get-OfflineRepairState {
@@ -255,6 +256,19 @@ namespace RslOffline
         private static extern int ORGetValue(IntPtr hive, string key, string name,
             out uint type, byte[] data, ref uint size);
 
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int OROpenKey(IntPtr handle, string subKey, out IntPtr result);
+
+        [DllImport("offreg.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int OREnumKey(IntPtr handle, uint index, StringBuilder name, ref uint nameLength,
+            IntPtr className, IntPtr classLength, IntPtr lastWriteTime);
+
+        [DllImport("offreg.dll", ExactSpelling = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        private static extern int ORCloseKey(IntPtr key);
+
         private RegistryHiveReader(IntPtr value) { handle = value; }
 
         public bool IsOpen { get { return handle != IntPtr.Zero; } }
@@ -317,6 +331,35 @@ namespace RslOffline
             if (type != 4 || data.Length != 4)
                 throw new InvalidDataException("'" + key + "\\" + name + "' is not a registry DWORD.");
             return BitConverter.ToUInt32(data, 0);
+        }
+
+        // Names of the direct subkeys of a hive-relative key, or null when the key is absent.
+        public string[] GetSubKeyNames(string key)
+        {
+            if (!IsOpen) throw new ObjectDisposedException("RegistryHiveReader");
+            IntPtr subKey;
+            int result = OROpenKey(handle, key, out subKey);
+            if (result == 2 || result == 3) return null;
+            Check(result, "Opening '" + key + "'");
+            try
+            {
+                var names = new System.Collections.Generic.List<string>();
+                for (uint index = 0; ; index++)
+                {
+                    // Registry key names are limited to 255 characters.
+                    var name = new StringBuilder(256);
+                    uint length = (uint)name.Capacity;
+                    result = OREnumKey(subKey, index, name, ref length, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                    if (result == 259) break;
+                    Check(result, "Enumerating '" + key + "'");
+                    names.Add(name.ToString(0, (int)length));
+                }
+                return names.ToArray();
+            }
+            finally
+            {
+                Check(ORCloseKey(subKey), "Closing '" + key + "'");
+            }
         }
 
         public void Dispose()

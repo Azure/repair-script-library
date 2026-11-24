@@ -62,7 +62,9 @@ function Get-InfDriverFact {
 
     $services = @()
     $binaries = @()
+    $hardwareIds = @()
     $driverVer = $null
+    $class = $null
     ForEach ($entry in $entries) {
         if ($entry.Key -ieq 'AddService') {
             # AddService = name,flags,install-section. An empty name is the null service and installs nothing.
@@ -76,9 +78,19 @@ function Get-InfDriverFact {
         elseif ($entry.Section -eq 'version' -and $entry.Key -ieq 'DriverVer') {
             $driverVer = (& $expand $entry.Value).Trim()
         }
+        elseif ($entry.Section -eq 'version' -and $entry.Key -ieq 'Class') {
+            $class = (& $expand $entry.Value).Trim().Trim('"')
+        }
+        elseif ($entry.Section -ne 'strings') {
+            # Model lines: <description> = <install-section>, <hardware-id>[, <compatible-id>...]
+            ForEach ($part in @($entry.Value -split ',' | Select-Object -Skip 1)) {
+                $id = (& $expand $part).Trim().Trim('"').ToUpperInvariant()
+                if ($id -match '^[A-Z0-9_]+\\VEN_[^\s,]+$' -and $hardwareIds -notcontains $id) { $hardwareIds += $id }
+            }
+        }
     }
 
-    return [pscustomobject]@{ services = $services; serviceBinaries = $binaries; driverVer = $driverVer }
+    return [pscustomobject]@{ services = $services; serviceBinaries = $binaries; hardwareIds = $hardwareIds; driverVer = $driverVer; class = $class }
 }
 
 function Get-OfflineDriverPackage {
@@ -102,6 +114,8 @@ function Get-OfflineDriverPackage {
             driverVer       = $facts.driverVer
             services        = $facts.services
             serviceBinaries = $facts.serviceBinaries
+            hardwareIds     = $facts.hardwareIds
+            class           = $facts.class
         }
     }
     return $result
@@ -146,6 +160,22 @@ function Get-OfflineServiceState {
     return $state
 }
 
+function Test-ManaDeviceDriverStaged {
+    # True when one of $Packages lists a hardware ID that matches the device at $DevicePath (BUS\ID\instance).
+    # An INF ID matches the device ID exactly or as a prefix ending at an '&' boundary, the way PCI IDs nest.
+    Param([Parameter(Mandatory = $true)][string]$DevicePath, [AllowEmptyCollection()][object[]]$Packages = @())
+
+    $parts = $DevicePath.ToUpperInvariant() -split '\\'
+    if ($parts.Count -lt 3) { return $false }
+    $deviceId = "$($parts[0])\$($parts[1])"
+    ForEach ($pkg in @($Packages | Where-Object { $_ })) {
+        ForEach ($hwid in @($pkg.hardwareIds)) {
+            if ($deviceId -eq $hwid -or $deviceId.StartsWith("$hwid&")) { return $true }
+        }
+    }
+    return $false
+}
+
 function Get-ManaDriveAssessment {
     # Turns the facts for one installation into problems, unknowns and a verdict.
     Param($Finding)
@@ -167,15 +197,46 @@ function Get-ManaDriveAssessment {
     if (-not $Finding.driverStoreFound) { $unknowns += 'driver-store-unreadable' }
     elseif (@($Finding.manaPackages).Count -eq 0) { $problems += 'mana-driver-missing' }
 
+    # CONFIGFLAG_REINSTALL: Plug and Play installs the device again at the next boot, copying the driver
+    # binaries from the staged package and rewriting the service.
+    $reinstallFlag = 0x20
+    $devices = @($Finding.manaDevices | Where-Object { $_ })
+    $stagedServices = @($Finding.manaPackages | ForEach-Object { $_.services })
+    $netStaged = @($Finding.manaPackages | Where-Object { $_ -and "$($_.class)" -eq 'Net' }).Count -gt 0
+    $optional = @()
+    if ($Finding.Contains('manaDevicesRead') -and $Finding.manaDevicesRead -eq $false) { $unknowns += 'mana-devices-unknown' }
+    ForEach ($device in $devices) {
+        if ($device.service) { continue }
+        if (Test-ManaDeviceDriverStaged -DevicePath $device.path -Packages $Finding.manaPackages) {
+            # A device Windows has already seen keeps its instance key. Without a driver and without the reinstall
+            # flag, Plug and Play treats it as configured and never installs the driver staged for it.
+            if (-not ([int]$device.configFlags -band $reinstallFlag)) { $problems += "mana-device-not-bound:$($device.path)" }
+        }
+        elseif ($netStaged -and $device.path -match '^(?i)MANA_BUS\\') {
+            # With a Net-class MANA package staged the Ethernet function is covered, so another MANA_BUS child left
+            # without a driver is a non-Ethernet function (RDMA, for example): reported, but networking still works.
+            $optional += $device.path
+        }
+        else {
+            $problems += "mana-device-no-driver:$($device.path)"
+        }
+    }
     ForEach ($svc in @($Finding.manaServices)) {
         if ($svc.readError) { $unknowns += "mana-service-unknown:$($svc.name)"; continue }
         if (-not $svc.present) { continue }   # installed by Plug and Play when the MANA VF first appears
         if ($svc.start -eq $serviceDisabled) { $problems += "mana-driver-disabled:$($svc.name)" }
-        if ($svc.binaryPresent -eq $false) { $problems += "mana-driver-binary-missing:$($svc.name)" }
+        if ($svc.binaryPresent -eq $false) {
+            # Installing a staged package copies the binary back, so a missing binary is only a problem while
+            # no staged package provides the service or a device bound to it will not be reinstalled.
+            $bound = @($devices | Where-Object { $_.service -eq $svc.name })
+            $pending = ($stagedServices -contains $svc.name) -and
+                (@($bound | Where-Object { -not ([int]$_.configFlags -band $reinstallFlag) }).Count -eq 0)
+            if (-not $pending) { $problems += "mana-driver-binary-missing:$($svc.name)" }
+        }
     }
 
     $verdict = if ($problems.Count) { 'NOT_READY' } elseif ($unknowns.Count) { 'UNKNOWN' } else { 'READY' }
-    return [pscustomobject]@{ verdict = $verdict; problems = $problems; unknowns = $unknowns }
+    return [pscustomobject]@{ verdict = $verdict; problems = $problems; unknowns = $unknowns; optionalDevicesWithoutDriver = $optional }
 }
 
 function Get-OverallVerdict {
@@ -188,6 +249,33 @@ function Get-OverallVerdict {
     return 'READY'
 }
 
+
+function Get-OfflineManaDevice {
+    # MANA device instances Windows has already enumerated: the VF (PCI\VEN_1414&DEV_00BA) and the devices its bus
+    # driver creates (MANA_BUS\...). Each carries the bound service, if any, and its ConfigFlags.
+    Param([Parameter(Mandatory = $true)]$Reader, [Parameter(Mandatory = $true)][string]$ControlSet)
+
+    $devices = @()
+    ForEach ($bus in 'PCI', 'MANA_BUS') {
+        $busKey = "$ControlSet\Enum\$bus"
+        $ids = $Reader.GetSubKeyNames($busKey)
+        ForEach ($id in @($ids)) {
+            if (-not $id) { continue }
+            if ($bus -eq 'PCI' -and $id -notmatch '^(?i)VEN_1414&DEV_00BA') { continue }
+            ForEach ($instance in @($Reader.GetSubKeyNames("$busKey\$id"))) {
+                if (-not $instance) { continue }
+                $key = "$busKey\$id\$instance"
+                $flags = $Reader.ReadDword($key, 'ConfigFlags')
+                $devices += [pscustomobject]@{
+                    path        = "$bus\$id\$instance"
+                    service     = $Reader.ReadString($key, 'Service')
+                    configFlags = $(if ($null -eq $flags) { 0 } else { [int]$flags })
+                }
+            }
+        }
+    }
+    return $devices
+}
 
 function Get-ManaOfflineAssessment {
     # Gathers every MANA readiness fact for the Windows installation at $WindowsRoot (e.g. F:\Windows).
@@ -205,10 +293,13 @@ function Get-ManaOfflineAssessment {
         driverStoreFound = $false
         manaPackages     = @()
         manaServices     = @()
+        manaDevices      = @()
+        manaDevicesRead  = $false
         mellanoxPackages = @()
         verdict          = 'UNKNOWN'
         problems         = @()
         unknowns         = @()
+        optionalDevicesWithoutDriver = @()
         readWarnings     = @()
     }
 
@@ -229,7 +320,9 @@ function Get-ManaOfflineAssessment {
     $mana = Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mana'
     $finding.driverStoreFound = $mana.repositoryFound
     $finding.manaPackages = @($mana.packages)
-    $finding.mellanoxPackages = @((Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mlx').packages)
+    # Mellanox packages are informational; their long hardware-ID lists would only bloat the evidence line.
+    $finding.mellanoxPackages = @((Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mlx').packages |
+            Select-Object package, inf, driverVer)
 
     try {
         $system = Open-OfflineRegistryReader -Path "$WindowsRoot\System32\config\SYSTEM"
@@ -244,6 +337,8 @@ function Get-ManaOfflineAssessment {
             $finding.manaServices = @($serviceNames | ForEach-Object {
                     Get-OfflineServiceState -Reader $system -ControlSet $controlSet -ServiceName $_ -WindowsRoot $WindowsRoot
                 })
+            $finding.manaDevices = @(Get-OfflineManaDevice -Reader $system -ControlSet $controlSet)
+            $finding.manaDevicesRead = $true
             $finding.systemHiveRead = $true
         }
         finally { $system.Dispose() }
@@ -256,6 +351,7 @@ function Get-ManaOfflineAssessment {
     $finding.verdict = $assessment.verdict
     $finding.problems = @($assessment.problems)
     $finding.unknowns = @($assessment.unknowns)
+    $finding.optionalDevicesWithoutDriver = @($assessment.optionalDevicesWithoutDriver)
     if (-not $finding.systemHiveRead) { $finding.unknowns += 'system-hive-unreadable' }
     return $finding
 }

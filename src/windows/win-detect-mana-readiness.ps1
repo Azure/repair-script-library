@@ -18,7 +18,9 @@
 #   when the check ends, so a later repair script finds it exactly as attached. A disk that is offline
 #   because its disk ID collides with the repair VM's own disk is left untouched and reported. A disk
 #   that Windows had already onlined writable before this script ran is reported in riskIndicators,
-#   not changed.
+#   not changed. NTFS does not replay its log on a read-only volume, so on a copy taken from a running VM
+#   the read-only view can miss changes written just before the copy (diskReadOnly=true in the evidence
+#   marks that view); win-fix-mana-driver, which opens the disk writable, always assesses the current state.
 #
 #   A missing MANA driver loses accelerated networking but, as long as netvsc is healthy, the VM still
 #   reaches the network through the synthetic adapter. problems tells the two cases apart.
@@ -119,6 +121,7 @@ try {
     $riskIndicators = @()
     if (@($findings | Where-Object { $_.diskReadOnly -eq $false }).Count) { $riskIndicators += 'disk-already-online-writable' }
     if (@($findings | Where-Object { @($_.mellanoxPackages).Count -and -not @($_.manaPackages).Count }).Count) { $riskIndicators += 'mellanox-driver-only' }
+    if (@($findings | Where-Object { @($_.optionalDevicesWithoutDriver).Count }).Count) { $riskIndicators += 'mana-optional-device-without-driver' }
 
     $evidence = [ordered]@{
         schemaVersion  = '1.0'

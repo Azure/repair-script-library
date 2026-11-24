@@ -45,19 +45,30 @@ $inf = @(
     '[Version]',
     'Signature   = "$WINDOWS NT$"',
     'DriverVer   = 01/02/2026,2.0.18.52 ; trailing comment',
+    'Class       = Net',
     '[Example.Services]',
     'AddService = %ServiceName%, 0x00000002, Example_Service_Inst',
+    '[MSFT.NTamd64]',
+    '%Desc% = Example.ndi, PCI\VEN_1414&DEV_00BA',
+    '%Desc2%=Other.ndi, mana_bus\VEN_1414&ROLE_004c, %CompatId%',
     'AddService = , 0x00000002   ; null service installs nothing',
     'addservice = "quoted;svc", 2, Other_Inst',
     '[Example_Service_Inst]',
     'ServiceBinary = %13%\example.sys',
     '[Strings]',
-    'ServiceName = "examplesvc"'
+    'ServiceName = "examplesvc"',
+    'CompatId = "mana_bus\VEN_1414&ROLE_004c_d"'
 )
 $facts = Get-InfDriverFact -Lines $inf
 Assert-Equal '01/02/2026,2.0.18.52' $facts.driverVer 'DriverVer must be read from [Version] with the comment stripped.'
 Assert-Equal 'examplesvc,quoted;svc' ($facts.services -join ',') 'AddService names must expand [Strings] tokens, keep quoted semicolons, and skip the null service.'
 Assert-Equal 'example.sys' ($facts.serviceBinaries -join ',') 'ServiceBinary must resolve to the binary file name.'
+Assert-Equal 'Net' $facts.class 'The setup class is read from [Version].'
+Assert-Equal 'PCI\VEN_1414&DEV_00BA,MANA_BUS\VEN_1414&ROLE_004C,MANA_BUS\VEN_1414&ROLE_004C_D' ($facts.hardwareIds -join ',') 'Model lines yield upper-cased hardware and compatible IDs, with [Strings] tokens expanded.'
+$hwPkg = @([pscustomobject]@{ hardwareIds = $facts.hardwareIds })
+Assert-True (Test-ManaDeviceDriverStaged -DevicePath 'PCI\VEN_1414&DEV_00BA&SUBSYS_00B91414&REV_00\5&a&0&0' -Packages $hwPkg) 'A less specific INF ID matches a more specific device ID at an & boundary.'
+Assert-True (-not (Test-ManaDeviceDriverStaged -DevicePath 'PCI\VEN_1414&DEV_00BAX\1' -Packages $hwPkg)) 'An INF ID must not match across an ID boundary.'
+Assert-True (-not (Test-ManaDeviceDriverStaged -DevicePath 'MANA_BUS\VEN_1414&ROLE_0003\1' -Packages $hwPkg)) 'A device no package lists has no staged driver.'
 Assert-Equal 0 @((Get-InfDriverFact -Lines @()).services).Count 'An empty INF must yield no services.'
 Write-Host 'PASS: INF parsing (DriverVer, AddService with [Strings] expansion, null service, quoted semicolons, ServiceBinary).'
 
@@ -162,6 +173,53 @@ Assert-Equal 'UNKNOWN' (Get-OverallVerdict -Verdicts @('READY', 'UNKNOWN')) 'An 
 Assert-Equal 'READY' (Get-OverallVerdict -Verdicts @('READY', 'READY')) 'All ready is READY.'
 Assert-Equal 'UNKNOWN' (Get-OverallVerdict -Verdicts @()) 'No installations inspected is UNKNOWN.'
 Write-Host "PASS: $($cases.Count) verdict cases and the overall verdict precedence."
+
+# --- MANA device instances (live finding: a seen device is never reinstalled for a driver staged later) --------
+$pkgs = @([pscustomobject]@{ package = 'manavf.inf_x'; services = @('Mana'); hardwareIds = @('PCI\VEN_1414&DEV_00BA', 'MANA_BUS\R') })
+$deviceCases = @(
+    @{ Name = 'seen device without driver'; D = @(@{ path = 'PCI\VEN_1414&DEV_00BA\1'; service = $null; configFlags = 0 }); S = @(); Verdict = 'NOT_READY'; Problems = 'mana-device-not-bound:PCI\VEN_1414&DEV_00BA\1' },
+    @{ Name = 'seen device flagged for reinstall'; D = @(@{ path = 'PCI\VEN_1414&DEV_00BA\1'; service = $null; configFlags = 0x20 }); S = @(); Verdict = 'READY'; Problems = '' },
+    @{ Name = 'bound device'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0 }); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $true }); Verdict = 'READY'; Problems = '' },
+    @{ Name = 'binary missing, bound device not flagged'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0 }); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $false }); Verdict = 'NOT_READY'; Problems = 'mana-driver-binary-missing:Mana' },
+    @{ Name = 'binary missing, staged and bound device flagged'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0x20 }); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $false }); Verdict = 'READY'; Problems = '' },
+    @{ Name = 'flagged device with no staged driver'; D = @(@{ path = 'MANA_BUS\X\1'; service = $null; configFlags = 0x20 }); S = @(); Verdict = 'NOT_READY'; Problems = 'mana-device-no-driver:MANA_BUS\X\1' },
+    @{ Name = 'binary missing, staged, no device yet'; D = @(); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $false }); Verdict = 'READY'; Problems = '' }
+)
+ForEach ($case in $deviceCases) {
+    $finding = New-Finding $okNetvsc -Packages $pkgs -Services $case.S
+    $finding.manaDevices = @($case.D | ForEach-Object { [pscustomobject]$_ })
+    $finding.manaDevicesRead = $true
+    $result = Get-ManaDriveAssessment -Finding $finding
+    Assert-Equal $case.Verdict $result.verdict "Verdict for '$($case.Name)'."
+    Assert-Equal $case.Problems ($result.problems -join ';') "Problems for '$($case.Name)'."
+}
+$netPkgs = @([pscustomobject]@{ package = 'manavf.inf_x'; class = 'Net'; services = @('Mana'); hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') })
+$finding = New-Finding $okNetvsc -Packages $netPkgs
+$finding.manaDevices = @([pscustomobject]@{ path = 'MANA_BUS\VEN_1414&ROLE_004C\1'; service = 'Mana'; configFlags = 0 }, [pscustomobject]@{ path = 'MANA_BUS\VEN_1414&ROLE_0003\1'; service = $null; configFlags = 0x40 })
+$finding.manaDevicesRead = $true
+$result = Get-ManaDriveAssessment -Finding $finding
+Assert-Equal 'READY' $result.verdict 'With the Ethernet function covered, a MANA_BUS child without a driver (RDMA) does not block READY.'
+Assert-Equal 'MANA_BUS\VEN_1414&ROLE_0003\1' ($result.optionalDevicesWithoutDriver -join ',') 'The uncovered non-Ethernet child is reported as optional.'
+$finding.manaDevices = @([pscustomobject]@{ path = 'PCI\VEN_1414&DEV_00BA\1'; service = $null; configFlags = 0 })
+Assert-Equal 'mana-device-no-driver:PCI\VEN_1414&DEV_00BA\1' ((Get-ManaDriveAssessment -Finding $finding).problems -join ';') 'The VF is never optional: without its bus driver there is no MANA networking.'
+$finding = New-Finding $okNetvsc -Packages $pkgs; $finding.manaDevicesRead = $false
+Assert-Equal 'UNKNOWN' (Get-ManaDriveAssessment -Finding $finding).verdict 'Unreadable device instances block a READY claim.'
+
+$enumReader = [pscustomobject]@{
+    Keys   = @{
+        'ControlSet001\Enum\PCI'                                   = @('VEN_1414&DEV_00BA&SUBSYS_1&REV_00', 'VEN_8086&DEV_7111')
+        'ControlSet001\Enum\PCI\VEN_1414&DEV_00BA&SUBSYS_1&REV_00'  = @('5&a&0&0')
+        'ControlSet001\Enum\MANA_BUS'                              = @('VEN_1414&ROLE_004C')
+        'ControlSet001\Enum\MANA_BUS\VEN_1414&ROLE_004C'           = @('6&b&0&1')
+    }
+    Values = @{ 'ControlSet001\Enum\MANA_BUS\VEN_1414&ROLE_004C\6&b&0&1|Service' = 'Mana'; 'ControlSet001\Enum\MANA_BUS\VEN_1414&ROLE_004C\6&b&0&1|ConfigFlags' = [uint32]0x20 }
+}
+$enumReader | Add-Member ScriptMethod GetSubKeyNames { Param($key) if ($this.Keys.ContainsKey($key)) { , $this.Keys[$key] } else { $null } }
+$enumReader | Add-Member ScriptMethod ReadString { Param($key, $name) $this.Values["$key|$name"] }
+$enumReader | Add-Member ScriptMethod ReadDword { Param($key, $name) $this.Values["$key|$name"] }
+$devices = @(Get-OfflineManaDevice -Reader $enumReader -ControlSet 'ControlSet001')
+Assert-Equal 'PCI\VEN_1414&DEV_00BA&SUBSYS_1&REV_00\5&a&0&0|0|,MANA_BUS\VEN_1414&ROLE_004C\6&b&0&1|32|Mana' (@($devices | ForEach-Object { "$($_.path)|$($_.configFlags)|$($_.service)" }) -join ',') 'Only the MANA VF and MANA_BUS children are collected, with a missing ConfigFlags read as 0.'
+Write-Host "PASS: $($deviceCases.Count + 1) MANA device-instance cases and offline device enumeration."
 
 # --- Read-only contract against the script text ---------------------------------------------------
 ForEach ($forbidden in 'reg(\.exe)?\s+(load|unload|add|delete|import|restore|save)', 'Set-ItemProperty', 'New-ItemProperty', 'Remove-ItemProperty', 'Set-Disk', 'bcdedit', 'Remove-Item') {
