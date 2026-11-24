@@ -340,6 +340,47 @@ else
 fi
 losetup -d "$L"
 
+# The verdict describes the newest kernel, so a GRUB default pinned to another installed kernel must not be READY.
+L=$(new_image grub-pinned-older ext4); R="$WORK/grub-pinned-older.mnt"
+kernel "$R" 5.4.0-1109-azure none module yes
+kernel "$R" 6.8.0-1073-azure module module yes
+printf 'GRUB_DEFAULT="Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced"\n' > "$R/etc/default/grub"
+run_case grub-pinned-older "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-not-newest;' '"bootDefaultKernel":"5.4.0-1109-azure"'
+
+# With GRUB_DEFAULT=saved the kernel that boots is grubenv's saved_entry (RHEL-family BLS entry IDs name it).
+L=$(new_image grub-saved-entry-older ext4); R="$WORK/grub-saved-entry-older.mnt"
+kernel "$R" 5.14.0-362.el9.x86_64 module module yes
+kernel "$R" 5.14.0-427.el9.x86_64 module module yes
+printf 'GRUB_DEFAULT=saved\n' > "$R/etc/default/grub"
+printf '# GRUB Environment Block\nsaved_entry=0123abcd-5.14.0-362.el9.x86_64\n' > "$R/boot/grub/grubenv"
+run_case grub-saved-entry-older "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-not-newest;' '"bootDefaultKernel":"5.14.0-362.el9.x86_64"'
+
+# A saved_entry that names the newest kernel, and a numeric default, are the newest kernel: still READY.
+L=$(new_image grub-saved-entry-newest ext4); R="$WORK/grub-saved-entry-newest.mnt"
+kernel "$R" 5.14.0-362.el9.x86_64 module module yes
+kernel "$R" 5.14.0-427.el9.x86_64 module module yes
+printf 'GRUB_DEFAULT=saved\n' > "$R/etc/default/grub"
+printf 'saved_entry=0123abcd-5.14.0-427.el9.x86_64\n' > "$R/boot/grub/grubenv"
+run_case grub-saved-entry-newest "$L" '"verdict":"READY"' '"bootDefaultKernel":""'
+
+L=$(new_image grub-default-numeric ext4); R="$WORK/grub-default-numeric.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+printf 'GRUB_DEFAULT=0\n' > "$R/etc/default/grub"
+run_case grub-default-numeric "$L" '"verdict":"READY"' '"bootDefaultKernel":""'
+
+# Network configuration is resolved inside the disk: an absolute symlink to a file that exists only on this machine
+# is not read, while one that resolves to a file on the disk is.
+HOST_NETPLAN="$WORK/host-only-netplan.yaml"
+printf 'network:\n  ethernets:\n    eth1:\n      match:\n        driver: mlx5_core\n' > "$HOST_NETPLAN"
+L=$(new_image netplan-absolute-symlink ext4); R="$WORK/netplan-absolute-symlink.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+mkdir -p "$R/etc/netplan" "$R/opt/net"
+ln -s "$HOST_NETPLAN" "$R/etc/netplan/50-host-link.yaml"
+printf 'network:\n  ethernets:\n    enP12345s1:\n      dhcp4: true\n' > "$R/opt/net/vf.yaml"
+ln -s /opt/net/vf.yaml "$R/etc/netplan/60-guest-link.yaml"
+run_case netplan-absolute-symlink "$L" '"verdict":"READY"' '"vfPinnedConfigFiles":["/etc/netplan/60-guest-link.yaml"]'
+rm -f "$HOST_NETPLAN"
+
 rm -rf "$WORK"
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

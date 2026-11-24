@@ -16,6 +16,8 @@
 #       command line is read from the boot entry of the newest kernel (grub.cfg, or BLS entries and grubenv on a
 #       separate /boot). An install rule whose effect cannot be established is reported as unknown. Rules cannot
 #       disable a built-in driver, so they are recorded but not counted as a problem for one.
+#     - whether GRUB is pinned (GRUB_DEFAULT, or saved_entry with GRUB_DEFAULT=saved) to an installed kernel other
+#       than the newest; the kernel that boots is then not the one assessed, so the result is unknown
 #     - network configuration that references Mellanox drivers (mlx4/mlx5) or virtual-function interface
 #       names (enP*), which can bind networking to a virtual function instead of the synthetic interface
 #     - informational only: whether the newest initramfs image contains the mana module
@@ -618,6 +620,49 @@ BOOT_ARGS_STATUS="unknown"
 [ "$BOOT_ENTRY_FOUND" = "true" ] && BOOT_ARGS_STATUS="established"
 [ "$BOOT_ARGS_STATUS" = "unknown" ] && Log-Warning "No boot entry for kernel ${NEWEST_KERNEL:-none} was found, so the effective kernel command line could not be checked."
 
+# --- Boot default ----------------------------------------------------------------------------------
+# The verdict describes the newest installed kernel. GRUB can be pinned to a different one through GRUB_DEFAULT or,
+# with GRUB_DEFAULT=saved, through saved_entry in grubenv; the kernel that boots is then not the one assessed. A
+# default that names another installed kernel makes the result unknown instead of READY for the wrong kernel. A
+# numeric or title default that names no kernel version is left alone, because it normally selects the newest.
+grub_default_value() {
+    sed -nE 's/^[[:space:]]*GRUB_DEFAULT=["'"'"']?([^"'"'"']*).*/\1/p' "$1" 2>/dev/null | tail -n1 || true
+}
+GRUB_DEFAULT_SETTING=""
+file=$(resolve_in_root /etc/default/grub || echo "")
+[ -f "$file" ] && GRUB_DEFAULT_SETTING=$(grub_default_value "$file")
+if [ -d "$grub_d" ]; then
+    for defaults in "$grub_d"/*.cfg; do
+        [ -f "$defaults" ] || continue
+        value=$(grub_default_value "$defaults")
+        [ -n "$value" ] && GRUB_DEFAULT_SETTING="$value"
+    done
+fi
+BOOT_DEFAULT_TARGET="$GRUB_DEFAULT_SETTING"
+if [ "$GRUB_DEFAULT_SETTING" = "saved" ]; then
+    BOOT_DEFAULT_TARGET=""
+    for env in grub2/grubenv grub/grubenv; do
+        file=$(boot_path "$env" || echo "")
+        [ -f "$file" ] && BOOT_DEFAULT_TARGET=$(sed -n 's/^saved_entry=//p' "$file" 2>/dev/null | head -n1 || echo "")
+        [ -n "$BOOT_DEFAULT_TARGET" ] && break
+    done
+fi
+BOOT_DEFAULT_KERNEL=""
+if [ -n "$BOOT_DEFAULT_TARGET" ] && [ -n "$NEWEST_KERNEL" ]; then
+    case "$BOOT_DEFAULT_TARGET" in
+        *"$NEWEST_KERNEL"*) ;;
+        *)
+            for kernel in $KERNELS; do
+                [ "$kernel" = "$NEWEST_KERNEL" ] && continue
+                case "$BOOT_DEFAULT_TARGET" in *"$kernel"*) BOOT_DEFAULT_KERNEL="$kernel"; break ;; esac
+            done
+            ;;
+    esac
+fi
+if [ -n "$BOOT_DEFAULT_KERNEL" ]; then
+    Log-Warning "GRUB is set to boot kernel $BOOT_DEFAULT_KERNEL, not the newest installed kernel ${NEWEST_KERNEL}; the readiness of the kernel that boots was not assessed."
+fi
+
 MANA_DISABLED="false"
 NETVSC_DISABLED="false"
 [ "$MANA_RULE" = "disabled" ] && MANA_DISABLED="true"
@@ -625,12 +670,28 @@ NETVSC_DISABLED="false"
 [ -n "$RULE_EVIDENCE" ] && Log-Warning "Rules affecting MANA/synthetic networking: $RULE_EVIDENCE"
 
 # --- Network configuration pinned to a virtual function (report-only) -----------------------------------
-# File names only: configuration contents can include addresses.
-PINNED_FILES=$(grep -lsE 'mlx4_core|mlx4_en|mlx5_core|(^|[^A-Za-z0-9])enP[0-9]+' \
-    "$MOUNT_POINT"/etc/netplan/*.yaml "$MOUNT_POINT"/etc/netplan/*.yml \
-    "$MOUNT_POINT"/etc/sysconfig/network-scripts/ifcfg-* "$MOUNT_POINT"/etc/sysconfig/network/ifcfg-* \
-    "$MOUNT_POINT"/etc/NetworkManager/system-connections/* "$MOUNT_POINT"/etc/systemd/network/* \
-    "$MOUNT_POINT"/etc/udev/rules.d/*.rules 2>/dev/null | sed "s|^$MOUNT_POINT||" | sort -u || true)
+# File names only: configuration contents can include addresses. Each directory and file is resolved inside the
+# attached filesystem, so an absolute symlink (for example a netplan file linked to /run) is never read from the
+# repair VM's own configuration.
+PINNED_FILES=""
+for spec in '/etc/netplan|*.yaml' '/etc/netplan|*.yml' '/etc/sysconfig/network-scripts|ifcfg-*' \
+    '/etc/sysconfig/network|ifcfg-*' '/etc/NetworkManager/system-connections|*' '/etc/systemd/network|*' \
+    '/etc/udev/rules.d|*.rules'; do
+    dir="${spec%%|*}"
+    pattern="${spec#*|}"
+    host_dir=$(resolve_in_root "$dir" || echo "")
+    [ -d "$host_dir" ] || continue
+    for f in "$host_dir"/$pattern; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        guest_file="$dir/$(basename "$f")"
+        real=$(resolve_in_root "$guest_file" || echo "")
+        [ -f "$real" ] || continue
+        if grep -qsE 'mlx4_core|mlx4_en|mlx5_core|(^|[^A-Za-z0-9])enP[0-9]+' "$real"; then
+            PINNED_FILES="${PINNED_FILES}${guest_file}"$'\n'
+        fi
+    done
+done
+PINNED_FILES=$(printf '%s' "$PINNED_FILES" | sort -u || true)
 PINNED_COUNT=$(printf '%s\n' "$PINNED_FILES" | grep -c . || true)
 if [ "${PINNED_COUNT:-0}" -gt 0 ]; then
     Log-Warning "Network configuration referencing Mellanox drivers or VF interface names (report-only): $(echo "$PINNED_FILES" | tr '\n' ' ')"
@@ -683,6 +744,7 @@ fi
 [ "$NEWEST_MANA" = "unknown" ] && UNKNOWNS="${UNKNOWNS}mana-driver-unknown;"
 [ "$NEWEST_NETVSC" = "unknown" ] && UNKNOWNS="${UNKNOWNS}hv-netvsc-driver-unknown;"
 [ "$BOOT_ARGS_STATUS" = "unknown" ] && UNKNOWNS="${UNKNOWNS}kernel-command-line-unknown;"
+[ -n "$BOOT_DEFAULT_KERNEL" ] && UNKNOWNS="${UNKNOWNS}boot-default-kernel-not-newest;"
 # Report-only: a reference is a risk indicator, not proof that networking is bound to the virtual function.
 RISK_INDICATORS=""
 [ "${PINNED_COUNT:-0}" -gt 0 ] && RISK_INDICATORS="network-config-references-vf;"
@@ -711,7 +773,7 @@ $PINNED_FILES
 EOF
 
 cat > "$EVIDENCE_DIR/evidence.json" <<EOF
-{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","unknowns":"$UNKNOWNS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","mountMode":"$MOUNT_MODE","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"manaRule":"$MANA_RULE","hvNetvscRule":"$NETVSC_RULE","ruleEvidence":"$(json_escape "$RULE_EVIDENCE")","kernelCommandLine":"$BOOT_ARGS_STATUS","kernelCommandLineSources":"$(json_escape "$BOOT_ARGS_SOURCES")","bootMountMode":"$BOOT_MOUNT_MODE","vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
+{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","unknowns":"$UNKNOWNS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","mountMode":"$MOUNT_MODE","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"manaRule":"$MANA_RULE","hvNetvscRule":"$NETVSC_RULE","ruleEvidence":"$(json_escape "$RULE_EVIDENCE")","kernelCommandLine":"$BOOT_ARGS_STATUS","kernelCommandLineSources":"$(json_escape "$BOOT_ARGS_SOURCES")","bootDefaultKernel":"$(json_escape "$BOOT_DEFAULT_KERNEL")","bootMountMode":"$BOOT_MOUNT_MODE","vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
 EOF
 
 Log-Output "[MANA-EVIDENCE-JSON]$(cat "$EVIDENCE_DIR/evidence.json")"
