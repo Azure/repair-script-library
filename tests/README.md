@@ -36,17 +36,24 @@ pwsh -NoProfile -File ./tests/test-map-catalog.ps1
 sudo bash ./tests/test-linux-detect-mana-readiness.sh .
 ```
 
-Changes to `win-detect-mana-readiness.ps1`, its `map.json` entry, or the `-ReadOnly` mode of
-`Get-Disk-Partitions-v3.ps1` must pass these tests from the repository root. The detector test uses
-a temporary driver store and an in-memory stand-in for the offreg reader, so it needs no elevation;
-run it in Windows PowerShell 5.1 as well, because that is what runs on the repair VM.
+Changes to `win-detect-mana-readiness.ps1`, `win-fix-mana-driver.ps1`, `common/helpers/ManaReadiness.ps1`,
+their `map.json` entries, or the `-ReadOnly` mode of `Get-Disk-Partitions-v3.ps1` must pass these tests from the
+repository root. The tests use a temporary driver store, an in-memory stand-in for the offreg reader, and a
+scratch `HKCU` key in place of a mounted hive, so they need no elevation; run them in Windows PowerShell 5.1 as
+well, because that is what runs on the repair VM.
 
 ```powershell
 pwsh -NoProfile -File ./tests/test-map-catalog.ps1
 pwsh -NoProfile -File ./tests/test-get-disk-partitions-v3.ps1
 pwsh -NoProfile -File ./tests/test-win-detect-mana-readiness.ps1
+pwsh -NoProfile -File ./tests/test-win-fix-mana-driver.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File ./tests/test-win-detect-mana-readiness.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File ./tests/test-win-fix-mana-driver.ps1
 ```
+
+`win-fix-mana-driver` writes to the guest, so a change to its write behavior also needs live validation before
+merge: Repair on a disabled-service and a driver-missing copy, then boot the source VM on the repaired disk and
+confirm the MANA adapter binds, and Rollback on a repaired copy.
 
 ## Generation 1 to Generation 2 conversion merge gates
 

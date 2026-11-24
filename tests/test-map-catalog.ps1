@@ -71,6 +71,12 @@ Assert-True ($winManaDetector[0].description -match '--run-on-repair') `
 Assert-True ($winManaDetector[0].description -match 'Makes no changes') `
     'The Windows MANA detector description must state that it is read-only.'
 
+$winManaRepair = @($catalog | Where-Object id -eq 'win-fix-mana-driver')
+Assert-True ($winManaRepair.Count -eq 1) 'win-fix-mana-driver must be registered exactly once.'
+Assert-True ($winManaRepair[0].path -eq 'src/windows/win-fix-mana-driver.ps1') 'win-fix-mana-driver must point at the Windows MANA repair.'
+Assert-True ($winManaRepair[0].description -match '--run-on-repair') 'The MANA repair changes an attached offline disk, so its description must say --run-on-repair.'
+Assert-True ($winManaRepair[0].description -match 'Mode=Report \(default\) makes no changes') 'The MANA repair description must state that the default mode makes no changes.'
+
 $windowsDetector = @($catalog | Where-Object id -eq 'win-detect-nvme-readiness')
 Assert-True ($windowsDetector[0].description -match 'Hyper-V generation') `
     'The Windows detector description must say that it reports the Hyper-V generation.'

@@ -21,16 +21,23 @@ function Assert-Equal {
     if ("$Expected" -ne "$Actual") { throw "ASSERTION FAILED: $Message (expected '$Expected', got '$Actual')" }
 }
 
-$tokens = $null
-$parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseInput($sourceText, [ref]$tokens, [ref]$parseErrors)
-Assert-True ($parseErrors.Count -eq 0) "The detector must parse cleanly: $($parseErrors | Out-String)"
-$functions = $ast.FindAll({ Param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)
-ForEach ($fn in $functions) { . ([scriptblock]::Create($fn.Extent.Text)) }
-ForEach ($name in 'Get-InfDriverFact', 'Get-OfflineDriverPackage', 'Resolve-OfflineImagePath', 'Get-OfflineServiceState', 'Get-ManaDriveAssessment', 'Get-OverallVerdict') {
-    Assert-True ([bool](Get-Command $name -ErrorAction SilentlyContinue)) "The detector must define $name."
+$helperPath = Join-Path $repositoryRoot 'src/windows/common/helpers/ManaReadiness.ps1'
+$helperText = Get-Content -LiteralPath $helperPath -Raw
+ForEach ($path in $sourceScript, $helperPath) {
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) "$path must parse cleanly: $($parseErrors | Out-String)"
 }
-
+. $helperPath
+ForEach ($name in 'Get-InfDriverFact', 'Get-OfflineDriverPackage', 'Resolve-ManaServiceBinaryPath', 'Get-OfflineServiceState', 'Get-ManaDriveAssessment', 'Get-OverallVerdict', 'Get-ManaOfflineAssessment') {
+    Assert-True ([bool](Get-Command $name -ErrorAction SilentlyContinue)) "ManaReadiness.ps1 must define $name."
+}
+# The helper is also dot-sourced by win-fix-mana-driver next to Use-OfflineRegistryHive.ps1; a shared name would
+# silently replace one of the two definitions.
+$registryHelperText = Get-Content -LiteralPath (Join-Path $repositoryRoot 'src/windows/common/helpers/Use-OfflineRegistryHive.ps1') -Raw
+ForEach ($fn in [regex]::Matches($helperText, '(?m)^function ([\w-]+)')) {
+    Assert-True ($registryHelperText -notmatch "(?m)^function $([regex]::Escape($fn.Groups[1].Value))\b") "ManaReadiness.ps1 must not redefine $($fn.Groups[1].Value)."
+}
 # --- INF parsing --------------------------------------------------------------------------------
 # Synthetic INF: exercises the syntax the parser must survive, not a copy of a real MANA INF.
 $inf = @(
@@ -81,11 +88,11 @@ try {
     Write-Host 'PASS: driver store discovery (MANA, Mellanox, INF-less directory, missing store).'
 
     # --- ImagePath mapping --------------------------------------------------------------------------
-    Assert-Equal "$windowsRoot\System32\drivers\netvsc.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'netvsc' -ImagePath '\SystemRoot\System32\drivers\netvsc.sys') '\SystemRoot must map to the attached disk.'
-    Assert-Equal "$windowsRoot\System32\drivers\a.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'a' -ImagePath 'System32\drivers\a.sys') 'A System32-relative path must map to the attached disk.'
-    Assert-Equal "$windowsRoot\System32\drivers\b.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'b' -ImagePath '\??\C:\Windows\System32\drivers\b.sys') 'An absolute C:\Windows path must map to the attached disk, never the repair VM.'
-    Assert-Equal "$windowsRoot\System32\drivers\c.sys" (Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'c' -ImagePath $null) 'A missing ImagePath defaults to System32\drivers\<service>.sys.'
-    Assert-Equal '' "$(Resolve-OfflineImagePath -WindowsRoot $windowsRoot -ServiceName 'd' -ImagePath 'D:\Vendor\d.sys')" 'An unmappable path must not be guessed.'
+    Assert-Equal "$windowsRoot\System32\drivers\netvsc.sys" (Resolve-ManaServiceBinaryPath -WindowsRoot $windowsRoot -ServiceName 'netvsc' -ImagePath '\SystemRoot\System32\drivers\netvsc.sys') '\SystemRoot must map to the attached disk.'
+    Assert-Equal "$windowsRoot\System32\drivers\a.sys" (Resolve-ManaServiceBinaryPath -WindowsRoot $windowsRoot -ServiceName 'a' -ImagePath 'System32\drivers\a.sys') 'A System32-relative path must map to the attached disk.'
+    Assert-Equal "$windowsRoot\System32\drivers\b.sys" (Resolve-ManaServiceBinaryPath -WindowsRoot $windowsRoot -ServiceName 'b' -ImagePath '\??\C:\Windows\System32\drivers\b.sys') 'An absolute C:\Windows path must map to the attached disk, never the repair VM.'
+    Assert-Equal "$windowsRoot\System32\drivers\c.sys" (Resolve-ManaServiceBinaryPath -WindowsRoot $windowsRoot -ServiceName 'c' -ImagePath $null) 'A missing ImagePath defaults to System32\drivers\<service>.sys.'
+    Assert-Equal '' "$(Resolve-ManaServiceBinaryPath -WindowsRoot $windowsRoot -ServiceName 'd' -ImagePath 'D:\Vendor\d.sys')" 'An unmappable path must not be guessed.'
     Write-Host 'PASS: ImagePath mapping never resolves to the repair VM.'
 
     # --- Service state through an offreg stand-in ---------------------------------------------------
@@ -159,11 +166,12 @@ Write-Host "PASS: $($cases.Count) verdict cases and the overall verdict preceden
 # --- Read-only contract against the script text ---------------------------------------------------
 ForEach ($forbidden in 'reg(\.exe)?\s+(load|unload|add|delete|import|restore|save)', 'Set-ItemProperty', 'New-ItemProperty', 'Remove-ItemProperty', 'Set-Disk', 'bcdedit', 'Remove-Item') {
     Assert-True ($sourceText -notmatch $forbidden) "The detector must not contain a write primitive matching '$forbidden'."
+    Assert-True ($helperText -notmatch $forbidden) "ManaReadiness.ps1 must not contain a write primitive matching '$forbidden'."
 }
 Assert-True ($sourceText -match 'Get-Windows-OsDrives-v3 -ReadOnly') 'Discovery must bring an offline disk online read-only.'
 Assert-True ($sourceText -match '(?s)finally \{.*Restore-Disk-Partitions-v3') 'Disks must be returned to their attached state in a finally block.'
-Assert-True ($sourceText -match 'Open-OfflineRegistryReader') 'Hives must be read with the in-memory offreg reader.'
+Assert-True ($helperText -match 'Open-OfflineRegistryReader') 'Hives must be read with the in-memory offreg reader.'
 Assert-True ($sourceText -match '\[MANA-EVIDENCE-JSON\]') 'The detector must emit the shared MANA evidence marker.'
 Assert-True ($sourceText -match "scenario\s*=\s*'mana-readiness'") 'The scenario must match linux-detect-mana-readiness.'
-Assert-True ($sourceText -match '(?s)\.Dispose\(\).*\.Dispose\(\)') 'Each reader must be disposed.'
+Assert-True ($helperText -match '(?s)\.Dispose\(\).*\.Dispose\(\)') 'Each reader must be disposed.'
 Write-Host 'PASS: read-only contract (no hive mounts, registry writes or disk changes) and the evidence contract.'

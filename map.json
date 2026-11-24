@@ -200,6 +200,11 @@
 		"description": "Read-only check of whether a Windows OS disk is ready for hosts with the Microsoft Azure Network Adapter (MANA). Reports whether the synthetic network driver (netvsc) is present and enabled, which MANA driver packages are in the driver store, and whether any MANA driver service is disabled. Reads hives in memory without mounting them, and brings an offline disk online read-only. Makes no changes. NOTE: use option --run-on-repair."
 	},
 	{
+		"id": "win-fix-mana-driver",
+		"path": "src/windows/win-fix-mana-driver.ps1",
+		"description": "Repairs the MANA (Microsoft Azure Network Adapter) driver on an offline Windows OS disk: sets a disabled MANA driver service back to demand start, and adds the repair VM's signed MANA driver packages to the offline image with DISM when the driver is missing. Mode=Report (default) makes no changes; Mode=Repair backs up, applies and verifies; Mode=Rollback undoes a repair using its manifest (BackupFile=<path>). Synthetic network driver (netvsc) problems are reported but not changed. NOTE: use option --run-on-repair."
+	},
+	{
 		"id": "win-enable-nvme-boot-driver",
 		"path": "src/windows/win-enable-nvme-boot-driver.ps1",
 		"description": "Enables the Windows inbox stornvme boot-start driver on the offline OS disk of a VM that no longer boots after switching to an NVMe disk controller. Mode=Report (default) is read-only; Mode=Repair backs up, writes and verifies; Mode=Rollback restores the backup emitted by Repair. NOTE: use option --run-on-repair."
