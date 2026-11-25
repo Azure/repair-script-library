@@ -18,6 +18,43 @@ Do not merge an affected change when any gate fails or when the pull request doe
 results. These tests are static and fixture-based; they do not replace the live validation required
 for changes that modify a repair script's write behavior.
 
+## MANA readiness merge gates
+
+Changes to `linux-detect-mana-readiness.sh` or its `map.json` entry must pass both tests from the
+repository root. The second test needs root on Linux or WSL because it builds disk images and
+attaches them as loop devices; it also verifies that the detector writes nothing to the disk and
+leaves no mount, snapshot, or loop device behind. Install `xfsprogs` first (it provides `mkfs.xfs`
+and `xfs_io`); without it, the XFS and crash-consistent cases are skipped. One case temporarily writes
+`/usr/lib/modprobe.d/zz-mana-detector-fixture.conf` on the test machine, to prove the detector never reads the
+repair VM's own modprobe configuration, and removes it afterwards.
+
+```powershell
+pwsh -NoProfile -File ./tests/test-map-catalog.ps1
+```
+
+```bash
+sudo bash ./tests/test-linux-detect-mana-readiness.sh .
+```
+
+Changes to `win-detect-mana-readiness.ps1`, `win-fix-mana-driver.ps1`, `common/helpers/ManaReadiness.ps1`,
+their `map.json` entries, or the `-ReadOnly` mode of `Get-Disk-Partitions-v3.ps1` must pass these tests from the
+repository root. The tests use a temporary driver store, an in-memory stand-in for the offreg reader, and a
+scratch `HKCU` key in place of a mounted hive, so they need no elevation; run them in Windows PowerShell 5.1 as
+well, because that is what runs on the repair VM.
+
+```powershell
+pwsh -NoProfile -File ./tests/test-map-catalog.ps1
+pwsh -NoProfile -File ./tests/test-get-disk-partitions-v3.ps1
+pwsh -NoProfile -File ./tests/test-win-detect-mana-readiness.ps1
+pwsh -NoProfile -File ./tests/test-win-fix-mana-driver.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File ./tests/test-win-detect-mana-readiness.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File ./tests/test-win-fix-mana-driver.ps1
+```
+
+`win-fix-mana-driver` writes to the guest, so a change to its write behavior also needs live validation before
+merge: Repair on a disabled-service and a driver-missing copy, then boot the source VM on the repaired disk and
+confirm the MANA adapter binds, and Rollback on a repaired copy.
+
 ## Generation 1 to Generation 2 conversion merge gates
 
 Changes to `win-convert-gen1-to-gen2.ps1` or its `map.json` entry must pass both tests from the

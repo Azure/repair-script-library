@@ -1,11 +1,11 @@
 #########################################################################################################
 #
 # .SYNOPSIS
-#   NVMe-aware disk discovery for attached OS disks. v3.0.0
+#   NVMe-aware disk discovery for attached OS disks. v3.1.0
 #
 # .DESCRIPTION
 #   Returns the partitions of every OS/data disk attached to this repair VM, bringing each disk online
-#   and read-write first. Selects disks by BusType, so it works whether the repair VM was created with
+#   and read-write first (or, with -ReadOnly, online and read-only for detection-only callers). Selects disks by BusType, so it works whether the repair VM was created with
 #   the SCSI or the NVMe disk controller.
 #
 #   Get-Disk-Partitions.ps1 (v1) and Get-Disk-Partitions-v2.ps1 select with:
@@ -48,6 +48,9 @@
 # function is called, not to this file, so a dot-source into a child scope would leave it unresolved.
 $global:AzureTempDiskLabel = 'Temporary Storage'
 
+# Disks that Get-Disk-Partitions-v3 -ReadOnly brought online, for Restore-Disk-Partitions-v3 to put back.
+if ($null -eq $global:DiskPartitionsV3ReadOnlyChanges) { $global:DiskPartitionsV3ReadOnlyChanges = @() }
+
 # Allows the helper to be dot-sourced on its own (e.g. Pester) without init.ps1. The shims write to the
 # verbose and warning streams, so standalone runs need -Verbose to see Log-Info output.
 # Defined via the function: drive so the repo's Log-* naming convention does not trip PSScriptAnalyzer here.
@@ -89,7 +92,13 @@ function Get-Disk-Partitions-v3 {
 
         [Parameter(Mandatory = $false)]
         [ValidateRange(0, 300)]
-        [int]$DriveLetterTimeoutSeconds = 60
+        [int]$DriveLetterTimeoutSeconds = 60,
+
+        # For detection-only callers. An offline disk is marked read-only before it is brought online,
+        # so NTFS never mounts it writable and cannot replay its log onto the source disk. Read-only is
+        # never cleared. A disk that was already online is left exactly as it was found.
+        [Parameter(Mandatory = $false)]
+        [switch]$ReadOnly
     )
 
     $busTypes = switch ($BusTypeFilter) {
@@ -102,7 +111,8 @@ function Get-Disk-Partitions-v3 {
 
     # IsBoot and IsSystem both report $false while a disk is offline, so an offline attached OS disk is
     # correctly kept here while the repair VM's own live disk is excluded.
-    $disks = Get-Disk -ErrorAction Stop | Where-Object {
+    $allDisks = @(Get-Disk -ErrorAction Stop)
+    $disks = $allDisks | Where-Object {
         $busTypes -contains $_.BusType -and -not $_.IsBoot -and -not $_.IsSystem
     }
 
@@ -116,11 +126,57 @@ function Get-Disk-Partitions-v3 {
 
         $wasOffline = [bool]$disk.IsOffline
 
-        if ($disk.IsOffline) {
-            $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
+        if ($ReadOnly) {
+            if ($disk.IsOffline) {
+                # Windows keeps a disk offline when its disk ID matches another disk, which is what a copy of
+                # an OS disk looks like on a repair VM built from the same image. Onlining it makes Windows
+                # rewrite the ID, and a read-only attempt instead hides the disk and leaves a read-only flag
+                # on the repair VM that follows the ID to every later copy. Leave it exactly as found.
+                $sameId = @($allDisks | Where-Object { $_.Number -ne $disk.Number -and $disk.Guid -and "$($_.Guid)" -eq "$($disk.Guid)" })
+                if ("$($disk.OfflineReason)" -eq 'Collision' -or $sameId.Count) {
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) is offline because its disk ID collides with another disk. Bringing it online would rewrite its disk ID, so it was left untouched. Skipping."
+                    continue
+                }
+
+                $setReadOnly = -not $disk.IsReadOnly
+                # Registered before the first change, so a disk whose state cannot be read back afterwards is
+                # still returned to offline and writable by Restore-Disk-Partitions-v3.
+                $change = [pscustomobject]@{ Number = $disk.Number; ClearReadOnly = $setReadOnly }
+                $global:DiskPartitionsV3ReadOnlyChanges += $change
+                if ($setReadOnly) {
+                    $disk | Set-Disk -IsReadOnly $true -ErrorAction SilentlyContinue
+                }
+                # Onlining a disk whose read-only flag did not stick would mount it writable, which is
+                # the exact write this mode exists to prevent. Leave it offline instead.
+                $offlineState = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
+                if (-not $offlineState -or -not $offlineState.IsReadOnly) {
+                    [void](Restore-DiskPartitionV3Change -Change $change)
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be confirmed read-only while offline, so it was left offline. Skipping."
+                    continue
+                }
+                $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
+
+                $onlineState = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
+                if (-not $onlineState) {
+                    # The disk may be online: keep it read-only. Restore-Disk-Partitions-v3 clears the flag only
+                    # after it has confirmed the disk is offline again.
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be re-read after the read-only online attempt, so it was kept read-only until it is restored. Skipping."
+                    continue
+                }
+                if ($onlineState.IsOffline) {
+                    [void](Restore-DiskPartitionV3Change -Change $change)
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) did not come online read-only, so it is being returned to its original state. Skipping."
+                    continue
+                }
+            }
         }
-        if ($disk.IsReadOnly) {
-            $disk | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue
+        else {
+            if ($disk.IsOffline) {
+                $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
+            }
+            if ($disk.IsReadOnly) {
+                $disk | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue
+            }
         }
 
         # Read the state back. Without this a disk that stayed offline is skipped further down as
@@ -130,7 +186,11 @@ function Get-Disk-Partitions-v3 {
             Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be re-read after being brought online, skipping."
             continue
         }
-        if ($diskState.IsOffline -or $diskState.IsReadOnly) {
+        if ($ReadOnly -and $diskState.IsOffline) {
+            Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) is still offline after a read-only online attempt. Skipping."
+            continue
+        }
+        if (-not $ReadOnly -and ($diskState.IsOffline -or $diskState.IsReadOnly)) {
             Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) is still Offline=$($diskState.IsOffline) ReadOnly=$($diskState.IsReadOnly) after Set-Disk, so it cannot be repaired. Skipping."
             continue
         }
@@ -199,12 +259,15 @@ function Get-Windows-OsDrives-v3 {
 
         [Parameter(Mandatory = $false)]
         [ValidateRange(0, 300)]
-        [int]$DriveLetterTimeoutSeconds = 60
+        [int]$DriveLetterTimeoutSeconds = 60,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$ReadOnly
     )
 
     $osDrives = @()
 
-    ForEach ($partition in (Get-Disk-Partitions-v3 -BusTypeFilter $BusTypeFilter -DriveLetterTimeoutSeconds $DriveLetterTimeoutSeconds)) {
+    ForEach ($partition in (Get-Disk-Partitions-v3 -BusTypeFilter $BusTypeFilter -DriveLetterTimeoutSeconds $DriveLetterTimeoutSeconds -ReadOnly:$ReadOnly)) {
         if ([string]::IsNullOrWhiteSpace($partition.DriveLetter)) { continue }
         if ($partition.DriveLetter -eq "`0") { continue }
 
@@ -221,4 +284,54 @@ function Get-Windows-OsDrives-v3 {
     }
 
     return $osDrives
+}
+function Restore-DiskPartitionV3Change {
+    <#
+      Returns one disk recorded by Get-Disk-Partitions-v3 -ReadOnly to offline and, if this helper set it, writable.
+      The read-only flag is cleared only after the disk has been confirmed offline, so it is never writable while
+      online. Returns $true and drops the record once the result is verified; otherwise the record is kept for
+      Restore-Disk-Partitions-v3.
+    #>
+    [CmdletBinding()]
+    Param([Parameter(Mandatory = $true)]$Change)
+
+    $state = Get-Disk -Number $Change.Number -ErrorAction SilentlyContinue
+    if ($state -and -not $state.IsOffline) {
+        $state | Set-Disk -IsOffline $true -ErrorAction SilentlyContinue
+        $state = Get-Disk -Number $Change.Number -ErrorAction SilentlyContinue
+    }
+    if ($state -and $state.IsOffline -and $Change.ClearReadOnly -and $state.IsReadOnly) {
+        $state | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue
+        $state = Get-Disk -Number $Change.Number -ErrorAction SilentlyContinue
+    }
+    if (-not $state -or -not $state.IsOffline -or ($Change.ClearReadOnly -and $state.IsReadOnly)) { return $false }
+    $global:DiskPartitionsV3ReadOnlyChanges = @($global:DiskPartitionsV3ReadOnlyChanges | Where-Object { -not [object]::ReferenceEquals($_, $Change) })
+    return $true
+}
+
+function Restore-Disk-Partitions-v3 {
+    <#
+      Puts back every disk that Get-Disk-Partitions-v3 -ReadOnly brought online. Each disk is taken
+      offline first and only then has its read-only flag cleared, so it is never mounted writable.
+      Detection callers must call this in a finally block: the read-only flag survives a reboot of the
+      repair VM, and the v1/v2 helpers used by most repair scripts never clear it, so a disk left
+      read-only would make a later repair silently unable to write.
+
+      Returns the numbers of disks that could not be restored; their records are kept for a retry.
+    #>
+    [CmdletBinding()]
+    Param()
+
+    $failed = @()
+    ForEach ($change in @($global:DiskPartitionsV3ReadOnlyChanges)) {
+        if (-not (Restore-DiskPartitionV3Change -Change $change)) {
+            Write-V3Log -Level Warning -Message "Restore-Disk-Partitions-v3: disk $($change.Number) could not be returned to offline and writable. Clear it manually with diskpart: select disk $($change.Number), offline disk, attributes disk clear readonly."
+            $failed += $change.Number
+        }
+        else {
+            Write-V3Log -Level Info -Message "Restore-Disk-Partitions-v3: disk $($change.Number) returned to offline and writable, as it was attached."
+        }
+    }
+    # Disks that could not be verified stay recorded, so a later call can retry them.
+    return $failed
 }
