@@ -139,6 +139,10 @@ function Get-Disk-Partitions-v3 {
                 }
 
                 $setReadOnly = -not $disk.IsReadOnly
+                # Registered before the first change, so a disk whose state cannot be read back afterwards is
+                # still returned to offline and writable by Restore-Disk-Partitions-v3.
+                $change = [pscustomobject]@{ Number = $disk.Number; ClearReadOnly = $setReadOnly }
+                $global:DiskPartitionsV3ReadOnlyChanges += $change
                 if ($setReadOnly) {
                     $disk | Set-Disk -IsReadOnly $true -ErrorAction SilentlyContinue
                 }
@@ -146,18 +150,24 @@ function Get-Disk-Partitions-v3 {
                 # the exact write this mode exists to prevent. Leave it offline instead.
                 $offlineState = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
                 if (-not $offlineState -or -not $offlineState.IsReadOnly) {
-                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be marked read-only while offline, so it was left offline. Skipping."
+                    [void](Restore-DiskPartitionV3Change -Change $change)
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be confirmed read-only while offline, so it was left offline. Skipping."
                     continue
                 }
                 $disk | Set-Disk -IsOffline $false -ErrorAction SilentlyContinue
 
                 $onlineState = Get-Disk -Number $disk.Number -ErrorAction SilentlyContinue
-                if (-not $onlineState -or $onlineState.IsOffline) {
-                    if ($setReadOnly) { $disk | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue }
-                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) did not come online read-only, so it was returned to its original state. Skipping."
+                if (-not $onlineState) {
+                    # The disk may be online: keep it read-only. Restore-Disk-Partitions-v3 clears the flag only
+                    # after it has confirmed the disk is offline again.
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) could not be re-read after the read-only online attempt, so it was kept read-only until it is restored. Skipping."
                     continue
                 }
-                $global:DiskPartitionsV3ReadOnlyChanges += [pscustomobject]@{ Number = $disk.Number; ClearReadOnly = $setReadOnly }
+                if ($onlineState.IsOffline) {
+                    [void](Restore-DiskPartitionV3Change -Change $change)
+                    Write-V3Log -Level Warning -Message "Get-Disk-Partitions-v3: disk $($disk.Number) did not come online read-only, so it is being returned to its original state. Skipping."
+                    continue
+                }
             }
         }
         else {
@@ -275,6 +285,30 @@ function Get-Windows-OsDrives-v3 {
 
     return $osDrives
 }
+function Restore-DiskPartitionV3Change {
+    <#
+      Returns one disk recorded by Get-Disk-Partitions-v3 -ReadOnly to offline and, if this helper set it, writable.
+      The read-only flag is cleared only after the disk has been confirmed offline, so it is never writable while
+      online. Returns $true and drops the record once the result is verified; otherwise the record is kept for
+      Restore-Disk-Partitions-v3.
+    #>
+    [CmdletBinding()]
+    Param([Parameter(Mandatory = $true)]$Change)
+
+    $state = Get-Disk -Number $Change.Number -ErrorAction SilentlyContinue
+    if ($state -and -not $state.IsOffline) {
+        $state | Set-Disk -IsOffline $true -ErrorAction SilentlyContinue
+        $state = Get-Disk -Number $Change.Number -ErrorAction SilentlyContinue
+    }
+    if ($state -and $state.IsOffline -and $Change.ClearReadOnly -and $state.IsReadOnly) {
+        $state | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue
+        $state = Get-Disk -Number $Change.Number -ErrorAction SilentlyContinue
+    }
+    if (-not $state -or -not $state.IsOffline -or ($Change.ClearReadOnly -and $state.IsReadOnly)) { return $false }
+    $global:DiskPartitionsV3ReadOnlyChanges = @($global:DiskPartitionsV3ReadOnlyChanges | Where-Object { -not [object]::ReferenceEquals($_, $Change) })
+    return $true
+}
+
 function Restore-Disk-Partitions-v3 {
     <#
       Puts back every disk that Get-Disk-Partitions-v3 -ReadOnly brought online. Each disk is taken
@@ -283,23 +317,14 @@ function Restore-Disk-Partitions-v3 {
       repair VM, and the v1/v2 helpers used by most repair scripts never clear it, so a disk left
       read-only would make a later repair silently unable to write.
 
-      Returns the numbers of disks that could not be restored.
+      Returns the numbers of disks that could not be restored; their records are kept for a retry.
     #>
     [CmdletBinding()]
     Param()
 
     $failed = @()
     ForEach ($change in @($global:DiskPartitionsV3ReadOnlyChanges)) {
-        $state = Get-Disk -Number $change.Number -ErrorAction SilentlyContinue
-        if ($state -and -not $state.IsOffline) {
-            $state | Set-Disk -IsOffline $true -ErrorAction SilentlyContinue
-            $state = Get-Disk -Number $change.Number -ErrorAction SilentlyContinue
-        }
-        if ($state -and $state.IsOffline -and $change.ClearReadOnly -and $state.IsReadOnly) {
-            $state | Set-Disk -IsReadOnly $false -ErrorAction SilentlyContinue
-            $state = Get-Disk -Number $change.Number -ErrorAction SilentlyContinue
-        }
-        if (-not $state -or -not $state.IsOffline -or ($change.ClearReadOnly -and $state.IsReadOnly)) {
+        if (-not (Restore-DiskPartitionV3Change -Change $change)) {
             Write-V3Log -Level Warning -Message "Restore-Disk-Partitions-v3: disk $($change.Number) could not be returned to offline and writable. Clear it manually with diskpart: select disk $($change.Number), offline disk, attributes disk clear readonly."
             $failed += $change.Number
         }
@@ -307,6 +332,6 @@ function Restore-Disk-Partitions-v3 {
             Write-V3Log -Level Info -Message "Restore-Disk-Partitions-v3: disk $($change.Number) returned to offline and writable, as it was attached."
         }
     }
-    $global:DiskPartitionsV3ReadOnlyChanges = @()
+    # Disks that could not be verified stay recorded, so a later call can retry them.
     return $failed
 }

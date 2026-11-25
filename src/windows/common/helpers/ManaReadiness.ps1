@@ -152,10 +152,20 @@ function Get-OfflineServiceState {
         $state.readError = $_.Exception.Message
         return $state
     }
-
-    if ($state.present) {
-        $binary = Resolve-ManaServiceBinaryPath -WindowsRoot $WindowsRoot -ServiceName $ServiceName -ImagePath $state.imagePath
-        if ($binary) { $state.binaryPresent = [bool](Test-Path -LiteralPath $binary -PathType Leaf) }
+    # An existing service without a valid start type (0-4) is broken in a way this check cannot judge, so the
+    # state is unknown rather than healthy.
+    if ($state.present -and ($null -eq $state.start -or $state.start -gt 4)) {
+        $state.readError = "the Start value is missing or invalid ($($state.start))"
+        return $state
+    }
+    try {
+        if ($state.present) {
+            $binary = Resolve-ManaServiceBinaryPath -WindowsRoot $WindowsRoot -ServiceName $ServiceName -ImagePath $state.imagePath
+            if ($binary) { $state.binaryPresent = [bool](Test-Path -LiteralPath $binary -PathType Leaf) }
+        }
+    }
+    catch {
+        $state.readError = $_.Exception.Message
     }
     return $state
 }
@@ -171,6 +181,36 @@ function Test-ManaDeviceDriverStaged {
     ForEach ($pkg in @($Packages | Where-Object { $_ })) {
         ForEach ($hwid in @($pkg.hardwareIds)) {
             if ($deviceId -eq $hwid -or $deviceId.StartsWith("$hwid&")) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-ManaFunctionId {
+    # Hardware IDs of the MANA functions. The VF bus driver (mana_bus_vf.inf) binds the PCI virtual function and
+    # creates MANA_BUS children; the Net-class Ethernet driver (manavf.inf) binds the Ethernet child. Other children
+    # are optional only when positively identified here as non-Ethernet, such as RDMA (mana_ib_vf.inf).
+    return [pscustomobject]@{
+        vfBus       = 'PCI\VEN_1414&DEV_00BA'
+        ethernet    = 'MANA_BUS\VEN_1414&ROLE_004C'
+        nonEthernet = @{ 'MANA_BUS\VEN_1414&ROLE_0003' = 'RDMA' }
+    }
+}
+
+function Test-ManaIdMatch {
+    # True when hardware ID $A and $B name the same device, one possibly more specific at an '&' boundary.
+    Param([string]$A, [string]$B)
+    $A = $A.ToUpperInvariant(); $B = $B.ToUpperInvariant()
+    return ($A -eq $B) -or $A.StartsWith("$B&") -or $B.StartsWith("$A&")
+}
+
+function Test-ManaPackageCoverage {
+    # True when one of $Packages (of setup class $Class, if given) lists hardware ID $Id.
+    Param([AllowEmptyCollection()][object[]]$Packages = @(), [Parameter(Mandatory = $true)][string]$Id, [string]$Class)
+    ForEach ($pkg in @($Packages | Where-Object { $_ })) {
+        if ($Class -and "$($pkg.class)" -ne $Class) { continue }
+        ForEach ($hwid in @($pkg.hardwareIds)) {
+            if ($hwid -and (Test-ManaIdMatch -A $Id -B $hwid)) { return $true }
         }
     }
     return $false
@@ -194,36 +234,58 @@ function Get-ManaDriveAssessment {
         elseif ($null -eq $netvsc.binaryPresent) { $unknowns += 'netvsc-binary-unknown' }
     }
 
+    # Networking needs both the VF bus driver and a Net-class Ethernet driver. A store holding only some MANA
+    # packages (only the RDMA package, for example) is not ready even before any MANA device has been seen.
+    $ids = Get-ManaFunctionId
     if (-not $Finding.driverStoreFound) { $unknowns += 'driver-store-unreadable' }
     elseif (@($Finding.manaPackages).Count -eq 0) { $problems += 'mana-driver-missing' }
+    else {
+        if (-not (Test-ManaPackageCoverage -Packages $Finding.manaPackages -Id $ids.vfBus)) { $problems += 'mana-bus-driver-missing' }
+        if (-not (Test-ManaPackageCoverage -Packages $Finding.manaPackages -Id $ids.ethernet -Class 'Net')) { $problems += 'mana-ethernet-driver-missing' }
+    }
+    if ($Finding.Contains('systemHiveRead') -and -not $Finding.systemHiveRead) { $unknowns += 'system-hive-unreadable' }
 
     # CONFIGFLAG_REINSTALL: Plug and Play installs the device again at the next boot, copying the driver
     # binaries from the staged package and rewriting the service.
     $reinstallFlag = 0x20
     $devices = @($Finding.manaDevices | Where-Object { $_ })
     $stagedServices = @($Finding.manaPackages | ForEach-Object { $_.services })
-    $netStaged = @($Finding.manaPackages | Where-Object { $_ -and "$($_.class)" -eq 'Net' }).Count -gt 0
     $optional = @()
     if ($Finding.Contains('manaDevicesRead') -and $Finding.manaDevicesRead -eq $false) { $unknowns += 'mana-devices-unknown' }
     ForEach ($device in $devices) {
-        if ($device.service) { continue }
+        if ($device.service) {
+            if ("$($device.service)" -notmatch '^[A-Za-z0-9_.-]{1,64}$') { $unknowns += "mana-device-service-invalid:$($device.path)" }
+            continue
+        }
         if (Test-ManaDeviceDriverStaged -DevicePath $device.path -Packages $Finding.manaPackages) {
             # A device Windows has already seen keeps its instance key. Without a driver and without the reinstall
             # flag, Plug and Play treats it as configured and never installs the driver staged for it.
             if (-not ([int]$device.configFlags -band $reinstallFlag)) { $problems += "mana-device-not-bound:$($device.path)" }
         }
-        elseif ($netStaged -and $device.path -match '^(?i)MANA_BUS\\') {
-            # With a Net-class MANA package staged the Ethernet function is covered, so another MANA_BUS child left
-            # without a driver is a non-Ethernet function (RDMA, for example): reported, but networking still works.
-            $optional += $device.path
-        }
         else {
-            $problems += "mana-device-no-driver:$($device.path)"
+            # A MANA_BUS child left without a driver is optional only when it is a known non-Ethernet function
+            # (RDMA, for example). The Ethernet child and the VF itself are required, and a role this check does not
+            # know cannot be assumed harmless.
+            $parts = "$($device.path)" -split '\\'
+            $deviceId = "$($parts[0])\$($parts[1])"
+            $nonEthernet = @($ids.nonEthernet.Keys | Where-Object { Test-ManaIdMatch -A $deviceId -B $_ }).Count -gt 0
+            $required = (Test-ManaIdMatch -A $deviceId -B $ids.ethernet) -or (Test-ManaIdMatch -A $deviceId -B $ids.vfBus)
+            if ($nonEthernet) { $optional += $device.path }
+            elseif ($required) { $problems += "mana-device-no-driver:$($device.path)" }
+            else { $unknowns += "mana-device-role-unknown:$($device.path)" }
         }
     }
     ForEach ($svc in @($Finding.manaServices)) {
         if ($svc.readError) { $unknowns += "mana-service-unknown:$($svc.name)"; continue }
-        if (-not $svc.present) { continue }   # installed by Plug and Play when the MANA VF first appears
+        if (-not $svc.present) {
+            # Harmless only while no device has been installed for it: Plug and Play creates the service when the
+            # MANA VF first appears. A device still bound to a deleted service has no driver until it is reinstalled.
+            $bound = @($devices | Where-Object { $_.service -eq $svc.name })
+            $pending = ($stagedServices -contains $svc.name) -and
+                (@($bound | Where-Object { -not ([int]$_.configFlags -band $reinstallFlag) }).Count -eq 0)
+            if ($bound.Count -and -not $pending) { $problems += "mana-driver-service-missing:$($svc.name)" }
+            continue
+        }
         if ($svc.start -eq $serviceDisabled) { $problems += "mana-driver-disabled:$($svc.name)" }
         if ($svc.binaryPresent -eq $false) {
             # Installing a staged package copies the binary back, so a missing binary is only a problem while
@@ -333,17 +395,24 @@ function Get-ManaOfflineAssessment {
             $finding.controlSet = $controlSet
             $finding.architecture = $system.ReadString("$controlSet\Control\Session Manager\Environment", 'PROCESSOR_ARCHITECTURE')
             $finding.netvsc = Get-OfflineServiceState -Reader $system -ControlSet $controlSet -ServiceName 'netvsc' -WindowsRoot $WindowsRoot
-            $serviceNames = @($finding.manaPackages | ForEach-Object { $_.services } | Select-Object -Unique)
+            $finding.manaDevices = @(Get-OfflineManaDevice -Reader $system -ControlSet $controlSet)
+            # Services named by the packages, plus any service a seen MANA device is still bound to: a device bound
+            # to a service whose key was deleted has no driver.
+            $serviceNames = @(@($finding.manaPackages | ForEach-Object { $_.services }) +
+                @($finding.manaDevices | Where-Object { "$($_.service)" -match '^[A-Za-z0-9_.-]{1,64}$' } | ForEach-Object { "$($_.service)" }) |
+                    Where-Object { $_ } | Sort-Object -Unique)
             $finding.manaServices = @($serviceNames | ForEach-Object {
                     Get-OfflineServiceState -Reader $system -ControlSet $controlSet -ServiceName $_ -WindowsRoot $WindowsRoot
                 })
-            $finding.manaDevices = @(Get-OfflineManaDevice -Reader $system -ControlSet $controlSet)
-            $finding.manaDevicesRead = $true
-            $finding.systemHiveRead = $true
         }
         finally { $system.Dispose() }
+        # Set only after the reader closed cleanly: a failed close means the facts cannot be relied on.
+        $finding.manaDevicesRead = $true
+        $finding.systemHiveRead = $true
     }
     catch {
+        $finding.manaDevicesRead = $false
+        $finding.systemHiveRead = $false
         $finding.readWarnings += "could not read the SYSTEM hive: $($_.Exception.Message)"
     }
 
@@ -352,6 +421,5 @@ function Get-ManaOfflineAssessment {
     $finding.problems = @($assessment.problems)
     $finding.unknowns = @($assessment.unknowns)
     $finding.optionalDevicesWithoutDriver = @($assessment.optionalDevicesWithoutDriver)
-    if (-not $finding.systemHiveRead) { $finding.unknowns += 'system-hive-unreadable' }
     return $finding
 }

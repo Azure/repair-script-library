@@ -158,6 +158,47 @@ if ($script:setDiskCalls -contains 'disk2:IsOffline=False') { throw 'ReadOnly: a
 if (-not $osDisk.IsOffline) { throw 'ReadOnly: the disk must stay offline.' }
 Write-Host 'PASS: -ReadOnly leaves a disk offline when it cannot be made read-only.'
 
+# A disk whose state cannot be re-read must never have read-only cleared, and stays recorded for Restore.
+$script:hideDisk = $null
+function Get-Disk {
+    [CmdletBinding()]
+    Param([int]$Number)
+
+    if ($PSBoundParameters.ContainsKey('Number')) {
+        if ($script:hideDisk -and (& $script:hideDisk)) { return $null }
+        return @($resourceDisk, $osDisk) | Where-Object Number -eq $Number
+    }
+    return @($resourceDisk, $osDisk)
+}
+
+Reset-OfflineOsDisk
+$script:hideDisk = { -not $osDisk.IsOffline }
+$result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0 -ReadOnly 3>$null)
+$script:hideDisk = $null
+if ($result.Count -ne 0) { throw 'ReadOnly: a disk that cannot be re-read after onlining must be skipped.' }
+if (-not $osDisk.IsReadOnly -or $script:setDiskCalls -contains 'disk2:IsReadOnly=False') {
+    throw "ReadOnly: read-only must not be cleared while the disk may be online; calls were '$($script:setDiskCalls -join ',')'."
+}
+if (@($global:DiskPartitionsV3ReadOnlyChanges).Count -ne 1) { throw 'ReadOnly: the change must stay recorded until restoration is verified.' }
+$script:setDiskCalls = @()
+$failed = @(Restore-Disk-Partitions-v3)
+if ($failed.Count -or -not $osDisk.IsOffline -or $osDisk.IsReadOnly -or ($script:setDiskCalls -join ',') -ne 'disk2:IsOffline=True,disk2:IsReadOnly=False') {
+    throw "Restore: the retained disk must go offline first, then become writable; calls were '$($script:setDiskCalls -join ',')'."
+}
+if (@($global:DiskPartitionsV3ReadOnlyChanges).Count) { throw 'Restore: a verified disk must be removed from the change list.' }
+Write-Host 'PASS: -ReadOnly keeps a disk read-only and recorded when it cannot be re-read after onlining; Restore then returns it.'
+
+Reset-OfflineOsDisk
+$script:hideDisk = { $osDisk.IsReadOnly }
+$result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0 -ReadOnly 3>$null)
+$failed = @(Restore-Disk-Partitions-v3 3>$null)
+$script:hideDisk = $null
+if ($result.Count -ne 0 -or $script:setDiskCalls -contains 'disk2:IsOffline=False') { throw 'ReadOnly: a disk whose read-only state cannot be confirmed must never be onlined.' }
+if ($failed -notcontains 2 -or @($global:DiskPartitionsV3ReadOnlyChanges).Count -ne 1) { throw 'Restore: an unverifiable disk must be reported and kept for a retry.' }
+$failed = @(Restore-Disk-Partitions-v3)
+if ($failed.Count -or $osDisk.IsReadOnly -or -not $osDisk.IsOffline -or @($global:DiskPartitionsV3ReadOnlyChanges).Count) { throw 'Restore: the retry must return the disk offline and writable.' }
+Write-Host 'PASS: a read-only flag that cannot be read back is tracked from the first change and restored on retry.'
+
 Reset-OfflineOsDisk
 $osDisk.IsReadOnly = $true
 $result = @(Get-Disk-Partitions-v3 -DriveLetterTimeoutSeconds 0)

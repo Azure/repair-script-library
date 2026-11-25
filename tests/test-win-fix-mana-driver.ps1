@@ -27,7 +27,7 @@ Assert-True ($parseErrors.Count -eq 0) "The repair script must parse cleanly: $(
 # Script-level constants first, then the functions that use them.
 ForEach ($statement in $ast.EndBlock.Statements) {
     if ($statement -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-        $statement.Left.Extent.Text -match '^\$(manifestSchema|demandStart|serviceDisabled|reinstallFlag|minimumBuild|servicePattern|devicePattern|registryKeyPattern|publishedDriverPattern)$') {
+        $statement.Left.Extent.Text -match '^\$(manifestSchema|demandStart|serviceDisabled|reinstallFlag|minimumBuild|servicePattern|devicePattern|registryKeyPattern|publishedDriverPattern|controlSetPattern)$') {
         . ([scriptblock]::Create($statement.Extent.Text))
     }
 }
@@ -44,8 +44,8 @@ function New-Assessment {
     [pscustomobject]@{ problems = $Problems; unknowns = $Unknowns; architecture = $Architecture; currentBuild = $Build; manaPackages = $Packages; manaDevices = $Devices }
 }
 $packages = @(
-    [pscustomobject]@{ inf = 'manavf.inf'; package = 'manavf.inf_amd64_a'; driverVer = '1/1/2026,2.0.18.52'; infPath = 'C:\x\manavf.inf'; services = @('Mana', 'ManaDirect'); hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') },
-    [pscustomobject]@{ inf = 'mana_bus_vf.inf'; package = 'mana_bus_vf.inf_amd64_b'; driverVer = '1/1/2026,2.0.18.52'; infPath = 'C:\x\mana_bus_vf.inf'; services = @('mana_bus'); hardwareIds = @('PCI\VEN_1414&DEV_00BA') }
+    [pscustomobject]@{ inf = 'manavf.inf'; package = 'manavf.inf_amd64_a'; driverVer = '1/1/2026,2.0.18.52'; infPath = 'C:\x\manavf.inf'; services = @('Mana', 'ManaDirect'); hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C'); class = 'Net' },
+    [pscustomobject]@{ inf = 'mana_bus_vf.inf'; package = 'mana_bus_vf.inf_amd64_b'; driverVer = '1/1/2026,2.0.18.52'; infPath = 'C:\x\mana_bus_vf.inf'; services = @('mana_bus'); hardwareIds = @('PCI\VEN_1414&DEV_00BA'); class = 'System' }
 )
 function Get-ActionText { Param($Plan) @($Plan.actions | ForEach-Object { if ($_.type -eq 'AddDriverPackage') { "Add:$($_.inf)" } elseif ($_.type -eq 'EnableService') { "Enable:$($_.service):$($_.from):$($_.to)" } else { "Reinstall:$($_.device):$($_.from):$($_.to)" } }) -join ',' }
 
@@ -76,6 +76,18 @@ Assert-Equal "Add:manavf.inf,Add:mana_bus_vf.inf,Enable:Mana:4:3,Reinstall:$($ni
 $plan = Get-ManaRepairPlan -Assessment (New-Assessment -Problems "mana-device-not-bound:$($vf.path)", "mana-device-not-bound:$($vf.path)" -Packages $packages -Devices @($vf)) -RepairVmArchitecture 'AMD64'
 Assert-Equal 1 @($plan.actions).Count 'A device is flagged once.'
 
+# A partially populated store gets only the package for the missing function.
+$plan = Get-ManaRepairPlan -Assessment (New-Assessment -Problems 'mana-ethernet-driver-missing' -Packages @($packages[1])) -RepairVmPackages $packages -RepairVmArchitecture 'AMD64'
+Assert-Equal 'Add:manavf.inf' (Get-ActionText $plan) 'A store with only the bus driver gets the Net-class Ethernet package.'
+$plan = Get-ManaRepairPlan -Assessment (New-Assessment -Problems 'mana-bus-driver-missing' -Packages @($packages[0])) -RepairVmPackages $packages -RepairVmArchitecture 'AMD64'
+Assert-Equal 'Add:mana_bus_vf.inf' (Get-ActionText $plan) 'A store with only the Ethernet driver gets the VF bus package.'
+$plan = Get-ManaRepairPlan -Assessment (New-Assessment -Problems 'mana-bus-driver-missing', 'mana-ethernet-driver-missing') -RepairVmPackages $packages -RepairVmArchitecture 'AMD64'
+Assert-Equal 'Add:mana_bus_vf.inf,Add:manavf.inf' (Get-ActionText $plan) 'A store with neither function (only RDMA, for example) gets both packages.'
+
+# A seen device still bound to a deleted service is reinstalled from the staged package that provides it.
+$plan = Get-ManaRepairPlan -Assessment (New-Assessment -Problems 'mana-driver-service-missing:Mana' -Packages $packages -Devices @($nic)) -RepairVmArchitecture 'AMD64'
+Assert-Equal "Reinstall:$($nic.path):0:32" (Get-ActionText $plan) 'A device bound to a deleted service is flagged for reinstall.'
+
 $refusals = @(
     @{ Name = 'no package on the repair VM'; A = (New-Assessment -Problems 'mana-driver-missing'); P = @(); Expect = 'repair-vm-has-no-mana-driver' },
     @{ Name = 'architecture mismatch'; A = (New-Assessment -Problems 'mana-driver-missing' -Architecture 'ARM64'); P = $packages; Expect = 'architecture-mismatch:ARM64-vs-AMD64' },
@@ -87,6 +99,8 @@ $refusals = @(
     @{ Name = 'hostile service name'; A = (New-Assessment -Problems 'mana-driver-disabled:..\..\Control'); P = @(); Expect = 'unexpected-service-name:..\..\Control' },
     @{ Name = 'unknown device'; A = (New-Assessment -Problems 'mana-device-not-bound:PCI\X\Y' -Packages $packages); P = @(); Expect = 'unexpected-device:PCI\X\Y' },
     @{ Name = 'device with no driver to install'; A = (New-Assessment -Problems 'mana-driver-missing', "mana-device-no-driver:$($vf.path)" -Devices @($vf) -Architecture 'ARM64'); P = $packages; Expect = "no-driver-to-install:$($vf.path)" },
+    @{ Name = 'repair VM without the Ethernet package'; A = (New-Assessment -Problems 'mana-ethernet-driver-missing' -Packages @($packages[1])); P = @($packages[1]); Expect = 'repair-vm-has-no-mana-driver:mana-ethernet-driver-missing' },
+    @{ Name = 'deleted service with no package to restore it'; A = (New-Assessment -Problems 'mana-driver-service-missing:Mana' -Devices @($nic)); P = @(); Expect = 'mana-driver-service-missing:Mana' },
     @{ Name = 'device the added packages do not support'; A = (New-Assessment -Problems 'mana-driver-missing', 'mana-device-no-driver:MANA_BUS\VEN_1414&ROLE_0003\6&1' -Devices @([pscustomobject]@{ path = 'MANA_BUS\VEN_1414&ROLE_0003\6&1'; service = $null; configFlags = 0 })); P = $packages; Expect = 'no-driver-to-install:MANA_BUS\VEN_1414&ROLE_0003\6&1' }
 )
 ForEach ($case in $refusals) {
@@ -103,11 +117,22 @@ Write-Host "PASS: repair planning (ready, disabled, missing, already-seen device
 $offline = [pscustomobject]@{ BuildNumber = '20348'; GuestComputerName = 'guest01' }
 function New-Manifest {
     Param($Changes = @(@{ key = 'Services\mana_bus'; name = 'Start'; before = 4; after = 3 }, @{ key = "Enum\$($vf.path)"; name = 'ConfigFlags'; before = 0; after = 32 }),
-        $Drivers = @(@{ publishedName = 'oem9.inf'; inf = 'manavf.inf' }), $Build = '20348', $Schema = $manifestSchema)
-    [pscustomobject]@{ schema = $Schema; guest = [pscustomobject]@{ buildNumber = $Build; computerName = 'guest01' }; registryChanges = $Changes; addedDrivers = $Drivers }
+        $Drivers = @(@{ publishedName = 'oem9.inf'; inf = 'manavf.inf' }), $Build = '20348', $Schema = $manifestSchema, $ControlSet = 'ControlSet002')
+    [pscustomobject]@{ schema = $Schema; controlSet = $ControlSet; guest = [pscustomobject]@{ buildNumber = $Build; computerName = 'guest01' }; registryChanges = $Changes; addedDrivers = $Drivers }
 }
-Assert-Equal 0 @(Test-ManaRollbackManifest -Manifest (New-Manifest) -Offline $offline).Count 'A valid manifest has no rejection reason.'
+$targets = [pscustomobject]@{ controlSetFound = $true; services = @('mana_bus', 'Mana'); devices = @($vf.path, $nic.path) }
+Assert-Equal 0 @(Test-ManaRollbackManifest -Manifest (New-Manifest) -Offline $offline -Targets $targets).Count 'A valid manifest has no rejection reason.'
 $rejected = @(
+    @{ Name = 'boot-critical service'; M = (New-Manifest -Changes @(@{ key = 'Services\storvsc'; name = 'Start'; before = 4; after = 0 })) },
+    @{ Name = 'non-MANA service with the Repair transition'; M = (New-Manifest -Changes @(@{ key = 'Services\storvsc'; name = 'Start'; before = 4; after = 3 })) },
+    @{ Name = 'MANA service with another transition'; M = (New-Manifest -Changes @(@{ key = 'Services\mana_bus'; name = 'Start'; before = 4; after = 0 })) },
+    @{ Name = 'ConfigFlags change other than the reinstall bit'; M = (New-Manifest -Changes @(@{ key = "Enum\$($vf.path)"; name = 'ConfigFlags'; before = 0; after = 1 })) },
+    @{ Name = 'reinstall bit already set before'; M = (New-Manifest -Changes @(@{ key = "Enum\$($vf.path)"; name = 'ConfigFlags'; before = 32; after = 32 })) },
+    @{ Name = 'device not on the disk'; M = (New-Manifest -Changes @(@{ key = 'Enum\PCI\VEN_1414&DEV_00BA\9&other'; name = 'ConfigFlags'; before = 0; after = 32 })) },
+    @{ Name = 'Start on a device key'; M = (New-Manifest -Changes @(@{ key = "Enum\$($vf.path)"; name = 'Start'; before = 4; after = 3 })) },
+    @{ Name = 'ConfigFlags on a service key'; M = (New-Manifest -Changes @(@{ key = 'Services\mana_bus'; name = 'ConfigFlags'; before = 0; after = 32 })) },
+    @{ Name = 'no control set'; M = (New-Manifest -ControlSet $null) },
+    @{ Name = 'path-like control set'; M = (New-Manifest -ControlSet 'ControlSet001\..\Select') },
     @{ Name = 'other installation'; M = (New-Manifest -Build '17763') },
     @{ Name = 'unknown schema'; M = (New-Manifest -Schema 'other/1') },
     @{ Name = 'key outside Services/Enum MANA'; M = (New-Manifest -Changes @(@{ key = 'Control\Session Manager'; name = 'Start'; before = 4; after = 3 })) },
@@ -117,8 +142,10 @@ $rejected = @(
     @{ Name = 'non-oem driver'; M = (New-Manifest -Drivers @(@{ publishedName = 'netvsc.inf' })) }
 )
 ForEach ($case in $rejected) {
-    Assert-True (@(Test-ManaRollbackManifest -Manifest $case.M -Offline $offline).Count -gt 0) "Manifest '$($case.Name)' must be rejected."
+    Assert-True (@(Test-ManaRollbackManifest -Manifest $case.M -Offline $offline -Targets $targets).Count -gt 0) "Manifest '$($case.Name)' must be rejected."
 }
+$missingSet = [pscustomobject]@{ controlSetFound = $false; services = @(); devices = @() }
+Assert-True (@(Test-ManaRollbackManifest -Manifest (New-Manifest) -Offline $offline -Targets $missingSet).Count -gt 0) 'A manifest whose control set is not on the disk must be rejected.'
 Write-Host "PASS: rollback manifest validation (valid plus $($rejected.Count) rejections)."
 
 # --- Offline MANA driver discovery ----------------------------------------------------------------
@@ -137,12 +164,14 @@ Remove-Item Function:\Get-WindowsDriver
 Write-Host 'PASS: offline MANA driver discovery.'
 
 # --- Registry write path against a scratch key ------------------------------------------------------
-$scratch = 'HKCU:\Software\RslManaFixTest-' + [guid]::NewGuid().ToString('N')
+$scratchRoot = 'HKCU:\Software\RslManaFixTest-' + [guid]::NewGuid().ToString('N')
+$scratch = "$scratchRoot\ControlSet001"
+$scratch2 = "$scratchRoot\ControlSet002"
 $backupDir = Join-Path ([System.IO.Path]::GetTempPath()) ('mana-fix-test-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $backupDir | Out-Null
 $script:gateCalls = @()
 function Invoke-WithHive { Param($Hive, [scriptblock]$ScriptBlock) & $ScriptBlock }
-function Get-OfflineSystemRootPath { Param([switch]$Strict) $scratch }
+function Get-OfflineSystemRootPath { Param([switch]$Strict) $scratch }   # Select\Current boots ControlSet001
 function Get-OfflineHiveKeyState { Param($HiveKey) if (Test-Path -LiteralPath $HiveKey) { 'Present' } else { 'Absent' } }
 function Assert-OfflineTarget { Param($Path, $Action) $script:gateCalls += $Path; $true }
 function New-Change { Param($Key, $Name, $From, $To, [switch]$Optional) [pscustomobject]@{ key = $Key; name = $Name; from = $From; to = $To; optional = [bool]$Optional } }
@@ -156,18 +185,29 @@ try {
 
     # The expected current value is a gate: a stale plan must not write anything, not even the other change.
     $threw = $false
-    try { Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 4 3), (New-Change 'Services\Mana' Start 4 3)) -BackupDirectory $backupDir | Out-Null }
+    try { Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 4 3), (New-Change 'Services\Mana' Start 4 3)) -BackupDirectory $backupDir -ControlSet ControlSet001 -RequireCurrent | Out-Null }
     catch { $threw = $_.Exception.Message -match 'expected 4' }
     Assert-True $threw 'A value that no longer matches the plan must stop the repair.'
     Assert-Equal 4 (Get-ItemProperty "$scratch\Services\mana_bus").Start 'Nothing may be written when any required change is stale.'
     Assert-Equal 0 $script:gateCalls.Count 'No write gate may be reached when validation fails.'
 
     $threw = $false
-    try { Set-OfflineRegistryDword -Changes @(New-Change 'Services\absent' Start 4 3) | Out-Null }
+    try { Set-OfflineRegistryDword -Changes @(New-Change 'Services\absent' Start 4 3) -ControlSet ControlSet001 | Out-Null }
     catch { $threw = $_.Exception.Message -match 'not present' }
     Assert-True $threw 'A missing key must stop the repair.'
 
-    $result = Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 4 3), (New-Change $deviceKey ConfigFlags 0 32)) -BackupDirectory $backupDir
+    # Repair writes only the assessed control set, and only while it is the one Select\Current boots.
+    $threw = $false
+    try { Set-OfflineRegistryDword -Changes @(New-Change 'Services\mana_bus' Start 4 3) -ControlSet ControlSet002 -RequireCurrent | Out-Null }
+    catch { $threw = $_.Exception.Message -match 'not the assessed ControlSet002' }
+    Assert-True $threw 'Repair must refuse a control set that is not the current one.'
+    $threw = $false
+    try { Set-OfflineRegistryDword -Changes @(New-Change 'Services\mana_bus' Start 4 3) -ControlSet ControlSet002 | Out-Null }
+    catch { $threw = $_.Exception.Message -match "control set 'ControlSet002' is not present" }
+    Assert-True $threw 'A control set that does not exist must be refused.'
+    Assert-Equal 0 $script:gateCalls.Count 'No write gate may be reached for a refused control set.'
+
+    $result = Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 4 3), (New-Change $deviceKey ConfigFlags 0 32)) -BackupDirectory $backupDir -ControlSet ControlSet001 -RequireCurrent
     Assert-Equal 3 (Get-ItemProperty "$scratch\Services\mana_bus").Start 'The disabled service is set to demand start.'
     Assert-Equal 32 (Get-ItemProperty "$scratch\$deviceKey").ConfigFlags 'The device is flagged for reinstall.'
     Assert-Equal 2 @($result.Applied).Count 'Both changes are reported as applied.'
@@ -177,13 +217,36 @@ try {
 
     # Rollback direction. Plug and Play clears the reinstall flag once used; an optional change is then skipped.
     Set-ItemProperty -Path "$scratch\$deviceKey" -Name ConfigFlags -Value 0 -Type DWord
-    $result = Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 3 4), (New-Change $deviceKey ConfigFlags 32 0 -Optional))
+    $result = Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 3 4), (New-Change $deviceKey ConfigFlags 32 0 -Optional)) -ControlSet ControlSet001
     Assert-Equal 4 (Get-ItemProperty "$scratch\Services\mana_bus").Start 'Rollback restores the recorded Start value.'
     Assert-Equal 1 @($result.Skipped).Count 'A reinstall flag already used by Plug and Play is skipped, not treated as a conflict.'
-    Write-Host 'PASS: registry write path (stale-plan gate, missing key, offline-target gate, .reg backup, read-back, rollback, used reinstall flag).'
+
+    # Rollback restores the control set in its manifest, even when Select\Current now boots another one.
+    New-Item -Path "$scratch2\Services\mana_bus" -Force | Out-Null
+    New-ItemProperty -Path "$scratch2\Services\mana_bus" -Name Start -Value 3 -PropertyType DWord | Out-Null
+    $result = Set-OfflineRegistryDword -Changes @(New-Change 'Services\mana_bus' Start 3 4) -ControlSet ControlSet002
+    Assert-Equal 4 (Get-ItemProperty "$scratch2\Services\mana_bus").Start 'Rollback writes the recorded control set.'
+    Assert-Equal 4 (Get-ItemProperty "$scratch\Services\mana_bus").Start 'The current control set is left alone.'
+
+    # A write whose read-back fails is still returned in Applied, so Repair records it for Rollback.
+    Set-ItemProperty -Path "$scratch\Services\mana_bus" -Name Start -Value 4 -Type DWord
+    $script:failReadBack = $true
+    function Get-ItemProperty {
+        [CmdletBinding()]
+        Param([string]$LiteralPath, [string]$Name, [string]$Path)
+        if ($Name -and $script:failReadBack) { throw 'simulated read-back failure' }
+        Microsoft.PowerShell.Management\Get-ItemProperty @PSBoundParameters
+    }
+    $result = Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 4 3), (New-Change $deviceKey ConfigFlags 0 32)) -ControlSet ControlSet001 -RequireCurrent
+    $script:failReadBack = $false
+    Remove-Item Function:\Get-ItemProperty
+    Assert-Equal 3 (Get-ItemProperty "$scratch\Services\mana_bus").Start 'The value was written before the read-back failed.'
+    Assert-Equal 'Services\mana_bus' (@($result.Applied | ForEach-Object { $_.key }) -join ',') 'The written value is in Applied; nothing after the failure is written.'
+    Assert-True ($result.Error -match 'simulated read-back failure') 'The read-back failure is returned to the caller.'
+    Write-Host 'PASS: registry write path (stale-plan gate, missing key, exact control set, offline-target gate, .reg backup, read-back, rollback, used reinstall flag, failed read-back recorded).'
 }
 finally {
-    Remove-Item -Path $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 

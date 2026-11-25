@@ -21,6 +21,10 @@
 #                                     it are flagged for reinstall, which copies the binary back.
 #     mana-device-no-driver:<device>  A seen MANA device that no staged package supports. Repaired only when a
 #                                     package this run adds lists the device's hardware ID.
+#     mana-bus-driver-missing         Some MANA packages are staged but not the VF bus driver, or not the Net-class
+#     mana-ethernet-driver-missing    Ethernet driver. Repair adds the repair VM's package that provides it.
+#     mana-driver-service-missing:<s> A seen MANA device is still bound to a service whose key was deleted. Repaired
+#                                     when a staged package provides the service, by reinstalling the device.
 #
 #   Packages are added first, then the disk is reassessed and the registry changes are planned from what is
 #   actually staged: service names come from the INF files, and DISM can refuse a package (for example on a guest
@@ -30,7 +34,9 @@
 #
 #   Mode=Report (default) makes no changes and prints the plan. Mode=Repair applies it, writes a rollback
 #   manifest and a .reg export of every key it changes, and verifies the result by reassessing the disk.
-#   Mode=Rollback undoes a Repair using its manifest.
+#   Mode=Rollback undoes a Repair using its manifest. The manifest records the control set Repair changed, and
+#   Rollback restores that exact control set. It accepts only the changes Repair can make: Start 4 -> 3 on a MANA
+#   service and the reinstall bit on a MANA device, both verified against the attached disk.
 #
 #   Problems with the synthetic network driver (netvsc) mean the VM has no network at all; they are reported
 #   but never changed by this script. An installation that cannot be fully read, an architecture mismatch, a
@@ -78,6 +84,7 @@ $servicePattern = '^[A-Za-z0-9_.-]{1,64}$'
 $devicePattern = '^(PCI|MANA_BUS)\\[A-Za-z0-9&_.-]{1,200}\\[A-Za-z0-9&_.-]{1,200}$'
 $registryKeyPattern = '^(Services\\[A-Za-z0-9_.-]{1,64}|Enum\\(PCI|MANA_BUS)\\[A-Za-z0-9&_.-]{1,200}\\[A-Za-z0-9&_.-]{1,200})$'
 $publishedDriverPattern = '^oem\d+\.inf$'
+$controlSetPattern = '^ControlSet\d{3}$'
 
 function Get-ManaRepairPlan {
     # Turns an assessment into the actions Repair would take, the reasons it must refuse, and problems this
@@ -104,11 +111,28 @@ function Get-ManaRepairPlan {
     ForEach ($unknown in @($Assessment.unknowns)) { $blockers += "assessment-incomplete:$unknown" }
 
     $problems = @($Assessment.problems)
-    $addingPackages = $false
-    if ($problems -contains 'mana-driver-missing') {
+    $incomingPackages = @()
+    $missingProblems = @($problems | Where-Object { $_ -in 'mana-driver-missing', 'mana-bus-driver-missing', 'mana-ethernet-driver-missing' })
+    if ($missingProblems.Count) {
         $packages = @($RepairVmPackages)
+        if ($packages.Count -and $missingProblems -notcontains 'mana-driver-missing') {
+            # A partially populated store: add only the repair VM packages that provide the missing function.
+            $ids = Get-ManaFunctionId
+            $needed = @()
+            if ($missingProblems -contains 'mana-bus-driver-missing') {
+                $bus = @($packages | Where-Object { Test-ManaPackageCoverage -Packages @($_) -Id $ids.vfBus })
+                if ($bus.Count) { $needed += $bus } else { $blockers += 'repair-vm-has-no-mana-driver:mana-bus-driver-missing' }
+            }
+            if ($missingProblems -contains 'mana-ethernet-driver-missing') {
+                $net = @($packages | Where-Object { Test-ManaPackageCoverage -Packages @($_) -Id $ids.ethernet -Class 'Net' })
+                if ($net.Count) { $needed += $net } else { $blockers += 'repair-vm-has-no-mana-driver:mana-ethernet-driver-missing' }
+            }
+            $seen = @{}
+            $packages = @($needed | Where-Object { -not $seen.ContainsKey($_.package) -and ($seen[$_.package] = $true) })
+        }
         $build = 0
-        if ($packages.Count -eq 0) { $blockers += 'repair-vm-has-no-mana-driver' }
+        if (@($RepairVmPackages).Count -eq 0) { $blockers += 'repair-vm-has-no-mana-driver' }
+        elseif ($packages.Count -eq 0) { }   # the missing function is already named in the blockers
         elseif (-not $Assessment.architecture -or -not $RepairVmArchitecture -or $Assessment.architecture -ne $RepairVmArchitecture) {
             $blockers += "architecture-mismatch:$($Assessment.architecture)-vs-$RepairVmArchitecture"
         }
@@ -116,16 +140,16 @@ function Get-ManaRepairPlan {
             $blockers += "unsupported-os-build:$($Assessment.currentBuild)"
         }
         else {
-            $addingPackages = $true
+            $incomingPackages = $packages
             ForEach ($pkg in $packages) {
                 $actions += [pscustomobject]@{ type = 'AddDriverPackage'; inf = $pkg.inf; package = $pkg.package; driverVer = $pkg.driverVer; source = $pkg.infPath }
             }
         }
     }
-    $providedServices = @(@($Assessment.manaPackages) + $(if ($addingPackages) { @($RepairVmPackages) } else { @() }) | ForEach-Object { $_.services })
+    $providedServices = @(@($Assessment.manaPackages) + @($incomingPackages) | ForEach-Object { $_.services })
 
     ForEach ($problem in $problems) {
-        if ($problem -eq 'mana-driver-missing') { continue }
+        if ($missingProblems -contains $problem) { continue }
         if ($problem -match '^mana-driver-disabled:(.+)$') {
             $service = $Matches[1]
             if ($service -notmatch $servicePattern) { $blockers += "unexpected-service-name:$service"; continue }
@@ -141,13 +165,14 @@ function Get-ManaRepairPlan {
             # Only the packages this repair adds can supply a driver; whether DISM really staged it is checked
             # by reassessing the disk after the packages are added.
             $path = $Matches[1]
-            $incoming = $(if ($addingPackages) { @($RepairVmPackages) } else { @() })
+            $incoming = @($incomingPackages)
             $device = @($devices | Where-Object { $_.path -eq $path }) | Select-Object -First 1
             if ($path -notmatch $devicePattern -or -not $device) { $blockers += "unexpected-device:$path"; continue }
             if (-not (Test-ManaDeviceDriverStaged -DevicePath $path -Packages $incoming)) { $blockers += "no-driver-to-install:$path"; continue }
             if (-not ([int]$device.configFlags -band $reinstallFlag)) { & $addFlag $device }
         }
-        elseif ($problem -match '^mana-driver-binary-missing:(.+)$') {
+        elseif ($problem -match '^mana-driver-(?:binary|service)-missing:(.+)$') {
+            # Reinstalling the devices bound to the service recreates it and copies its binary from the staged package.
             $service = $Matches[1]
             if ($providedServices -notcontains $service) { $blockers += $problem; continue }
             ForEach ($device in @($devices | Where-Object { $_.service -eq $service -and -not ([int]$_.configFlags -band $reinstallFlag) })) {
@@ -165,26 +190,65 @@ function Get-ManaRepairPlan {
 
 function Test-ManaRollbackManifest {
     # Validates a manifest before Rollback touches anything. Returns the reasons it is unusable; empty means usable.
-    Param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)]$Offline)
+    # Only the changes Repair can make are accepted: Start 4 -> 3 on a service in $Targets.services, and setting the
+    # reinstall bit in ConfigFlags on a device in $Targets.devices. $Targets lists the MANA services and devices found
+    # in the manifest's control set on the attached disk (see Get-ManaRollbackTarget).
+    Param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)]$Offline, $Targets)
 
     $reasons = @()
     if ($Manifest.schema -ne $manifestSchema) { $reasons += "unexpected schema '$($Manifest.schema)'" }
     if ("$($Manifest.guest.buildNumber)" -ne "$($Offline.BuildNumber)" -or "$($Manifest.guest.computerName)" -ne "$($Offline.GuestComputerName)") {
         $reasons += 'the manifest was written for a different Windows installation'
     }
-    ForEach ($change in @($Manifest.registryChanges)) {
-        if ("$($change.key)" -notmatch $registryKeyPattern) { $reasons += "invalid registry key '$($change.key)'" }
-        if (@('Start', 'ConfigFlags') -notcontains "$($change.name)") { $reasons += "invalid value name '$($change.name)'" }
-        ForEach ($field in 'before', 'after') {
-            $value = -1
-            if (-not [int]::TryParse("$($change.$field)", [ref]$value) -or $value -lt 0) { $reasons += "invalid $field value '$($change.$field)' for $($change.key)" }
-            elseif ("$($change.name)" -eq 'Start' -and $value -gt 4) { $reasons += "invalid Start value '$value' for $($change.key)" }
+    $changes = @($Manifest.registryChanges | Where-Object { $_ })
+    if ($changes.Count -and "$($Manifest.controlSet)" -notmatch $controlSetPattern) { $reasons += "invalid control set '$($Manifest.controlSet)'" }
+    elseif ($changes.Count -and (-not $Targets -or -not $Targets.controlSetFound)) { $reasons += "control set '$($Manifest.controlSet)' is not present on the attached disk" }
+    $services = @($Targets.services)
+    $devices = @($Targets.devices)
+    ForEach ($change in $changes) {
+        $before = -1; $after = -1
+        if (-not [int]::TryParse("$($change.before)", [ref]$before) -or -not [int]::TryParse("$($change.after)", [ref]$after) -or $before -lt 0 -or $after -lt 0) {
+            $reasons += "invalid before/after values for $($change.key)"
+            continue
+        }
+        if ("$($change.key)" -notmatch $registryKeyPattern) { $reasons += "invalid registry key '$($change.key)'"; continue }
+        if ("$($change.key)" -match '^Services\\(.+)$') {
+            $service = $Matches[1]
+            if ("$($change.name)" -ne 'Start') { $reasons += "invalid value name '$($change.name)' for $($change.key)" }
+            elseif ($before -ne $serviceDisabled -or $after -ne $demandStart) { $reasons += "unexpected Start change $before -> $after for $($change.key)" }
+            elseif ($services -notcontains $service) { $reasons += "$service is not a MANA driver service on the attached disk" }
+        }
+        else {
+            $device = "$($change.key)" -replace '^Enum\\', ''
+            if ("$($change.name)" -ne 'ConfigFlags') { $reasons += "invalid value name '$($change.name)' for $($change.key)" }
+            elseif (($before -band $reinstallFlag) -or $after -ne ($before -bor $reinstallFlag)) { $reasons += "unexpected ConfigFlags change $before -> $after for $($change.key)" }
+            elseif ($devices -notcontains $device) { $reasons += "$device is not a MANA device on the attached disk" }
         }
     }
     ForEach ($driver in @($Manifest.addedDrivers)) {
         if ("$($driver.publishedName)" -notmatch $publishedDriverPattern) { $reasons += "invalid published driver name '$($driver.publishedName)'" }
     }
     return $reasons
+}
+
+function Get-ManaRollbackTarget {
+    # The MANA services and device instances in control set $ControlSet of the attached disk, read with the in-memory
+    # offreg reader: the only registry targets a manifest may name.
+    Param([Parameter(Mandatory = $true)][string]$WindowsRoot, [Parameter(Mandatory = $true)][string]$ControlSet)
+
+    $targets = [pscustomobject]@{ controlSetFound = $false; services = @(); devices = @() }
+    if ($ControlSet -notmatch $controlSetPattern) { return $targets }
+    $system = Open-OfflineRegistryReader -Path "$WindowsRoot\System32\config\SYSTEM"
+    try {
+        if ($null -eq $system.GetSubKeyNames($ControlSet)) { return $targets }
+        $targets.controlSetFound = $true
+        $devices = @(Get-OfflineManaDevice -Reader $system -ControlSet $ControlSet)
+        $targets.devices = @($devices | ForEach-Object { $_.path })
+        $packageServices = @((Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mana').packages | ForEach-Object { $_.services })
+        $targets.services = @(@($packageServices) + @($devices | ForEach-Object { "$($_.service)" }) | Where-Object { $_ -match $servicePattern } | Sort-Object -Unique)
+    }
+    finally { $system.Dispose() }
+    return $targets
 }
 
 function Get-OfflineManaDriverEntry {
@@ -205,20 +269,32 @@ function Get-OfflineManaDriverEntry {
 }
 
 function Set-OfflineRegistryDword {
-    # Writes DWORD values under the offline SYSTEM hive's active control set inside one mount, and reads each back.
-    # Each change carries the value it expects to find. A required change whose value differs stops everything
-    # before the first write; an Optional change whose value differs is skipped and returned in Skipped.
+    # Writes DWORD values under control set $ControlSet of the offline SYSTEM hive inside one mount, and reads each
+    # back. -RequireCurrent also requires $ControlSet to be the one Select\Current boots (Repair); Rollback restores
+    # the control set its manifest names, whichever is current. Each change carries the value it expects to find. A
+    # required change whose value differs stops everything before the first write; an Optional change whose value
+    # differs is skipped and returned in Skipped. A failure after the first write does not throw: every value written
+    # is in Applied, including one whose read-back failed, and the failure is in Error, so the caller can record
+    # what Rollback must undo before it stops.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
         Justification = 'Changes and BackupDirectory are used inside the Invoke-WithHive script block, which PSScriptAnalyzer cannot see through.')]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
         Justification = 'Runs non-interactively under az vm repair run; Mode=Report is the dry run and every write passes Assert-OfflineTarget.')]
     Param(
         [Parameter(Mandatory = $true)][object[]]$Changes,
+        [Parameter(Mandatory = $true)][string]$ControlSet,
+        [switch]$RequireCurrent,
         [string]$BackupDirectory
     )
 
+    if ($ControlSet -notmatch $controlSetPattern) { throw "Invalid control set '$ControlSet'. No changes were made." }
     Invoke-WithHive 'SYSTEM' {
-        $root = Get-OfflineSystemRootPath -Strict
+        $current = Get-OfflineSystemRootPath -Strict:$RequireCurrent
+        if ($RequireCurrent -and (Split-Path -Path $current -Leaf) -ne $ControlSet) {
+            throw "The offline SYSTEM hive now boots $(Split-Path -Path $current -Leaf), not the assessed $ControlSet. No changes were made."
+        }
+        $root = "$(Split-Path -Path $current -Parent)\$ControlSet"
+        if ((Get-OfflineHiveKeyState -HiveKey $root) -ne 'Present') { throw "The offline control set '$ControlSet' is not present. No changes were made." }
         $apply = @()
         $skipped = @()
         ForEach ($change in $Changes) {
@@ -241,13 +317,29 @@ function Set-OfflineRegistryDword {
                 }
             }
         }
+        $applied = [System.Collections.Generic.List[object]]::new()
+        $failure = $null
         ForEach ($item in $apply) {
-            [void](Assert-OfflineTarget -Path $item.path -Action "set the offline $($item.change.key)\$($item.change.name) value")
-            Set-ItemProperty -LiteralPath $item.path -Name $item.change.name -Value ([int]$item.change.to) -Type DWord -ErrorAction Stop
-            $readBack = (Get-ItemProperty -LiteralPath $item.path -Name $item.change.name -ErrorAction Stop).$($item.change.name)
-            if ([int]$readBack -ne [int]$item.change.to) { throw "Verification failed: $($item.change.key)\$($item.change.name) reads $readBack after writing $($item.change.to)." }
+            try {
+                [void](Assert-OfflineTarget -Path $item.path -Action "set the offline $($item.change.key)\$($item.change.name) value")
+                Set-ItemProperty -LiteralPath $item.path -Name $item.change.name -Value ([int]$item.change.to) -Type DWord -ErrorAction Stop
+            }
+            catch {
+                $failure = "Could not set $($item.change.key)\$($item.change.name): $($_.Exception.Message)"
+                break
+            }
+            # Recorded as soon as the write succeeds, so Rollback can undo it even if the read-back below fails.
+            $applied.Add($item.change)
+            try {
+                $readBack = (Get-ItemProperty -LiteralPath $item.path -Name $item.change.name -ErrorAction Stop).$($item.change.name)
+                if ([int]$readBack -ne [int]$item.change.to) { throw "it reads $readBack after writing $($item.change.to)" }
+            }
+            catch {
+                $failure = "Verification failed for $($item.change.key)\$($item.change.name): $($_.Exception.Message)"
+                break
+            }
         }
-        return [pscustomobject]@{ Applied = @($apply | ForEach-Object { $_.change }); Skipped = $skipped }
+        return [pscustomobject]@{ Applied = @($applied); Skipped = $skipped; Error = $failure }
     }
 }
 
@@ -283,7 +375,8 @@ try {
             throw "Mode=Rollback requires BackupFile=<full path> to the mana-repair-manifest.json written by Repair. Not found: '$BackupFile'."
         }
         $manifest = Get-Content -LiteralPath $BackupFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        $reasons = @(Test-ManaRollbackManifest -Manifest $manifest -Offline $offline)
+        $targets = Get-ManaRollbackTarget -WindowsRoot $windowsRoot -ControlSet "$($manifest.controlSet)"
+        $reasons = @(Test-ManaRollbackManifest -Manifest $manifest -Offline $offline -Targets $targets)
         if ($reasons.Count) { throw "BackupFile '$BackupFile' cannot be used: $($reasons -join '; '). No changes were made." }
 
         # Check everything before changing anything: a published name can be reused by another driver, so only
@@ -302,9 +395,10 @@ try {
                 [pscustomobject]@{ key = $_.key; name = $_.name; from = [int]$_.after; to = [int]$_.before; optional = ($_.name -eq 'ConfigFlags') }
             })
         if ($registryChanges.Count) {
-            $result = Set-OfflineRegistryDword -Changes $registryChanges
-            ForEach ($change in @($result.Applied)) { Log-Output "Restored $($change.key)\$($change.name) to $($change.to)." }
+            $result = Set-OfflineRegistryDword -Changes $registryChanges -ControlSet "$($manifest.controlSet)"
+            ForEach ($change in @($result.Applied)) { Log-Output "Restored $($manifest.controlSet)\$($change.key)\$($change.name) to $($change.to)." }
             ForEach ($change in @($result.Skipped)) { Log-Warning "Left $($change.key)\$($change.name) unchanged: it no longer holds the value Repair wrote (Plug and Play has already used the reinstall flag)." }
+            if ($result.Error) { throw "Rollback stopped: $($result.Error). The driver packages were not removed." }
         }
         ForEach ($name in $toRemove) {
             [void](Assert-OfflineTarget -Path $windowsRoot -Action "remove the offline MANA driver package $name")
@@ -323,7 +417,7 @@ try {
         Log-Output "Before: verdict $($before.verdict). Problems: $(@($before.problems) -join '; '). Unknown: $(@($before.unknowns) -join '; ')"
 
         $repairVmPackages = @()
-        if (@($before.problems) -contains 'mana-driver-missing') {
+        if (@($before.problems | Where-Object { $_ -in 'mana-driver-missing', 'mana-bus-driver-missing', 'mana-ethernet-driver-missing' }).Count) {
             $source = Get-OfflineDriverPackage -WindowsRoot $env:SystemRoot -InfPrefix 'mana'
             $repairVmPackages = @($source.packages | ForEach-Object {
                     $_ | Add-Member -NotePropertyName infPath -NotePropertyValue (Join-Path "$env:SystemRoot\System32\DriverStore\FileRepository\$($_.package)" $_.inf) -PassThru
@@ -362,6 +456,7 @@ try {
                 createdAtUtc    = (Get-Date).ToUniversalTime().ToString('o')
                 updatedAtUtc    = $null
                 state           = 'in-progress'
+                controlSet      = "$($before.controlSet)"
                 guest           = [ordered]@{ buildNumber = "$($offline.BuildNumber)"; computerName = "$($offline.GuestComputerName)"; productName = "$($offline.ProductName)" }
                 addedDrivers    = @()
                 registryChanges = @()
@@ -407,6 +502,9 @@ try {
             $registryPlan = $plan
             if ($packageActions.Count) {
                 $staged = Get-ManaOfflineAssessment -WindowsRoot $windowsRoot
+                if ("$($staged.controlSet)" -ne $manifest.controlSet) {
+                    throw "The active control set changed from $($manifest.controlSet) to $($staged.controlSet) while packages were added. No registry value was changed. Roll back the added packages with Mode=Rollback BackupFile='$manifestPath'."
+                }
                 $registryPlan = Get-ManaRepairPlan -Assessment $staged -RepairVmArchitecture $env:PROCESSOR_ARCHITECTURE
                 if (@($registryPlan.blockers).Count) {
                     throw "After adding the driver packages the repair cannot be completed: $(@($registryPlan.blockers) -join '; '). No registry value was changed. Roll back the added packages with Mode=Rollback BackupFile='$manifestPath'."
@@ -422,10 +520,11 @@ try {
                     elseif ($_.type -eq 'ReinstallDevice') { [pscustomobject]@{ key = "Enum\$($_.device)"; name = 'ConfigFlags'; from = $_.from; to = $_.to } }
                 })
             if ($registryChanges.Count) {
-                $result = Set-OfflineRegistryDword -Changes $registryChanges -BackupDirectory $evidenceRoot
+                $result = Set-OfflineRegistryDword -Changes $registryChanges -BackupDirectory $evidenceRoot -ControlSet $manifest.controlSet -RequireCurrent
                 $manifest.registryChanges = @($result.Applied | ForEach-Object { [ordered]@{ key = $_.key; name = $_.name; before = $_.from; after = $_.to } })
                 Save-ManaManifest -Manifest $manifest -Path $manifestPath
-                ForEach ($change in @($result.Applied)) { Log-Output "Set $($change.key)\$($change.name) to $($change.to) (read back)." }
+                if ($result.Error) { throw "$($result.Error). Every value written is in the manifest; roll back with Mode=Rollback BackupFile='$manifestPath'." }
+                ForEach ($change in @($result.Applied)) { Log-Output "Set $($manifest.controlSet)\$($change.key)\$($change.name) to $($change.to) (read back)." }
             }
             $manifest.state = 'applied'
             Save-ManaManifest -Manifest $manifest -Path $manifestPath

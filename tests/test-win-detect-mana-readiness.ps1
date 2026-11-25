@@ -129,6 +129,9 @@ try {
         'ControlSet001\Services\gone|Start'        = [uint32]3
         'ControlSet001\Services\gone|ImagePath'    = 'System32\drivers\gone.sys'
         'ControlSet001\Services\corrupt|Start'     = [System.IO.InvalidDataException]::new('not a registry DWORD')
+        'ControlSet001\Services\nostart|Type'      = [uint32]1
+        'ControlSet001\Services\nostart|ImagePath' = '\SystemRoot\System32\drivers\netvsc.sys'
+        'ControlSet001\Services\badstart|Start'    = [uint32]7
     }
     $netvsc = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'netvsc' -WindowsRoot $windowsRoot
     Assert-True ($netvsc.present -and $netvsc.start -eq 3 -and $netvsc.binaryPresent) 'A healthy service must be present with its binary.'
@@ -138,15 +141,23 @@ try {
     Assert-True ($absent.present -eq $false -and $null -eq $absent.binaryPresent) 'An absent service key must be reported as not present.'
     $corrupt = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'corrupt' -WindowsRoot $windowsRoot
     Assert-True ($corrupt.readError -and $null -eq $corrupt.present) 'A read failure must be unknown, never absent.'
-    Write-Host 'PASS: service state (healthy, missing binary, absent key, read failure).'
+    $noStart = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'nostart' -WindowsRoot $windowsRoot
+    Assert-True ($noStart.readError -match 'Start') 'An existing service without a Start value must be unknown, even with a healthy binary.'
+    $badStart = Get-OfflineServiceState -Reader $reader -ControlSet 'ControlSet001' -ServiceName 'badstart' -WindowsRoot $windowsRoot
+    Assert-True ($badStart.readError -match 'Start') 'A Start value outside 0..4 must be unknown.'
+    Assert-Equal 'UNKNOWN' (Get-ManaDriveAssessment -Finding ([ordered]@{ netvsc = $noStart; driverStoreFound = $true; manaPackages = @([pscustomobject]@{ class = 'System'; hardwareIds = @('PCI\VEN_1414&DEV_00BA') }, [pscustomobject]@{ class = 'Net'; hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') }); manaServices = @() })).verdict 'A netvsc service without Start makes the verdict unknown.'
+    Write-Host 'PASS: service state (healthy, missing binary, absent key, read failure, missing or invalid Start).'
 }
 finally {
     Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # --- Verdicts -------------------------------------------------------------------------------------
+$busPkg = [pscustomobject]@{ package = 'mana_bus_vf.inf_x'; class = 'System'; services = @('mana_bus'); hardwareIds = @('PCI\VEN_1414&DEV_00BA') }
+$netPkg = [pscustomobject]@{ package = 'manavf.inf_x'; class = 'Net'; services = @('Mana'); hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') }
+$rdmaPkg = [pscustomobject]@{ package = 'mana_ib_vf.inf_x'; class = 'RDMA'; services = @('mana_ib'); hardwareIds = @('MANA_BUS\VEN_1414&ROLE_0003') }
 function New-Finding {
-    Param($Netvsc, [bool]$StoreFound = $true, [object[]]$Packages = @([pscustomobject]@{ package = 'manavf.inf_x' }), [object[]]$Services = @())
+    Param($Netvsc, [bool]$StoreFound = $true, [object[]]$Packages = @($busPkg, $netPkg), [object[]]$Services = @())
     [ordered]@{ netvsc = $Netvsc; driverStoreFound = $StoreFound; manaPackages = $Packages; manaServices = $Services }
 }
 $okNetvsc = @{ present = $true; start = 3; binaryPresent = $true; readError = $null }
@@ -161,7 +172,11 @@ $cases = @(
     @{ Name = 'MANA service disabled'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; present = $true; start = 4; binaryPresent = $true })); Verdict = 'NOT_READY'; Problems = 'mana-driver-disabled:m' },
     @{ Name = 'SYSTEM hive unreadable'; Finding = (New-Finding $null); Verdict = 'UNKNOWN'; Problems = '' },
     @{ Name = 'driver store unreadable'; Finding = (New-Finding $okNetvsc -StoreFound $false -Packages @()); Verdict = 'UNKNOWN'; Problems = '' },
-    @{ Name = 'MANA service read failure'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; readError = 'x' })); Verdict = 'UNKNOWN'; Problems = '' }
+    @{ Name = 'MANA service read failure'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; readError = 'x' })); Verdict = 'UNKNOWN'; Problems = '' },
+    @{ Name = 'only the RDMA package staged'; Finding = (New-Finding $okNetvsc -Packages @($rdmaPkg)); Verdict = 'NOT_READY'; Problems = 'mana-bus-driver-missing;mana-ethernet-driver-missing' },
+    @{ Name = 'only the bus package staged'; Finding = (New-Finding $okNetvsc -Packages @($busPkg)); Verdict = 'NOT_READY'; Problems = 'mana-ethernet-driver-missing' },
+    @{ Name = 'Ethernet ID listed by a non-Net package'; Finding = (New-Finding $okNetvsc -Packages @($busPkg, [pscustomobject]@{ package = 'x'; class = 'System'; hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') })); Verdict = 'NOT_READY'; Problems = 'mana-ethernet-driver-missing' },
+    @{ Name = 'only the Ethernet package staged'; Finding = (New-Finding $okNetvsc -Packages @($netPkg)); Verdict = 'NOT_READY'; Problems = 'mana-bus-driver-missing' }
 )
 ForEach ($case in $cases) {
     $result = Get-ManaDriveAssessment -Finding $case.Finding
@@ -175,14 +190,17 @@ Assert-Equal 'UNKNOWN' (Get-OverallVerdict -Verdicts @()) 'No installations insp
 Write-Host "PASS: $($cases.Count) verdict cases and the overall verdict precedence."
 
 # --- MANA device instances (live finding: a seen device is never reinstalled for a driver staged later) --------
-$pkgs = @([pscustomobject]@{ package = 'manavf.inf_x'; services = @('Mana'); hardwareIds = @('PCI\VEN_1414&DEV_00BA', 'MANA_BUS\R') })
+$pkgs = @($busPkg, [pscustomobject]@{ package = 'manavf.inf_x'; class = 'Net'; services = @('Mana'); hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C', 'MANA_BUS\R') })
 $deviceCases = @(
     @{ Name = 'seen device without driver'; D = @(@{ path = 'PCI\VEN_1414&DEV_00BA\1'; service = $null; configFlags = 0 }); S = @(); Verdict = 'NOT_READY'; Problems = 'mana-device-not-bound:PCI\VEN_1414&DEV_00BA\1' },
     @{ Name = 'seen device flagged for reinstall'; D = @(@{ path = 'PCI\VEN_1414&DEV_00BA\1'; service = $null; configFlags = 0x20 }); S = @(); Verdict = 'READY'; Problems = '' },
     @{ Name = 'bound device'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0 }); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $true }); Verdict = 'READY'; Problems = '' },
     @{ Name = 'binary missing, bound device not flagged'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0 }); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $false }); Verdict = 'NOT_READY'; Problems = 'mana-driver-binary-missing:Mana' },
     @{ Name = 'binary missing, staged and bound device flagged'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0x20 }); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $false }); Verdict = 'READY'; Problems = '' },
-    @{ Name = 'flagged device with no staged driver'; D = @(@{ path = 'MANA_BUS\X\1'; service = $null; configFlags = 0x20 }); S = @(); Verdict = 'NOT_READY'; Problems = 'mana-device-no-driver:MANA_BUS\X\1' },
+    @{ Name = 'child of an unknown role with no driver'; D = @(@{ path = 'MANA_BUS\X\1'; service = $null; configFlags = 0x20 }); S = @(); Verdict = 'UNKNOWN'; Problems = '' },
+    @{ Name = 'device bound to a deleted service'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0 }); S = @(@{ name = 'Mana'; present = $false }); Verdict = 'NOT_READY'; Problems = 'mana-driver-service-missing:Mana' },
+    @{ Name = 'deleted service, staged, device flagged'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Mana'; configFlags = 0x20 }); S = @(@{ name = 'Mana'; present = $false }); Verdict = 'READY'; Problems = '' },
+    @{ Name = 'deleted service not staged'; D = @(@{ path = 'MANA_BUS\R\1'; service = 'Gone'; configFlags = 0x20 }); S = @(@{ name = 'Gone'; present = $false }); Verdict = 'NOT_READY'; Problems = 'mana-driver-service-missing:Gone' },
     @{ Name = 'binary missing, staged, no device yet'; D = @(); S = @(@{ name = 'Mana'; present = $true; start = 3; binaryPresent = $false }); Verdict = 'READY'; Problems = '' }
 )
 ForEach ($case in $deviceCases) {
@@ -193,7 +211,7 @@ ForEach ($case in $deviceCases) {
     Assert-Equal $case.Verdict $result.verdict "Verdict for '$($case.Name)'."
     Assert-Equal $case.Problems ($result.problems -join ';') "Problems for '$($case.Name)'."
 }
-$netPkgs = @([pscustomobject]@{ package = 'manavf.inf_x'; class = 'Net'; services = @('Mana'); hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') })
+$netPkgs = @($busPkg, $netPkg)
 $finding = New-Finding $okNetvsc -Packages $netPkgs
 $finding.manaDevices = @([pscustomobject]@{ path = 'MANA_BUS\VEN_1414&ROLE_004C\1'; service = 'Mana'; configFlags = 0 }, [pscustomobject]@{ path = 'MANA_BUS\VEN_1414&ROLE_0003\1'; service = $null; configFlags = 0x40 })
 $finding.manaDevicesRead = $true
@@ -201,10 +219,27 @@ $result = Get-ManaDriveAssessment -Finding $finding
 Assert-Equal 'READY' $result.verdict 'With the Ethernet function covered, a MANA_BUS child without a driver (RDMA) does not block READY.'
 Assert-Equal 'MANA_BUS\VEN_1414&ROLE_0003\1' ($result.optionalDevicesWithoutDriver -join ',') 'The uncovered non-Ethernet child is reported as optional.'
 $finding.manaDevices = @([pscustomobject]@{ path = 'PCI\VEN_1414&DEV_00BA\1'; service = $null; configFlags = 0 })
-Assert-Equal 'mana-device-no-driver:PCI\VEN_1414&DEV_00BA\1' ((Get-ManaDriveAssessment -Finding $finding).problems -join ';') 'The VF is never optional: without its bus driver there is no MANA networking.'
+$finding.manaPackages = @($netPkg)
+Assert-Equal 'mana-bus-driver-missing;mana-device-no-driver:PCI\VEN_1414&DEV_00BA\1' ((Get-ManaDriveAssessment -Finding $finding).problems -join ';') 'The VF is never optional: without its bus driver there is no MANA networking.'
+# A Net package that does not list the Ethernet child's ID does not make that child optional.
+$finding = New-Finding $okNetvsc -Packages @($busPkg, [pscustomobject]@{ package = 'old.inf_x'; class = 'Net'; hardwareIds = @('MANA_BUS\VEN_1414&ROLE_0042') })
+$finding.manaDevices = @([pscustomobject]@{ path = 'MANA_BUS\VEN_1414&ROLE_004C\1'; service = $null; configFlags = 0 })
+$finding.manaDevicesRead = $true
+$result = Get-ManaDriveAssessment -Finding $finding
+Assert-True (@($result.problems) -contains 'mana-device-no-driver:MANA_BUS\VEN_1414&ROLE_004C\1') 'An uncovered Ethernet child is a problem, never optional.'
+Assert-Equal 0 @($result.optionalDevicesWithoutDriver).Count 'The Ethernet child is not reported as optional.'
 $finding = New-Finding $okNetvsc -Packages $pkgs; $finding.manaDevicesRead = $false
 Assert-Equal 'UNKNOWN' (Get-ManaDriveAssessment -Finding $finding).verdict 'Unreadable device instances block a READY claim.'
 
+function New-FakeHive {
+    Param([hashtable]$Values)
+    $r = [pscustomobject]@{ Values = $Values }
+    $r | Add-Member ScriptMethod ReadDword { Param($key, $name) $this.Values["$key|$name"] }
+    $r | Add-Member ScriptMethod ReadString { Param($key, $name) $this.Values["$key|$name"] }
+    $r | Add-Member ScriptMethod GetSubKeyNames { Param($key) $null }
+    $r | Add-Member ScriptMethod Dispose { }
+    return $r
+}
 $enumReader = [pscustomobject]@{
     Keys   = @{
         'ControlSet001\Enum\PCI'                                   = @('VEN_1414&DEV_00BA&SUBSYS_1&REV_00', 'VEN_8086&DEV_7111')
@@ -219,7 +254,29 @@ $enumReader | Add-Member ScriptMethod ReadString { Param($key, $name) $this.Valu
 $enumReader | Add-Member ScriptMethod ReadDword { Param($key, $name) $this.Values["$key|$name"] }
 $devices = @(Get-OfflineManaDevice -Reader $enumReader -ControlSet 'ControlSet001')
 Assert-Equal 'PCI\VEN_1414&DEV_00BA&SUBSYS_1&REV_00\5&a&0&0|0|,MANA_BUS\VEN_1414&ROLE_004C\6&b&0&1|32|Mana' (@($devices | ForEach-Object { "$($_.path)|$($_.configFlags)|$($_.service)" }) -join ',') 'Only the MANA VF and MANA_BUS children are collected, with a missing ConfigFlags read as 0.'
-Write-Host "PASS: $($deviceCases.Count + 1) MANA device-instance cases and offline device enumeration."
+Write-Host "PASS: $($deviceCases.Count + 2) MANA device-instance cases and offline device enumeration."
+
+# --- A SYSTEM reader that fails to close invalidates what it read ----------------------------------
+$assessRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mana-win-dispose-" + [guid]::NewGuid().ToString('N'))
+try {
+    function Get-OfflineDriverPackage { Param($WindowsRoot, $InfPrefix) [pscustomobject]@{ repositoryFound = $true; packages = $(if ($InfPrefix -eq 'mana') { @($busPkg, $netPkg) } else { @() }) } }
+    function Open-OfflineRegistryReader {
+        Param($Path)
+        $r = New-FakeHive @{ 'Select|Current' = [uint32]1; 'ControlSet001\Services\netvsc|Start' = [uint32]3; 'ControlSet001\Services\mana_bus|Start' = [uint32]3; 'ControlSet001\Services\Mana|Start' = [uint32]3 }
+        if ($Path -like '*SYSTEM') { $r | Add-Member -Force ScriptMethod Dispose { throw 'ORCloseHive failed' } }
+        return $r
+    }
+    function Resolve-ManaServiceBinaryPath { Param($WindowsRoot, $ServiceName, $ImagePath) $null }
+    $result = Get-ManaOfflineAssessment -WindowsRoot $assessRoot
+    Assert-True (-not $result.systemHiveRead) 'A reader that failed to close must not count as read.'
+    Assert-Equal 'UNKNOWN' $result.verdict 'Facts from a reader that failed to close cannot make the installation READY.'
+    Assert-True (@($result.unknowns) -contains 'system-hive-unreadable') 'The close failure is reported as an unknown.'
+    Write-Host 'PASS: a SYSTEM reader close failure makes the assessment UNKNOWN.'
+}
+finally {
+    Remove-Item Function:\Get-OfflineDriverPackage, Function:\Open-OfflineRegistryReader, Function:\Resolve-ManaServiceBinaryPath -ErrorAction SilentlyContinue
+    . $helperPath
+}
 
 # --- Read-only contract against the script text ---------------------------------------------------
 ForEach ($forbidden in 'reg(\.exe)?\s+(load|unload|add|delete|import|restore|save)', 'Set-ItemProperty', 'New-ItemProperty', 'Remove-ItemProperty', 'Set-Disk', 'bcdedit', 'Remove-Item') {
