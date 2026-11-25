@@ -75,6 +75,9 @@ run_case() {    # $1=name $2=loop $3..=jq-free expectations as key=value substri
     [ "$status" -eq 0 ] || { ok=0; reason="exit=$status"; }
     [ "$before" = "$after" ] || { ok=0; reason="$reason image-modified"; }
     [ -n "$json" ] || { ok=0; reason="$reason no-json"; }
+    if [ -n "$json" ] && command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$json" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null || { ok=0; reason="$reason invalid-json"; }
+    fi
     findmnt -rn -S "${loop}p1" >/dev/null 2>&1 && { ok=0; reason="$reason left-mounted"; }
     for p in "${loop}"p*; do
         findmnt -rn -S "$p" >/dev/null 2>&1 && { ok=0; reason="$reason left-mounted:$p"; }
@@ -331,13 +334,14 @@ kernel "$R" 6.8.0-1073-azure module module yes
 mkdir -p "$R/etc/default/grub.d" "$R/etc/pinning"
 echo 'GRUB_DEFAULT="Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced"' > "$R/etc/pinning/pin.cfg"
 ln -s /etc/pinning/pin.cfg "$R/etc/default/grub.d/50-pin.cfg"
-run_case grub-d-absolute-symlink "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-not-newest;' '"bootDefaultKernel":"5.4.0-1109-azure"'
+run_case grub-d-absolute-symlink "$L" '"verdict":"READY"' '"bootDefaultStatus":"newest"' '"pendingBootDefault":"Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced"'
 
-# A numeric submenu default such as 1>2 can select an older kernel; it cannot be resolved offline, so unknown.
+# A numeric submenu default such as 1>2 in the generated grub.cfg can select an older kernel; it cannot be resolved
+# offline, so unknown.
 L=$(new_image grub-default-submenu ext4); R="$WORK/grub-default-submenu.mnt"
 kernel "$R" 5.4.0-1109-azure none module yes
 kernel "$R" 6.8.0-1073-azure module module yes
-printf 'GRUB_DEFAULT="1>2"\n' > "$R/etc/default/grub"
+printf 'set default="1>2"\n' >> "$R/boot/grub/grub.cfg"
 run_case grub-default-submenu "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-unknown;' '"bootDefaultStatus":"unknown"'
 
 # A separate /boot already mounted on this machine (device override while an operator has it open) is left alone:
@@ -449,18 +453,19 @@ else
 fi
 losetup -d "$L"
 
-# The verdict describes the newest kernel, so a GRUB default pinned to another installed kernel must not be READY.
+# The verdict describes the newest kernel, so a generated GRUB default pinned to another installed kernel must not be READY.
 L=$(new_image grub-pinned-older ext4); R="$WORK/grub-pinned-older.mnt"
 kernel "$R" 5.4.0-1109-azure none module yes
 kernel "$R" 6.8.0-1073-azure module module yes
-printf 'GRUB_DEFAULT="Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced"\n' > "$R/etc/default/grub"
+printf 'set default="Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced"\n' >> "$R/boot/grub/grub.cfg"
 run_case grub-pinned-older "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-not-newest;' '"bootDefaultKernel":"5.4.0-1109-azure"'
 
-# With GRUB_DEFAULT=saved the kernel that boots is grubenv's saved_entry (RHEL-family BLS entry IDs name it).
+# With GRUB_DEFAULT=saved, grub.cfg boots grubenv's saved_entry (RHEL-family BLS entry IDs name it).
 L=$(new_image grub-saved-entry-older ext4); R="$WORK/grub-saved-entry-older.mnt"
 kernel "$R" 5.14.0-362.el9.x86_64 module module yes
 kernel "$R" 5.14.0-427.el9.x86_64 module module yes
 printf 'GRUB_DEFAULT=saved\n' > "$R/etc/default/grub"
+printf 'if [ "${next_entry}" ] ; then\n   set default="${next_entry}"\nelse\n   set default="${saved_entry}"\nfi\n' >> "$R/boot/grub/grub.cfg"
 printf '# GRUB Environment Block\nsaved_entry=0123abcd-5.14.0-362.el9.x86_64\n' > "$R/boot/grub/grubenv"
 run_case grub-saved-entry-older "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-not-newest;' '"bootDefaultKernel":"5.14.0-362.el9.x86_64"'
 
@@ -469,13 +474,56 @@ L=$(new_image grub-saved-entry-newest ext4); R="$WORK/grub-saved-entry-newest.mn
 kernel "$R" 5.14.0-362.el9.x86_64 module module yes
 kernel "$R" 5.14.0-427.el9.x86_64 module module yes
 printf 'GRUB_DEFAULT=saved\n' > "$R/etc/default/grub"
+printf 'set default="${saved_entry}"\n' >> "$R/boot/grub/grub.cfg"
 printf 'saved_entry=0123abcd-5.14.0-427.el9.x86_64\n' > "$R/boot/grub/grubenv"
 run_case grub-saved-entry-newest "$L" '"verdict":"READY"' '"bootDefaultKernel":""'
 
 L=$(new_image grub-default-numeric ext4); R="$WORK/grub-default-numeric.mnt"
 kernel "$R" 6.8.0-1073-azure module module yes
 printf 'GRUB_DEFAULT=0\n' > "$R/etc/default/grub"
+printf 'set default="0"\n' >> "$R/boot/grub/grub.cfg"
 run_case grub-default-numeric "$L" '"verdict":"READY"' '"bootDefaultKernel":""'
+
+# /etc/default/grub changed to 0 without regenerating grub.cfg: GRUB still boots the older kernel, so not READY.
+L=$(new_image grub-default-stale ext4); R="$WORK/grub-default-stale.mnt"
+kernel "$R" 5.4.0-1109-azure none module yes
+kernel "$R" 6.8.0-1073-azure module module yes
+printf 'GRUB_DEFAULT=0\n' > "$R/etc/default/grub"
+printf 'set default="Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced"\n' >> "$R/boot/grub/grub.cfg"
+run_case grub-default-stale "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-not-newest;' '"bootDefaultKernel":"5.4.0-1109-azure"' '"pendingBootDefault":"0"'
+
+# A one-time next_entry in grubenv overrides grub.cfg's default for the next boot.
+L=$(new_image grub-next-entry ext4); R="$WORK/grub-next-entry.mnt"
+kernel "$R" 5.4.0-1109-azure none module yes
+kernel "$R" 6.8.0-1073-azure module module yes
+printf 'set default="0"\n' >> "$R/boot/grub/grub.cfg"
+printf 'next_entry=Advanced options for Ubuntu>gnulinux-5.4.0-1109-azure-advanced\n' > "$R/boot/grub/grubenv"
+run_case grub-next-entry "$L" '"verdict":"UNKNOWN"' '"bootDefaultSource":"grubenv next_entry"' '"bootDefaultKernel":"5.4.0-1109-azure"'
+
+# BLS-only layout with no readable grub.cfg and no saved_entry: the booted kernel cannot be established.
+L=$(new_image boot-default-unreadable ext4); R="$WORK/boot-default-unreadable.mnt"
+kernel "$R" 5.14.0-427.el9.x86_64 module module yes; rm -f "$R/boot/grub/grub.cfg"
+mkdir -p "$R/boot/loader/entries"
+printf 'title RHEL\nlinux /vmlinuz-5.14.0-427.el9.x86_64\noptions root=UUID=0000 ro\n' > "$R/boot/loader/entries/abc.conf"
+run_case boot-default-unreadable "$L" '"verdict":"UNKNOWN"' 'boot-default-kernel-unknown;' '"kernelCommandLine":"established"'
+
+# A generated grub.cfg linux line can carry GRUB variables too: resolved from grub.cfg when set there...
+L=$(new_image grub-cfg-var-resolved ext4); R="$WORK/grub-cfg-var-resolved.mnt"
+GRUB_EXTRA='$extra_args' kernel "$R" 6.8.0-1073-azure module module yes
+sed -i '1i set extra_args="console=ttyS0 module_blacklist=mana"' "$R/boot/grub/grub.cfg"
+run_case grub-cfg-var-resolved "$L" '"verdict":"NOT_READY"' 'mana-driver-disabled;' '"kernelCommandLine":"established"'
+
+# ...and making the command line unknown when they cannot be resolved offline.
+L=$(new_image grub-cfg-var-unresolved ext4); R="$WORK/grub-cfg-var-unresolved.mnt"
+GRUB_EXTRA='$kernelopts' kernel "$R" 6.8.0-1073-azure module module yes
+run_case grub-cfg-var-unresolved "$L" '"verdict":"UNKNOWN"' 'kernel-command-line-unknown;' '"kernelCommandLineUnresolved":"/boot/grub/grub.cfg:$kernelopts;"'
+
+# Control characters are valid in Linux file names; every one must be escaped so the evidence stays valid JSON.
+L=$(new_image json-control-char ext4); R="$WORK/json-control-char.mnt"
+kernel "$R" 6.8.0-1073-azure module module yes
+mkdir -p "$R/etc/netplan"
+printf 'network:\n  ethernets:\n    enP12345s1:\n      dhcp4: true\n' > "$R/etc/netplan/70-a"$'\x01'"b"$'\x1f'"c.yaml"
+run_case json-control-char "$L" '"verdict":"READY"' '"/etc/netplan/70-a\u0001b\u001fc.yaml"'
 
 # Network configuration is resolved inside the disk: an absolute symlink to a file that exists only on this machine
 # is not read, while one that resolves to a file on the disk is.

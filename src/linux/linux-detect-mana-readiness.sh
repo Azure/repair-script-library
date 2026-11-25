@@ -160,6 +160,16 @@ json_escape() {
     value=${value//$'\n'/\\n}
     value=${value//$'\r'/\\r}
     value=${value//$'\t'/\\t}
+    # Every other U+0001-U+001F control character (valid in Linux file names) as \u00XX, so the JSON stays valid.
+    if [[ "$value" == *[[:cntrl:]]* ]]; then
+        local code oct ch hex
+        for code in {1..31}; do
+            printf -v oct '%03o' "$code"
+            printf -v ch '%b' "\\0$oct"
+            printf -v hex '\\u%04x' "$code"
+            value=${value//"$ch"/$hex}
+        done
+    fi
     printf '%s' "$value"
 }
 
@@ -623,35 +633,44 @@ EOF
     return 1
 }
 
+# Expands GRUB variable references ($kernelopts, ${extra}) in kernel arguments $2 from source $1 into RESOLVED_ARGS.
+# Generated grub.cfg linux lines and BLS options can both carry them. A reference that cannot be resolved is recorded in
+# BOOT_ARGS_UNRESOLVED, which makes the command line unknown rather than silently dropping what it may contain.
+resolve_boot_vars() {
+    local source="$1" var name value
+    RESOLVED_ARGS="$2"
+    # Longest names first, so $kernelopts is replaced before a shorter $kernel could match its prefix.
+    for var in $(printf '%s' "$RESOLVED_ARGS" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' | sort -ru || true); do
+        name="${var#\$}"; name="${name#\{}"; name="${name%\}}"
+        if value=$(grub_variable "$name"); then
+            RESOLVED_ARGS=${RESOLVED_ARGS//"$var"/$value}
+        else
+            BOOT_ARGS_UNRESOLVED="${BOOT_ARGS_UNRESOLVED}${source}:${var};"
+            RESOLVED_ARGS=${RESOLVED_ARGS//"$var"/}
+        fi
+    done
+}
+
 if [ "$BOOT_MOUNT_MODE" != "not-mounted" ] && [ -n "$NEWEST_KERNEL" ]; then
     while IFS= read -r file; do
         [ -n "$file" ] || continue
         args=$(K="vmlinuz-$NEWEST_KERNEL" awk '$1 ~ /^linux(efi|16)?$/ && index($2, ENVIRON["K"]) { $1 = ""; $2 = ""; print }' "$file" 2>/dev/null || echo "")
         if [ -n "$args" ]; then
-            BOOT_ARGS="$BOOT_ARGS $args"
-            BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}/boot${file#"$(guest_to_host /boot)"};"
+            guest="/boot${file#"$(guest_to_host /boot)"}"
+            resolve_boot_vars "$guest" "$args"
+            BOOT_ARGS="$BOOT_ARGS $RESOLVED_ARGS"
+            BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}${guest};"
             BOOT_ENTRY_FOUND="true"
         fi
     done <<EOF
 $GRUB_CFG_FILES
 EOF
-    # BLS entries reference variables such as $kernelopts. An entry whose variables cannot all be resolved has not
-    # had its arguments checked, so it makes the command line unknown rather than silently dropping them.
-    while IFS=$'\t' read -r guest entry; do
+        while IFS=$'\t' read -r guest entry; do
         [ -n "$entry" ] || continue
         K="$NEWEST_KERNEL" awk '$1 == "linux" && index($2, ENVIRON["K"]) { found = 1 } END { exit !found }' "$entry" 2>/dev/null || continue
         options=$(sed -n 's/^options[[:space:]]\{1,\}//p' "$entry" 2>/dev/null | head -n1 || echo "")
-        # Longest names first, so $kernelopts is replaced before a shorter $kernel could match its prefix.
-        for var in $(printf '%s' "$options" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' | sort -ru || true); do
-            name="${var#\$}"; name="${name#\{}"; name="${name%\}}"
-            if value=$(grub_variable "$name"); then
-                options=${options//"$var"/$value}
-            else
-                BOOT_ARGS_UNRESOLVED="${BOOT_ARGS_UNRESOLVED}${guest}:${var};"
-                options=${options//"$var"/}
-            fi
-        done
-        BOOT_ARGS="$BOOT_ARGS $options"
+        resolve_boot_vars "$guest" "$options"
+        BOOT_ARGS="$BOOT_ARGS $RESOLVED_ARGS"
         BOOT_ARGS_SOURCES="${BOOT_ARGS_SOURCES}${guest};"
         BOOT_ENTRY_FOUND="true"
     done < <(guest_files /boot/loader/entries '*.conf')
@@ -734,37 +753,91 @@ elif [ -n "$BOOT_ARGS_UNRESOLVED" ]; then
 fi
 
 # --- Boot default ----------------------------------------------------------------------------------
-# The verdict describes the newest installed kernel, which is GRUB's first menu entry. GRUB can be pinned to another
-# entry through GRUB_DEFAULT or, with GRUB_DEFAULT=saved, through saved_entry in grubenv. A default that names another
-# installed kernel makes the result unknown and is reported. Any other default except the first entry (empty or 0) -
-# a numeric submenu path such as 1>2, or a title without a version - may select an older kernel and cannot be
-# resolved reliably offline, so it also makes the result unknown instead of READY for a kernel that may not boot.
-GRUB_DEFAULT_SETTING="${GRUB_SETTING[GRUB_DEFAULT]}"
-BOOT_DEFAULT_TARGET="$GRUB_DEFAULT_SETTING"
-if [ "$GRUB_DEFAULT_SETTING" = "saved" ]; then
-    BOOT_DEFAULT_TARGET=$(grub_variable saved_entry 2>/dev/null || echo "")
-fi
-BOOT_DEFAULT_KERNEL=""
-BOOT_DEFAULT_STATUS="newest"
-if [ -n "$NEWEST_KERNEL" ]; then
-    case "$BOOT_DEFAULT_TARGET" in
-        ''|0) ;;
-        *"$NEWEST_KERNEL"*) ;;
-        *)
-            BOOT_DEFAULT_STATUS="unknown"
-            for kernel in $KERNELS; do
-                [ "$kernel" = "$NEWEST_KERNEL" ] && continue
-                case "$BOOT_DEFAULT_TARGET" in *"$kernel"*) BOOT_DEFAULT_KERNEL="$kernel"; BOOT_DEFAULT_STATUS="older"; break ;; esac
-            done
-            ;;
+# The verdict describes the newest installed kernel, which is GRUB's first menu entry. The entry GRUB actually boots
+# comes from the generated grub.cfg ("set default=...") and grubenv (saved_entry, and a one-time next_entry), not from
+# GRUB_DEFAULT in /etc/default/grub, which only takes effect at the next grub-mkconfig and is reported as pending.
+# A default that names another installed kernel makes the result unknown and is reported. Any other default except
+# the first entry (empty or 0) - a numeric submenu path such as 1>2, or a title without a version - may select an
+# older kernel and cannot be resolved reliably offline, so it also makes the result unknown. When neither grub.cfg
+# nor grubenv can be read, the default cannot be established and is unknown.
+
+# Prints "<status> <kernel>" for boot target $1: newest, older <kernel>, or unknown.
+classify_boot_target() {
+    local target="$1" kernel
+    [ -n "$NEWEST_KERNEL" ] || { echo newest; return; }
+    case "$target" in
+        ''|0|*"$NEWEST_KERNEL"*) echo newest; return ;;
     esac
-fi
-if [ -n "$BOOT_DEFAULT_KERNEL" ]; then
-    Log-Warning "GRUB is set to boot kernel $BOOT_DEFAULT_KERNEL, not the newest installed kernel ${NEWEST_KERNEL}; the readiness of the kernel that boots was not assessed."
-elif [ "$BOOT_DEFAULT_STATUS" = "unknown" ]; then
-    Log-Warning "GRUB's default boot entry ($BOOT_DEFAULT_TARGET) could not be matched to an installed kernel, so the kernel that boots may not be the newest one."
+    for kernel in $KERNELS; do
+        [ "$kernel" = "$NEWEST_KERNEL" ] && continue
+        case "$target" in *"$kernel"*) echo "older $kernel"; return ;; esac
+    done
+    echo unknown
+}
+
+# Replaces $saved_entry / ${saved_entry} style references in $1 with their grubenv or grub.cfg values.
+expand_grub_target() {
+    local value="$1" var name resolved
+    for var in $(printf '%s' "$value" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' | sort -ru || true); do
+        name="${var#\$}"; name="${name#\{}"; name="${name%\}}"
+        resolved=$(grub_variable "$name" 2>/dev/null || echo "")
+        value=${value//"$var"/$resolved}
+    done
+    printf '%s' "$value"
+}
+
+BOOT_DEFAULT_SOURCE=""
+BOOT_DEFAULT_TARGET=""
+GENERATED_DEFAULT=""
+GENERATED_DEFAULT_FOUND="false"
+while IFS= read -r cfg; do
+    [ -n "$cfg" ] || continue
+    # 00_header writes set default="${next_entry}" for one-time boots and set default="<GRUB_DEFAULT>" otherwise.
+    value=$(sed -nE 's/^[[:space:]]*set[[:space:]]+default=["'"'"']?([^"'"'"']*).*/\1/p' "$cfg" 2>/dev/null | grep -v 'next_entry' | head -n1 || true)
+    if grep -qE '^[[:space:]]*set[[:space:]]+default=' "$cfg" 2>/dev/null; then
+        GENERATED_DEFAULT="$value"
+        GENERATED_DEFAULT_FOUND="true"
+        break
+    fi
+done <<EOF
+$GRUB_CFG_FILES
+EOF
+NEXT_ENTRY=""
+[ -n "$GRUBENV" ] && NEXT_ENTRY=$(sed -n 's/^next_entry=//p' "$GRUBENV" 2>/dev/null | head -n1 || true)
+
+if [ -n "$NEXT_ENTRY" ]; then
+    BOOT_DEFAULT_TARGET="$NEXT_ENTRY"; BOOT_DEFAULT_SOURCE="grubenv next_entry"
+elif [ "$GENERATED_DEFAULT_FOUND" = "true" ]; then
+    BOOT_DEFAULT_TARGET=$(expand_grub_target "$GENERATED_DEFAULT"); BOOT_DEFAULT_SOURCE="grub.cfg"
+elif [ -n "$GRUB_CFG_FILES" ]; then
+    BOOT_DEFAULT_TARGET=""; BOOT_DEFAULT_SOURCE="grub.cfg"    # no "set default": GRUB boots the first entry
+elif [ -n "$GRUBENV" ] && grep -q '^saved_entry=' "$GRUBENV" 2>/dev/null; then
+    BOOT_DEFAULT_TARGET=$(grub_variable saved_entry 2>/dev/null || echo ""); BOOT_DEFAULT_SOURCE="grubenv saved_entry"
 fi
 
+BOOT_DEFAULT_KERNEL=""
+if [ -z "$BOOT_DEFAULT_SOURCE" ]; then
+    BOOT_DEFAULT_STATUS="unknown"
+    [ -n "$NEWEST_KERNEL" ] || BOOT_DEFAULT_STATUS="newest"
+else
+    read -r BOOT_DEFAULT_STATUS BOOT_DEFAULT_KERNEL <<< "$(classify_boot_target "$BOOT_DEFAULT_TARGET")"
+fi
+if [ -n "$BOOT_DEFAULT_KERNEL" ]; then
+    Log-Warning "GRUB is set to boot kernel $BOOT_DEFAULT_KERNEL ($BOOT_DEFAULT_SOURCE), not the newest installed kernel ${NEWEST_KERNEL}; the readiness of the kernel that boots was not assessed."
+elif [ "$BOOT_DEFAULT_STATUS" = "unknown" ] && [ -z "$BOOT_DEFAULT_SOURCE" ]; then
+    Log-Warning "Neither the generated grub.cfg nor grubenv could be read, so the kernel GRUB boots could not be established."
+elif [ "$BOOT_DEFAULT_STATUS" = "unknown" ]; then
+    Log-Warning "GRUB's default boot entry ($BOOT_DEFAULT_TARGET, from $BOOT_DEFAULT_SOURCE) could not be matched to an installed kernel, so the kernel that boots may not be the newest one."
+fi
+
+# Report-only: the default grub-mkconfig will write next time.
+PENDING_BOOT_DEFAULT="${GRUB_SETTING[GRUB_DEFAULT]}"
+if [ -n "$PENDING_BOOT_DEFAULT" ] && [ "$PENDING_BOOT_DEFAULT" != "saved" ]; then
+    read -r pending_status _ <<< "$(classify_boot_target "$PENDING_BOOT_DEFAULT")"
+    if [ "$pending_status" != "$BOOT_DEFAULT_STATUS" ]; then
+        Log-Warning "GRUB_DEFAULT=$PENDING_BOOT_DEFAULT in the grub defaults takes effect at the next grub-mkconfig and would select a different entry ($pending_status) than the current one."
+    fi
+fi
 MANA_DISABLED="false"
 NETVSC_DISABLED="false"
 [ "$MANA_RULE" = "disabled" ] && MANA_DISABLED="true"
@@ -881,7 +954,7 @@ $PINNED_FILES
 EOF
 
 cat > "$EVIDENCE_DIR/evidence.json" <<EOF
-{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","unknowns":"$UNKNOWNS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","mountMode":"$MOUNT_MODE","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"manaRule":"$MANA_RULE","hvNetvscRule":"$NETVSC_RULE","ruleEvidence":"$(json_escape "$RULE_EVIDENCE")","kernelCommandLine":"$BOOT_ARGS_STATUS","kernelCommandLineSources":"$(json_escape "$BOOT_ARGS_SOURCES")","bootDefaultKernel":"$(json_escape "$BOOT_DEFAULT_KERNEL")","bootMountMode":"$BOOT_MOUNT_MODE","kernelCommandLineUnresolved":"$(json_escape "$BOOT_ARGS_UNRESOLVED")","pendingBootConfigSources":"$(json_escape "$GRUB_DEFAULT_SOURCES")","bootDefaultStatus":"$BOOT_DEFAULT_STATUS","vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
+{"schemaVersion":"1.0","scenario":"mana-readiness","producedBy":"linux-detect-mana-readiness","producedAtUtc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","verdict":"$VERDICT","problems":"$PROBLEMS","riskIndicators":"$RISK_INDICATORS","unknowns":"$UNKNOWNS","os":{"family":"linux","distro":"$(json_escape "$DISTRO_ID")","version":"$(json_escape "$DISTRO_VER")"},"guest":{"osPartition":"$(json_escape "$OS_PARTITION")","mountMode":"$MOUNT_MODE","newestKernel":"$(json_escape "$NEWEST_KERNEL")","newestKernelMana":"$NEWEST_MANA","newestKernelHvNetvsc":"$NEWEST_NETVSC","anyKernelHasMana":$ANY_KERNEL_MANA,"kernels":[${KERNELS_JSON}],"manaDisabledByRule":$MANA_DISABLED,"hvNetvscDisabledByRule":$NETVSC_DISABLED,"manaRule":"$MANA_RULE","hvNetvscRule":"$NETVSC_RULE","ruleEvidence":"$(json_escape "$RULE_EVIDENCE")","kernelCommandLine":"$BOOT_ARGS_STATUS","kernelCommandLineSources":"$(json_escape "$BOOT_ARGS_SOURCES")","bootDefaultKernel":"$(json_escape "$BOOT_DEFAULT_KERNEL")","bootMountMode":"$BOOT_MOUNT_MODE","kernelCommandLineUnresolved":"$(json_escape "$BOOT_ARGS_UNRESOLVED")","pendingBootConfigSources":"$(json_escape "$GRUB_DEFAULT_SOURCES")","bootDefaultStatus":"$BOOT_DEFAULT_STATUS","bootDefaultSource":"$(json_escape "$BOOT_DEFAULT_SOURCE")","pendingBootDefault":"$(json_escape "$PENDING_BOOT_DEFAULT")","vfPinnedConfigFiles":[${PINNED_JSON}],"initramfsHasMana":"$INITRAMFS_HAS_MANA","initramfsCheckMethod":"$INITRAMFS_METHOD"},"evidencePath":"$(json_escape "$EVIDENCE_DIR")"}
 EOF
 
 Log-Output "[MANA-EVIDENCE-JSON]$(cat "$EVIDENCE_DIR/evidence.json")"
