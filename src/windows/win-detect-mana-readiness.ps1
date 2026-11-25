@@ -118,6 +118,7 @@ try {
 
     $verdict = Get-OverallVerdict -Verdicts @($findings | ForEach-Object { $_.verdict })
     $problems = @($findings | ForEach-Object { $_.problems } | Select-Object -Unique)
+    $unknowns = @($findings | ForEach-Object { $_.unknowns } | Select-Object -Unique)
     $riskIndicators = @()
     if (@($findings | Where-Object { $_.diskReadOnly -eq $false }).Count) { $riskIndicators += 'disk-already-online-writable' }
     if (@($findings | Where-Object { @($_.mellanoxPackages).Count -and -not @($_.manaPackages).Count }).Count) { $riskIndicators += 'mellanox-driver-only' }
@@ -131,6 +132,7 @@ try {
         verdict        = $verdict
         problems       = (($problems | ForEach-Object { "$_;" }) -join '')
         riskIndicators = (($riskIndicators | ForEach-Object { "$_;" }) -join '')
+        unknowns       = (($unknowns | ForEach-Object { "$_;" }) -join '')
         os             = [ordered]@{ family = 'windows' }
         guest          = $findings
         evidencePath   = $evidenceRoot

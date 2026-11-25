@@ -326,6 +326,7 @@ function Set-OfflineRegistryDword {
             }
             catch {
                 $failure = "Could not set $($item.change.key)\$($item.change.name): $($_.Exception.Message)"
+                Log-Warning "Could not set $($item.change.key)\$($item.change.name) after $($applied.Count) earlier change(s): $($_.Exception.Message)"
                 break
             }
             # Recorded as soon as the write succeeds, so Rollback can undo it even if the read-back below fails.
@@ -336,6 +337,7 @@ function Set-OfflineRegistryDword {
             }
             catch {
                 $failure = "Verification failed for $($item.change.key)\$($item.change.name): $($_.Exception.Message)"
+                Log-Warning "$failure ($($applied.Count) change(s) written, including this one)"
                 break
             }
         }

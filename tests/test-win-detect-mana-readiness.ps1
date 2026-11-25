@@ -147,6 +147,16 @@ try {
     Assert-True ($badStart.readError -match 'Start') 'A Start value outside 0..4 must be unknown.'
     Assert-Equal 'UNKNOWN' (Get-ManaDriveAssessment -Finding ([ordered]@{ netvsc = $noStart; driverStoreFound = $true; manaPackages = @([pscustomobject]@{ class = 'System'; hardwareIds = @('PCI\VEN_1414&DEV_00BA') }, [pscustomobject]@{ class = 'Net'; hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') }); manaServices = @() })).verdict 'A netvsc service without Start makes the verdict unknown.'
     Write-Host 'PASS: service state (healthy, missing binary, absent key, read failure, missing or invalid Start).'
+
+    # --- An unreadable driver package is unknown, not fatal -----------------------------------------
+    function Open-OfflineRegistryReader { Param($Path) throw 'hive not available in this test' }
+    function Get-Content { throw [System.UnauthorizedAccessException]::new('Access to the path is denied.') }
+    try { $unreadable = Get-ManaOfflineAssessment -WindowsRoot $windowsRoot }
+    finally { Remove-Item -Path Function:\Get-Content, Function:\Open-OfflineRegistryReader }
+    Assert-True (-not $unreadable.driverStoreFound -and @($unreadable.manaPackages).Count -eq 0) 'A driver package that cannot be read must not be reported as a readable store.'
+    Assert-True (@($unreadable.unknowns) -contains 'driver-store-unreadable') 'An unreadable driver store must be an unknown.'
+    Assert-True (@($unreadable.readWarnings | Where-Object { $_ -match 'MANA driver packages' }).Count -eq 1) 'The read failure must be returned as a warning for the caller to log.'
+    Write-Host 'PASS: an unreadable driver package makes the assessment UNKNOWN instead of stopping the run.'
 }
 finally {
     Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -173,6 +183,7 @@ $cases = @(
     @{ Name = 'SYSTEM hive unreadable'; Finding = (New-Finding $null); Verdict = 'UNKNOWN'; Problems = '' },
     @{ Name = 'driver store unreadable'; Finding = (New-Finding $okNetvsc -StoreFound $false -Packages @()); Verdict = 'UNKNOWN'; Problems = '' },
     @{ Name = 'MANA service read failure'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; readError = 'x' })); Verdict = 'UNKNOWN'; Problems = '' },
+    @{ Name = 'MANA service binary not resolvable'; Finding = (New-Finding $okNetvsc -Services @(@{ name = 'm'; present = $true; start = 3; binaryPresent = $null })); Verdict = 'UNKNOWN'; Problems = '' },
     @{ Name = 'only the RDMA package staged'; Finding = (New-Finding $okNetvsc -Packages @($rdmaPkg)); Verdict = 'NOT_READY'; Problems = 'mana-bus-driver-missing;mana-ethernet-driver-missing' },
     @{ Name = 'only the bus package staged'; Finding = (New-Finding $okNetvsc -Packages @($busPkg)); Verdict = 'NOT_READY'; Problems = 'mana-ethernet-driver-missing' },
     @{ Name = 'Ethernet ID listed by a non-Net package'; Finding = (New-Finding $okNetvsc -Packages @($busPkg, [pscustomobject]@{ package = 'x'; class = 'System'; hardwareIds = @('MANA_BUS\VEN_1414&ROLE_004C') })); Verdict = 'NOT_READY'; Problems = 'mana-ethernet-driver-missing' },
@@ -288,5 +299,6 @@ Assert-True ($sourceText -match '(?s)finally \{.*Restore-Disk-Partitions-v3') 'D
 Assert-True ($helperText -match 'Open-OfflineRegistryReader') 'Hives must be read with the in-memory offreg reader.'
 Assert-True ($sourceText -match '\[MANA-EVIDENCE-JSON\]') 'The detector must emit the shared MANA evidence marker.'
 Assert-True ($sourceText -match "scenario\s*=\s*'mana-readiness'") 'The scenario must match linux-detect-mana-readiness.'
+Assert-True ($sourceText -match '(?m)^\s*unknowns\s*=\s*\(\(\$unknowns') 'The evidence must carry top-level unknowns, as linux-detect-mana-readiness does.'
 Assert-True ($helperText -match '(?s)\.Dispose\(\).*\.Dispose\(\)') 'Each reader must be disposed.'
 Write-Host 'PASS: read-only contract (no hive mounts, registry writes or disk changes) and the evidence contract.'

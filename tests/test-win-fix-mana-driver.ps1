@@ -228,6 +228,20 @@ try {
     Assert-Equal 4 (Get-ItemProperty "$scratch2\Services\mana_bus").Start 'Rollback writes the recorded control set.'
     Assert-Equal 4 (Get-ItemProperty "$scratch\Services\mana_bus").Start 'The current control set is left alone.'
 
+    # A write that fails part-way must return the values already written, so Rollback can undo them.
+    Set-ItemProperty -Path "$scratch\Services\mana_bus" -Name Start -Value 4 -Type DWord
+    Set-ItemProperty -Path "$scratch\$deviceKey" -Name ConfigFlags -Value 0 -Type DWord
+    function Assert-OfflineTarget { Param($Path, $Action) if ($Path -like '*\Enum\*') { throw 'not the offline hive' }; $true }
+    $script:warnings = @()
+    function Log-Warning { Param($Message) $script:warnings += $Message }
+    $result = Set-OfflineRegistryDword -Changes @((New-Change 'Services\mana_bus' Start 4 3), (New-Change $deviceKey ConfigFlags 0 32)) -ControlSet ControlSet001 -RequireCurrent
+    Assert-Equal 'Services\mana_bus' (@($result.Applied).key -join ',') 'The value written before the failure is reported as applied.'
+    Assert-True ($result.Error -match 'not the offline hive') 'The failure is reported instead of discarding what was written.'
+    Assert-True (@($script:warnings | Where-Object { $_ -match 'after 1 earlier change' }).Count -eq 1) 'The failed write is logged with the number of changes already made.'
+    Assert-Equal 0 (Get-ItemProperty "$scratch\$deviceKey").ConfigFlags 'The failed change is not written.'
+    Assert-True ($sourceText -match '(?s)\$manifest\.registryChanges = .*Save-ManaManifest.*if \(\$result\.Error\)') 'Repair records the applied values in the manifest before stopping on a failed write.'
+    function Assert-OfflineTarget { Param($Path, $Action) $script:gateCalls += $Path; $true }
+
     # A write whose read-back fails is still returned in Applied, so Repair records it for Rollback.
     Set-ItemProperty -Path "$scratch\Services\mana_bus" -Name Start -Value 4 -Type DWord
     $script:failReadBack = $true
@@ -243,7 +257,7 @@ try {
     Assert-Equal 3 (Get-ItemProperty "$scratch\Services\mana_bus").Start 'The value was written before the read-back failed.'
     Assert-Equal 'Services\mana_bus' (@($result.Applied | ForEach-Object { $_.key }) -join ',') 'The written value is in Applied; nothing after the failure is written.'
     Assert-True ($result.Error -match 'simulated read-back failure') 'The read-back failure is returned to the caller.'
-    Write-Host 'PASS: registry write path (stale-plan gate, missing key, exact control set, offline-target gate, .reg backup, read-back, rollback, used reinstall flag, failed read-back recorded).'
+    Write-Host 'PASS: registry write path (stale-plan gate, missing key, exact control set, offline-target gate, .reg backup, read-back, rollback, used reinstall flag, partial failure, failed read-back recorded).'
 }
 finally {
     Remove-Item -Path $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -287,7 +287,8 @@ function Get-ManaDriveAssessment {
             continue
         }
         if ($svc.start -eq $serviceDisabled) { $problems += "mana-driver-disabled:$($svc.name)" }
-        if ($svc.binaryPresent -eq $false) {
+        if ($null -eq $svc.binaryPresent) { $unknowns += "mana-driver-binary-unknown:$($svc.name)" }
+        elseif ($svc.binaryPresent -eq $false) {
             # Installing a staged package copies the binary back, so a missing binary is only a problem while
             # no staged package provides the service or a device bound to it will not be reinstalled.
             $bound = @($devices | Where-Object { $_.service -eq $svc.name })
@@ -379,12 +380,23 @@ function Get-ManaOfflineAssessment {
         $finding.readWarnings += "could not read the OS version from the SOFTWARE hive: $($_.Exception.Message)"
     }
 
-    $mana = Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mana'
-    $finding.driverStoreFound = $mana.repositoryFound
-    $finding.manaPackages = @($mana.packages)
-    # Mellanox packages are informational; their long hardware-ID lists would only bloat the evidence line.
-    $finding.mellanoxPackages = @((Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mlx').packages |
-            Select-Object package, inf, driverVer)
+    try {
+        $mana = Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mana'
+        $finding.driverStoreFound = $mana.repositoryFound
+        $finding.manaPackages = @($mana.packages)
+    }
+    catch {
+        # A package that cannot be read leaves the MANA services unknown, so the store is reported as unreadable.
+        $finding.readWarnings += "could not read the MANA driver packages: $($_.Exception.Message)"
+    }
+    try {
+        # Mellanox packages are informational; their long hardware-ID lists would only bloat the evidence line.
+        $finding.mellanoxPackages = @((Get-OfflineDriverPackage -WindowsRoot $WindowsRoot -InfPrefix 'mlx').packages |
+                Select-Object package, inf, driverVer)
+    }
+    catch {
+        $finding.readWarnings += "could not read the Mellanox driver packages: $($_.Exception.Message)"
+    }
 
     try {
         $system = Open-OfflineRegistryReader -Path "$WindowsRoot\System32\config\SYSTEM"
